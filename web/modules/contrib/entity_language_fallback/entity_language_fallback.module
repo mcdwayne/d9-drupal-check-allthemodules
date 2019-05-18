@@ -1,0 +1,250 @@
+<?php
+
+/**
+ * @file
+ * Add fallback languages to entities.
+ */
+
+use Drupal\Core\Entity\ContentEntityInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\entity_language_fallback\Plugin\search_api\datasource\ContentEntityFallback;
+use Drupal\language\ConfigurableLanguageInterface;
+
+/**
+ * Implements hook_language_fallback_candidates_alter()
+ */
+function entity_language_fallback_language_fallback_candidates_alter(array &$candidates, array $context) {
+  $operation = $context['operation'];
+
+  if ($operation == 'entity_upcast' || $operation == 'entity_view') {
+    $attempted_langcode = $context['langcode'];
+    /** @var \Drupal\Core\Entity\ContentEntityInterface $entity */
+    $entity = $context['data'];
+
+    if ($entity->isTranslatable()) {
+      $candidates = [$attempted_langcode => $attempted_langcode];
+      $fallback_langcodes = \Drupal::service('language_fallback.controller')->getFallbackChain($attempted_langcode);
+
+      foreach ($fallback_langcodes as $fallback_langcode) {
+        if (!empty($fallback_langcode) && $attempted_langcode != $fallback_langcode && !in_array($fallback_langcode, $candidates)) {
+          $candidates[$fallback_langcode] = $fallback_langcode;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter()
+ */
+function entity_language_fallback_form_language_admin_edit_form_alter(&$form, FormStateInterface $form_state) {
+  /** @var Drupal\language\Entity\ConfigurableLanguage $this_language */
+  $this_language = $form_state->getFormObject()->getEntity();
+
+  $languages = Drupal::languageManager()->getLanguages();
+  $options = [];
+  foreach($languages as $language) {
+    // Only include this language if its not itself.
+    if ($language->getId() != $this_language->getId()) {
+      $options[$language->getId()] = $language->getName();
+    }
+  }
+
+  $form['entity_language_fallback'] = [
+    '#title' => t('Entity fallback language'),
+    '#description' => t('Choose one or more fallback languages in prioritized order. The languages are used as fallback in entity view.'),
+    '#type' => 'details',
+    '#open' => TRUE,
+    '#tree' => TRUE,
+  ];
+
+  // Creating one priority field per available language.
+  $default_values = $this_language->getThirdPartySetting('entity_language_fallback', 'fallback_langcodes', []);
+  for ($i = 0; $i < count($options); $i++) {
+    $form['entity_language_fallback'][$i] = [
+      '#type' => 'select',
+      '#title' => t('Priority @priority', ['@priority' => $i + 1]),
+      '#description' => t('Choose the language used as priority @priority fallback language.', ['@priority' => $i + 1]),
+      '#options' => $options,
+      '#default_value' => !empty($default_values[$i]) ? $default_values[$i] : '',
+      '#empty_option' => t('-None-'),
+      '#tree' => TRUE,
+    ];
+  }
+
+  $form['#entity_builders'][] = 'entity_language_fallback_form_language_admin_edit_form_builder';
+}
+
+/**
+ * Entity builder for the language form entity_language_fallback options.
+ *
+ * @see entity_language_fallback_form_language_admin_edit_form_alter()
+ */
+function entity_language_fallback_form_language_admin_edit_form_builder($entity_type, ConfigurableLanguageInterface $this_language, &$form, FormStateInterface $form_state) {
+  $this_language->setThirdPartySetting(
+    'entity_language_fallback',
+    'fallback_langcodes',
+    $form_state->getValue('entity_language_fallback')
+  );
+}
+
+/**
+ * Implements hook_entity_insert().
+ *
+ * Modified version of search_api_entity_insert().
+ * @see search_api_entity_insert()
+ */
+function entity_language_fallback_entity_insert(EntityInterface $entity) {
+  if (!\Drupal::moduleHandler()->moduleExists('search_api')) {
+    return;
+  }
+  // Check if the entity is a content entity.
+  if (!($entity instanceof ContentEntityInterface) || $entity->search_api_skip_tracking) {
+    return;
+  }
+  $indexes = ContentEntityFallback::getIndexesForEntity($entity);
+  if (!$indexes) {
+    return;
+  }
+
+  // Compute the item IDs for all languages set up on the language fallback chain.
+  $item_ids = [];
+  $entity_id = $entity->id();
+  $fallback_controller = \Drupal::service('language_fallback.controller');
+  $fallback_languages = array_keys($fallback_controller->getTranslations($entity));
+
+  foreach ($fallback_languages as $langcode) {
+    $item_ids[] = $entity_id . ':' . $langcode;
+  }
+  $datasource_id = 'entity_language_fallback:' . $entity->getEntityTypeId();
+  foreach ($indexes as $index) {
+    $filtered_item_ids = ContentEntityFallback::filterValidItemIds($index, $datasource_id, $item_ids);
+    $index->trackItemsInserted($datasource_id, $filtered_item_ids);
+  }
+}
+
+/**
+ * Implements hook_entity_update().
+ *
+ * search_api_entity_update() can only update items that are in ContentEntity
+ * datasources.
+ *
+ * @see search_api_entity_update().
+ */
+function entity_language_fallback_entity_update(EntityInterface $entity) {
+  if (!\Drupal::moduleHandler()->moduleExists('search_api')) {
+    return;
+  }
+  // Check if the entity is a content entity.
+  if (!($entity instanceof ContentEntityInterface) || $entity->search_api_skip_tracking) {
+    return;
+  }
+  $indexes = ContentEntityFallback::getIndexesForEntity($entity);
+  if (!$indexes) {
+    return;
+  }
+
+  /** @var \Drupal\entity_language_fallback\FallbackControllerInterface $fallback_controller */
+  static $fallback_controller;
+  if (!isset($fallback_controller)) {
+    $fallback_controller = \Drupal::service('language_fallback.controller');
+  }
+
+  // Compare old and new languages for the entity to identify inserted,
+  // updated and deleted translations (and, therefore, search items).
+  $entity_id = $entity->id();
+  $inserted_item_ids = [];
+  $updated_item_ids = $fallback_controller->getTranslations($entity);
+  $deleted_item_ids = [];
+  $old_translations = $fallback_controller->getTranslations($entity->original);
+  foreach ($old_translations as $langcode => $language) {
+    if (!isset($updated_item_ids[$langcode])) {
+      $deleted_item_ids[] = $langcode;
+    }
+  }
+  foreach ($updated_item_ids as $langcode => $language) {
+    if (!isset($old_translations[$langcode])) {
+      unset($updated_item_ids[$langcode]);
+      $inserted_item_ids[] = $langcode;
+    }
+  }
+
+  $datasource_id = 'entity_language_fallback:' . $entity->getEntityTypeId();
+  $combine_id = function ($langcode) use ($entity_id) {
+    return $entity_id . ':' . $langcode;
+  };
+  $inserted_item_ids = array_map($combine_id, $inserted_item_ids);
+  $updated_item_ids = array_map($combine_id, array_keys($updated_item_ids));
+  $deleted_item_ids = array_map($combine_id, $deleted_item_ids);
+  foreach ($indexes as $index) {
+    if ($inserted_item_ids) {
+      $filtered_item_ids = ContentEntityFallback::filterValidItemIds($index, $datasource_id, $inserted_item_ids);
+      $index->trackItemsInserted($datasource_id, $filtered_item_ids);
+    }
+    if ($updated_item_ids) {
+      $index->trackItemsUpdated($datasource_id, $updated_item_ids);
+    }
+    if ($deleted_item_ids) {
+      $index->trackItemsDeleted($datasource_id, $deleted_item_ids);
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_delete().
+ *
+ * Deletes all entries for this entity from the tracking table for each index
+ * that tracks this entity type.
+ *
+ * By setting the $entity->search_api_skip_tracking property to a true-like
+ * value before this hook is invoked, you can prevent this behavior and make the
+ * Search API ignore this deletion. (Note that this might lead to stale data in
+ * the tracking table or on the server, since the item will not removed from
+ * there (if it has been added before).)
+ *
+ * Note that this function implements tracking only on behalf of the "Content
+ * Entity" datasource defined in this module, not for entity-based datasources
+ * in general. Datasources defined by other modules still have to implement
+ * their own mechanism for tracking new/updated/deleted entities.
+ *
+ * @see \Drupal\search_api\Plugin\search_api\datasource\ContentEntity
+ */
+function entity_language_fallback_entity_delete(EntityInterface $entity) {
+  if (!\Drupal::moduleHandler()->moduleExists('search_api')) {
+    return;
+  }
+  // Check if the entity is a content entity.
+  if (!($entity instanceof ContentEntityInterface) || $entity->search_api_skip_tracking) {
+    return;
+  }
+  $indexes = ContentEntityFallback::getIndexesForEntity($entity);
+  if (!$indexes) {
+    return;
+  }
+
+  // Remove the search items for all the entity's translations.
+  $item_ids = [];
+  $entity_id = $entity->id();
+  foreach (array_keys($entity->getTranslationLanguages()) as $langcode) {
+    $item_ids[] = $entity_id . ':' . $langcode;
+  }
+  $datasource_id = 'entity:' . $entity->getEntityTypeId();
+  foreach ($indexes as $index) {
+    $index->trackItemsDeleted($datasource_id, $item_ids);
+  }
+}
+
+/**
+ * Implements hook_search_api_index_items_alter().
+ */
+function entity_language_fallback_search_api_index_items_alter(\Drupal\search_api\IndexInterface $index, array &$items) {
+  /** @var Drupal\search_api\Item\Item $item */
+  foreach ($items as &$item) {
+    $object = $item->getOriginalObject(TRUE);
+    $lang = isset($object->language) ? $object->language : $object->getValue()->langcode->value;
+    if ($lang) {
+      $item->setLanguage($lang);
+    }
+  }
+}
