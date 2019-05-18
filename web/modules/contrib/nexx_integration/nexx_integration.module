@@ -1,0 +1,302 @@
+<?php
+
+/**
+ * @file
+ * Contains module hooks.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+
+/**
+ * Implements hook_library_info_build().
+ */
+function nexx_integration_library_info_build() {
+  $libraries = [];
+
+  $config = \Drupal::service('config.factory')
+    ->get('nexx_integration.settings');
+
+  if ($config && ($omnia_id = $config->get('omnia_id'))) {
+    $libraries['base'] = [
+      'version' => '1.x',
+      'dependencies' => ['core/jquery', 'core/drupal', 'core/backbone'],
+      'css' => ['theme' => ['css/styles.css' => []]],
+      'js' => [
+        '//arc.nexx.cloud/sdk/' . $omnia_id . '.play' => [
+          'type' => 'external',
+        ],
+        'js/nexxplay.js' => [],
+        'js/models/PlayerModel.js' => [],
+        'js/views/SwiperObserverView.js' => [],
+        'js/views/PlayerView.js' => [],
+      ],
+    ];
+  }
+
+  return $libraries;
+}
+
+/**
+ * Implements hook_taxonomy_term_insert().
+ *
+ * Used to insert terms into nexxOMNIA video CMS.
+ */
+function nexx_integration_taxonomy_term_insert(EntityInterface $term) {
+  $response_data = nexx_integration_taxonomy_term_request($term, 'insert');
+
+  if (!empty($response_data['result']['itemupdate']['generatedID'])) {
+    $drupal_id = $term->id();
+    $nexx_id = $response_data['result']['itemupdate']['generatedID'];
+    $vid = $term->bundle();
+
+    update_nexx_term_id_mapping($drupal_id, $nexx_id, $vid);
+  }
+}
+
+/**
+ * Implements hook_taxonomy_term_update().
+ *
+ * Used to update terms into nexxOMNIA video CMS.
+ */
+function nexx_integration_taxonomy_term_update(EntityInterface $term) {
+  $nexx_id = nexx_integration_taxonomy_term_nexx_id($term);
+
+  // No nexx_id found, we need to insert the term.
+  if (!$nexx_id) {
+    nexx_integration_taxonomy_term_insert($term);
+  }
+  else {
+    $response_data = nexx_integration_taxonomy_term_request($term, 'update', ['item' => $nexx_id]);
+
+    if ($response_data) {
+      // If omnia does not know the object yet, insert it.
+      if (!empty($response_data['metadata']['status']) && $response_data['metadata']['status'] == 403) {
+        $response_data = nexx_integration_taxonomy_term_request($term, 'insert');
+
+        if (!empty($response_data['result']['itemupdate']['generatedID'])) {
+          $drupal_id = $term->id();
+          $nexx_id = $response_data['result']['itemupdate']['generatedID'];
+          $vid = $term->get('vid')->getString();
+
+          update_nexx_term_id_mapping($drupal_id, $nexx_id, $vid);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_taxonomy_term_delete().
+ *
+ * Used to delete terms into nexxOMNIA video CMS.
+ */
+function nexx_integration_taxonomy_term_delete(EntityInterface $term) {
+  $database = \Drupal::getContainer()->get('database');
+  $nexx_id = nexx_integration_taxonomy_term_nexx_id($term);
+  nexx_integration_taxonomy_term_request($term, 'delete', ['item' => $nexx_id]);
+
+  // Remove stale entry.
+  $database->delete('nexx_taxonomy_term_data')
+    ->condition('tid', $term->id())
+    ->execute();
+}
+
+/**
+ * Implements and extends hook_taxonomy_term_request().
+ *
+ * Additionally to the default hook parameters two internal params are added.
+ *
+ * @throws \InvalidArgumentException
+ *   Throws an exception if an unsupported operation is supplied.
+ */
+function nexx_integration_taxonomy_term_request(EntityInterface $term, $command, $additional_params = []) {
+  $term_bundle = $term->bundle();
+  $container = \Drupal::getContainer();
+  $entity_type_manager = \Drupal::entityTypeManager();
+  $nexx_notification = $container->get('nexx_integration.notification');
+  $response_data = [];
+  $valid_commands = ['update', 'insert', 'delete'];
+  if (!in_array($command, $valid_commands)) {
+    throw new \InvalidArgumentException(sprintf('Invalid command used: %s', $command));
+  }
+
+  /*
+   * Find media bundles, that have a setting for this vocabulary
+   */
+  foreach ($container->get('entity_type.bundle.info')
+    ->getBundleInfo('media') as $bundle_id => $bundle_info) {
+    /** @var \Drupal\media\MediaTypeInterface $bundle */
+    $bundle = $entity_type_manager->getStorage('media_type')
+      ->load($bundle_id);
+    if ($bundle->getSource()->getPluginId() === 'nexx_video') {
+      $configuration = $bundle->getSource()->getConfiguration();
+
+      $field_definitions = $container->get('entity_field.manager')
+        ->getFieldDefinitions('media', $bundle_id);
+
+      if (!empty($configuration['channel_field'])) {
+        $channel_field_settings = $field_definitions[$configuration['channel_field']]->getSetting('handler_settings');
+      }
+      if (!empty($configuration['actor_field'])) {
+        $actors_field_settings = $field_definitions[$configuration['actor_field']]->getSetting('handler_settings');
+      }
+      if (!empty($configuration['tag_field'])) {
+        $tags_field_settings = $field_definitions[$configuration['tag_field']]->getSetting('handler_settings');
+      }
+
+      /*
+       * TODO: Omnia might add more taxonomies then channel
+       * and actor in the future.
+       *
+       * Prepare for this by removing the hard coded names.
+       */
+      if (isset($channel_field_settings['target_bundles']) && in_array($term_bundle, $channel_field_settings['target_bundles'])) {
+        $streamtype = "channels";
+        $params = ['title' => $term->label()] + $additional_params;
+
+        // Omnia knows the concept of parents for the channel taxonomy
+        // But only one parent per term is allowed. Drupal allows multiple
+        // parents per term, so we use only the first term for mapping.
+        $parents = $entity_type_manager->getStorage('taxonomy_term')->loadParents($term->id());
+        if ($parents) {
+          $parent = array_shift($parents);
+          $params['parent'] = nexx_integration_taxonomy_term_nexx_id($parent);
+        }
+      }
+      elseif (isset($actors_field_settings['target_bundles']) && in_array($term_bundle, $actors_field_settings['target_bundles'])) {
+        $streamtype = "persons";
+        $params = ['artistname' => $term->label()] + $additional_params;
+      }
+      elseif (isset($tags_field_settings['target_bundles']) && in_array($term_bundle, $tags_field_settings['target_bundles'])) {
+        $streamtype = "tags";
+        $params = ['tag' => $term->label()] + $additional_params;
+      }
+      if (!empty($streamtype)) {
+        $response_data = $nexx_notification->$command($streamtype, $term->id(), $params);
+      }
+      break;
+    }
+  }
+  return $response_data;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function nexx_integration_theme() {
+  return [
+    'nexx_player' => [
+      'variables' => [
+        'container_id' => NULL,
+        'video_id' => NULL,
+        'autoplay' => NULL,
+        'exitMode' => NULL,
+        'disableAds' => NULL,
+        'streamType' => NULL,
+      ],
+      'template' => 'nexx-player',
+    ],
+    'iframe_nexx_player' => [
+      'variables' => [
+        'video_hash' => NULL,
+        'omnia_id' => NULL,
+        'container_id' => NULL,
+      ],
+      'template' => 'iframe-nexx-player',
+    ],
+    'omnia_editor' => [
+      'variables' => [
+        'auth_key' => NULL,
+      ],
+      'template' => 'omnia-editor',
+    ],
+  ];
+}
+
+/**
+ * Retrieve corresponding nexx id for a given taxonomy term.
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $term
+ *   The term for which the naxx id should be found.
+ *
+ * @return int
+ *   nexx id for the given Term.
+ */
+function nexx_integration_taxonomy_term_nexx_id(EntityInterface $term) {
+  $database = \Drupal::getContainer()->get('database');
+  $result = $database->select('nexx_taxonomy_term_data', 'n')
+    ->fields('n', ['nexx_item_id'])
+    ->condition('n.tid', $term->id())
+    ->execute();
+  $nexx_id = $result->fetchField();
+  return $nexx_id;
+}
+
+/**
+ * Update nexx term id mapping table.
+ *
+ * @param int $drupal_id
+ *   The drupal tid of the term.
+ * @param int $nexx_id
+ *   The nexx id of the same term.
+ * @param int $vid
+ *   The drupal vid of the term.
+ */
+function update_nexx_term_id_mapping($drupal_id, $nexx_id, $vid) {
+  $database = \Drupal::getContainer()->get('database');
+  $database->merge('nexx_taxonomy_term_data')->key([
+    'tid' => $drupal_id,
+  ])->fields([
+    'tid' => $drupal_id,
+    'nexx_item_id' => $nexx_id,
+    'vid' => $vid,
+  ])->execute();
+}
+
+/**
+ * Implements hook_cron().
+ */
+function nexx_integration_cron() {
+  /** @var \Drupal\nexx_integration\VideoManagerServiceInterface $videoManager */
+  $videoManager = \Drupal::getContainer()->get('nexx_integration.videomanager');
+  $logger = \Drupal::getContainer()->get('logger.factory')->get('nexx_integration');
+  $storage = \Drupal::entityTypeManager()->getStorage($videoManager->entityType());
+
+  $video_field = $videoManager->videoFieldName();
+
+  // Check videos, that could be activated.
+  /** @var \Drupal\Core\Entity\Query\QueryInterface $ids */
+  $ids = $storage->getQuery()
+    ->condition($video_field . '.validfrom_ssc', REQUEST_TIME, '<=')
+    ->condition($video_field . '.validto_ssc', REQUEST_TIME, '>')
+    ->condition("status", FALSE)
+    ->execute();
+
+  foreach ($storage->loadMultiple($ids) as $video) {
+    $video->set("status", TRUE);
+    $video->save();
+    $logger->info("Published nexx video \"@videoname\" (id: @id)", [
+      '@videoname' => $video->label(),
+      '@id' => $video->id(),
+    ]
+    );
+  }
+
+  /** @var \Drupal\Core\Entity\Query\QueryInterface $ids */
+  $ids = $storage->getQuery()
+    ->condition($video_field . '.validto_ssc', 0, '<>')
+    ->condition($video_field . '.validto_ssc', REQUEST_TIME, '<=')
+    ->condition("status", TRUE)
+    ->execute();
+
+  foreach ($storage->loadMultiple($ids) as $video) {
+    /** @var \Drupal\media\MediaInterface $video */
+    $video->set("status", FALSE);
+    $video->save();
+    $logger->info("Unpublished nexx video \"@videoname\" (id: @id)", [
+      '@videoname' => $video->label(),
+      '@id' => $video->id(),
+    ]
+    );
+  }
+}
