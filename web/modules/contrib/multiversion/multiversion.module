@@ -1,0 +1,721 @@
+<?php
+
+use Drupal\Core\Cache\Cache;
+use Drupal\Core\Entity\ContentEntityInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\StringTranslation\TranslatableMarkup;
+use Drupal\Core\Utility\Error;
+use Drupal\multiversion\Entity\Storage\ContentEntityStorageInterface;
+use Drupal\multiversion\Entity\WorkspaceInterface;
+use Drupal\multiversion\MultiversionFieldItemList;
+use Drupal\views\Plugin\views\query\QueryPluginBase;
+use Drupal\views\ViewExecutable;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\multiversion\Entity\Workspace;
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function multiversion_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'entity_type_alter') {
+    $group = $implementations['multiversion'];
+    unset($implementations['multiversion']);
+    $implementations = ['multiversion' => $group] + $implementations;
+  }
+  if ($hook == 'field_info_alter') {
+    $group = $implementations['multiversion'];
+    unset($implementations['multiversion']);
+    $implementations['multiversion'] = $group;
+  }
+}
+
+/**
+ * Implements hook_entity_type_alter().
+ *
+ * @param \Drupal\Core\Entity\EntityTypeInterface[] $entity_types
+ */
+function multiversion_entity_type_alter(array &$entity_types) {
+  /** @var \Drupal\multiversion\MultiversionManagerInterface $manager */
+  $manager = \Drupal::service('multiversion.manager');
+  foreach ($entity_types as $entity_type) {
+    if ($manager->allowToAlter($entity_type)) {
+      // Make all content entity types revisionable.
+      if (!$entity_type->isRevisionable()) {
+        // We only need to set the revision key to make an entity type
+        // revisionable. The table names will be handled by the storage class.
+        // @see \Drupal\Core\Entity\Sql\SqlContentEntityStorage::initTableLayout
+        $keys = $entity_type->getKeys();
+        $keys['revision'] = 'revision_id';
+        $entity_type->set('entity_keys', $keys);
+        if ($entity_type->getRevisionTable() === null) {
+          $entity_type->set('revision_table', $entity_type->id() . '_revision');
+        }
+        if ($entity_type->getRevisionDataTable() === null) {
+          $entity_type->set('revision_data_table', $entity_type->id() . '_field_revision');
+        }
+      }
+
+      $namespace = 'Drupal\multiversion\Entity\Storage\Sql';
+      $original_storage_class = $entity_type->getHandlerClass('storage');
+      $entity_type->setHandlerClass('original_storage', $original_storage_class);
+      switch ($entity_type->id()) {
+        case 'node':
+          $entity_type->setHandlerClass('storage', "$namespace\\NodeStorage");
+          break;
+
+        case 'taxonomy_term':
+          $entity_type->setHandlerClass('storage', "$namespace\\TermStorage");
+          break;
+
+        case 'comment':
+          $entity_type->setHandlerClass('storage', "$namespace\\CommentStorage");
+          break;
+
+        case 'menu_link_content':
+          $entity_type->setClass('Drupal\multiversion\Entity\MenuLinkContent');
+          $entity_type->setHandlerClass('storage', "$namespace\\MenuLinkContentStorage");
+          break;
+
+        case 'file':
+          $entity_type->setHandlerClass('storage', "$namespace\\FileStorage");
+          break;
+
+        case 'media':
+          $entity_type->setHandlerClass('storage', "$namespace\\MediaStorage");
+          break;
+
+        case 'paragraph':
+          $entity_type->setClass('Drupal\multiversion\Entity\Paragraph');
+          $entity_type->setHandlerClass('storage', "$namespace\\ContentEntityStorage");
+          break;
+
+        case 'poll':
+          $entity_type->setHandlerClass('storage', "$namespace\\PollStorage");
+          break;
+
+        case 'crop':
+          $entity_type->setHandlerClass('storage', "$namespace\\CropStorage");
+          break;
+
+        case 'redirect':
+          $entity_type->setHandlerClass('storage_schema', 'Drupal\multiversion\Redirect\RedirectStorageSchema');
+          if (in_array($original_storage_class, [NULL, 'Drupal\Core\Entity\Sql\SqlContentEntityStorage'])) {
+            $entity_type->setHandlerClass('storage', "$namespace\\ContentEntityStorage");
+          }
+          break;
+
+        default:
+          // We can only override the storage handler for entity types we know
+          // what to expect of.
+          if (in_array($original_storage_class, [NULL, 'Drupal\Core\Entity\Sql\SqlContentEntityStorage'])) {
+            $entity_type->setHandlerClass('storage', "$namespace\\ContentEntityStorage");
+          }
+          break;
+      }
+    }
+  }
+
+  if (isset($entity_types['block_content']) && $manager->allowToAlter($entity_types['block_content'])) {
+    $entity_types['block']->setHandlerClass('storage', 'Drupal\multiversion\Entity\Storage\Sql\BlockStorage');
+  }
+}
+
+/**
+ * Implements hook_entity_base_field_info().
+ *
+ * @param \Drupal\Core\Entity\EntityTypeInterface $entity_type
+ * @return \Drupal\Core\Field\BaseFieldDefinition[]
+ */
+function multiversion_entity_base_field_info(EntityTypeInterface $entity_type) {
+  /** @var \Drupal\multiversion\MultiversionManagerInterface $manager */
+  $manager = \Drupal::service('multiversion.manager');
+
+  if ($manager->allowToAlter($entity_type)) {
+    $fields = [];
+
+    // Get the minor version only from the \Drupal::VERSION string.
+    $minor_version = substr(\Drupal::VERSION, 0, 3);
+
+    // @todo: Alter the entity label field to make it revisionable.
+
+    // In some scenarios where's in a state of limbo where we've already
+    // altered and enabled the entity type but we're given an old entity type
+    // definition for this hook and we get an empty revision key. However,
+    // these are always the entity types that Multiversion has enabled revisions
+    // on, so we can assume the same name of the revision key.
+    $revision_key = $entity_type->getKey('revision') ?: 'revision_id';
+
+    // This will essentially overwrite the revision field definition but also
+    // ensure that entity types that we enabled revisions for get a revision
+    // field definition of a type that we expect.
+    $fields[$revision_key] = BaseFieldDefinition::create('integer')
+      ->setLabel(t('Revision ID'))
+      ->setDescription(t('The local revision ID of the entity.'))
+      ->setReadOnly(TRUE)
+      ->setSetting('unsigned', TRUE);
+
+    // Add the revision_default field on 8.5 or higher.
+    if (version_compare($minor_version, '8.5', '>=')) {
+      $fields['revision_default'] = BaseFieldDefinition::create('boolean')
+        ->setLabel(t('Default revision'))
+        ->setDescription(t('A flag indicating whether this was a default revision when it was saved.'))
+        ->setStorageRequired(TRUE)
+        ->setTranslatable(FALSE)
+        ->setRevisionable(TRUE)
+        // We cannot tell whether existing revisions were default or not when
+        // they were created, but since we did not support creating non-default
+        // revisions in any core stable UI so far, we default to TRUE.
+        ->setInitialValue(TRUE);
+    }
+
+    // This field shouldn't really be revisionable since all revisions for an
+    // entity will only ever exist in one and the same workspace. But we mark
+    // this as revisionable to make the storage query more performance because
+    // then we don't need to join the data table (which it isn't by default).
+    if ($entity_type->get('workspace') !== FALSE) {
+      $fields['workspace'] = BaseFieldDefinition::create('workspace_reference')
+        ->setLabel(t('Workspace reference'))
+        ->setDescription(t('The workspace this entity belongs to.'))
+        ->setSetting('target_type', 'workspace')
+        ->setRevisionable(FALSE)
+        ->setTranslatable(FALSE)
+        ->setCardinality(1)
+        ->setReadOnly(TRUE);
+    }
+
+    $fields['_deleted'] = BaseFieldDefinition::create('boolean')
+      ->setLabel(t('Deleted flag'))
+      ->setDescription(t('Indicates if the entity is flagged as deleted or not.'))
+      ->setRevisionable(TRUE)
+      ->setTranslatable(FALSE)
+      ->setDefaultValue(FALSE)
+      ->setCardinality(1);
+
+    $fields['_rev'] = BaseFieldDefinition::create('revision_token')
+      ->setLabel(t('Revision token'))
+      ->setDescription(t('The token for this entity revision.'))
+      ->setRevisionable(TRUE)
+      ->setTranslatable(FALSE)
+      ->setCardinality(1)
+      ->setReadOnly(TRUE);
+
+    // Add the 'revision_translation_affected' field if needed. Limit this to
+    // Drupal version 8.4 and higher.
+    if (version_compare($minor_version, '8.4', '>=') && $entity_type->isTranslatable()) {
+      $fields[$entity_type->getKey('revision_translation_affected')] = BaseFieldDefinition::create('boolean')
+        ->setName($entity_type->getKey('revision_translation_affected'))
+        ->setTargetEntityTypeId($entity_type->id())
+        ->setTargetBundle(NULL)
+        ->setLabel(new TranslatableMarkup('Revision translation affected'))
+        ->setDescription(new TranslatableMarkup('Indicates if the last edit of a translation belongs to current revision.'))
+        ->setReadOnly(TRUE)
+        ->setRevisionable(TRUE)
+        ->setTranslatable(TRUE);
+    }
+
+    return $fields;
+  }
+}
+
+/**
+ * Implements hook_data_type_info_alter().
+ */
+function multiversion_data_type_info_alter(&$info) {
+  $info['entity_reference']['class'] = '\Drupal\multiversion\EntityReference';
+}
+
+/**
+ * Implements hook_field_info_alter().
+ */
+function multiversion_field_info_alter(&$info) {
+  if (\Drupal::state()->get('multiversion_uninstalling', FALSE)) {
+    return;
+  }
+
+  $info['uuid']['class'] = '\Drupal\multiversion\Field\UuidItem';
+  $info['entity_reference']['class'] = '\Drupal\multiversion\EntityReferenceItem';
+  $info['file']['class'] = '\Drupal\multiversion\FileItem';
+  $info['image']['class'] = '\Drupal\multiversion\ImageItem';
+  if (isset($info['entity_reference_revisions'])) {
+    $info['entity_reference_revisions']['class'] = '\Drupal\multiversion\EntityReferenceRevisionsItem';
+  }
+  if (\Drupal::moduleHandler()->moduleExists('pathauto')) {
+    $info['path']['list_class'] = MultiversionFieldItemList::class;
+  }
+}
+
+/**
+ * Implements hook_entity_base_field_info_alter().
+ *
+ * @param array $fields
+ * @param \Drupal\Core\Entity\EntityTypeInterface $entity_type
+ */
+function multiversion_entity_base_field_info_alter(&$fields, EntityTypeInterface $entity_type) {
+  /** @var \Drupal\multiversion\MultiversionManagerInterface $manager */
+  $manager = \Drupal::service('multiversion.manager');
+  if ($manager->allowToAlter($entity_type)) {
+    $exclude_fields = [
+      $entity_type->getKey('id'),
+      $entity_type->getKey('revision'),
+      $entity_type->getKey('uuid'),
+      $entity_type->getKey('bundle'),
+      $entity_type->getKey('langcode'),
+      'workspace',
+      '_deleted',
+      '_rev',
+    ];
+    if ($entity_type->id() == 'comment') {
+      $exclude_fields[] = 'comment_type';
+    }
+    foreach ($fields as $key => $field) {
+      if (!in_array($key, $exclude_fields)) {
+        $field->setRevisionable(TRUE);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update().
+ */
+function multiversion_workspace_update(EntityInterface $entity) {
+  /** @var \Drupal\multiversion\Entity\WorkspaceInterface $entity */
+  if (!$entity->isPublished() && $entity->original->isPublished()) {
+    $default_workspace = \Drupal::getContainer()->getParameter('workspace.default');
+    \Drupal::service('workspace.manager')->setActiveWorkspace(Workspace::load($default_workspace));
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_presave().
+ */
+function multiversion_workspace_presave(EntityInterface $entity) {
+  if ($entity->isDefaultWorkspace() && !$entity->isPublished() && $entity->original->isPublished()) {
+    throw new Exception('The default workspace cannot be archived.');
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update().
+ */
+function multiversion_paragraph_update(EntityInterface $entity) {
+  // Update the target_revision_id field value for the parent entity if it
+  // changed (for example when saving a revision after a stub revision during
+  // replication).
+  $parent = $entity->getParentEntity();
+  $entity_revision_parent_field_name = $entity->getEntityType()->get('entity_revision_parent_field_name_field');
+
+  if ($parent instanceof ContentEntityInterface &&
+    !empty($entity->workspace) &&
+    $entity_revision_parent_field_name &&
+    !empty($entity->{$entity_revision_parent_field_name}->value) &&
+    (
+      $entity->_rev->is_stub ||
+      (!empty($entity->original) && $entity->original->_rev->is_stub)
+    )
+  ) {
+    $parent_field_name = $entity->{$entity_revision_parent_field_name}->value;
+    $storage = \Drupal::entityTypeManager()->getStorage($parent->getEntityTypeId());
+    $storage->resetCache([$parent->id()]);
+    // Load the most recent version of the parent.
+    $parent = $storage->load($parent->id());
+    if ($parent && !empty($parent->{$parent_field_name})) {
+      $save_parent = FALSE;
+      $values = $parent->{$parent_field_name}->getValue();
+      $updated_values = [];
+      foreach ($values as $delta => $value) {
+        $updated_values[$delta] = $value;
+        if ($value['target_id'] == $entity->id() && $value['target_revision_id'] != $entity->getRevisionId()) {
+          $updated_values[$delta]['target_revision_id'] = $entity->getRevisionId();
+          $save_parent = TRUE;
+        }
+      }
+      if ($save_parent) {
+        $parent->{$parent_field_name}->setValue($updated_values);
+        try {
+          $storage->saveWithoutForcingNewRevision($parent);
+          $storage->resetCache([$parent->id()]);
+        }
+        catch (\Exception $e) {
+          $details = t('Failed to save parent entity with UUID: %uuid_parent for paragraph entity with UUID: %uuid_paragraph.',
+            [
+              '%uuid_parent' => $parent->uuid(),
+              '%uuid_paragraph' => $entity->uuid(),
+            ]);
+          \Drupal::logger('Multiversion')->error('%type: @message in %function (line %line of %file). ' . $details, Error::decodeException($e));
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_views_data_alter().
+ */
+function multiversion_views_data_alter(array &$data) {
+  foreach ($data as $key => $item) {
+    // Set standard handler for _rev field.
+    if (isset($data[$key]['_rev'])) {
+      $data[$key]['_rev']['field']['id'] = 'standard';
+    }
+    if (isset($data[$key]['_deleted'])) {
+      // Use status = 1 instead of status <> 0 in WHERE statement.
+      $data[$key]['_deleted']['filter']['use_equal'] = TRUE;
+    }
+    // Add a new filter that filters content by current active workspace.
+    if (isset($data[$key]['workspace'])) {
+      $data[$key]['current_workspace'] = [
+        'title' => t('Current workspace'),
+        'help' => t('Filters content by current active workspace.'),
+        'filter' => [
+          'field' => 'workspace',
+          'id' => 'current_workspace',
+          'label' => t('Current workspace'),
+        ],
+      ];
+      // Unset the 'Workspace reference' filter because users are not allowed to
+      // filter by a specific workspace, other than current active workspace.
+      // To filter by current active workspace will be used the 'Current workspace'
+      // filter.
+      unset($data[$key]['workspace']);
+    }
+  }
+}
+
+/**
+ * Implements hook_views_post_execute().
+ */
+function multiversion_views_post_execute(ViewExecutable $view) {
+  // Add deleted entities if we have rows for them.
+  // When we want to get deleted entities using the _deleted field, entities
+  // should be loaded with
+  // \Drupal::entityManager()->getTypeStorage($entity_type)->loadDeleted($id) or
+  // \Drupal::entityManager()->getTypeStorage($entity_type)->loadMultipleDeleted($ids),
+  // otherwise the _entity field in the view result rows will be null.
+  $base_field = $view->storage->get('base_field');
+  $table_info = $view->query->getEntityTableInfo();
+  $content_type_info = array_column($table_info, 'entity_type');
+  if (is_array($view->result) && $content_type = reset($content_type_info)) {
+    $manager = \Drupal::service('multiversion.manager');
+    $storage = \Drupal::entityTypeManager()->getStorage($content_type);
+    if ($storage instanceof ContentEntityStorageInterface && $manager->allowToAlter($storage->getEntityType())) {
+      $ids = [];
+      foreach ($view->result as $index => $row) {
+        if (empty($row->_entity) && !empty($row->{$base_field})) {
+          $ids[$index] = $row->{$base_field};
+        }
+      }
+      $entities = $storage->loadMultipleDeleted($ids);
+      foreach ($view->result as $index => $row) {
+        if (empty($row->_entity) && !empty($row->{$base_field}) && isset($entities[$row->{$base_field}])) {
+          $view->result[$index]->_entity = $entities[$row->{$base_field}];
+        }
+        // In all other cases unset rows that don't have a value for _entity key.
+        elseif (empty($row->_entity)) {
+          unset($view->result[$index]);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_views_query_alter().
+ *
+ * @param \Drupal\views\ViewExecutable $view
+ *   The view object about to be processed.
+ * @param QueryPluginBase $query
+ *   The query plugin object for the query.
+ */
+function multiversion_views_query_alter(ViewExecutable $view, QueryPluginBase $query) {
+  // Add a new filter for default core views, it will filter deleted content.
+  $views_ids = [
+    'content',
+    'frontpage',
+    'comments_recent',
+    'content_recent',
+    'taxonomy_term',
+    'glossary',
+    'archive',
+    'block_content',
+    'poll_admin',
+    'poll_list',
+  ];
+  if (in_array($view->id(), $views_ids)) {
+    /** @var \Drupal\multiversion\MultiversionManagerInterface $manager */
+    $manager = \Drupal::service('multiversion.manager');
+    $entity_type = $view->getBaseEntityType();
+    if (!$manager->isEnabledEntityType($entity_type)) {
+      return;
+    }
+
+    $base_table = $view->storage->get('base_table');
+    $view->query->where[1]['conditions'][] = [
+      'field' => $base_table . '._deleted',
+      'value' => FALSE,
+      'operator' => '=',
+    ];
+    $view->query->where[1]['conditions'][] = [
+      'field' => $base_table . '.workspace',
+      'value' => multiversion_get_active_workspace_id(),
+      'operator' => '=',
+    ];
+  }
+}
+
+/**
+ * Implements hook_element_info_alter().
+ */
+function multiversion_element_info_alter(array &$types) {
+  foreach ($types as &$type) {
+    if (!isset($type['#pre_render'])) {
+      $type['#pre_render'] = [];
+    }
+    $type['#pre_render'][] = 'multiversion_element_pre_render';
+  }
+}
+
+/**
+ * Element pre-render callback.
+ */
+function multiversion_element_pre_render($element) {
+  if (isset($element['#cache'])) {
+    if (!isset($element['#cache']['contexts'])) {
+      $element['#cache']['contexts'] = [];
+    }
+    $element['#cache']['contexts'] = Cache::mergeContexts(
+      $element['#cache']['contexts'], ['workspace']
+    );
+  }
+  return $element;
+}
+
+/**
+ * Callback for getting the active workspace ID.
+ */
+function multiversion_get_active_workspace_id() {
+  return \Drupal::service('multiversion.manager')->getActiveWorkspaceId();
+}
+
+/**
+ * URI callback for the workspace entity type.
+ */
+function multiversion_workspace_uri(WorkspaceInterface $entity) {
+  return $entity->id();
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function multiversion_form_node_type_edit_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state) {
+  // Users don't have the option to disable revisions when using Multiversion.
+  // @todo: {@link https://www.drupal.org/node/2597393 See if there's a way
+  // to just disable this particular option.}
+  unset($form['workflow']['options']['#options']['revision']);
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function multiversion_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  if (isset($form['revision']['#group']) && $form['revision']['#group'] == 'revision_information') {
+    // Users don't have the option to disable revisions when using Multiversion.
+    $form['revision']['#default_value'] = TRUE;
+    $form['revision']['#disabled'] = TRUE;
+  }
+}
+
+/**
+ * Prepares a file destination directory.
+ *
+ * If the directory doesn't exist it tries to create it, if the directory is not
+ * writable it tries to make it writable. In case it can't create the directory
+ * or make it writable, logs the error message and returns FALSE.
+ * When the directory exists and it is writable returns TRUE.
+ *
+ * @param string $destination
+ *
+ * @return bool
+ */
+function multiversion_prepare_file_destination($destination) {
+  $dirname = \Drupal::service('file_system')->dirname($destination);
+
+  return file_prepare_directory($dirname, FILE_MODIFY_PERMISSIONS | FILE_CREATE_DIRECTORY);
+}
+
+/**
+ * Implements hook_menu_links_discovered_alter().
+ */
+function multiversion_menu_links_discovered_alter(&$links) {
+  // Get all custom menu links and set links with the correct ID.
+  // The ID format now will be 'menu_link_content:ENTITY_UUID:ENTITY_ID' - we
+  // need to change it because we need new entry in the menu_tree table for the
+  // same link on different workspaces.
+  // The old ID format is 'menu_link_content:ENTITY_UUID'.
+  if (\Drupal::moduleHandler()->moduleExists('menu_link_content')) {
+    $storage = \Drupal::entityTypeManager()->getStorage('menu_link_content');
+    if (\Drupal::service('multiversion.manager')->isEnabledEntityType($storage->getEntityType())) {
+      $workspaces = Workspace::loadMultiple();
+      foreach ($workspaces as $workspace_id => $workspace) {
+        $storage->useWorkspace($workspace_id);
+        $menu_link_content_entities = $storage->loadMultiple();
+        $new_ids = [];
+        $links_to_purge = [];
+        /** @var \Drupal\menu_link_content\MenuLinkContentInterface $menu_link_content */
+        foreach ($menu_link_content_entities as $menu_link_content) {
+          // Unset links with old ID format.
+          $uuid = $menu_link_content->uuid();
+          $old_id = "menu_link_content:$uuid";
+          $new_id = "$old_id:" . $menu_link_content->id();
+          if (isset($links[$old_id])) {
+            $links_to_purge[] = $old_id;
+            unset($links[$old_id]);
+          }
+          $new_ids[$old_id] = $new_id;
+          if (!isset($links[$new_id])) {
+            $links[$new_id] = $menu_link_content->getPluginDefinition();
+          }
+          // Set a new plugin class tha will handle new ID format.
+          $links[$new_id]['class'] = 'Drupal\multiversion\Plugin\Menu\MenuLinkContent';
+        }
+        if ($links_to_purge) {
+          \Drupal::service('menu.tree_storage')->purgeMultiple($links_to_purge);
+        }
+        foreach ($links as $id => $link) {
+          if (!empty($link['parent']) && in_array($link['parent'], array_keys($new_ids))) {
+            $links[$id]['parent'] = $new_ids[$link['parent']];
+          }
+        }
+        $storage->useWorkspace(NULL);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_modules_installed().
+ */
+function multiversion_modules_installed($modules) {
+  // Enable entity types provided by installed modules and supported by
+  // Multiversion.
+  $entity_type_manager = \Drupal::entityTypeManager();
+  $supported_entity_types = \Drupal::configFactory()
+    ->getEditable('multiversion.settings')
+    ->get('supported_entity_types');
+  $supported_entity_types = $supported_entity_types ?: [];
+  $entities_to_enable = [];
+  foreach ($supported_entity_types as $entity_type_id) {
+    $entity_type = $entity_type_manager->getDefinition($entity_type_id, FALSE);
+    if (!empty($entity_type) && in_array($entity_type->getProvider(), $modules)) {
+      $entities_to_enable[$entity_type_id] = $entity_type;
+    }
+  }
+  if (!empty($entities_to_enable)) {
+    \Drupal::service('multiversion.manager')->enableEntityTypes($entities_to_enable);
+  }
+}
+
+/**
+ * Implements hook_search_plugin_alter().
+ */
+function multiversion_search_plugin_alter(array &$definitions) {
+  if (isset($definitions['node_search'])) {
+    $definitions['node_search']['class'] = 'Drupal\multiversion\Entity\Search\NodeSearch';
+  }
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ *
+ * Adds the workspace as a class to the body.
+ */
+function multiversion_preprocess_html(&$variables) {
+  $active_workspace = \Drupal::service('workspace.manager')
+    ->getActiveWorkspace();
+  if ($active_workspace && $machine_name = $active_workspace->getMachineName()) {
+    // Add a new body class with the active workspace.
+    $variables['attributes']['class'][] = 'workspace-' . $machine_name;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Alters the 'revision_overview_form' for provided by Diff module.
+ */
+function multiversion_form_revision_overview_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  if (isset($form['node_revisions_table'])) {
+    foreach ($form['node_revisions_table'] as $key => $revision_info) {
+      if (empty($revision_info['operations']) || !is_array($revision_info['operations'])) {
+        continue;
+      }
+      if (isset($revision_info['operations']['#links']['delete'])) {
+        unset($form['node_revisions_table'][$key]['operations']['#links']['delete']);
+      }
+    }
+  }
+}
+
+/**
+ * Add workspace field in url_alias table.
+ *
+ * @param bool $install
+ *
+ * @throws \Drupal\Component\Plugin\Exception\InvalidPluginDefinitionException
+ */
+function _multiversion_add_workspace_field_in_url_alias_table($install = FALSE) {
+  $database = \Drupal::database();
+  $schema = $database->schema();
+  $table = 'url_alias';
+  $field = 'workspace';
+  if (!$schema->fieldExists($table, $field)) {
+    $spec = [
+      'description' => 'The workspace the alias belongs to.',
+      'type' => 'int',
+      'unsigned' => TRUE,
+      'default' => $install ? 1 : 0,
+      'size' => 'normal',
+    ];
+    $schema->addField($table, $field, $spec);
+  }
+  $table_data = $database->select($table)
+    ->fields($table)
+    ->execute()
+    ->fetchAll();
+  $entity_type_manager = \Drupal::entityTypeManager();
+  $entity_type_manager->clearCachedDefinitions();
+  $entity_ids = [];
+  foreach ($table_data as $row) {
+    $row_data = (array) $row;
+    $source_elements = explode('/', $row_data['source']);
+    if (!empty($source_elements[1]) && !empty($source_elements[2]) && is_numeric($source_elements[2])) {
+      if ($entity_type_manager->getDefinition($source_elements[1], FALSE)) {
+        $entity_ids[$source_elements[1]][$row_data['pid']] = $source_elements[2];
+      }
+    }
+  }
+  $workspaces = Workspace::loadMultiple();
+  foreach ($workspaces as $workspace_id => $workspace) {
+    foreach ($entity_ids as $entity_type_id => $ids) {
+      $storage = $entity_type_manager->getStorage($entity_type_id);
+      if ($storage instanceof ContentEntityStorageInterface) {
+        $storage->useWorkspace($workspace_id);
+        $entities = $storage->loadMultiple($ids);
+        $storage->useWorkspace(NULL);
+      }
+      if (empty($entities)) {
+        continue;
+      }
+      foreach ($ids as $pid => $entity_id) {
+        if (in_array($entity_id, array_keys($entities))) {
+          $database->update($table)
+            ->fields([$field => $workspace_id])
+            ->condition('pid', $pid)
+            ->execute();
+        }
+      }
+    }
+  }
+}
