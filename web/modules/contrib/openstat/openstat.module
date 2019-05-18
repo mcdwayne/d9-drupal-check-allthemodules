@@ -1,0 +1,320 @@
+<?php
+/**
+ * @file
+ * Main code file for Openstat module.
+ */
+
+use \Drupal\Component\Serialization\Json;
+use \Drupal\Component\Utility\String;
+use \Drupal\Component\Utility\Unicode;
+use \GuzzleHttp\Exception\BadResponseException;
+
+/**
+ * Implements hook_help().
+ */
+function openstat_help($path, $arg) {
+  if ($path == 'admin/config/system/openstat') {
+    return t('!Openstat is a free (registration required) statistic service.',
+      array('!Openstat' => l(t('Openstat'), 'https://www.openstat.ru'))
+    );
+  }
+}
+
+/**
+ * Implements hook_permission().
+ */
+function openstat_permission() {
+  return array(
+    'administer openstat' => array(
+      'title' => t('Administer Openstat'),
+      'description' => t('Perform maintenance tasks for Openstat.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu_link_defaults().
+ */
+function openstat_menu_link_defaults() {
+  $items['system.admin.config.system.openstat'] = array(
+    'link_title' => 'Openstat',
+    'description' => 'Configure tracking behavior to get insights into your website traffic and marketing effectiveness.',
+    'parent' => 'system.admin.config.system',
+    'route_name' => 'openstat.settings',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_page_alter().
+ */
+function openstat_page_alter(&$page) {
+  $config = \Drupal::config('openstat.settings');
+  $id = $config->get('id');
+
+  // Exit if counter ID is not set.
+  if (!$id) {
+    return NULL;
+  }
+
+  // Exit if counter should not be visible for current page or user.
+  if (!_openstat_visibility_pages() || !_openstat_visibility_roles()) {
+    return NULL;
+  }
+
+  // Make the array with counter settings.
+  $settings = array();
+  $settings['counter'] = $id;
+
+  $type = $config->get('type');
+
+  // If counter with image.
+  if ($type) {
+
+    $image_type = $config->get('image_type');
+    $gradient = $config->get('gradient');
+    $font_color = $config->get('font_color');
+    $image_id = NULL;
+
+    // Find an image identifier.
+    if (($image_type == 87) || ($image_type == 5081) || ($image_type == 5085)) {
+      if ($gradient && !$font_color) {
+        $image_id = $image_type;
+      }
+      if (!$gradient && !$font_color) {
+        $image_id = $image_type + 1;
+      }
+      if ($gradient && $font_color) {
+        $image_id = $image_type + 2;
+      }
+      if (!$gradient && $font_color) {
+        $image_id = $image_type + 3;
+      }
+    }
+    else {
+      if ($gradient) {
+        $image_id = $image_type;
+      }
+      else {
+        $image_id = $image_type + 1;
+      }
+    }
+
+    $settings['image'] = $image_id;
+
+    $color = $config->get('color');
+
+    if ($color == 'custom') {
+      $color = String::checkPlain($config->get('custom_color'));
+    }
+
+    $settings['color'] = $color;
+
+  }
+
+  // This setting must be in every counter code.
+  $settings['next'] = 'openstat';
+
+  $track_links = $config->get('track_links');
+
+  if ($track_links) {
+    $settings['track_links'] = $track_links;
+  }
+
+  $code = 'var openstat = ' . Json::encode($settings) . ';';
+  $code .= '(function(d, t, p) {';
+  $code .= 'var j = d.createElement(t); j.async = true; j.type = "text/javascript";';
+  $code .= 'j.src = ("https:" == p ? "https:" : "http:") + "//openstat.net/cnt.js";';
+  $code .= 'var s = d.getElementsByTagName(t)[0]; s.parentNode.insertBefore(j, s);';
+  $code .= '})(document, "script", document.location.protocol);';
+
+  $page['#attached']['js'][] = array(
+    'data' => $code,
+    'type' => 'inline',
+  );
+
+}
+
+/**
+ * Openstat counter code visibility for pages.
+ *
+ * @return bool
+ *   TRUE if the counter should be on current page and otherwise FALSE.
+ */
+function _openstat_visibility_pages() {
+  static $page_match;
+
+  // Cache visibility result if function is called more than once.
+  if (!isset($page_match)) {
+    $config = \Drupal::config('openstat.settings');
+    $visibility = $config->get('visibility_pages');
+    $setting_pages = $config->get('pages');
+
+    // Match path if necessary.
+    if (!empty($setting_pages)) {
+      // Convert path to lowercase. This allows comparison of the same path
+      // with different case. Ex: /Page, /page, /PAGE.
+      $pages = Unicode::strtolower($setting_pages);
+      if ($visibility < 2) {
+        // Compare the lowercase path alias (if any) and internal path.
+        $path = current_path();
+        $path_alias = Unicode::strtolower(\Drupal::service('path.alias_manager')->getPathAlias($path));
+        $page_match = drupal_match_path($path_alias, $pages) || (($path != $path_alias) && drupal_match_path($path, $pages));
+        // When $visibility has a value of 0, the tracking code is displayed on
+        // all pages except those listed in $pages. When set to 1, it
+        // is displayed only on those pages listed in $pages.
+        $page_match = !($visibility xor $page_match);
+      }
+      else {
+        $page_match = FALSE;
+      }
+    }
+    else {
+      $page_match = TRUE;
+    }
+
+  }
+  return $page_match;
+}
+
+/**
+ * Openstat counter visibility for user roles.
+ *
+ * @return bool
+ *   TRUE if the counter should be add for current user and otherwise FALSE.
+ */
+function _openstat_visibility_roles() {
+
+  $account = \Drupal::currentUser();
+  $config = \Drupal::config('openstat.settings');
+  $enabled = $visibility = $config->get('visibility_roles');
+  $roles = $config->get('roles');
+
+  $has_roles = FALSE;
+  foreach ($roles as $key => $value) {
+    if ($key === $value) {
+      $has_roles = TRUE;
+      break;
+    }
+  }
+
+  if ($has_roles) {
+    // One or more roles are selected.
+    foreach (array_values($account->getRoles()) as $rid) {
+
+      // Is the current user a member of one of these roles?
+      if (isset($roles[$rid]) && $rid === $roles[$rid]) {
+        // Current user is a member of a role that should be tracked/excluded
+        // from tracking.
+        $enabled = !$visibility;
+        break;
+      }
+    }
+  }
+  else {
+    // No role is selected for tracking, therefore all roles should be tracked.
+    $enabled = TRUE;
+  }
+
+  return $enabled;
+}
+
+
+/**
+ * Get Openstat identifier.
+ *
+ * Register new Openstat account with current site or adding it
+ * to existing Openstat user account.
+ *
+ * @return int
+ *   Openstat counter identifier.
+ */
+function openstat_get_countet_id() {
+
+  $counter_id = NULL;
+
+  $user = \Drupal::currentUser();
+  $email = $user->getEmail();
+
+  $new_user_headers = array(
+    'Content-Type' => 'application/x-www-form-urlencoded',
+  );
+
+  $new_user_data = array(
+    'email' => $email,
+    'format' => 'json',
+    'client_info' => 'WEBO@Drupal 8',
+  );
+
+  $options = array(
+    'verify' => FALSE,
+  );
+
+  try {
+    // Check if user register or not.
+    $new_user_response = Drupal::httpClient()->post('https://www.openstat.ru/rest/v0.3/simple_add', $new_user_headers, $new_user_data, $options)->send();
+    $data = $new_user_response->json();
+    // Get ID for new user.
+    $counter_id = $data['msg'];
+  }
+  catch (BadResponseException $e) {
+    $response = $e->getResponse();
+
+    // Get new ID for existing user.
+    if ($response->getStatusCode() == '409') {
+      $existing_user_headers = array(
+        'Content-Type' => 'application/json',
+      );
+      global $base_root;
+      $existing_user_data = array(
+        'owner' => $email,
+        'site_url' => $base_root,
+        'client_info' => 'WEBO@Drupal 8',
+      );
+      $existing_user_data = Json::encode($existing_user_data);
+
+      try {
+        $existing_user_response = Drupal::httpClient()->post('https://www.openstat.ru/rest/v0.3/counters?format=json', $existing_user_headers, $existing_user_data, $options)->send();
+        $existing_user_data = $existing_user_response->json();
+        $counter_id = $existing_user_data['id'];
+
+      }
+      catch (BadResponseException $e) {
+      }
+    }
+
+  }
+
+  return $counter_id;
+}
+
+/**
+  Returns HTML for Openstat counter image.
+
+ * @param array $variables
+ *   An associative array containing:
+ *   - id: The Openstat counter identifier.
+ *
+ * @ingroup themeable
+ */
+function theme_openstat($variables) {
+
+  $id = String::checkPlain($variables['id']);
+  $output = '<span id="openstat' . $id . '"></span>';
+  return $output;
+
+}
+
+/**
+ * Implements hook_theme().
+ */
+function openstat_theme() {
+  return array(
+    'openstat' => array(
+      'variables' => array(
+        'id' => NULL,
+      ),
+    ),
+  );
+}
