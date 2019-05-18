@@ -1,0 +1,149 @@
+<?php
+
+/**
+ * @file
+ * Better messages module file.
+ */
+
+use Drupal\Core\Render\Element\StatusMessages;
+use Drupal\Core\Cache\CacheableMetadata;
+use Drupal\Core\Plugin\ContextAwarePluginInterface;
+use Drupal\Component\Plugin\Exception\ContextException;
+use Drupal\Core\Cache\CacheableDependencyInterface;
+
+/**
+ * Implements hook_theme().
+ */
+function better_messages_theme() {
+  return [
+    'better_messages_wrapper' => [
+      'render element' => 'element',
+      'variables' => [
+        'children' => '',
+        'message_list' => [],
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_element_info_alter().
+ */
+function better_messages_element_info_alter(array &$info) {
+  // Replace the default pre_render for status_messages with our custom one.
+  $info['status_messages']['#pre_render'][0] = 'better_messages_status_messages_pre_render';
+}
+
+/**
+ * Pre render callback for 'status_messages' render element.
+ */
+function better_messages_status_messages_pre_render(array $element) {
+  // The code below is heavily copied from StatusMessages::renderMessages().
+  $element = [
+    '#lazy_builder' => ['better_messages_status_messages_lazy_builder', [$element['#display']]],
+    '#create_placeholder' => TRUE,
+  ];
+
+  // Directly create a placeholder as we need this to be placeholdered
+  // regardless if this is a POST or GET request.
+  // @todo remove this when https://www.drupal.org/node/2367555 lands.
+  return \Drupal::service('render_placeholder_generator')->createPlaceholder($element);
+}
+
+/**
+ * Lazy builder for 'status_messages'.
+ *
+ * Improved version of StatusMessages::renderMessages() that additionally wraps
+ * the output into an overlay markup whenever necessary.
+ *
+ * @param string|null $type
+ *   Limit the messages returned by type. Defaults to NULL, meaning all types.
+ *   Passed on to drupal_get_messages(). These values are supported:
+ *   - NULL
+ *   - 'status'
+ *   - 'warning'
+ *   - 'error'
+ *
+ * @return array
+ *   A renderable array containing the messages.
+ */
+function better_messages_status_messages_lazy_builder($type) {
+  $render = StatusMessages::renderMessages($type);
+  if (!empty($render)) {
+    $render['#theme_wrappers'][] = 'better_messages_wrapper';
+    $render['#attached']['library'][] = 'better_messages/better_messages';
+    $render['#attached']['drupalSettings']['better_messages'] = \Drupal::config('better_messages.settings')->get();
+  }
+
+  return $render;
+}
+
+/**
+ * Preprocess for 'better_messages_wrapper' theme hook.
+ */
+function template_preprocess_better_messages_wrapper(&$variables) {
+  $settings = \Drupal::config('better_messages.settings');
+  $cache = CacheableMetadata::createFromRenderArray($variables);
+  $cache->addCacheTags($settings->getCacheTags());
+  $cache->addCacheContexts($settings->getCacheContexts());
+  $cache->mergeCacheMaxAge($settings->getCacheMaxAge());
+
+  // Inject the messages from $variables into our "better_messages" context
+  // since now we have crossed beyond the point where "current" messages are
+  // retrievable via drupal_get_messages().
+  \Drupal::service('better_messages.context')->setMessages($variables['message_list']);
+
+  /** @var \Drupal\Core\Condition\ConditionManager $condition_manager */
+  $condition_manager = \Drupal::service('plugin.manager.condition');
+  /** @var \Drupal\Core\Plugin\Context\ContextRepositoryInterface $context_repository */
+  $context_repository = \Drupal::service('context.repository');
+  /** @var \Drupal\Core\Plugin\Context\ContextHandlerInterface $context_handler */
+  $context_handler = \Drupal::service('context.handler');
+
+  $pass = TRUE;
+  foreach ($settings->get('visibility') as $condition_id => $condition) {
+    $condition = $condition_manager->createInstance($condition_id, $condition);
+    if ($condition instanceof ContextAwarePluginInterface) {
+      try {
+        $contexts = $context_repository->getRuntimeContexts(array_values($condition->getContextMapping()));
+        $context_handler->applyContextMapping($condition, $contexts);
+      }
+      catch (ContextException $e) {
+        // We couldn't initialize the condition, so it just cannot participate.
+        continue;
+      }
+    }
+
+    try {
+      $pass = $condition->execute();
+    }
+    catch (ContextException $e) {
+      // Condition couldn't evaluate itself. Let's skip it.
+      continue;
+    }
+
+    if ($condition instanceof CacheableDependencyInterface) {
+      $cache->addCacheTags($condition->getCacheTags());
+      $cache->addCacheContexts($condition->getCacheContexts());
+      $cache->mergeCacheMaxAge($condition->getCacheMaxAge());
+    }
+
+    if (!$pass) {
+      break;
+    }
+  }
+
+  $cache->applyTo($variables);
+
+  if ($pass && !empty($variables['message_list'])) {
+    $variables['attributes']['class'][] = 'better-messages-overlay';
+
+    if (\Drupal::config('better_messages.settings')->get('fixed')) {
+      $variables['attributes']['class'][] = 'better-messages-position-fixed';
+    }
+
+    if (isset($variables['message_list']['error'])) {
+      $variables['attributes']['class'][] = 'better-messages-has-errors';
+    }
+  }
+}
