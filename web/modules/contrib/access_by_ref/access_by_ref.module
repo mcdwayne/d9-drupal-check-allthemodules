@@ -1,0 +1,205 @@
+<?php
+
+/******************
+*
+* If access not already granted, and if it's a content type we manage, and if user has permission
+* Check to see whether the content meets one of the access by reference conditions and grant accordingly
+*
+******************/
+
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Routing\Access\AccessInterface;
+use Drupal\Core\Entity;
+
+
+function haveNodeAccess($target_id,$op,$account){
+  $target_node = node_load($target_id);  dsm($target_id);
+ 
+  if(isset($target_node) && $target_node->access($op)==1 ){
+    return $target_node; 
+  } else{
+    return false;
+  }
+
+}
+
+
+
+
+function access_by_ref_node_access(\Drupal\node\NodeInterface $node, $op, \Drupal\Core\Session\AccountInterface $account) {
+
+	//return AccessResult::allowed();
+   // Perform basic access checks
+  if(
+    !isset($account) || $op != 'update' || $account->id() == 0 ||  !isset($node) || $account->id() == $node->getOwner()->id() || !$account->hasPermission('access node by reference')
+  ) {
+    return AccessResult::neutral();
+  }
+
+  $configs = access_by_ref_get_config($node);
+  $control_entity = $node;
+
+  foreach($configs as $config){
+    $field = $config['node_field'];
+    $extra = $config['reference_data'];
+    $vals = $node->$field->getValue(); 
+
+
+    $grant_access = false;
+    switch($config['reference_type']){
+      case 'user':  //allow if user is in this field
+        // get any users referenced in this field
+        
+        $uid = (\Drupal::currentUser()->id());
+        foreach($vals as $value){
+          
+         if($value['target_id'] == $uid){
+         $control_entity = (\Drupal::currentUser());  
+          $grant_access = true;
+         }
+        }
+        break;
+      case 'user_mail':  //allow if user is in this field
+        // get any users referenced in this field
+        
+        $umail = (\Drupal::currentUser()->getEmail());
+        foreach($vals as $value){
+         if(strcasecmp($value['value'], $umail) == 0){
+          $control_entity = \Drupal\user\Entity\User::load(\Drupal::currentUser()); 
+          $grant_access = true; break;
+         }
+        }
+        break;
+      case 'shared':  //allow if user shares a value is in this field
+
+        
+        $user = \Drupal\user\Entity\User::load(\Drupal::currentUser()->id());
+        $ufield = $config['reference_data'];
+        $uvals =  $user->get($ufield)->getValue();
+     
+
+        foreach($vals as $value){
+          foreach($uvals as $uvalue){
+              if($value['value'] == $uvalue['value'] ){ 
+                $control_entity = $user;
+                $grant_access = true; 
+                break;
+              }
+          }
+        }
+        break;
+      case 'inherit':  //inherit the CRUD of the referenced, if more liberal
+        // get any nodes referenced in this field
+    
+    $handler = $node->$field->getFieldDefinition()->getSetting('handler'); // switch based on handler
+    switch ($handler){
+      case 'default:node':
+        foreach($vals as $value){ 
+            $target = $value['target_id'];
+            if ($control_entity = haveNodeAccess($target,$op,$account)){
+             $grant_access = true; 
+             break;
+          } 
+            }
+            break;
+      case 'default:paragraph':
+        foreach($vals as $value){ // this is pointing to a paragraph
+              $target = $value['target_id'];
+              $paragraph = \Drupal\paragraphs\Entity\Paragraph::load( $target );
+            $parvals = $paragraph->$extra->getValue(); 
+            foreach($parvals as $target){ 
+             if ($control_entity = haveNodeAccess($target,$op,$account)){
+               $grant_access = true;  
+               break;
+             } 
+            }
+            }
+            break;
+    }
+
+
+
+   
+        break;
+      case 'manage_referenced':  //control if this node is referenced in a node the user can access.  
+        // get any nodes referenced in this field
+   
+        $nids = access_by_ref_get_overlords($node, $config['node_field']);
+        foreach($nids as $nid){
+         if ($control_entity = haveNodeAccess($nid,$op,$account)){
+               $grant_access = true; 
+               break;
+             } 
+        }
+        break;
+
+      case 'secret': //allow access if the URL parameter matches the field
+        
+        if(!isset($_GET[$field])) continue;
+        foreach($vals as $value){
+          
+          if($_GET[$field] == $value['value']){
+            $grant_access = true; 
+            break;
+          }
+        }
+        break;
+    } // end of switch
+
+    if ($grant_access){
+
+      return AccessResult::allowed()
+          ->cachePerPermissions()
+          ->cachePerUser()
+          ->addCacheableDependency($control_entity);
+
+        // job done. Break out of the loop and go home
+    }
+
+  }
+  
+
+
+  return AccessResult::neutral() 
+          ->cachePerPermissions()
+          ->addCacheableDependency($control_entity);
+}
+
+function access_by_ref_get_config(\Drupal\node\NodeInterface $node){
+  $my_type = $node->getType();
+  $sql = 'SELECT * FROM {access_by_ref} WHERE `node_type` = :ntype'; // query the database for the set of configured access methods
+
+  $result = \Drupal::database()->query($sql, array(':ntype' => $my_type));
+  $rows = array();
+  while($row = $result->fetchAssoc()){
+    $rows[] = $row;
+  }
+  
+  return $rows;
+}
+
+function access_by_ref_get_overlords(\Drupal\node\NodeInterface $node, $overfield){ // collect the nids of the nodes that reference this node in the named field
+
+
+  $table = "node__$overfield"; // naming convention
+  $targetfield = $overfield . "_target_id";
+  $parms = array(':nid'=>$node->id(), ':ntype'=>$node->getType());
+
+  $sql = "SELECT entity_id FROM $table WHERE $targetfield = :nid AND bundle = :ntype";
+  $rows = array();
+  $result = \Drupal::database()->query($sql, $parms);
+  while($row = $result->fetchAssoc()){
+    $rows[] = $row['entity_id'];
+  }  
+
+  return $rows;
+
+}
+
+function access_by_ref_entity_presave(Drupal\Core\Entity\EntityInterface $entity) {
+
+  //dsm($entity->getEntityTypeId());
+
+}
+
+
