@@ -1,0 +1,140 @@
+<?php
+
+/**
+ * @file
+ * Google natural language autotagging functionality.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\taxonomy\Entity\Term;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\node\NodeInterface;
+
+/**
+ * Implements hook_help().
+ */
+function google_nl_autotag_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the google_nl_autotag module.
+    case 'help.page.google_nl_autotag':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t("Autotag content using Google's natural language processor API.") . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function google_nl_autotag_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // Disable autotag field since it gets automatically updated during node save.
+  if (isset($form['field_google_nl_autotag_cats'])) {
+    $form['field_google_nl_autotag_cats']['#disabled'] = TRUE;
+    $form['field_google_nl_autotag_cats']['widget']['add_more']['#access'] = FALSE;
+
+    // Don't show an extra empty field if there already are one or more tags.
+    $max_delta = $form['field_google_nl_autotag_cats']['widget']['#max_delta'];
+    if ($max_delta > 0 && !$form['field_google_nl_autotag_cats']['widget'][$max_delta]['target_id']['#default_value']) {
+      unset($form['field_google_nl_autotag_cats']['widget'][$max_delta]);
+      $form['field_google_nl_autotag_cats']['widget']['#max_delta'] = $max_delta - 1;
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_presave().
+ */
+function google_nl_autotag_node_presave(NodeInterface $node) {
+  $config = \Drupal::config('google_nl_autotag.settings');
+  $content_type = $node->getType();
+
+  if ($fields = $config->get('content_types')[$content_type] ?? NULL) {
+    $text_to_analyze = '';
+    foreach ($fields as $field) {
+      foreach ($node->get(str_replace('node.' . $content_type . '.', '', $field))->getValue() as $value) {
+        if (isset($value['value'])) {
+          $text_to_analyze .= $value['value'];
+        }
+        else {
+          $text_to_analyze .= $value;
+        }
+      }
+    }
+
+    try {
+      $categories = \Drupal::service('google_nl_api')
+        ->classifyContent(strip_tags($text_to_analyze));
+
+      $cat_values = [];
+      foreach ($categories as $category) {
+        if ($category['confidence'] > $config->get('classification_threshold')) {
+          $cat_name = str_replace('/', '>>', ltrim($category['name'], '/'));
+          $cat_values[] = ['target_id' => google_nl_autotag_parse_google_cat($cat_name)];
+        }
+      }
+      $node->set('field_google_nl_autotag_cats', $cat_values);
+    }
+    catch (\Exception $e) {
+      // API errors get automatically logged; we don't need to do anything here
+      // other than continue on without changing the tags.
+    }
+  }
+}
+
+/**
+ * Finds (and if necessary, creates) the term corresponding to a given category.
+ *
+ * @param string $cat_name
+ *   The term to look up. Hierarchy can be indicated by including ">>" between
+ *   term names.
+ *
+ * @return int
+ *   The ID of the term.
+ */
+function google_nl_autotag_parse_google_cat($cat_name) {
+
+  // Loop through hierarchy of input and build out tree.
+  $term_names = explode('>>', $cat_name);
+  $curr_parent = '0';
+  foreach ($term_names as $index => $term_name) {
+    $term_found = FALSE;
+    $term_name = trim($term_name);
+    // Get all terms with the current parent.
+    /** @var \Drupal\taxonomy\Entity\Term $level_terms */
+    $level_terms = \Drupal::entityTypeManager()->getStorage('taxonomy_term')->loadTree('google_nl_autotag_categories', $curr_parent, $index + 1, TRUE);
+    foreach ($level_terms as $level_term) {
+      if ($level_term->getName() == $term_name) {
+        if ($index == (count($term_names) - 1)) {
+          // We have found our term at the deepest level of the hierarchy.
+          return $level_term->id();
+        }
+        else {
+          // We've found the current level, but there are more levels to dig
+          // through.
+          $curr_parent = $level_term->id();
+          $term_found = TRUE;
+          break;
+        }
+      }
+    }
+    if (!$term_found) {
+      $new_term = Term::create([
+        'vid' => 'google_nl_autotag_categories',
+        'name' => $term_name,
+        'parent' => $curr_parent,
+      ]);
+      $new_term->save();
+      if ($index == (count($term_names) - 1)) {
+        // The new term is the bottom-most term.
+        return $new_term->id();
+      }
+      else {
+        // There are more terms to process below the newly created one.
+        $curr_parent = $new_term->id();
+      }
+    }
+  }
+}
