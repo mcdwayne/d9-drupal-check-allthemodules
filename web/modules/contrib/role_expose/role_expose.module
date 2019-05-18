@@ -1,0 +1,177 @@
+<?php
+
+/**
+ * @file
+ * Allows users to see their own roles and other user in admin defined roles.
+ */
+
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\user\Entity\Role;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\role_expose\ExposableRoles;
+
+/**
+ * Implements hook_help().
+ */
+function role_expose_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.role_expose':
+      return '<p>' . t('Role Expose -module gives site administrators ability to expose user their own user roles.')
+             . ' ' . t('Users may be granted an option to view own roles or all users roles.') . '<p>' .
+             '</p>' . t('By default all roles are unchecked ie. not visible.') . '</p>';
+
+    case 'entity.user_role.collection':
+      return '<p>' . t("Role Expose -selection allows you to adjust which user roles are visible on user's profile page.") . '</p>';
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Alter admin-section Role -form by adding an element to control exposing in
+ * User's profile page.
+ */
+function role_expose_form_user_role_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+
+  $role = $form_state->getFormObject()->getEntity();
+
+  $default_value = $role->getThirdPartySetting('role_expose', 'role_expose', ExposableRoles::EXPOSE_NEVER);
+  $options = [
+    ExposableRoles::EXPOSE_NEVER => t('Never'),
+    ExposableRoles::EXPOSE_WITH => t('User with this role'),
+    ExposableRoles::EXPOSE_WITHOUT => t('User <em>without</em> this role'),
+    ExposableRoles::EXPOSE_ALWAYS => t('Always'),
+  ];
+
+  $form['role_expose'] = [
+    '#type' => 'select',
+    '#options' => $options,
+    '#default_value' => $default_value,
+    '#title' => t('Role expose'),
+    '#description' => t('Choose when this role should displayed in User profile page.'),
+  ];
+
+  if (in_array($role->id(), [AccountInterface::ANONYMOUS_ROLE, AccountInterface::AUTHENTICATED_ROLE])) {
+    $form['role_expose']['#disabled'] = 'disabled';
+    $form['role_expose']['#description'] .= ' ' . t("NOTE: Role %label can't be exposed in User's profile.", [
+      '%label' => $role->label(),
+    ]);
+  }
+
+  $form['#entity_builders'][] = 'role_expose_form_user_role_form_builder';
+
+}
+
+/**
+ * Entity builder for the user_role_form with third party options.
+ *
+ * @see role_expose_form_user_role_form_alter()
+ */
+function role_expose_form_user_role_form_builder($entity_type, Role $role, &$form, FormStateInterface $form_state) {
+  if ($value = $form_state->getValue('role_expose')) {
+    $role->setThirdPartySetting('role_expose', 'role_expose', $value);
+  }
+  else {
+    $role->unsetThirdPartySetting('role_expose', 'role_expose');
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_view_alter().
+ */
+function role_expose_user_view_alter(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display) {
+
+  // Anonymous are not allowed to see the role info.
+  if (\Drupal::currentUser()->isAnonymous()) {
+    return;
+  }
+  // Display Roles info only on full page -view mode.
+  if (!isset($build['#view_mode']) || $build['#view_mode'] !== 'full') {
+    return;
+  }
+
+  $user = \Drupal::currentUser();
+  $own_user_profile = $user->id() == $entity->id();
+  $access_own = ($user->id() == $entity->id()) && $user->hasPermission('view own roles');
+  $access_all = $user->hasPermission('view roles of all users');
+
+  // Add Role Expose fieldset to the User profile page only if user has
+  // permissions to see that info.
+  if (!$access_own && !$access_all) {
+    return;
+  }
+
+  $exposed_has = \Drupal::service('role_expose.exposable')
+    ->getVisibleRolesUserHas($entity);
+  $exposed_missing = \Drupal::service('role_expose.exposable')
+    ->getVisibleRolesUserDoesNotHave($entity);
+  $roles = \Drupal::service('role_expose.exposable')->getSystemRoles();
+
+  // Ensure there is something to display.
+  if (empty($exposed_has) && empty($exposed_missing)) {
+    return;
+  }
+  // Set the container first, with some title and description.
+  $build['role_expose'] = [
+    '#type' => 'fieldset',
+    '#attributes' => [
+      'class' => [
+        'role-expose',
+        'roles-list',
+      ],
+      // Satisfy template_preprocess_fieldset() with id, since we're also
+      // providing #description.
+      'id' => 'role_expose',
+    ],
+    '#title' => t('Roles'),
+    '#description' => t('The roles give different permissions on the site. Please contact your site administration for more info.'),
+  ];
+
+  // Roles that user has and should be exposed (if any)
+  if (!empty($exposed_has)) {
+    $items = [
+      '#theme' => 'item_list',
+    ];
+    if ($own_user_profile) {
+      $items['#prefix'] = '<h3>' . t('Roles you have') . '</h3>';
+    }
+    else {
+      $items['#prefix'] = '<h3>' . t('Roles user has') . '</h3>';
+    }
+
+    foreach ($exposed_has as $role_id) {
+      $items['#items'][] = $roles[$role_id]->label();
+    }
+    $items['#attributes'] = [
+      'class' => [
+        'roles-user-has',
+      ],
+    ];
+    $build['role_expose']['has']['#markup'] = \Drupal::service('renderer')->render($items);
+  }
+
+  // Roles that user does not have, but should be exposed (if any)
+  if (!empty($exposed_missing)) {
+    $items = [
+      '#theme' => 'item_list',
+    ];
+    if ($own_user_profile) {
+      $items['#prefix'] = '<h3>' . t('Roles you do not have') . '</h3>';
+    }
+    else {
+      $items['#prefix'] = '<h3>' . t('Roles user does not have') . '</h3>';
+    }
+    foreach ($exposed_missing as $role_id) {
+      $items['#items'][] = $roles[$role_id]->label();
+    }
+    $items['#attributes'] = [
+      'class' => [
+        'roles-user-does-not-have',
+      ],
+    ];
+    $build['role_expose']['has-not']['#markup'] = \Drupal::service('renderer')->render($items);
+  }
+}
