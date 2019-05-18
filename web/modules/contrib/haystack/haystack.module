@@ -1,0 +1,301 @@
+<?php
+
+/**
+ * @file
+ * Contains haystack.module.
+ */
+
+use Drupal\Core\Url;
+use Drupal\file\Entity\File;
+use Drupal\image\Entity\ImageStyle;
+use Drupal\menu_link_content\Entity\MenuLinkContent;
+use Drupal\node\Entity\NodeType;
+use Drupal\node\NodeInterface;
+
+const HAYSTACK_API_SERVER  = 'https://api.haystack.menu/api/';
+const HAYSTACK_API_VERSION = 'v1';
+const HAYSTACK_ANALYTICS   = 'stats';
+const HAYSTACK_JS          = '//js.haystack.menu/v1/haystack.min.js';
+
+/**
+ * Implements hook_cache_flush().
+ */
+function haystack_cache_flush() {
+  \Drupal::service('haystack.core')->setSetting('js_cache', user_password(10));
+  return array('haystack');
+}
+
+/**
+ * Implements hook_cron().
+ */
+function haystack_cron() {
+  $haystack = \Drupal::service('haystack.core');
+
+  $cur_cache = \Drupal::cache()->get('haystack_analytics');
+  if ($cur_cache && isset($cur_cache->data) && !empty($cur_cache->data)) {
+    $cur_cache = $cur_cache->data;
+  }
+  else {
+    return;
+  }
+
+  $package = array(
+    'data'      => $cur_cache,
+    'api_token' => $haystack->getSetting('api_key'),
+  );
+
+  $haystack->apiCall($package, 'stats', 'stats');
+
+  \Drupal::cache()->set('haystack_analytics', array());
+}
+
+/**
+ * Implements hook_node_update_index().
+ *
+ * When the Drupal default search is updating it's index we update Haystack.
+ */
+function haystack_node_update_index(NodeInterface $node) {
+
+  $haystackContent = \Drupal::service('haystack.content');
+  $haystackContent->indexNode($node);
+
+  return '';
+}
+
+/**
+ * Implements hook_haystack_allow_indexing().
+ */
+function haystack_haystack_allow_indexing(NodeInterface $node) {
+  $haystack = \Drupal::service('haystack.core');
+
+  // Only index the content types selected in configuration.
+  $enabled_types = $haystack->getContentTypes();
+  if (in_array($node->getType(), $enabled_types) && $node->isPublished()) {
+    return TRUE;
+  }
+  else {
+    return FALSE;
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete() for node_delete().
+ *
+ * Remove index entry when a node is deleted.
+ */
+function haystack_node_delete(NodeInterface $node) {
+
+  $haystackContent = \Drupal::service('haystack.content');
+  $haystackContent->deleteNode($node);
+
+//  // Only process if the node is of the  types selected in configuration.
+//  $haystack = \Drupal::service('haystack.core');
+//
+//  if (in_array($node->getType(), $haystack->getContentTypes())) {
+//    $package = array(
+//      'api_token' => $haystack->getSetting('api_key'),
+//      'id'        => 'content-' . $node->id(),
+//      'type'      => $node->getType(),
+//    );
+//
+//    // Write changes to the Server.
+//    $haystack->apiCall($package, 'index', 'delete');
+//  }
+}
+
+
+/**
+ * Implements hook_haystack_get_image().
+ */
+function haystack_haystack_get_image($node) {
+  $result = \Drupal::database()->query("SELECT fu.fid FROM {file_usage} AS fu
+    LEFT JOIN {file_managed} AS fm ON fu.fid = fm.fid
+    WHERE fu.type = 'node' AND fu.id = :nid AND fm.filemime LIKE '%image%' LIMIT 1",
+    array(':nid' => $node->id()));
+
+  $img_id = $result->fetchField();
+
+  $image = '';
+  if ($img_id) {
+    $file = File::load($img_id);
+    $style = ImageStyle::load('haystack_thumb');
+    $image = $style->buildUrl($file->getFileUri());
+  }
+
+  return !empty($image) ? array(
+    'weight' => 0,
+    'image'  => $image,
+  ) : NULL;
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert() for menu_link_content_insert().
+ */
+function haystack_menu_link_content_insert(MenuLinkContent $link) {
+
+  // Find the menus that should be used.
+  $haystack = \Drupal::service('haystack.core');
+  $menus    = $haystack->getSetting('menus');
+  $menus    = array_filter($menus);
+
+  $menu_name = $link->get('menu_name')->first()->getValue()['value'];
+
+  if (in_array($menu_name, $menus)) {
+    $package = $haystack->getLinkData($link);
+
+    // Write changes to the Server.
+    $haystack->apiCall($package);
+
+    $cache = $haystack->getSetting('menu_cache');
+    $cache[] = $link->id();
+    $haystack->setSetting('menu_cache', $cache);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update().
+ */
+function haystack_menu_link_content_update(MenuLinkContent $link) {
+  $haystack = \Drupal::service('haystack.core');
+  $cache    = $haystack->getSetting('menu_cache');
+
+  if (is_array($cache) && in_array($link->id(), $cache)) {
+    // We hid the item, disabled it.
+    if (!$link->isEnabled()) {
+      haystack_menu_link_content_delete($link);
+    }
+    // Item enabled, just update.
+    else {
+      $package = $haystack->getLinkData($link);
+      // Write changes to the Server.
+      $haystack->apiCall($package);
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ */
+function haystack_menu_link_content_delete(MenuLinkContent $link) {
+  $haystack = \Drupal::service('haystack.core');
+  $cache    = $haystack->getSetting('menu_cache');
+
+  if (is_array($cache) && in_array($link->id(), $cache)) {
+    $package = array(
+      'api_token' => $haystack->getSetting('api_key'),
+      'id'        => 'menu-' . $link->id(),
+      'type'      => 'menu',
+    );
+
+    // Write changes to the Server.
+    $haystack->apiCall($package, 'index', 'delete');
+
+    $new_cache = array_diff($cache, array($link->id()));
+    $haystack->setSetting('menu_cache', $new_cache);
+  }
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ */
+function haystack_preprocess_page(&$variables) {
+
+  $route = \Drupal::routeMatch()->getRouteObject();
+  $is_admin = \Drupal::service('router.admin_context')->isAdminRoute($route);
+  if (!$is_admin) {
+    $haystack = \Drupal::service('haystack.core');
+    $client_hash = $haystack->getSetting('client_hash');
+    if ($client_hash) {
+      $quick_links_menu = $haystack->getSetting('quick_links_menu');
+      $quick_links = $haystack->getSetting('quick_links');
+      $quick_links_title = $haystack->getSetting('quick_links_title');
+      $search_id = $haystack->getSetting('search_id_key');
+      $analytics = Url::fromRoute('haystack.ajax')->toString();
+
+      $all_node_types = NodeType::loadMultiple();
+      $types_tmp = $haystack->getContentTypes();
+      $types = [];
+      foreach ($types_tmp as $k => $v) {
+        $tmp = $all_node_types[$k]->label();
+        if ($tmp) {
+          $types[] = [
+            'type' => $k,
+            'name' => $tmp,
+          ];
+        }
+      }
+
+
+      switch ($quick_links_menu){
+        case 'menu':
+          $menuTreeService = \Drupal::service('menu.link_tree');
+          $menu_parameters = new \Drupal\Core\Menu\MenuTreeParameters();
+          $menu_parameters->excludeRoot();
+          $menu = $menuTreeService->load('haystack', $menu_parameters);
+
+          $manipulators = [
+            ['callable' => 'menu.default_tree_manipulators:checkNodeAccess'],
+            ['callable' => 'menu.default_tree_manipulators:checkAccess'],
+            ['callable' => 'menu.default_tree_manipulators:generateIndexAndSort'],
+          ];
+          $tree = $menuTreeService->transform($menu, $manipulators);
+          $tree = $menuTreeService->build($tree);
+          $tree = \Drupal::service('renderer')->render($tree);
+          $ql_code = '<div>' . $quick_links_title . '</div>' . $tree;
+          break;
+
+        case 'custom':
+          $ql_code = '<div>' . $quick_links_title . '</div>' . $quick_links;
+          break;
+
+        default:
+          $ql_code = '';
+      }
+
+      $data = [
+        'client_hash' => $client_hash,
+        'analytics' => $analytics,
+        'quick_links' => $ql_code,
+      ];
+
+      // Check if decay is set.
+      $decay = $haystack->getSetting('decay_factor', '');
+      if (!empty($decay)) {
+        $data['decay'] = $decay;
+      }
+
+      // Check if a search page is defined.
+      $searchPage = $haystack->getSetting('search_page_url', '');
+      if (!empty($searchPage)) {
+        $data['search_page'] = $searchPage;
+      }
+
+      // Check for languages.
+      $systemLanguages = \Drupal::languageManager()->getLanguages();
+      $defaultLanguage = \Drupal::languageManager()->getDefaultLanguage();
+      $enabledLanguages = $haystack->getSetting('languages', []);
+      $enabledLanguages = array_filter($enabledLanguages);
+
+      if (count($systemLanguages) > 1 && !empty($enabledLanguages)) {
+        $data['currentLanguage'] = \Drupal::languageManager()->getCurrentLanguage()->getId();
+        $data['languages'][$defaultLanguage->getId()] = $defaultLanguage->getName();
+        foreach ($enabledLanguages as $langId) {
+          $data['languages'][$langId] = $systemLanguages[$langId]->getName();
+        }
+      }
+
+      if (!empty($types)) {
+        $data['types'] = $types;
+      }
+      if ($search_id) {
+        $data['trig'] = $search_id;
+      }
+
+      $variables['#attached']['drupalSettings']['haystack_settings'] = $data;
+
+    }
+  }
+  $variables['#attached']['library'][] = 'haystack/styles';
+  $variables['#attached']['library'][] = 'haystack/scripts';
+
+}
