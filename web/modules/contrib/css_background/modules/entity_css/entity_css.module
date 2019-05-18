@@ -1,0 +1,250 @@
+<?php
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Core\Routing\RouteMatchInterface;
+
+/**
+ * Implements hook_help().
+ */
+function entity_css_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the paragraph_css module.
+    case 'help.page.entity_css':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Page CSS') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function entity_css_page_attachments(array &$attachments) {
+  // Skip admin pages.
+  if (\Drupal::service('router.admin_context')->isAdminRoute()) {
+    return;
+  }
+
+  /** @var \Drupal\Core\Entity\EntityInterface $entity */
+  $entity = entity_css_get_entity();
+  if ($entity) {
+    // Find all referenced entities.
+    $referenced_entities = $entity->referencedEntities();
+
+    // Get the CSS backgrounds.
+    /** @var \Drupal\css_background\Entity\CssBackgroundEntityInterface[] $css_backgrounds */
+    $css_backgrounds = array_filter($referenced_entities, function (EntityInterface $entity) {
+      return $entity->getEntityTypeId() == 'css_background';
+    });
+
+    // Get the CSS text color.
+    $css_text_color = isset($entity->css_text_color) ? $entity->css_text_color->getValue() : '';
+
+    // Attach related (non-paragraph) CSS.
+    foreach ($referenced_entities as $entity) {
+      if ($entity->getEntityTypeId() != 'paragraph' && isset($entity->css_background)) {
+        // Attach the one and only content_group item's CSS.
+        entity_css_attach_css($attachments, $entity);
+
+        // Get the related backgrounds if the page doesn't have any.
+        if (!$css_backgrounds) {
+          $css_backgrounds = $entity->css_background->referencedEntities();
+        }
+
+        // Get the related CSS text color if the page doesn't have one.
+        if (!$css_text_color) {
+          $css_text_color = $entity->css_text_color->getValue();
+        }
+      }
+    }
+
+    // Attach page CSS.
+    entity_css_attach_css($attachments, $entity);
+
+    // Attach the background image CSS.
+    if ($css_backgrounds) {
+      // Convert the CSS background to strings.
+      $css_background_strings = [];
+      foreach ($css_backgrounds as $css_background) {
+        $css_background_strings[] = $css_background->getCss();
+      }
+      $css_background_string = implode(', ', $css_background_strings);
+
+      // Set the page background in JS. If we set it here in the style, it's
+      // not low enough on the page, and bootstrap overrides it. The bootstrap
+      // overrides are in JS too.
+      $attachments['#attached']['drupalSettings']['entityCss']['background'] = $css_background_string;
+    }
+
+    // Set the text color CSS.
+    if ($css_text_color) {
+      $attachments['#attached']['drupalSettings']['entityCss']['textColor'] = $css_text_color[0]['value'];
+    }
+  }
+
+  // Attach the view page JS.
+  $attachments['#attached']['library'][] = 'entity_css/view_page';
+  $attachments['#attached']['drupalSettings']['entityCss']['pageSelector'] = theme_get_setting('css_background_selector') ?: 'body';
+}
+
+/**
+ * Implements hook_entity_base_field_info().
+ */
+function entity_css_entity_base_field_info(EntityTypeInterface $entity_type) {
+  $fields = [];
+
+  // Quick exit if the entity type is not supported.
+  $entity_types = \Drupal::config('entity_css.settings')->get('entity_types');
+  // @todo: Why isn't config defined yet?
+  if (!in_array($entity_type->id(), $entity_types ?: ['node'])) {
+    return $fields;
+  }
+
+  $fields['css_background'] = BaseFieldDefinition::create('entity_reference')
+    ->setLabel(t('CSS background'))
+    ->setDescription(t('Enter CSS backgrounds used by the page. Multiple backgrounds can be specified.'))
+    ->setSettings([
+      'target_type' => 'css_background',
+      'handler' => 'default:css_background',
+      'handler_settings' => [
+        'target_bundles' => NULL,
+        'auto_create' => FALSE,
+      ],
+    ])
+    ->setDisplayOptions('form', [
+      'type' => 'inline_entity_form_complex',
+      'weight' => 99,
+      'settings' => [
+        'match_operator' => 'CONTAINS',
+        'form_mode' => 'default',
+        'override_labels' => FALSE,
+        'label_singular' => '',
+        'label_plural' => '',
+        'allow_new' => TRUE,
+        'allow_existing' => FALSE,
+      ],
+    ])
+    ->setDisplayConfigurable('form', TRUE);
+
+  $fields['css_text_color'] = BaseFieldDefinition::create('string')
+    ->setLabel(t('CSS Text color'))
+    ->setDescription(t('Enter the CSS text color. See <a href="@url">@url</a>.', [
+      '@url' => 'https://www.w3schools.com/cssref/css_colors_legal.asp',
+    ]))
+    ->setDisplayOptions('form', [
+      'type' => 'string_textfield',
+      'weight' => 101,
+      'settings' => [
+        'size' => 60,
+        'placeholder' => '',
+      ],
+    ])
+    ->setDisplayConfigurable('form', TRUE);
+
+  $fields['css_file'] = BaseFieldDefinition::create('file')
+    ->setLabel(t('CSS file'))
+    ->setDescription(t('Upload a CSS file that is used by the page. Page CSS is attached after Content group CSS.'))
+    ->setSettings([
+      'file_directory' => '[current-page:url:relative]/css',
+      'file_extensions' => 'css',
+      'max_filesize' => '',
+      'description_field' => FALSE,
+      'handler' => 'default:file',
+      'handler_settings' => [],
+    ])
+    ->setDisplayOptions('form', [
+      'type' => 'hidden',
+      'weight' => 101,
+    ])
+    ->setDisplayConfigurable('form', TRUE);
+
+  return $fields;
+}
+
+/**
+ * Return the entity of the path.
+ *
+ * @param string $path *   (optional) The path to lookup, defaults to the current path.
+ *
+ * @return \Drupal\Core\Entity\EntityInterface|null
+ *   The entity of the current path, or null if none.
+ *
+ * @todo: This implements something similar to menu_get_object() which was
+ * likely removed intentionally, so is this a bad idea?
+ */
+function entity_css_get_entity($path = NULL) {
+  // Get the current path if none is specified.
+  if (!$path) {
+    $path = parse_url(\Drupal::requestStack()->getCurrentRequest()->getRequestUri(), PHP_URL_PATH);
+  }
+  $base_path = base_path();
+  if (empty($path) || $path == $base_path || $path == '<front>') {
+    $path = \Drupal::config('system.site')->get('page.front');
+  }
+
+  // Convert the specified path to an internal path.
+  $source_path = \Drupal::service('path.alias_manager')->getPathByAlias($path);
+  $source_path = preg_replace(":^$base_path:", '', $source_path);
+
+  // Check if this is the entity path.
+  // @todo: this makes assumption that are possibly not valid. For example, is
+  // the entity path always "/entity_type_id/entity_id"?
+  $parts = explode('/', trim($source_path, '/'));
+  if (count($parts) >= 2) {
+    list($entity_type_id, $entity_id) = $parts;
+    $entity_type_id = str_replace('-', '_', $entity_type_id);
+    // Check that the path is for an entity.
+    $entity_type_manager = \Drupal::entityTypeManager();
+    /** @var \Drupal\Core\Entity\EntityTypeManagerInterface $entity_type_manager */
+    $entity_types = $entity_type_manager->getDefinitions();
+    if (is_numeric($entity_id) && isset($entity_types[$entity_type_id])) {
+      /** @var \Drupal\Core\Entity\EntityStorageInterface $entity_storage */
+      $entity_storage = $entity_type_manager->getStorage($entity_type_id);
+      if ($entity_storage) {
+        // Load and return the entity.
+        return $entity_storage->load($entity_id);
+      }
+    }
+  }
+  return NULL;
+}
+
+/**
+ * Attach the CSS from the entity to the page.
+ *
+ * @param array $attachments
+ *   Attachments array from hook_page_attachments().
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ *   The entity.
+ *
+ * @todo: refactor this to use libraries and cache tags?
+ */
+function entity_css_attach_css(array &$attachments, EntityInterface $entity, $field_name = 'css_file') {
+  if (!isset($entity->{$field_name})) {
+    return;
+  }
+
+  // Attach all the CSS files, there can be multiple ones.
+  /** @var \Drupal\file\Entity\File $file */
+  foreach ($entity->get($field_name)->referencedEntities() as $file) {
+    $uri = $file->getFileUri();
+    if (file_exists($uri)) {
+      $attachments['#attached']['html_head_link'][] = [
+        [
+          'rel' => 'stylesheet',
+          'type' => 'text/css',
+          'href' => file_create_url($uri),
+        ],
+        TRUE,
+      ];
+    }
+    else {
+      // @todo: what should we do here? log a warning?
+    }
+  }
+}
