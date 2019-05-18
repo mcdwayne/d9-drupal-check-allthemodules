@@ -1,0 +1,243 @@
+<?php
+
+/**
+ * @file
+ * Install, update and uninstall functions for the PowerTagging module.
+ */
+
+/**
+ * Implements hook_schema().
+ */
+function powertagging_schema() {
+  $schema['powertagging_entity_extraction_cache'] = array(
+    'description' => 'Table that stores field values containing extracted entities.',
+    'fields' => array(
+      'entity_type' => array(
+        'description' => 'The entity type, e.g. "node".',
+        'type' => 'varchar',
+        'length' => 128,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'bundle' => array(
+        'description' => 'The bundle of the entity.',
+        'type' => 'varchar',
+        'length' => 32,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'entity_id' => array(
+        'description' => 'The ID of the entity.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'language' => array(
+        'description' => 'The language of the entity.',
+        'type' => 'varchar',
+        'length' => 32,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'field_name' => array(
+        'description' => 'The name of the field.',
+        'type' => 'varchar',
+        'length' => 32,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'delta' => array(
+        'description' => 'The sequence number for this data item, used for multi-value fields.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'html' => array(
+        'description' => 'The rendered HTML containing the extracted entities.',
+        'type' => 'text',
+        'not null' => FALSE,
+        'size' => 'big',
+        'translatable' => FALSE,
+      ),
+    ),
+    'primary key' => array('entity_type', 'entity_id', 'field_name', 'language', 'delta'),
+  );
+
+  return $schema;
+}
+
+/**
+ * Adds the new data properties settings to all PowerTagging configurations.
+ */
+function powertagging_update_8101() {
+
+  $configs = \Drupal\powertagging\Entity\PowerTaggingConfig::loadMultiple();
+  /** @var \Drupal\powertagging\Entity\PowerTaggingConfig $config */
+  foreach ($configs as $config) {
+    $settings = $config->getConfig();
+    $settings['data_properties'] = ['skos:altLabel', 'skos:hiddenLabel', 'skos:exactMatch'];
+    $config->setConfig($settings);
+    $config->save();
+  }
+
+  return t('PowerTagging configurations updated.');
+}
+
+/**
+ * Adds a new table for saving html with extracted entities.
+ */
+function powertagging_update_8102() {
+  $schema = powertagging_schema();
+  \Drupal::database()->schema()->createTable('powertagging_entity_extraction_cache', $schema['powertagging_entity_extraction_cache']);
+}
+
+/**
+ * Updates field_alt_labels into multi-value fields instead of a comma-separated text field.
+ */
+function powertagging_update_8103(&$sandbox) {
+  _powertagging_update_labels($sandbox, 'field_alt_labels');
+}
+
+/**
+ * Updates field_hidden_labels into multi-value fields instead of a comma-separated text field.
+ */
+function powertagging_update_8104(&$sandbox) {
+  _powertagging_update_labels($sandbox, 'field_hidden_labels');
+}
+
+/**
+ * Updates labels into multi-value fields instead of a comma-separated text field.
+ *
+ * @param array $sandbox
+ *   Associative array containing properties to share between batch sessions.
+ * @param string $field_name
+ *   The name of the field to update the labels for.
+ */
+function _powertagging_update_labels(&$sandbox, $field_name) {
+  $database = \Drupal::database();
+  if (!isset($sandbox['progress'])) {
+    $sandbox['progress'] = 0;
+    $sandbox['current_id'] = 0;
+
+    $check_field_query = $database->select('config', 'c');
+    $check_field_query->fields('c', ['data'])
+      ->condition('name', 'field.storage.taxonomy_term.' . $field_name);
+    $field_config = $check_field_query->execute()->fetchField();
+    // In case the field doesn't exist yet just return.
+    if ($field_config === FALSE) {
+      $sandbox['#finished'] = 1;
+      return;
+    }
+
+    $field_config_data = unserialize($field_config);
+    // In case the field already was changed just return.
+    if ($field_config_data['cardinality'] === -1) {
+      $sandbox['#finished'] = 1;
+      return;
+    }
+
+    // Update field config and cardinality.
+    $field_config_data['cardinality'] = -1;
+    $field_config_data['type'] = 'string';
+    $field_config_data['settings']['max_length'] = 1024;
+    $database->update('config')
+      ->fields(array(
+        'data' => serialize($field_config_data),
+      ))
+      ->condition('name', 'field.storage.taxonomy_term.' . $field_name)
+      ->execute();
+
+    // Update field instance configs.
+    $instance_query = $database->select('config', 'c');
+    $instance_query->fields('c', ['name', 'data'])
+      ->condition('name', '%field.field.taxonomy_term.%.' . $field_name, 'LIKE');
+    $instance_configs = $instance_query->execute()->fetchAll(\PDO::FETCH_ASSOC);
+    foreach ($instance_configs as $instance_config) {
+      $field_instance_data = unserialize($instance_config['data']);
+      $field_instance_data['field_type'] = 'string';
+      $database->update('config')
+        ->fields(array(
+          'data' => serialize($field_instance_data),
+        ))
+        ->condition('name', $instance_config['name'])
+        ->execute();
+    }
+
+    $label_query = $database->select('taxonomy_term__' . $field_name, 'f');
+    $label_query->fields('f', ['entity_id']);
+    $sandbox['max_items'] = $label_query->countQuery()->execute()->fetchField();
+  }
+
+  $label_query = $database->select('taxonomy_term__' . $field_name, 'f');
+  $label_query->fields('f')
+    ->condition('entity_id', $sandbox['current_id'], '>');
+  $label_query->orderBy('entity_id', 'ASC');
+  $label_query->range(0, 10);
+  $labels_data = $label_query->execute()->fetchAll(\PDO::FETCH_ASSOC);
+
+  // There are still labels to change.
+  if (!empty($labels_data)) {
+    $sandbox['#finished'] = 0;
+    foreach ($labels_data as $label_data) {
+      $sandbox['current_id'] = $label_data['entity_id'];
+      $sandbox['#finished'] = ($sandbox['progress'] / $sandbox['max_items']);
+      $sandbox['progress']++;
+      $label_values = explode(',', $label_data[$field_name . '_value']);
+      // A multi-value field has to be created
+      if (count($label_values) > 1) {
+        // Delete old row from values and revision.
+        $database->delete('taxonomy_term__' . $field_name)
+          ->condition('entity_id', $label_data['entity_id'])
+          ->condition('revision_id', $label_data['revision_id'])
+          ->execute();
+
+        // Add new rows for values and revision.
+        $insert_value_query = $database->insert('taxonomy_term__' . $field_name)->fields(array_keys($label_data));
+        $label_data['delta'] = 0;
+        foreach ($label_values as $label_value) {
+          $label_data[$field_name . '_value'] = $label_value;
+          $insert_value_query->values($label_data);
+          $label_data['delta']++;
+        }
+        $insert_value_query->execute();
+      }
+    }
+
+    // Show progress message if in drush.
+    if (function_exists('drush_log')) {
+      drush_log(t('Finished updating @done / @max labels for @field.', array('@done' => $sandbox['progress'], '@max' => $sandbox['max_items'], '@field' => $field_name)), 'success');
+    }
+  }
+  // All labels were changed.
+  else {
+    // At the end change value length to 1024 characters.
+    $field_value_spec = array(
+      'type' => 'varchar',
+      'length' => 1024,
+      'not null' => FALSE,
+    );
+    $database->schema()->changeField('taxonomy_term__' . $field_name, $field_name . '_value', $field_name . '_value', $field_value_spec);
+
+    $sandbox['#finished'] = 1;
+  }
+}
+
+/**
+ * Adds remaining fields to PowerTagging configurations if necessary.
+ */
+function powertagging_update_8105() {
+  $configs = \Drupal\powertagging\Entity\PowerTaggingConfig::loadMultiple();
+  /** @var \Drupal\powertagging\Entity\PowerTaggingConfig $config */
+  foreach ($configs as $config) {
+    $settings = $config->getConfig();
+    $taxonomy_id = isset($settings['project']['taxonomy_id']) ? $settings['project']['taxonomy_id'] : '';
+    if (!empty($taxonomy_id)) {
+      $vocabulary = \Drupal\taxonomy\Entity\Vocabulary::load($taxonomy_id);
+      if (!empty($vocabulary)) {
+        \Drupal\powertagging\Form\PowerTaggingConfigForm::addVocabularyFields($vocabulary);
+      }
+    }
+  }
+}

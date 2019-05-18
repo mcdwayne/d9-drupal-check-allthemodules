@@ -1,0 +1,560 @@
+<?php
+
+/**
+ * @file
+ * Contains powertagging.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+
+// Always add the general PowerTagging resource library.
+function powertagging_page_attachments(array &$page) {
+  $page['#attached']['library'][] = 'powertagging/general';
+}
+
+/**
+ * Implements hook_help().
+ */
+function powertagging_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the powertagging module.
+    case 'help.page.powertagging':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('PowerTagging is semantic power for Drupal. This module extends Drupal’s ability to support linking and finding of ideas, contents and experts.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function powertagging_theme() {
+  return [
+    'powertagging' => [
+      'render element' => 'children',
+      'template' => 'powertagging',
+    ],
+    'slider' => [
+      'render element' => 'element',
+      'template' => 'slider',
+    ],
+  ];
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Alter the field configuration of the powertagging_tags field.
+ */
+function powertagging_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  $field_storage = $form_state->getStorage();
+  if (isset($field_storage['field_config'])) {
+    /* @var \Drupal\field\Entity\FieldConfig $field_config */
+    $field_config = $field_storage['field_config'];
+    if ($form_id == 'field_storage_config_edit_form' && $field_config->getType() == 'powertagging_tags') {
+      // Fix the cardinality to "Unlimited".
+      $form['cardinality_container']['cardinality']['#default_value'] = -1;
+      $form['cardinality_container']['cardinality']['#attributes']['disabled'] = 'disabled';
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_presave().
+ *
+ * @param Drupal\Core\Entity\ContentEntityBase $entity
+ */
+function powertagging_entity_presave($entity) {
+  // One of the supported entities is being created at the moment.
+  if (in_array($entity->getEntityTypeId(), array('node', 'user', 'taxonomy_term'))) {
+    $bundle = $entity->bundle();
+
+    $field_definitions = \Drupal::service('entity_field.manager')->getFieldDefinitions($entity->getEntityTypeId(), $bundle);
+    // Get the form display to check which widgets are used.
+    $form_display = \Drupal::entityTypeManager()
+      ->getStorage('entity_form_display')
+      ->load($entity->getEntityTypeId() . '.' . $bundle . '.' . 'default');
+
+    /** @var \Drupal\field\Entity\FieldConfig $field_definition */
+    foreach ($field_definitions as $field_definition) {
+      $field_settings = $field_definition->getSettings();
+      $field_name = $field_definition->getName();
+
+      // It is a PowerTagging field.
+      if ($field_definition->getType() == 'powertagging_tags') {
+        $specific_widget_type = $form_display->getComponent($field_definition->getName());
+        $tag_entity = FALSE;
+        switch ($specific_widget_type['type']) {
+          case 'powertagging_tags_default':
+            // Only tag new entities and only if the auto-tag is enabled.
+            if ($entity->isNew() && isset($field_settings['automatically_tag_new_entities']) && $field_settings['automatically_tag_new_entities']) {
+              // Only go on if the entity doesn't have values for that field yet.
+              if (!$entity->hasField($field_name) || !$entity->get($field_name)
+                  ->count()) {
+                $tag_entity = TRUE;
+              }
+            }
+
+            break;
+          case 'powertagging_invisible':
+            $tag_entity = TRUE;
+            break;
+        }
+
+        if ($tag_entity) {
+          // Build the tag settings.
+          $powertagging_config = \Drupal\powertagging\Entity\PowerTaggingConfig::load($field_definition->getFieldStorageDefinition()
+            ->getSetting('powertagging_id'));
+          $powertagging = new \Drupal\powertagging\PowerTagging($powertagging_config);
+          $tag_settings = $powertagging->buildTagSettings([
+            'entity_type_id' => $entity->getEntityTypeId(),
+            'bundle' => $bundle,
+            'field_type' => $field_name,
+          ]);
+
+          // Extract the tags.
+          $tids = $powertagging->extractTagsOfEntity($entity, $tag_settings);
+
+          // Update the field value.
+          $entity->set($field_name, $tids);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ *
+ * @param \Drupal\node\Entity\Node $node
+ *   The node that gets inserted
+ */
+function powertagging_node_insert($node) {
+  // Add the node to the entity extraction cache.
+  \Drupal\powertagging\PowerTagging::buildEntityExtractionCache('node', $node);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update().
+ *
+ * @param \Drupal\node\Entity\Node $node
+ *   The node that gets updated
+ */
+function powertagging_node_update($node) {
+  // Update the node in the entity extraction cache.
+  \Drupal\powertagging\PowerTagging::deleteEntityExtractionCache('node', $node);
+  \Drupal\powertagging\PowerTagging::buildEntityExtractionCache('node', $node);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ *
+ * @param \Drupal\node\Entity\Node $node
+ *   The node that gets deleted
+ */
+function powertagging_node_delete($node) {
+  // Remove the node from the entity extraction cache.
+  \Drupal\powertagging\PowerTagging::deleteEntityExtractionCache('node', $node);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ */
+function powertagging_field_config_delete(Drupal\field\Entity\FieldConfig $field_config) {
+  $entity_type = $field_config->getTargetEntityTypeId();
+  $bundle = $field_config->getTargetBundle();
+  $field_name = $field_config->getName();
+
+  // Remove everything from the field in the entity extraction cache.
+  \Drupal::database()->delete('powertagging_entity_extraction_cache')
+    ->condition('entity_type', $entity_type)
+    ->condition('bundle', $bundle)
+    ->condition('field_name', $field_name)
+    ->execute();
+
+  // Remove the field from the extraction configuration.
+  $config = \Drupal::configFactory()->getEditable('powertagging.settings');
+  $extraction_variable = $config->get('entity_extraction_settings');
+  if (isset($extraction_variable[$entity_type]) && isset($extraction_variable[$entity_type][$bundle]) && in_array($field_name, $extraction_variable[$entity_type][$bundle]['fields'])) {
+    $extraction_variable[$entity_type][$bundle]['fields'] = array_diff($extraction_variable[$entity_type][$bundle]['fields'], [$field_name]);
+    $config->set('entity_extraction_settings', $extraction_variable)->save();
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ */
+function powertagging_node_type_delete(Drupal\node\Entity\NodeType $node_type) {
+  // Remove the node type from the PowerTagging entity extraction cache.
+  \Drupal::database()->delete('powertagging_entity_extraction_cache')
+    ->condition('entity_type', 'node')
+    ->condition('bundle', $node_type->id())
+    ->execute();
+
+  // Remove the node type from the extraction configuration.
+  $config = \Drupal::configFactory()->getEditable('powertagging.settings');
+  $extraction_variable = $config->get('entity_extraction_settings');
+  if (isset($extraction_variable['node']) && isset($extraction_variable['node'][$node_type->id()])) {
+    unset($extraction_variable['node'][$node_type->id()]);
+    $config->set('entity_extraction_settings', $extraction_variable)->save();
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ */
+/*function powertagging_entity_delete($entity) {
+  var_dump($entity); exit;
+}*/
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function powertagging_form_node_type_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  $content_type = $form['type']['#default_value'];
+
+  if ($content_type) {
+    // Add a custom validation handler.
+    $form['#validate'][] = 'powertagging_form_node_type_form_validate';
+
+    // Add a new vertical tab for the PowerTagging entity extraction settings.
+    $form['powertagging_entity_extraction'] = array(
+      '#type' => 'details',
+      '#title' => t('PowerTagging entity extraction'),
+      '#group' => 'additional_settings',
+    );
+
+    // Build nodes counts.
+    $total_nodes_query = \Drupal::database()->select('node', 'n');
+    $total_nodes_query->fields('n', ['nid'])
+      ->condition('n.type', $content_type);
+    $total_count = $total_nodes_query->countQuery()->execute()->fetchField();
+
+    $extraction_nodes_query = \Drupal::database()->select('node', 'n');
+    $extraction_nodes_query->fields('n', ['nid'])
+      ->condition('n.type', $content_type);
+    $extraction_nodes_query->join('powertagging_entity_extraction_cache', 'c', 'c.entity_id = n.nid AND c.entity_type = \'node\'');
+    $extraction_nodes_query->distinct();
+    $extracted_count = $extraction_nodes_query->countQuery()
+      ->execute()
+      ->fetchField();
+
+    $form['powertagging_entity_extraction']['powertagging_entity_extraction_info'] = array(
+      '#type' => 'markup',
+      '#markup' => '<p><b>' . t('Nodes of this type with extracted entities') . ': ' . $extracted_count . ' / ' . $total_count . '</b></p>',
+    );
+
+    $extraction_settings = \Drupal\powertagging\PowerTagging::getEntityExtractionSettings('node', $content_type);
+    $form['powertagging_entity_extraction']['powertagging_extraction_enabled'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Enable Schema.org Entity Extraction'),
+      '#description' => t('If this option is enabled, every time a node gets created or updated, the markup of selected fields will be enriched with Schema.org annotations for entities extracted by PoolParty.') . '<br />' . t('Note: This feature requires PoolParty 7.0+ and will result in an increased time to save nodes.'),
+      '#default_value' => $extraction_settings['enabled'],
+    );
+
+    // Batch operation link.
+    $form['powertagging_entity_extraction']['operations'] = array(
+      '#type' => 'container',
+      '#states' => array(
+        'visible' => array(
+          '#edit-powertagging-extraction-enabled' => array('checked' => TRUE),
+        ),
+      ),
+    );
+
+    $form['powertagging_entity_extraction']['operations']['powertagging_extraction_batch_extract'] = array(
+      '#type' => 'markup',
+      '#markup' => '<ul class="action-links"><li>' . \Drupal\Core\Link::fromTextAndUrl(t('Extract entities for all nodes of this type'), \Drupal\Core\Url::fromRoute('powertagging.extract_entity_tags', [
+          'entity_type' => 'node',
+          'bundle' => $content_type
+        ], ['query' => ['destination' => isset($_GET['destination']) ? $_GET['destination'] : '<front>']]))
+          ->toString() . '</li></ul>',
+    );
+
+    $connections = \Drupal\semantic_connector\SemanticConnector::getConnectionsByType('pp_server');
+    $connection_options = array();
+    if (!empty($connections)) {
+      /** @var \Drupal\semantic_connector\Entity\SemanticConnectorPPServerConnection $connection */
+      foreach ($connections as $connection) {
+        $connection_options[$connection->getId()] = $connection->getTitle();
+      }
+    }
+
+    $form['powertagging_entity_extraction']['powertagging_extraction_connection_id'] = array(
+      '#type' => 'select',
+      '#title' => t('Select the PoolParty connection to use'),
+      '#description' => t('If you haven\'t created a PoolParty server connection yet, you can do so in the Semantic Connector module %link first.', [
+        '%link' => new \Drupal\Component\Render\FormattableMarkup(\Drupal\Core\Link::fromTextAndUrl('here', \Drupal\Core\Url::fromRoute('entity.pp_server_connection.add_form', [], ['query' => ['destination' => isset($_GET['destination']) ? $_GET['destination'] : '']]))
+          ->toString(), array())
+      ]),
+      '#options' => $connection_options,
+      '#empty_option' => '-- Select a connection --',
+      '#default_value' => $extraction_settings['connection_id'],
+      '#states' => array(
+        'visible' => array(
+          '#edit-powertagging-extraction-enabled' => array('checked' => TRUE),
+        ),
+        'required' => array(
+          '#edit-powertagging-extraction-enabled' => array('checked' => TRUE),
+        ),
+      ),
+    );
+
+    // Language mapping
+    $form['powertagging_entity_extraction']['languages'] = array(
+      '#type' => 'item',
+      '#title' => t('Map the Drupal languages with the PoolParty languages'),
+      '#states' => array(
+        'visible' => array(
+          '#edit-powertagging-extraction-enabled' => array('checked' => TRUE),
+        ),
+        'required' => array(
+          '#edit-powertagging-extraction-enabled' => array('checked' => TRUE),
+        ),
+      ),
+    );
+
+    // Currently only English is supported by our entity extraction engine.
+    $project_language_options = array('en' => 'English (en)');
+    foreach (\Drupal::languageManager()->getLanguages() as $language) {
+      $form['powertagging_entity_extraction']['languages'][$language->getId()] = array(
+        '#type' => 'select',
+        '#title' => $language->getName(),
+        '#options' => $project_language_options,
+        '#empty_option' => '',
+        '#parents' => ['powertagging_extraction_languages', $language->getId()],
+        '#default_value' => (isset($extraction_settings['languages'][$language->getId()]) ? $extraction_settings['languages'][$language->getId()] : ''),
+      );
+    }
+
+    $fields = \Drupal::service('entity_field.manager')
+      ->getFieldDefinitions('node', $content_type);
+    $form_display = \Drupal::entityTypeManager()
+      ->getStorage('entity_form_display')
+      ->load('node.' . $content_type . '.default');
+
+    // Get all text area fields of the bundle.
+    $bundle_fields = [];
+    /** @var \Drupal\field\Entity\FieldConfig $field */
+    foreach ($fields as $field_id => $field) {
+      $specific_widget_type = $form_display->getComponent($field->getName());
+      if ($specific_widget_type && in_array($specific_widget_type['type'], [
+          'text_textarea',
+          'text_textarea_with_summary'
+        ])) {
+        $bundle_fields[$field_id] = $field->label();
+      }
+    }
+
+    $form['powertagging_entity_extraction']['powertagging_extraction_fields'] = array(
+      '#type' => 'checkboxes',
+      '#title' => t('Fields to extract entities for'),
+      '#options' => $bundle_fields,
+      '#default_value' => $extraction_settings['fields'],
+      '#states' => array(
+        'visible' => array(
+          '#edit-powertagging-extraction-enabled' => array('checked' => TRUE),
+        ),
+        'required' => array(
+          '#edit-powertagging-extraction-enabled' => array('checked' => TRUE),
+        ),
+      ),
+    );
+
+    $form['powertagging_entity_extraction']['powertagging_extraction_types'] = array(
+      '#type' => 'checkboxes',
+      '#title' => t('Types of entities to extract'),
+      '#options' => [
+        'location' => t('Locations'),
+        'organization' => t('Organizations'),
+        'person' => t('People'),
+      ],
+      '#default_value' => $extraction_settings['types'],
+      '#states' => array(
+        'visible' => array(
+          '#edit-powertagging-extraction-enabled' => array('checked' => TRUE),
+        ),
+        'required' => array(
+          '#edit-powertagging-extraction-enabled' => array('checked' => TRUE),
+        ),
+      ),
+    );
+
+    $form['powertagging_entity_extraction']['powertagging_extraction_display_entities'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Display extracted entities'),
+      '#description' => t('If this option is enabled, every extracted entity in the text will be visibly marked, otherwise extracted entities get added invisible to users.'),
+      '#default_value' => $extraction_settings['display_entities'],
+      '#states' => array(
+        'visible' => array(
+          '#edit-powertagging-extraction-enabled' => array('checked' => TRUE),
+        ),
+      ),
+    );
+  }
+}
+
+/**
+ * Custom validator handler for the node type form.
+ *
+ * Join all PoolParty GraphSearch settings into one variable instead of
+ * the standard multiple variables.
+ */
+function powertagging_form_node_type_form_validate($form, \Drupal\Core\Form\FormStateInterface &$form_state) {
+  $content_type = $form['type']['#default_value'];
+  $old_extraction_config = \Drupal\powertagging\PowerTagging::getEntityExtractionSettings('node', $content_type);
+
+  $values = $form_state->getValues();
+  if ($values['powertagging_extraction_enabled']) {
+    if (empty($values['powertagging_extraction_connection_id'])) {
+      $form_state->setErrorByName('powertagging_extraction_connection_id', t('Please select a connection to use for entity extraction.'));
+    }
+
+    $extraction_languages = array_filter($values['powertagging_extraction_languages']);
+    if (empty($extraction_languages)) {
+      $form_state->setErrorByName('powertagging_extraction_languages', t('Please select an extraction language for at least one Drupal language.'));
+    }
+
+    $fields = array_keys(array_filter($values['powertagging_extraction_fields']));
+    if (empty($fields)) {
+      $form_state->setErrorByName('powertagging_extraction_fields', t('Please select at least one field to extract entities from.'));
+    }
+
+    $extraction_types = array_keys(array_filter($values['powertagging_extraction_types']));
+    if (empty($extraction_types)) {
+      $form_state->setErrorByName('powertagging_extraction_types', t('Please select at least one type of entities to extract.'));
+    }
+
+    // Save the configuration in case there was no error.
+    if (empty($form_state->getErrors())) {
+      $extraction_config = [
+        'enabled' => $values['powertagging_extraction_enabled'],
+        'connection_id' => $values['powertagging_extraction_connection_id'],
+        'languages' => $values['powertagging_extraction_languages'],
+        'fields' => $fields,
+        'types' => $extraction_types,
+        'display_entities' => $values['powertagging_extraction_display_entities'],
+      ];
+      $config = \Drupal::configFactory()->getEditable('powertagging.settings');
+      $extraction_variable = $config->get('entity_extraction_settings');
+      $extraction_variable['node'][$content_type] = $extraction_config;
+      $config->set('entity_extraction_settings', $extraction_variable)->save();
+
+      // Clean all entries for this content type in case the extraction types
+      // are getting changed.
+      if (count($old_extraction_config['types']) != count($extraction_types) || array_diff($old_extraction_config['types'], $extraction_types)) {
+        \Drupal::database()->delete('powertagging_entity_extraction_cache')
+          ->condition('entity_type', 'node')
+          ->condition('bundle', $content_type)
+          ->execute();
+      }
+      // Otherwise check if a subset of cached entries needs to be deleted.
+      else {
+        // Clean all entries for fields, which are not required anymore.
+        $fields_to_remove = array_diff($old_extraction_config['fields'], $fields);
+        if (!empty($fields_to_remove)) {
+          \Drupal::database()->delete('powertagging_entity_extraction_cache')
+            ->condition('entity_type', 'node')
+            ->condition('bundle', $content_type)
+            ->condition('field_name', $fields_to_remove, 'IN')
+            ->execute();
+        }
+
+        // Clean all entries for removed languages.
+        $old_languages = array_keys(array_filter($old_extraction_config['languages']));
+        $new_languages = array_keys(array_filter($values['powertagging_extraction_languages']));
+        $languages_to_remove = array_diff($old_languages, $new_languages);
+        if (!empty($languages_to_remove)) {
+          \Drupal::database()->delete('powertagging_entity_extraction_cache')
+            ->condition('entity_type', 'node')
+            ->condition('bundle', $content_type)
+            ->condition('language', $languages_to_remove, 'IN')
+            ->execute();
+        }
+      }
+    }
+  }
+  else {
+    // If it was enabled before, remove the configuration and clean entries.
+    if ($old_extraction_config) {
+      $config = \Drupal::configFactory()->getEditable('powertagging.settings');
+      $extraction_variable = $config->get('entity_extraction_settings');
+      unset($extraction_variable['node'][$content_type]);
+      $config->set('entity_extraction_settings', $extraction_variable)->save();
+
+      \Drupal::database()->delete('powertagging_entity_extraction_cache')
+        ->condition('entity_type', 'node')
+        ->condition('bundle', $content_type)
+        ->execute();
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_view_alter().
+ *
+ * @param array $build
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ * @param \Drupal\Core\Entity\Display\EntityViewDisplayInterface $display
+ */
+function powertagging_entity_view_alter(array &$build, $entity, $display) {
+  $entity_id = $entity->id();
+  $language = $entity->language()->getId();
+
+  $extraction_config = \Drupal\powertagging\PowerTagging::getEntityExtractionSettings($entity->getEntityTypeId(), $entity->bundle());
+  if ($extraction_config['enabled']) {
+    // Get all cache values for the current entity.
+    $cached_values_query = \Drupal::database()->select('powertagging_entity_extraction_cache', 'c');
+    $cached_values_query->fields('c', ['field_name', 'delta', 'html'])
+      ->condition('entity_type', $entity->getEntityTypeId())
+      ->condition('entity_id', $entity_id)
+      ->condition('language', $language);
+    $cached_values = $cached_values_query->execute()
+      ->fetchAll(\PDO::FETCH_ASSOC);
+
+    if (!empty($cached_values)) {
+      // Show the entities if required.
+      if ($extraction_config['display_entities']) {
+        $classes = ['powertagging-entity-extraction-show'];
+        if (isset($build['#attributes']) && isset($build['#attributes']['class'])) {
+          $classes = array_merge($build['#attributes']['class'], $classes);
+        }
+        $build['#attributes']['class'] = $classes;
+      }
+
+      // Replace the markups with the cached values.
+      foreach ($cached_values as $cached_value) {
+        if (isset($build[$cached_value['field_name']]) && isset($build[$cached_value['field_name']][$cached_value['delta']])) {
+          $build[$cached_value['field_name']][$cached_value['delta']]['#text'] = $cached_value['html'];
+          // Full HTML is required to show the meta tags.
+          $build[$cached_value['field_name']][$cached_value['delta']]['#format'] = 'full_html';
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_semantic_connector_global_notification_actions().
+ */
+function powertagging_semantic_connector_global_notification_actions() {
+  return array(
+    array(
+      'id' => 'powertagging_refresh_extraction_model',
+      'title' => t('Required extraction model updates'),
+      'description' => t("PowerTagging with the latest state of the PoolParty thesaurus is only possible if the extraction model is up to date."),
+      'default_value' => TRUE,
+      'callback' => ['Drupal\powertagging\PowerTagging', 'checkExtractionModels'],
+    ),
+    array(
+      'id' => 'powertagging_retag_content',
+      'title' => t('Required retagging of content'),
+      'description' => t("After the extraction model was refreshed, content has to be retagged in order to tagged with the most up to date concepts."),
+      'default_value' => TRUE,
+      'callback' => ['Drupal\powertagging\PowerTagging', 'checkRetaggingRequired'],
+    ),
+  );
+}
