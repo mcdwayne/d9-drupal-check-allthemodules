@@ -1,0 +1,147 @@
+<?php
+
+/**
+ * @file
+ * Update hooks for the MerlinOne module.
+ */
+
+use Drupal\Core\TempStore\TempStoreException;
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_requirements().
+ */
+function merlinone_requirements($phase) {
+  if ($phase != 'runtime') {
+    return [];
+  }
+
+  $archive_url = \Drupal::config('merlinone.settings')->get('archive_url');
+  $requirements = [];
+  if (!$archive_url) {
+    $requirements = [
+      'merlinone.archive_url' => [
+        'title' => t('MerlinOne Archive URL'),
+        'value' => t('None'),
+        'description' => t('No Archive URL configured. Set one in the <a href=":settings">MerlinOne settings</a>.', [
+          ':settings' => Url::fromRoute('merlinone.settings')->toString(),
+        ]),
+        'severity' => REQUIREMENT_ERROR,
+      ],
+    ];
+  }
+
+  return $requirements;
+}
+
+/**
+ * Updates the URL configuration key.
+ */
+function merlinone_update_8101() {
+  $config_factory = \Drupal::configFactory();
+  $config = $config_factory->getEditable('merlinone.settings');
+  $config->set('archive_url', $config->get('mx_domain'));
+  $config->clear('mx_domain');
+  $config->save(TRUE);
+}
+
+/**
+ * Update configuration to support Media in Core.
+ *
+ * Removes unsupported bare image field Entity Browser widgets and updates the
+ * plugin ID for Media Entity Browser widgets.
+ */
+function merlinone_update_8201() {
+  /** @var \Drupal\Core\Config\ConfigFactoryInterface $config_factory */
+  $config_factory = \Drupal::service('config.factory');
+
+  // Save browsers we changed to clear cached forms.
+  $changed_browsers = [];
+
+  foreach ($config_factory->listAll('entity_browser.browser.') as $name) {
+    $config = $config_factory->getEditable($name);
+    $widgets = $config->get('widgets');
+    $changed = FALSE;
+    foreach ($widgets as $widget_uuid => &$widget) {
+
+      // Remove old unsupported image field widget.
+      if ($widget['id'] == 'merlinone_search') {
+        $changed = TRUE;
+        unset($widgets[$widget_uuid]);
+      }
+
+      if ($widget['id'] == 'merlinone_search_media_entity') {
+        // Change plugin ID for Media Entity widget.
+        $widget['id'] = 'merlinone_search';
+
+        // Update configuration key.
+        $widget['settings']['media_type'] = $widget['settings']['media_entity_bundle'];
+        unset($widget['settings']['media_entity_bundle']);
+        $changed = TRUE;
+      }
+    }
+    if ($changed) {
+      $config->set('widgets', $widgets)->save(TRUE);
+      $changed_browsers[] = $config->get('name');
+    }
+  }
+
+  /** @var \Drupal\user\SharedTempStoreFactory $tempstore */
+  $tempstore = \Drupal::service('user.shared_tempstore');
+  $collection = $tempstore->get('entity_browser.config');
+
+  // Delete SharedTempStore keys referencing the browsers we modified.
+  foreach ($changed_browsers as $browser) {
+    try {
+      $collection->delete($browser);
+    }
+    catch (TempStoreException $e) {
+      // Swallow exceptions.
+    }
+  }
+}
+
+/**
+ * Updates the plugin ID.
+ */
+function merlinone_update_8202() {
+  /** @var \Drupal\Core\Config\ConfigFactoryInterface $config_factory */
+  $config_factory = \Drupal::service('config.factory');
+
+  foreach ($config_factory->listAll('media.type.') as $name) {
+    $config = $config_factory->getEditable($name);
+
+    if ($config->get('source') == 'media_merlinone_image') {
+      $config->set('source', 'merlinone_image')->save(TRUE);
+    }
+  }
+
+  // Flush all caches.
+  drupal_flush_all_caches();
+}
+
+/**
+ * Update dependencies and clear media source cache.
+ */
+function merlinone_update_8203() {
+  $dependents = \Drupal::service('config.manager')
+    ->findConfigEntityDependents('module', ['merlinone_document']);
+
+  $key = 'dependencies.module';
+
+  foreach (array_keys($dependents) as $config) {
+    $config = \Drupal::configFactory()->getEditable($config);
+    $dependencies = $config->get($key);
+    if (is_array($dependencies)) {
+      $config->set($key, array_map(function ($module) {
+        return $module === 'merlinone_document' ? 'merlinone' : $module;
+      }, $dependencies))->save();
+    }
+  }
+
+  // Clear the processor plugin cache now that we've moved the MerlinOneImage
+  // class.
+  \Drupal::getContainer()
+    ->get('plugin.manager.media.source')
+    ->clearCachedDefinitions();
+}
