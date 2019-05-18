@@ -1,0 +1,20 @@
+README.txt
+==========
+
+Captcha-free is based on a tutorial by Jack Born published on jQuery.com.
+This module gives form spam protection for those that don't want to use the aggravating
+captchas or a third party external service.
+
+It basically won't allow the submit of a protected form if the user has
+disabled cookies, JavaScript, or exceeds a preset time limit on the page.
+In each case error warnings are given in case the user is a real person and not a bot.
+
+No database tables are created. Only 3 settings are required and they are configured via an Admin UI.
+
+For 8.x-1.x: Permission added for "Access Captcha-free". Requires Anonymous User permission enabled.
+
+INSTALATION NOTE
+================
+
+This module was intended to be installed at /modules/captcha_free but will work in
+a sub-directory such as /modules/custom/captcha_free.
