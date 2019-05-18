@@ -1,0 +1,425 @@
+<?php
+
+/**
+ * @file
+ * Integrates Drupal with Acquia DAM.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Render\Element;
+
+/**
+ * Implements hook_theme().
+ */
+function media_acquiadam_theme($existing, $type, $theme, $path) {
+  return [
+    'asset_details' => [
+      'variables' => [
+        'asset_data' => [],
+        'asset_preview' => NULL,
+        'asset_link' => NULL,
+      ],
+    ],
+    'checkboxes__acquiadam_assets' => [
+      'render element' => 'element',
+      'template' => 'checkboxes--acquiadam-assets',
+    ],
+    'asset_browser_message' => [
+      'variables' => [
+        'message' => [],
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_field_formatter_info_alter().
+ */
+function media_acquiadam_field_formatter_info_alter(&$info) {
+  // Allow using the image formatter on a file field.
+  if (isset($info['image']) && !in_array('file', $info['image']['field_types'])) {
+    $info['image']['field_types'][] = 'file';
+  }
+}
+
+/**
+ * Implements hook_entity_type_alter().
+ */
+function media_acquiadam_entity_type_alter(array &$entity_types) {
+  /** #var $entity_types \Drupal\Core\Entity\EntityTypeInterface[] */
+  $entity_types['user']->setLinkTemplate('acquiadam-auth-form', '/user/{user}/acquiadam');
+}
+
+/**
+ * Implements hook_menu_local_tasks_alter().
+ *
+ * Hides the 'Acquia DAM' tab on the user profile if the user is not viewing their
+ * own profile.
+ */
+function media_acquiadam_menu_local_tasks_alter(&$data, $route_name) {
+  if ($route_name == 'entity.user.canonical') {
+    foreach ($data['tabs'][0] as $key => $link) {
+      if (
+        $link['#link']['url']->getRouteName() == 'entity.user.acquiadam_auth' &&
+        $link['#link']['url']->getRouteParameters()['user'] != \Drupal::currentUser()->id()
+      ) {
+        unset($data['tabs'][0][$key]);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ *
+ * Allow custom markup for acquiadam asset checkboxes.
+ */
+function media_acquiadam_preprocess_checkboxes__acquiadam_assets(&$variables) {
+  $element = $variables['element'];
+  $variables['children'] = $element['#children'];
+  $variables['element']['#theme'] = 'checkboxes__acquiadam_assets';
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_presave().
+ *
+ * @var \Drupal\media\Entity\Media $entity
+ *
+ * Override the preSave function from \Drupal\media\Entity\Media
+ * because it ignores empty values (e.g. status = 0) and doesn't set date values
+ * for created/changed because the are already set by Drupal core
+ */
+function media_acquiadam_media_presave($entity) {
+
+  // Only go for a resync when updating existing entities.
+  if ($entity->isNew()) {
+    return;
+  }
+
+  /** @var $source \Drupal\media_acquiadam\Plugin\media\Source\AcquiadamAsset */
+  $source = $entity->getSource();
+  if ('acquiadam_asset' !== $source->getPluginId()) {
+    return;
+  }
+
+  $assetID = $source->getAssetID($entity);
+  if (empty($assetID)) {
+    return;
+  }
+
+  $asset = $source->getAsset($assetID);
+  if (empty($asset)) {
+    $is_dam_deleted = \Drupal::service('media_acquiadam.asset_data')
+      ->get($assetID, 'remote_deleted');
+    if ($is_dam_deleted && $entity->isPublished()) {
+      \Drupal::logger('media_acquiadam')
+        ->warning('Unable to retrieve asset @assetID. Setting media entity @mediaID to unpublished.', [
+          '@assetID' => $assetID,
+          '@mediaID' => $entity->id(),
+        ]);
+      $entity->setUnpublished();
+    }
+    else {
+      \Drupal::logger('media_acquiadam')
+        ->warning('Unable to retrieve asset @assetID.', [
+          '@assetID' => $assetID,
+        ]);
+    }
+    return;
+  }
+
+  foreach ($entity->bundle->entity->getFieldMap() as $source_field => $destination_field) {
+    if ($entity->hasField($destination_field)) {
+      $entity->set($destination_field, $source->getMetadata($entity, $source_field));
+    }
+  }
+
+  $entity->updateQueuedThumbnail();
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ */
+function media_acquiadam_media_delete(EntityInterface $entity) {
+  /** @var $source \Drupal\media_acquiadam\Plugin\media\Source\AcquiadamAsset */
+  $source = $entity->getSource();
+  if ('acquiadam_asset' !== $source->getPluginId()) {
+    return;
+  }
+
+  /** @var \Drupal\media\Entity\Media $entity */
+  $asset_id = $source->getAssetID($entity);
+  if (!empty($asset_id)) {
+    $usages = media_acquiadam_get_cross_bundle_usage($asset_id);
+    // If usages is empty then that means no media entities are referencing the
+    // asset ID and it should be safe to delete the stored data.
+    if (empty($usages)) {
+      \Drupal::service('media_acquiadam.asset_data')->delete($asset_id);
+    }
+  }
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Refresh acquiadam metadata and sync to media entities.
+ */
+function media_acquiadam_cron() {
+  $cron_config = \Drupal::configFactory()
+    ->getEditable('media_acquiadam.settings');
+
+  $interval = $cron_config->get('sync_interval');
+  // 3600 seconds = 1 hour
+  $interval = !empty($interval) ? $interval : 3600;
+
+  // Rate limit so we're not syncing every minute even if cron is configured to.
+  $next_execution = \Drupal::state()->get('media_acquiadam.next_sync');
+  $next_execution = !empty($next_execution) ? $next_execution : 0;
+  $request_time = \Drupal::time()->getRequestTime();
+
+  // -1 interval means run on every cron.
+  $process_queues = ($interval == -1 || $request_time >= $next_execution);
+  if ($process_queues) {
+    \Drupal::state()->set('media_acquiadam.next_sync', $request_time + $interval);
+    media_acquiadam_refresh_asset_sync_queue();
+    media_acquiadam_purge_expired_tokens();
+  }
+}
+
+/**
+ * Implements HOOK_form_FORM_ID_alter().
+ */
+function media_acquiadam_form_media_type_edit_form_alter(&$form, \Drupal\Core\Form\FormStateInterface &$form_state) {
+  $form['#attached']['library'][] = 'media_acquiadam/asset_form';
+
+  // Add a field mapping to the entity publishing status if one doesn't exist.
+  $mappings = &$form['source_dependent']['field_map'];
+  if (!empty($mappings)) {
+    foreach (Element::children($mappings) as $key) {
+      $options = &$mappings[$key]['#options'];
+      if (!isset($options['status'])) {
+        $options['status'] = t('Publishing status');
+      }
+    }
+  }
+
+  // Insert headline before first XMP field in the fieldset.
+  $mapping_keys = array_keys($mappings);
+  $xmp_keys = preg_grep('/xmp_.+/i', $mapping_keys);
+  reset($xmp_keys);
+  $offset = key($xmp_keys);
+  
+  if ($offset) {
+    $xmp_header = ['xmp_header' =>[
+      '#type' => 'html_tag',
+      '#tag' => 'h4',
+      '#value' => t('Field Mapping: XMP Metadata'),
+      '#attributes' => ['class' => 'fieldset-subhead'],
+    ]];
+    array_splice($mappings, $offset, 0, $xmp_header);
+  }
+}
+
+/**
+ * Adds media items to the asset sync queue for later proessing.
+ *
+ * @return int The number of items currently in the queue.
+ */
+function media_acquiadam_refresh_asset_sync_queue() {
+  $queue = \Drupal::queue('media_acquiadam_asset_refresh');
+  // We only want to re-queue everything when the queue is totally empty. This
+  // should help minimize the number of duplicate syncs we perform on assets.
+  if ($queue->numberOfItems() <= 0) {
+    // We need a mapping of bundles to fields so we can filter out remotely
+    // deleted assets.
+    $asset_id_fields = media_acquiadam_get_bundle_asset_id_fields();
+    // Re-queue all available media entities for syncing.
+    if (!empty($asset_id_fields)) {
+      // Assets with the 'remote_deleted' flag have been deleted within
+      // Acquia DAM so we should not attempt to sync them down again.
+      $deleted_from_dam = \Drupal::database()
+        ->select('acquiadam_assets_data', 'ad')
+        ->fields('ad', ['asset_id'])
+        ->condition('ad.name', 'remote_deleted')
+        ->condition('ad.value', TRUE)
+        ->execute()
+        ->fetchCol();
+
+      foreach ($asset_id_fields as $bundle => $field) {
+        // It would be nice to additionally filter by last created/changed, but
+        // that information is not reliable as it may have been overridden by an
+        // asset sync.
+        $media_id_query = \Drupal::entityQuery('media')
+          ->condition('bundle', $bundle);
+          if (!empty($deleted_from_dam)) {
+            $media_id_query->condition($field, $deleted_from_dam, 'NOT IN');
+          }
+
+        $media_ids = $media_id_query->execute();
+        if (!empty($media_ids)) {
+          foreach ($media_ids as $media_id) {
+            $queue->createItem(['media_id' => $media_id]);
+          }
+        }
+      }
+    }
+  }
+
+  return $queue->numberOfItems();
+}
+
+/**
+ * Purge Acquia DAM authentication tokens for inactive Drupal users.
+ */
+function media_acquiadam_purge_expired_tokens() {
+  $cookie_params = session_get_cookie_params();
+  // 2000000 is the Drupal default value for cookie lifetime (approx 23 days).
+  $lifetime = $cookie_params['lifetime'] ?: 2000000;
+
+  // The user data keys associated with DAM authentication.
+  $purgable_keys = [
+    'acquiadam_access_token',
+    'acquiadam_refresh_token',
+    'acquiadam_access_token_expiration',
+  ];
+
+  try {
+    $db = \Drupal::database();
+
+    $expired_tokens_query = $db
+      ->select('users_data', 'ud_expired')
+      ->fields('ud_expired', ['uid'])
+      ->condition('ud_expired.module', 'media_acquiadam')
+      ->condition('ud_expired.name', 'acquiadam_access_token_expiration')
+      ->condition('ud_expired.value', REQUEST_TIME - $lifetime, '<=');
+
+    // Select our UID list into a temporary table so we can delete without
+    // involving PHP. queryTemporary requires a string-based query at this time.
+    $temporary_table = $db->queryTemporary((string) $expired_tokens_query, $expired_tokens_query->getArguments());
+    $temporary_query = $db->select($temporary_table, 'tt')
+      ->fields('tt', ['uid']);
+
+    $deleted_count = $db
+      ->delete('users_data')
+      ->condition('module', 'media_acquiadam')
+      ->condition('name', $purgable_keys, 'IN')
+      ->condition('uid', $temporary_query, 'IN')
+      ->execute();
+
+    if ($deleted_count > 0) {
+      \Drupal::logger('media_acquiadam')
+        ->info('Deleted @count records (approx. @estimate inactive users).', [
+          '@count' => $deleted_count,
+          '@estimate' => intval($deleted_count / count($purgable_keys)),
+        ]);
+    }
+  } catch (Exception $x) {
+    Drupal::logger('media_acquiadam')
+      ->error('Unable to purge old authentication tokens.');
+    watchdog_exception('media_acquiadam', $x);
+  }
+}
+
+/**
+ * Get a list of asset ID fields related to their bundle.
+ *
+ * @return array
+ *   An array of media bundles and associated asset ID fields
+ */
+function media_acquiadam_get_bundle_asset_id_fields() {
+  $asset_id_fields = &drupal_static(__FUNCTION__, []);
+  try {
+    $media_bundles = \Drupal::entityTypeManager()
+      ->getStorage('media_type')
+      ->loadByProperties(['source' => 'acquiadam_asset']);
+    /** @var \Drupal\media\Entity\MediaType $bundle */
+    foreach ($media_bundles as $name => $bundle) {
+      $asset_id_fields[$name] = $bundle->getSource()
+        ->getConfiguration()['source_field'];
+    }
+  } catch (Exception $x) {
+    watchdog_exception('media_acquiadam', $x);
+  }
+
+  return $asset_id_fields;
+}
+
+/**
+ * Get a collection of media entities using the given asset ID.
+ *
+ * @param int $assetID
+ *   The asset ID to check usages of.
+ *
+ * @return array
+ *   An array of media IDs using the given asset ID, keyed by their bundle.
+ */
+function media_acquiadam_get_cross_bundle_usage($assetID) {
+  $usages = [];
+  $asset_id_fields = media_acquiadam_get_bundle_asset_id_fields();
+  foreach ($asset_id_fields as $bundle => $field) {
+    $media_ids = \Drupal::entityQuery('media')
+      ->condition('bundle', $bundle)
+      ->condition($field, $assetID)
+      ->execute();
+    if (!empty($media_ids)) {
+      $usages[$bundle] = array_keys($media_ids);
+    }
+  }
+
+  return $usages;
+}
+
+/**
+ * Implements hook_views_data().
+ */
+function media_acquiadam_views_data() {
+  // Expose acquiadam_assets_data table to views.
+  $data['acquiadam_assets_data']['table']['group'] = t('Acquia DAM');
+  $data['acquiadam_assets_data']['name'] = [
+    'title' => t('Acquia DAM asset data name'),
+    'help' => t('The name of the asset data.'),
+    'field' => [
+      'id' => 'standard',
+    ],
+    'sort' => [
+      'id' => 'standard',
+    ],
+    'filter' => [
+      'id' => 'string',
+    ],
+    'argument' => [
+      'id' => 'string',
+    ],
+  ];
+
+  return $data;
+}
+
+/**
+ * Implements hook_views_data_alter().
+ */
+function media_acquiadam_views_data_alter(array &$data) {
+  // The default source_field defined in MediaSource plugin.
+  $source_field = \Drupal::service('plugin.manager.media.source')
+    ->createInstance('acquiadam_asset')
+    ->defaultConfiguration()['source_field'];
+  // The source field table contains the media item's asset id.
+  $source_field_table = 'media__' . $source_field;
+  // The asset id.
+  $source_field_asset_id = $source_field . '_value';
+
+  // Grouping display in Views UI.
+  $data[$source_field_table]['table']['group'] = t('Acquia DAM');
+  // Provide a relationship between source field and asset data tables
+  $data[$source_field_table]['acquiadam_source_to_asset_data'] = [
+    'title' => t('Asset field to data'),
+    'help' => t('Creates a relationship between the media source field to the asset data.'),
+    'relationship' => [
+      'base' => 'acquiadam_assets_data',
+      'base field' => 'asset_id',
+      'field' => $source_field_asset_id,
+      'id' => 'standard',
+      'label' => t('Asset data'),
+    ],
+  ];
+}

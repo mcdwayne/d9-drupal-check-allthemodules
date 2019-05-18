@@ -1,0 +1,146 @@
+<?php
+
+/**
+ * @file
+ * Installation related hooks and functions.
+ */
+
+use Drupal\field\Entity\FieldConfig;
+use Drupal\field\Entity\FieldStorageConfig;
+
+/**
+ * Implements HOOK_schema().
+ */
+function media_acquiadam_schema() {
+  $schema = [];
+
+  $schema['acquiadam_assets_data'] = [
+    'description' => 'Acquia DAM asset information.',
+    'fields' => [
+      'asset_id' => [
+        'description' => 'The asset ID.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ],
+      'name' => [
+        'description' => 'The identifier of the data.',
+        'type' => 'varchar_ascii',
+        'length' => 128,
+        'not null' => TRUE,
+        'default' => '',
+      ],
+      'value' => [
+        'description' => 'The value.',
+        'type' => 'blob',
+        'not null' => FALSE,
+        'size' => 'big',
+      ],
+      'serialized' => [
+        'description' => 'Whether value is serialized.',
+        'type' => 'int',
+        'size' => 'tiny',
+        'unsigned' => TRUE,
+        'default' => 0,
+      ],
+    ],
+    'primary key' => ['asset_id', 'name'],
+    'indexes' => [
+      'asset_id' => ['asset_id'],
+      'name' => ['name'],
+    ],
+  ];
+
+  return $schema;
+}
+
+/**
+ * Installs the new asset data schema if necessary.
+ */
+function media_acquiadam_update_8101(&$sandbox) {
+
+  $table_name = 'acquiadam_assets_data';
+
+  $db_schema = \Drupal::database()->schema();
+  if ($db_schema->tableExists($table_name)) {
+    return;
+  }
+
+  $new_schema = media_acquiadam_schema();
+  $db_schema->createTable($table_name, $new_schema[$table_name]);
+}
+
+/**
+ * Consolidate Acquia DAM bundle source fields to a single field.
+ */
+function media_acquiadam_update_8102(&$sandbox) {
+  $default_field_name = 'field_acquiadam_asset_id';
+  $destination_table = 'media__' . $default_field_name;
+  $connection = \Drupal::database();
+  $db_schema = $connection->schema();
+  $entity_type_manager = \Drupal::service('entity_type.manager');
+
+  // Create asset id field if it doesn't exist.
+  if (!$db_schema->tableExists($destination_table)) {
+    $entity_type_manager->getStorage('field_storage_config')
+      ->create([
+        'entity_type' => 'media',
+        'field_name' => $default_field_name,
+        'type' => 'integer',
+      ])
+      ->save();
+  }
+
+  // Get asset id fields and reduce to those that don't match the default.
+  $asset_id_fields = media_acquiadam_get_bundle_asset_id_fields();
+  $fields_to_migrate = array_diff($asset_id_fields, ['field_acquiadam_asset_id']);
+  
+  // Loop through existing bundles/fields and transfer field table data
+  // as well as set the source_field for media types.
+  foreach ($fields_to_migrate as $bundle => $field) {
+    // Select all fields from origin.
+    $origin_table = 'media__' . $field;
+    $origin_query = $connection->select($origin_table, 'o')->fields('o');
+
+    // Insert origin fields into destination.
+    $connection->insert($destination_table)
+      ->from($origin_query)
+      ->execute();
+
+    // The bundle config.
+    $config = \Drupal::service('config.factory')->getEditable('media.type.' . $bundle);
+    // Set the new source_field.
+    $config->set('source_configuration', ['source_field' => $default_field_name]);
+    // Map the asset id to the old field to avoid potential regressions.
+    $config->set('field_map.id', $field);
+    $config->save();
+
+    // Add field to bundle.
+    $label = 'Asset ID';
+    $field_storage = FieldStorageConfig::loadByName('media', $default_field_name);
+    $field = FieldConfig::loadByName('media', $bundle, $default_field_name);
+
+    if (empty($field)) {
+      $field = FieldConfig::create([
+        'field_storage' => $field_storage,
+        'bundle' => $bundle,
+        'label' => $label
+      ]);
+      $field->save();
+
+      // Assign widget settings for the 'default' form mode.
+      entity_get_form_display('media', $bundle, 'default')
+        ->setComponent($default_field_name, ['type' => 'number',])
+        ->save();
+
+      // Hide the id field in available view modes.
+      $view_modes = \Drupal::service('entity_display.repository')->getViewModes('media');
+      foreach ($view_modes as $view_mode => $view_mode_config) {
+        entity_get_display('media', $bundle, $view_mode)
+          ->removeComponent($default_field_name)
+          ->save();
+      }
+    }
+  }
+}
