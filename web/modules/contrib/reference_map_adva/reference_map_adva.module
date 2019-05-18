@@ -1,0 +1,130 @@
+<?php
+
+/**
+ * @file
+ * Contains reference_map_adva.module.
+ */
+
+use Drupal\Core\Entity\ContentEntityInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+
+/**
+ * Implements hook_help().
+ */
+function reference_map_adva_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the reference_map_adva module.
+    case 'help.page.reference_map_adva':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Integrates the Reference Map and Advanced Access modules generating access records and grants based on reference maps.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_entity_type_alter().
+ */
+function reference_map_adva_entity_type_alter(array &$entity_types) {
+  $entity_types['reference_map_config']->addConstraint('ReferenceMapAdvaLastStepIsUser');
+}
+
+/**
+ * Implements hook_entity_presave().
+ */
+function reference_map_adva_entity_presave(EntityInterface $entity) {
+  // Reference Maps only apply to content entity types, so exit if entity isn't
+  // an instance of ContentEntityInterface.
+  if (!$entity instanceof ContentEntityInterface) {
+    return;
+  }
+
+  // New entities couldn't have been referenced prior to now, so exit if the
+  // entity is new.
+  if ($entity->isNew()) {
+    return;
+  }
+
+  // Get the fields on this entity that are included in an advanced access map.
+  /* @var \Drupal\reference_map\Plugin\ReferenceMapTypeManagerInterface $reference_map_manager */
+  $reference_map_manager = \Drupal::service('plugin.manager.reference_map_type');
+  $map_data = $reference_map_manager->getMapStepsForEntityType($entity->getEntityTypeId());
+
+  // If no fields are mapped with advanced access maps, exit.
+  if (!isset($map_data['advanced_access'])) {
+    return;
+  }
+
+  // Find out which mapped fields have been updated.
+  $updated_fields = [];
+  $updated_entity_types = [];
+  foreach ($map_data['advanced_access'] as $map_id => $map_steps) {
+    foreach ($map_steps as $position => $step) {
+      // If this entity's position in this map is 0, its permissions are handled
+      // in adva_entity_update.
+      if ($position === 0) {
+        continue;
+      }
+
+      // If this step doesn't have a field_name, it is the last step pointing to
+      // the user and doesn't need to be checked.
+      if (!isset($step['field_name'])) {
+        continue;
+      }
+
+      // If this entity doesn't meet the bundle requirements of this step,
+      // continue.
+      if (!empty($steps['bundles']) && !in_array($entity->bundle(), $step['bundles'])) {
+        continue;
+      }
+
+      // If the step doesn't meet the field requirements of this step, continue.
+      $field = $step['field_name'];
+      if (!$entity->hasField($field)) {
+        continue;
+      }
+
+      // Record whether the field has been updated so that it doesn't need to be
+      // checked on every map.
+      if (!isset($updated_fields[$field])) {
+        $updated = array_column($entity->$field->getValue(), 'target_id');
+        sort($updated);
+        $original = array_column($entity->original->$field->getValue(), 'target_id');
+        sort($original);
+        $updated_fields[$field] = $updated != $original;
+      }
+
+      // If the field hasn't been updated, continue.
+      if (!$updated_fields[$field]) {
+        continue;
+      }
+
+      // Get the map.
+      /** @var \Drupal\reference_map\Plugin\ReferenceMapTypeBase $map */
+      $map = $reference_map_manager->getInstance([
+        'plugin_id' => 'advanced_access',
+        'map_id' => $map_id,
+      ]);
+
+      // If no entities were effected by the change, continue.
+      $entity_ids = $map->followReverse($entity, TRUE, $position);
+      if (empty($entity_ids)) {
+        continue;
+      }
+
+      // Merge the effected entities into the list of entities to update.
+      $source_type = $map->getConfig()->sourceType;
+      $updated_entity_types[$source_type] = isset($updated_entity_types[$source_type]) ? array_merge($updated_entity_types[$source_type], $entity_ids) : $entity_ids;
+    }
+  }
+
+  // Queue updated entities for access record update.
+  foreach ($updated_entity_types as $entity_type_id => $entity_ids) {
+    $consumer = \Drupal::service('plugin.manager.adva.consumer')
+      ->getConsumerForEntityTypeId($entity_type_id);
+    $consumer->rebuild($entity_ids);
+  }
+}
