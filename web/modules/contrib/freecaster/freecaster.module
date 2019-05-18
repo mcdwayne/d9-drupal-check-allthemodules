@@ -1,0 +1,256 @@
+<?php
+
+/**
+ * @file
+ * Contains hook implements to bind Freecaster API call.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\editor\Entity\Editor;
+use Drupal\freecaster\FcapiUtils;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Url;
+use Drupal\taxonomy\Entity\Term;
+
+/**
+ * Implements hook_help().
+ */
+function freecaster_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the freecaster module.
+    case 'help.page.freecaster':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Freecaster TV for D8') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_taxonomy_term_insert().
+ */
+function freecaster_taxonomy_term_insert($term) {
+
+  if ($term->getVocabularyId() == 'fc_video_channels') {
+    $storage = \Drupal::service('entity_type.manager')
+        ->getStorage('taxonomy_term');
+
+    $fcapi = FcapiUtils::checkApiCredentials();
+
+    if ($fcapi) {
+      // Create parent relation.
+      $parent = $storage->loadParents($term->get('tid')->value);
+
+      if (!empty($parent)) {
+        $p = $parent[key($parent)];
+        $parent_tid = $p->get('tid')->value;
+        $term_parent = $storage->load($parent_tid);
+        $channel_id_parent = $term_parent->get('field_channel_id')->value;
+
+        if (!empty($channel_id_parent)) {
+          $channel = $fcapi->create_channel($channel_id_parent,
+              array('name' => $term->getName()));
+
+          $term->set('field_channel_id', $channel->channel_id);
+          $term->save();
+        }
+      }
+      else {
+        $channel = $fcapi->create_channel(array('name' => $term->getName()));
+        $term->set('field_channel_id', $channel->channel_id);
+        $term->save();
+      }
+    }
+  }
+
+}
+
+/**
+ * Implements hook_taxonomy_term_presave().
+ */
+function freecaster_taxonomy_term_presave($term) {
+  if ($term->getVocabularyId() == 'fc_video_channels') {
+    $storage = \Drupal::service('entity_type.manager')->getStorage('taxonomy_term');
+    $fcapi = FcapiUtils::checkApiCredentials();
+    if ($fcapi) {
+      if (isset($term->get('field_channel_id')->value)) {
+        $channel = $fcapi->get_channel($term->get('field_channel_id')->value);
+        if (!isset($channel->error)) {
+          // Update title
+          // on update le titre sur Freecaster.
+          $fcapi->update_channel($channel->channel_id, array('name' => $term->getName($channel->name)));
+
+          // Update relations.
+          $parent = $storage->loadParents($term->get('tid')->value);
+          if (!empty($parent)) {
+            $p = $parent[key($parent)];
+            $parent_tid = $p->get('tid')->value;
+            $term_parent = $storage->load($parent_tid);
+            $channel_id_parent = $term_parent->get('field_channel_id')->value;
+            if (!empty($channel_id_parent)) {
+              $fcapi->link_channel_to_channel($term->get('field_channel_id')->value, $channel_id_parent);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_taxonomy_term_delete().
+ */
+function freecaster_taxonomy_term_delete($term) {
+  if ($term->getVocabularyId() == 'fc_video_channels') {
+    $fcapi = FcapiUtils::checkApiCredentials();
+    if ($fcapi) {
+      if (isset($term->get('field_channel_id')->value)) {
+        $fcid = $term->get('field_channel_id')->value;
+        $fcapi->delete_channel($fcid);
+        $channel = $fcapi->get_channel($fcid);
+        if (!isset($channel->error)) {
+          drupal_set_message('Channel ' . $fcid . ' : ' . $term->getName() . ' has been removed on Freecaster', 'error');
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_presave().
+ */
+function freecaster_entity_presave($entity) {
+
+  if ($entity->bundle() == 'freecaster_video') {
+    $fcapi = FcapiUtils::checkApiCredentials();
+    if ($fcapi) {
+      // Create mode.
+      if (empty($entity->get('field_video_fcid')->value)) {
+        if (!empty($entity->get('name')->value)) {
+          // Create video on freecaster.
+          $video = $fcapi->create_video(array('name' => $entity->get('name')->value));
+
+          // Update video description.
+          if (!empty($entity->get('field_description_fc')->value)) {
+            $fcapi->update_video($video->video_id, array('description' => $entity->get('field_description_fc')->value));
+          }
+
+          // Update relation according to chosen channels.
+          if (!empty($entity->get('field_channels_fc'))) {
+            foreach ($entity->get('field_channels_fc') as $channel) {
+              $target_id = $channel->getValue('target_id');
+              $cur_term = Term::load($target_id['target_id']);
+              $cur_fcid = $cur_term->get('field_channel_id')->value;
+              $fcapi->link_video_to_channel($video->video_id, $cur_fcid);
+            }
+          }
+          $entity->field_video_fcid->value = $video->video_id;
+          $entity->field_video_fc->value = 'http://player.freecaster.com/embed/' . $video->video_id;
+        }
+      }
+      // Edit mode.
+      else {
+        $video_id = $entity->get('field_video_fcid')->value;
+
+        // update video title
+        if (!empty($entity->get('name')->value)) {
+          $fcapi->update_video($video_id, array('name' => $entity->get('name')->value));
+        }
+
+        // Update video description.
+        if (!empty($entity->get('field_description_fc')->value)) {
+          $fcapi->update_video($video_id, array('description' => $entity->get('field_description_fc')->value));
+        }
+
+        // Update relation according to chosen channels.
+        if (!empty($entity->get('field_channels_fc'))) {
+          foreach ($entity->get('field_channels_fc') as $channel) {
+            $target_id = $channel->getValue('target_id');
+            $cur_term = Term::load($target_id['target_id']);
+            $cur_fcid = $cur_term->get('field_channel_id')->value;
+            $fcapi->link_video_to_channel($video_id, $cur_fcid);
+          }
+        }
+      }
+    }
+  }
+
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function freecaster_entity_delete($entity) {
+
+  if ($entity->bundle() == 'freecaster_video') {
+    $fcapi = FcapiUtils::checkApiCredentials();
+    if ($fcapi) {
+      if (!empty($entity->get('field_video_fcid')->value)) {
+        $fcapi->delete_video($entity->get('field_video_fcid')->value);
+      }
+    }
+  }
+
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function freecaster_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  global $base_url;
+
+  if ($form_id == 'media_freecaster_video_edit_form') {
+
+    $entity = $form_state->getFormObject()->getEntity();
+    $path = drupal_get_path('module', 'freecaster');
+
+    $form['field_video_fc']['#disabled'] = TRUE;
+    $form['field_video_fcid']['#disabled'] = TRUE;
+    $form['#attached']['library'][] = 'freecaster/freecaster_upload';
+    $form['#attached']['drupalSettings']['freecaster']['module_path'] = $base_url . "/" . $path;
+    $form['#attached']['drupalSettings']['freecaster']['base_url'] = $base_url;
+    $form['#attached']['drupalSettings']['freecaster']['videoname'] = $entity->name->get(0)->value;
+    $form['#attached']['drupalSettings']['freecaster']['videoid'] = $entity->field_video_fcid->get(0)->value;
+  }
+  elseif ($form_id == 'media_freecaster_video_form') {
+    foreach (array_keys($form['actions']) as $action) {
+      if ($action != 'preview' && isset($form['actions'][$action]['#type'])
+        && $form['actions'][$action]['#type'] === 'submit') {
+        $form['actions'][$action]['#submit'][] = 'freecaster_form_submit';
+      }
+    }
+
+    $form['field_video_fc']['#disabled'] = TRUE;
+    $form['field_video_fcid']['#disabled'] = TRUE;
+  }
+  elseif ($form_id == 'taxonomy_term_fc_video_channels_form') {
+    $form['field_channel_id']['#disabled'] = TRUE;
+  }
+}
+
+/**
+ * @param array $css
+ * @param \Editor $editor
+ */
+function freecaster_ckeditor_css_alter(array &$css, Editor $editor) {
+  $css[] = drupal_get_path('module', 'freecaster') . '/css/freecaster.css';
+}
+
+/**
+ * Custom submit callback to redirect user on edit form.
+ */
+function freecaster_form_submit(&$form, FormStateInterface $form_state) {
+  $entity = $form_state->getFormObject()->getEntity();
+  $form_state->setRedirectUrl(Url::fromRoute('entity.media.edit_form', ['media' => $entity->id()]));
+}
+
+/**
+ * Output a JSON-style error message.
+ */
+function freecaster_json_error($message) {
+  return json_encode(array(
+    'error' => $message,
+  ));
+}
