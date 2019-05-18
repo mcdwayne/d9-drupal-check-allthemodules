@@ -1,0 +1,379 @@
+<?php
+
+/**
+ * @file
+ * Enables the use of personal and site-wide contact forms.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Url;
+use LoginRadiusSDK\LoginRadius;
+use LoginRadiusSDK\LoginRadiusException;
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Add Social Login interface on login page.
+ *
+ */
+function sociallogin_form_user_login_form_alter(&$form, FormStateInterface $form_state) {
+  $config = \Drupal::config('sociallogin.settings');
+  if ($config->get('login_form') == 1) {
+    sociallogin_interface_widget($form);
+  }
+}
+
+
+function sociallogin_page_attachments(&$page) {  
+    $page['#attached']['library'][] = 'sociallogin/drupal.sociallogin_back';
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ *  Add Social Login interface on comment form.
+ *
+ * @param $form
+ * @param FormStateInterface $form_state
+ */
+function sociallogin_form_comment_form_alter(&$form, FormStateInterface $form_state) {
+  //comment_form
+  $config = \Drupal::config('sociallogin.settings');
+  if ($config->get('commenting_form') == 1) {
+    sociallogin_interface_widget($form);
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Add Social Login interface on register page.
+ * Prefill userprofile data when force registration is off.
+ *
+ * @param $form
+ * @param FormStateInterface $form_state
+ */
+function sociallogin_form_user_register_form_alter(&$form, FormStateInterface $form_state) {
+  $config = \Drupal::config('sociallogin.settings');
+  if ($config->get('register_form') == 1 && !isset($_SESSION['social_lrdata'])) {
+    sociallogin_interface_widget($form);
+  }
+  if (isset($_SESSION['social_lrdata'])) {
+    $userprofile = $_SESSION['social_lrdata'];
+    unset($_SESSION['social_lrdata']);
+
+    if (isset($userprofile->ID) && !empty($userprofile->ID)) {
+      $user_manager = \Drupal::service('sociallogin.user_manager');
+      $data = $user_manager->checkExistUsername($userprofile);
+      $form['account']['name']['#default_value'] = $data['username'];
+      $form['account']['mail']['#default_value'] = $userprofile->Email_value;
+
+      if ($config->get('verify_mail') == 1) {
+        $form['account']['pass']['#type'] = 'hidden';
+        $form['account']['pass']['#value'] = user_password();
+      }
+      $user_manager->field_create_user_array($form, $userprofile);
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Add Account Linking interface on profile page.
+ *
+ * @param $form
+ * @param FormStateInterface $form_state
+ * @param $form_id
+ * @return mixed
+ */
+function sociallogin_form_user_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+ if (!\Drupal::moduleHandler()->moduleExists('userregistration')) {  
+      $form['account']['mail']['#disabled'] = FALSE;
+ }
+  $config = \Drupal::config('sociallogin.settings');
+  $user = \Drupal::currentUser()->getRoles();
+  if ($config->get('enable_linking') == 1 && !\Drupal::currentUser()
+      ->isAnonymous()
+  && !in_array("administrator", $user)) {
+    $my_settings = sociallogin_interface_settings();    
+    $form['lr_linked'] = array(
+      '#type' => 'details',
+      '#title' => t($config->get('linking_text')),
+      '#theme' => 'lr_linked',
+      '#attributes' => array('class' => array('lr-linked')),
+      '#weight' => -20,
+      '#open' => TRUE,
+      '#attached' => array(
+        'drupalSettings' => array('lrsociallogin' => $my_settings),
+      ),
+    ); 
+        
+  $modules = array_keys(Drupal::moduleHandler()->getModuleList());
+  $form['lr_linked'];
+  if(in_array("userregistration", $modules)){
+       unset($form['lr_linked']);
+  }
+   
+  }
+  return $form;
+}
+
+/**
+ * Implements hook_theme().
+ *
+ * @return array
+ */
+function sociallogin_theme() {
+  $path = drupal_get_path('module', 'sociallogin') . '/theme';
+  $raaspath = drupal_get_path('module', 'userregistration') . '/theme';
+  return array(
+    'lr_popup' => array(
+      'template' => 'lr_popup',
+      'variables' => array(
+        'popup_params' => NULL,
+      ),
+      'path' => $path,
+    ),
+    'lr_links' => array(
+      'variables' => array(
+        'params' => NULL,
+      ),
+      'template' => 'lr_links',
+      'path' => $path,
+    ),
+    'lr_linked' => array(
+      'variables' => array(
+        'params' => NULL,
+      ),
+      'template' => 'lr_linked',
+      'path' => $path,
+    ),
+    'lr_debug_log' => array(
+      'variables' => array(
+        'output' => NULL,
+      ),
+      'template' => 'lr_debug_log',
+      'path' => $path,
+    ),    
+    'lr_raas_linked' => array(
+      'variables' => array(
+        'params' => NULL,
+      ),
+      'template' => 'lr_raas_linked',
+      'path' => $raaspath,
+    ),
+  );
+}
+
+/**
+ * Get Div to show social login interface.
+ *
+ * @param $form
+ */
+function sociallogin_interface_widget(&$form) {
+  if (\Drupal::currentUser()->isAnonymous()) {
+    $config = \Drupal::config('sociallogin.settings');
+    $api_key = trim($config->get('api_key'));
+    $secret = trim($config->get('api_secret'));
+    if (!empty($api_key) && !empty($secret) && (!preg_match('/^\{?[A-Z0-9]{8}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{12}\}?$/i', $api_key) || !preg_match('/^\{?[A-Z0-9]{8}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{12}\}?$/i', $secret))) {
+      $value = t('<div class="interface_error">Your LoginRadius API key or secret is not valid, please correct it or contact LoginRadius support at <a href="@this" target="_blank">www.LoginRadius.com</a></div>', array('@this' => 'http://www.Loginradius.com/'));
+    }
+    elseif (!empty($api_key) && !empty($secret)) {
+      $my_settings = sociallogin_interface_settings();
+      $form['lr_links'] = array(
+        '#type' => 'details',
+        '#title' => t($config->get('interface_label')),
+        '#theme' => 'lr_links',
+        '#attributes' => array('class' => array('lr-links')),
+        '#weight' => $config->get('widget_location') == 1 ? -102 : 102,
+        '#open' => TRUE,
+        '#attached' => array(
+          'drupalSettings' => array('lrsociallogin' => $my_settings),
+        ),
+      );
+    }
+  }
+}
+
+/**
+ * Get Subject and Body of welcome email.
+ *
+ * @param $key
+ * @param $message
+ * @param $params
+ */
+function sociallogin_mail($key, &$message, $params) {
+  $config = \Drupal::config('sociallogin.settings');
+  $data['user'] = $params['account'];
+  $options['langcode'] = $message['langcode'];
+  $variables = array(
+    '%sitename' => \Drupal::config('system.site')->get('name'),
+    '%displayname' => $data['user']->getDisplayName(),
+    '%pass' => $params['pass'],
+    '%username' => $data['user']->getUsername(),
+  );
+  switch ($key) {
+    case 'welcome_email':
+
+      $message['subject'] = Drupal\Component\Render\PlainTextOutput::renderFromHtml(t('Thank you for registering at %sitename', $variables, $options));
+      $body = strtr($config->get('welcome_email_message'), $variables);
+      $message['body'][] = Drupal\Component\Render\PlainTextOutput::renderFromHtml($body);
+      break;
+  }
+}
+
+/**
+ * Add Required Script to Show Social Login Interface.
+ *
+ * @param $vars
+ */
+function template_preprocess_lr_links(&$vars) {
+  $vars['lr_scripts'] = array(
+    '#attached' => array(
+      'library' => array('sociallogin/drupal.sociallogin'),
+    ),
+  );
+
+  $vars['lr_widget_scripts'] = array(
+    '#attached' => array(
+      'library' => array('sociallogin/drupal.socialloginremote'),
+    ),
+  );
+}
+
+/**
+ * Added Required variable to use in template fie.
+ *
+ * @param $vars
+ */
+function template_preprocess_lr_linked(&$vars) {
+  global $base_url;
+  $vars['image_url'] = $base_url . '/' . drupal_get_path('module', 'sociallogin') . '/images';
+  $vars['lr_scripts'] = array(
+    '#attached' => array(
+      'library' => array('sociallogin/drupal.sociallogin'),
+    ),
+  );
+
+  $vars['lr_widget_scripts'] = array(
+    '#attached' => array(
+      'library' => array('sociallogin/drupal.socialloginremote'),
+    ),
+  );
+  $user = \Drupal::currentUser();
+  $user_manager = \Drupal::service('sociallogin.user_manager');
+  $result = $user_manager->getMappedAccounts($user->id());
+  
+  $vars['show_link'] = count($result) > 1 ? TRUE : FALSE;
+  //$vars['currentid'] = $_SESSION['_sf2_attributes']['lrID'];   
+  //  $vars['provide_name'] = $_SESSION['_sf2_attributes']['provide_name']; 
+  $count = array();
+  $count = 0;
+  foreach ($result as $identity) {
+    $status = FALSE;
+    if (isset($_SESSION['_sf2_attributes']['lrID']) && $identity->provider_id == $_SESSION['_sf2_attributes']['lrID']) {
+      $status = TRUE;
+    }    
+    $vars['connected'][$count] = $status;
+    $vars['providers'][$count] = $identity->provider;
+    $vars['delete_url'][$count] = 'sociallogin/delete/' . $identity->provider_id . '/' . $identity->provider;
+    $count++;
+  }
+}
+
+/**
+ * Get Required Script variable to show Social Login Interface.
+ *
+ * @return array
+ */
+function sociallogin_interface_settings() {
+  $config = \Drupal::config('sociallogin.settings');
+  $api_key = trim($config->get('api_key'));
+  $interfacerow = $config->get('interface_columns');
+  $interfacerow = !empty($interfacerow) && is_numeric($interfacerow) ? trim($interfacerow) : 0;
+
+  $my_settings = array(
+    'interfacesize' => $config->get('interface_size') && $config->get('interface_size') == 1 ? 'large' : 'small',
+    'lrinterfacebackground' => $config->get('interface_bgcolor'),
+    'noofcolumns' => (int) $interfacerow,
+    'apikey' => $api_key,
+    'location' => urldecode(sociallogin_get_callback_url()),
+    'callback' => sociallogin_get_callback_url(),
+  );
+  return $my_settings;
+}
+
+/**
+ * Get Callback Url For Social Login Interface.
+ *
+ * @return string
+ */
+function sociallogin_get_callback_url() {
+  $destination = (\Drupal::destination()->getAsArray());
+  $callback = $destination['destination'];
+
+  if (strpos($callback, 'ajax') !== FALSE) {
+    if (isset($_SESSION['redirect_url'])) {
+      return $_SESSION['redirect_url'];
+    }
+    else {
+      $callback = Url::fromRoute('user');
+    }
+  }
+  $url = Url::fromUserInput('/user/sociallogin', array(
+    'query' => array('destination' => $callback),
+    'absolute' => TRUE,
+  ))->toString();
+  return urlencode($url);
+}
+
+/**
+ * Validate LoginRadius API Credentials.
+ *
+ * @param $apikey
+ * @param $apisecret
+ * @return array
+ */
+function get_authentication($apikey, $apisecret) {
+
+  if (isset($apikey)) {   
+    $data = array();
+    try {
+      $validate_url = 'https://api.loginradius.com/api/v2/app/validate?apikey=' . rawurlencode(trim($apikey)) . '&apisecret=' . rawurlencode(trim($apisecret));
+      $result = json_decode(LoginRadius::apiClient($validate_url, FALSE));
+
+      if (empty($result)) {
+        $data['message'] = t('please check your php.ini settings to enable CURL or FSOCKOPEN');
+        $data['status'] = 'error';
+      }
+      elseif (isset($result->Status) && !$result->Status) {
+        $error = array(
+          "API_KEY_NOT_VALID" => "LoginRadius API key is invalid. Get your LoginRadius API key from LoginRadius account",
+          "API_SECRET_NOT_VALID" => "LoginRadius API Secret is invalid. Get your LoginRadius API Secret from LoginRadius account",
+          "API_KEY_NOT_FORMATED" => "LoginRadius API Key is not formatted correctly",
+          "API_SECRET_NOT_FORMATED" => "LoginRadius API Secret is not formatted correctly",
+        );
+
+        foreach ($result->Messages as $value) {
+          $data['message'] = $error["$value"];
+          $data['status'] = 'error';
+          break;
+        }
+      }
+
+      return $data;
+    }
+    catch (LoginRadiusException $e) {
+      \Drupal::logger('sociallogin')->error($e);
+    }
+  }
+}
+
+function sociallogin_user_delete($account) {  
+  if (!\Drupal::moduleHandler()->moduleExists('userregistration')) {
+  $user_manager = \Drupal::service('sociallogin.user_manager');   
+    $user_manager->deleteMapUser($account->id());
+  }
+}
+
