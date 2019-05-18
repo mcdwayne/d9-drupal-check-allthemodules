@@ -1,0 +1,220 @@
+<?php
+use Drupal\Core\Form\FormStateInterface;
+
+/**
+ * @file
+ * File for the cloudinary_storage module.
+ */
+
+/**
+ * Flag for new resource of cloudinary_storage.
+ */
+define('CLOUDINARY_STORAGE_NEW', 'new');
+
+/**
+ * Flag for remove resource of cloudinary_storage.
+*/
+define('CLOUDINARY_STORAGE_REMOVE', 'remove');
+
+/**
+ * Get all valid cloudinary storage info by hook_cloudinary_storage_info().
+ */
+function cloudinary_storage_info() {
+  $storages = &drupal_static(__FUNCTION__);
+
+  if (!isset($storages)) {
+    $storages = \Drupal::moduleHandler()->invokeAll('cloudinary_storage_info');
+
+    // Support alter, so that other modules can modify exist settings.
+    \Drupal::moduleHandler()->alter('cloudinary_storage_info', $storages);
+
+    foreach ($storages as $key => $process) {
+      if (!isset($process['class']) || !class_exists($process['class'])) {
+        unset($storages[$key]);
+      }
+    }
+  }
+
+  return $storages;
+}
+
+/**
+ * Check the default storage loaded or not.
+ */
+function cloudinary_storage_class() {
+  $storages = cloudinary_storage_info();
+  $storage = \Drupal::config('cloudinary_storage.settings')->get('cloudinary_storage_default');
+
+  if (empty($storages) || empty($storage)) {
+    return FALSE;
+  }
+
+  return isset($storages[$storage]) ? $storages[$storage]['class'] : FALSE;
+}
+
+/**
+ * Implements hook_cloudinary_stream_wrapper_resource_create().
+ */
+function cloudinary_storage_cloudinary_stream_wrapper_resource_create($resource) {
+  // Update parent path to store new file or folder.
+  if (isset($resource['public_id'])) {
+    if ($storage_class = cloudinary_storage_class()) {
+      $storage = new $storage_class($resource);
+      list($path, $file) = $storage->resourceUpdate();
+      $data = array(CLOUDINARY_STORAGE_NEW => $file);
+
+      if ($resource['mode'] == CLOUDINARY_STREAM_WRAPPER_FILE) {
+        $storage->folderUpdate($path, $data);
+      }
+      elseif ($resource['mode'] == CLOUDINARY_STREAM_WRAPPER_FOLDER) {
+        $storage->folderUpdate($path, NULL, $data);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_cloudinary_stream_wrapper_resource_rename().
+ */
+function cloudinary_storage_cloudinary_stream_wrapper_resource_rename($src_resource, $dst_resource) {
+  if ($storage_class = cloudinary_storage_class()) {
+    $src_path = $dst_path = FALSE;
+    $src_file = $dst_file = '';
+
+    $src_storage = new $storage_class($src_resource);
+    list($src_path, $src_file) = $src_storage->resourceUpdate(FALSE);
+
+    $dst_storage = new $storage_class($dst_resource);
+    list($dst_path, $dst_file) = $dst_storage->resourceUpdate();
+
+    if ($src_path !== FALSE && $src_path == $dst_path) {
+      $src_storage->folderUpdate($src_path, array(CLOUDINARY_STORAGE_NEW => $dst_file, CLOUDINARY_STORAGE_REMOVE => $src_file));
+    }
+    else {
+      if ($src_path !== FALSE) {
+        $src_storage->folderUpdate($src_path, array(CLOUDINARY_STORAGE_REMOVE => $src_file));
+      }
+
+      if ($dst_path !== FALSE) {
+        $dst_storage->folderUpdate($dst_path, array(CLOUDINARY_STORAGE_NEW => $dst_file));
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_cloudinary_stream_wrapper_resource_prepare().
+ */
+function cloudinary_storage_cloudinary_stream_wrapper_resource_prepare($resource) {
+  if (isset($resource['public_id'])) {
+    if ($storage_class = cloudinary_storage_class()) {
+      $storage = new $storage_class($resource, FALSE);
+      $data = $storage->getResource();
+      $resource = array_merge($resource, $data);
+    }
+  }
+
+  return $resource;
+}
+
+/**
+ * Implements hook_cloudinary_stream_wrapper_resource_loaded().
+ */
+function cloudinary_storage_cloudinary_stream_wrapper_resource_loaded($resource) {
+  // Insert or update resource data which load from remote.
+  if ($storage_class = cloudinary_storage_class()) {
+    $storage = new $storage_class($resource);
+    $storage->resourceUpdate();
+  }
+}
+
+/**
+ * Implements hook_cloudinary_stream_wrapper_resource_delete().
+ */
+function cloudinary_storage_cloudinary_stream_wrapper_resource_delete($resource) {
+  if (isset($resource['public_id'])) {
+    if ($storage_class = cloudinary_storage_class()) {
+      $storage = new $storage_class($resource);
+      list($path, $file) = $storage->resourceUpdate(FALSE);
+
+      if ($resource['mode'] == CLOUDINARY_STREAM_WRAPPER_FILE) {
+        $storage->folderUpdate($path, array(CLOUDINARY_STORAGE_REMOVE => $file));
+      }
+    }
+  }
+}
+
+/**
+ * Clear exist storage when storage method changed.
+ */
+function cloudinary_storage_clear() {
+  if ($storage_class = cloudinary_storage_class()) {
+    $storage = new $storage_class();
+    $storage->clear();
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for cloudinary_sdk_settings().
+ *
+ * Alters the setting form for Cloudinary settings.
+ *
+ * @see cloudinary_sdk_settings()
+ */
+function cloudinary_storage_form_cloudinary_sdk_settings_alter(&$form, $form_state) {
+  $storages = cloudinary_storage_info();
+
+  if (empty($storages)) {
+    return;
+  }
+
+  $options = array();
+  foreach ($storages as $key => $storage) {
+    $options[$key] = $storage['title'];
+  }
+
+  $form['storage'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Cloudinary storage settings'),
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE,
+    '#description' => t('Choose one of the storage to reduce network requests and improve loading speed for uploaded Cloudinary files.'),
+  );
+
+  $form['storage']['cloudinary_storage_default'] = array(
+    '#type' => 'radios',
+    '#title' => t('Storage for uploaded cloudinary files'),
+    '#options' => $options,
+    '#default_value' => \Drupal::config('cloudinary_storage.settings')->get('cloudinary_storage_default'),
+  );
+
+  // Unshfit exist storage clear checking.
+  array_unshift($form['#submit'], 'cloudinary_storage_settings_submit');
+}
+
+/**
+ * Submit for the cloudinary_sdk_settings() form.
+ */
+function cloudinary_storage_settings_submit($form, &$form_state) {
+  $c_storage = \Drupal::config('cloudinary_storage.settings')->get('cloudinary_storage_default');
+  $storage = $form_state->getValue(['cloudinary_storage_default']);
+
+  $c_cloud_name = \Drupal::config('cloudinary_sdk.settings')->get('cloudinary_sdk_cloud_name');
+  $cloud_name = $form_state->getValue(['cloudinary_sdk_cloud_name']);
+
+  $sdk_config = \Drupal::service('config.factory')->getEditable('cloudinary_storage.settings');
+  $sdk_config->set('cloudinary_storage_default', $storage);
+  $sdk_config->save();
+
+  $sdk_config = \Drupal::service('config.factory')->getEditable('cloudinary_sdk.settings');
+  $sdk_config->set('cloudinary_sdk_cloud_name', $cloud_name);
+  $sdk_config->save();
+
+  // Clear storage if storage method or cloud name changed.
+  $clear = ($c_storage && $c_storage != $storage) || ($c_cloud_name && $c_cloud_name != $cloud_name);
+
+  // Clear exist storage.
+  if ($clear) {
+    cloudinary_storage_clear();
+  }
+}

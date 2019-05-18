@@ -1,0 +1,693 @@
+<?php
+
+/**
+ * @file
+ * File for the Cloudinary Stream Wrapper module.
+ */
+use Drupal\image\Entity\ImageStyle;
+
+/**
+ * Flag for dealing with Cloudinary file.
+ */
+define('CLOUDINARY_STREAM_WRAPPER_FILE', 0100000 | 0777);
+
+/**
+ * Flag for dealing with Cloudinary directory.
+ */
+define('CLOUDINARY_STREAM_WRAPPER_FOLDER', 0040000 | 0777);
+
+/**
+ * The sample file name in root folder.
+ */
+define('CLOUDINARY_STREAM_WRAPPER_SAMPLE', 'sample.jpg');
+
+/**
+ * The tag prefix of Cloudinary used for list folder items by tag.
+ */
+define('CLOUDINARY_STREAM_WRAPPER_FOLDER_TAG_PREFIX', 'root/');
+
+/**
+ * The resource_type of images on Cloudinary.
+ */
+define('CLOUDINARY_STREAM_WRAPPER_RESOURCE_IMAGE', 'image');
+
+/**
+ * The resource_type of none images on Cloudinary.
+ */
+define('CLOUDINARY_STREAM_WRAPPER_RESOURCE_RAW', 'raw');
+
+/**
+ * Append type of image transformation.
+ */
+define('CLOUDINARY_STREAM_WRAPPER_TRANSFORMATION_APPEND', 0);
+
+/**
+ * New type of image transformation.
+ */
+define('CLOUDINARY_STREAM_WRAPPER_TRANSFORMATION_NEW', 1);
+
+/**
+ * Multiple type of image transformation.
+ */
+define('CLOUDINARY_STREAM_WRAPPER_TRANSFORMATION_MULTIPLE', 2);
+
+/**
+ * Implements hook_help().
+ */
+function cloudinary_stream_wrapper_help($path, $arg) {
+  $output = '';
+
+  switch ($path) {
+    case 'admin/help#cloudinary_stream_wrapper':
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t("The Cloudinary module allows the local file system to be replaced with Cloudinary. Uploads are saved into the Drupal file table using Drupal 7's file stream wrapper system.") . '</p>';
+      $output .= '<h3>' . t('How to use') . '</h3>';
+      $output .= '<ul>';
+      $output .= '<li>' . t("Image upload - Securely upload images or any other file, at any scale from any source. API for fast upload directly from your user's browsers or mobile apps.") . '</li>';
+      $output .= '<li>' . t('Cloud storage - Store as many images as needed. Our image hosting service stores images privately and safely with automatic backup and historical revisions.') . '</li>';
+      $output .= '<li>' . t('Powerful administration - Manage your media library interactively with our Digital Asset Management solution or via APIs. Gain insights using advanced analytics.') . '</li>';
+      $output .= '<li>' . t('Image manipulation - Manipulate your images dynamically to fit any graphics design. Apply effects, resizing, cropping, face detection, watermarks and tons of image processing capabilities.') . '</li>';
+      $output .= '<li>' . t("Fast delivery - Get your images delivered lightning-fast, responsive and highly optimized for any device in any location. Images are served via Akamai's worldwide CDN.") . '</li>';
+      $output .= '</ul>';
+      break;
+  }
+
+  return $output;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for cloudinary_sdk_settings().
+ *
+ * Alters the setting form for Cloudinary settings.
+ *
+ * @see cloudinary_sdk_settings()
+ */
+function cloudinary_stream_wrapper_form_cloudinary_sdk_settings_alter(&$form, $form_state) {
+  $config = cloudinary_sdk_config_load();
+
+  if (!$config) {
+    return;
+  }
+
+  // Get Cloudinary SDK configs.
+  $configs = \Drupal::config('cloudinary_sdk.settings');
+
+  $form['settings']['cloudinary_stream_wrapper_logging'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable error logging.'),
+    '#default_value' => (bool) $configs->get('cloudinary_stream_wrapper_logging'),
+    '#description' => t('Enable if you want to logging any errors messages during file processing by cloudinary.'),
+  );
+
+  $root_folders = cloudinary_stream_wrapper_load_resource('');
+
+  /**
+   * Issue #2992506 by otrolopezmas, lquessenberry: Cloudinary Stream Wrapper - Non existent default value for folder displays a warning
+   */
+
+  if (!empty($root_folders['folders'])) {
+    $folders = array();
+    foreach ($root_folders['folders'] as $folder) {
+      $folders[str_replace('.', '_', $folder)] = 'Folder: /' . $folder . ' [cloudinary.' . $folder . '://]';
+    }
+
+    $form['folders'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Stream Wrapper Settings'),
+      '#collapsible' => TRUE,
+      '#collapsed' => FALSE,
+      '#description' => t('You can enable more stream wrappers for Cloudinary with root folders.'),
+    );
+
+    $config_value = $configs->get('cloudinary_stream_wrapper_folders');
+    $default_value = is_array($config_value) && !empty($config_value) ? $config_value : [];
+
+    $form['folders']['cloudinary_stream_wrapper_folders'] = array(
+      '#type' => 'checkboxes',
+      '#title' => t('Cloudinary scheme with root folder'),
+      '#options' => $folders,
+      '#default_value' => $default_value,
+    );
+  }
+}
+
+/**
+ * Load file or folder resource from Cloudinary.
+ */
+function cloudinary_stream_wrapper_resource($public_id, $options, $reset = FALSE) {
+  $resources = &drupal_static(__FUNCTION__, array());
+  // Unset resource of static variables if reset.
+  if ($reset) {
+    if (isset($resources[$public_id])) {
+      $resources[$public_id] = NULL;
+      unset($resources[$public_id]);
+    }
+
+    return FALSE;
+  }
+
+  if (!isset($resources[$public_id]) || empty($resources[$public_id])) {
+    $resource = cloudinary_stream_wrapper_load_resource($public_id, $options);
+    if ($resource) {
+      $resources[$public_id] = $resource;
+    }
+  }
+
+  return isset($resources[$public_id]) ? $resources[$public_id] : FALSE;
+}
+
+/**
+ * Load files in folder on Cloudinary.
+ */
+function cloudinary_stream_wrapper_load_folder_files($tag, $options = array()) {
+  $resources = array();
+
+  try {
+    $api = new \Cloudinary\Api();
+    $data = (array) $api->resources_by_tag($tag, $options);
+    if (!empty($data['resources'])) {
+      $resources = $data['resources'];
+    }
+  }
+  catch (Exception $e) {
+    $options = [
+      '%folder' => $tag,
+      '%message' => $e->getMessage(),
+    ];
+    cloudinary_stream_wrapper_logger('Failed to load files of folder [%folder], [%message]', $options);
+  }
+
+  if (!empty($resources)) {
+    foreach ($resources as $key => $resource) {
+      $path = $resource['public_id'];
+      if (isset($resource['format'])) {
+        $path .= '.' . $resource['format'];
+      }
+
+      $basename = pathinfo($path, PATHINFO_BASENAME);
+
+      if ($basename) {
+        $resources[$key] = $basename;
+      }
+      else {
+        unset($resources[$key]);
+      }
+    }
+  }
+
+  return $resources;
+}
+
+/**
+ * Load file resource from storage.
+ *
+ * Default storage: Database, MongoDB, Redis;
+ * It provides some hooks to intergate with other storage.
+ */
+function cloudinary_stream_wrapper_resource_prepare($public_id) {
+  $data = array('public_id' => $public_id);
+  $resource = \Drupal::moduleHandler()->invokeAll('cloudinary_stream_wrapper_resource_prepare', [$data]);
+
+  if ($data != $resource) {
+    return $resource;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Load file resource on Cloudinary.
+ */
+function cloudinary_stream_wrapper_load_resource($public_id, $options = array()) {
+  // Load file resource locally first.
+  if ($resource = cloudinary_stream_wrapper_resource_prepare($public_id)) {
+    return $resource;
+  }
+  // Load folder first if public_id or options is empty.
+  if (empty($public_id) || empty($options)) {
+    // Return directory resource if public_id is a directory on Cloudinary.
+    if ($resource = cloudinary_stream_wrapper_load_folder($public_id)) {
+      return $resource;
+    }
+    // Return file resource on Cloudinary.
+    if ($resource = cloudinary_stream_wrapper_load_file($public_id, $options)) {
+      return $resource;
+    }
+  }
+  else {
+    //if (cloudinary_stream_wrapper_resource_prepare($public_id) == FALSE) {
+    // return FALSE;
+    //}
+    // Return file resource on Cloudinary.
+    if ($resource = cloudinary_stream_wrapper_load_file($public_id, $options)) {
+      return $resource;
+    }
+    // Return directory resource if public_id is a directory on Cloudinary.
+    if ($resource = cloudinary_stream_wrapper_load_folder($public_id)) {
+      return $resource;
+    }
+  }
+
+  return FALSE;
+}
+
+/**
+ * Delete files or files in directory on Cloudinary.
+ */
+function cloudinary_stream_wrapper_delete_resource($resource) {
+  if (!$resource || empty($resource['public_id'])) {
+    return FALSE;
+  }
+
+  if ($resource['mode'] == CLOUDINARY_STREAM_WRAPPER_FOLDER) {
+    return cloudinary_stream_wrapper_delete_folder($resource);
+  }
+  elseif ($resource['mode'] == CLOUDINARY_STREAM_WRAPPER_FILE) {
+    return cloudinary_stream_wrapper_delete_file($resource);
+  }
+
+  return FALSE;
+}
+
+/**
+ * Build file resource structure for Cloudinary.
+ */
+function cloudinary_stream_wrapper_resource_file_structure($resource) {
+  if (!is_array($resource)) {
+    $resource = array();
+  }
+
+  $keys = array(
+    'public_id' => '',
+    'format' => '',
+    'version' => '',
+    'resource_type' => '',
+    'type' => '',
+    'created_at' => '',
+    'bytes' => '',
+    'width' => '',
+    'height' => '',
+    'url' => '',
+    'secure_url' => '',
+    'tags' => '',
+    'context' => '',
+  );
+
+  $resource = array_intersect_key($resource, $keys);
+  $resource['mode'] = CLOUDINARY_STREAM_WRAPPER_FILE;
+  $resource['timestamp'] = strtotime($resource['created_at']);
+
+  return $resource;
+}
+
+/**
+ * Build folder resource structure for Cloudinary.
+ */
+function cloudinary_stream_wrapper_resource_folder_structure($path, $folders = array(), $files = array()) {
+  return array(
+    'public_id' => $path,
+    'mode' => CLOUDINARY_STREAM_WRAPPER_FOLDER,
+    'bytes' => 0,
+    'timestamp' => 0,
+    'folders' => $folders,
+    'files' => $files,
+  );
+}
+
+/**
+ * Create new file on Cloudinary.
+ */
+function cloudinary_stream_wrapper_create_file($base64_data, $options) {
+  try {
+    $options['api_key'] = \Drupal::config('cloudinary_sdk.settings')->get('cloudinary_sdk_api_key');
+    $options['api_secret'] = \Drupal::config('cloudinary_sdk.settings')->get('cloudinary_sdk_api_secret');
+    $options['cloud_name'] = \Drupal::config('cloudinary_sdk.settings')->get('cloudinary_sdk_cloud_name');
+    // Allow change of the options in the very last moment before upload.
+    \Drupal::moduleHandler()->alter('cloudinary_stream_wrapper_options', $options);
+    $data = (array) \Cloudinary\Uploader::upload($base64_data, $options);
+    $resource = cloudinary_stream_wrapper_resource_file_structure($data);
+    \Drupal::moduleHandler()->invokeAll('cloudinary_stream_wrapper_resource_create', [$resource]);
+
+    return TRUE;
+  }
+  catch (Exception $e) {
+    $options = [
+      '%file' => $options['public_id'],
+      '%message' => $e->getMessage(),
+    ];
+    cloudinary_stream_wrapper_logger('Upload file [%file] into Cloudinary failed, [%message].', $options);
+  }
+
+  return FALSE;
+}
+
+/**
+ * Delete file on Cloudinary.
+ */
+function cloudinary_stream_wrapper_delete_file($resource) {
+  try {
+    \Cloudinary\Uploader::destroy($resource['public_id']);
+    \Drupal::moduleHandler()->invokeAll('cloudinary_stream_wrapper_resource_delete', [$resource]);
+
+    return TRUE;
+  }
+  catch (Exception $e) {
+    $options = [
+      '%file' => $resource['public_id'],
+      '%message' => $e->getMessage(),
+    ];
+    cloudinary_stream_wrapper_logger('Failed to delete file [%file], [%message].', $options);
+  }
+
+  return FALSE;
+}
+
+/**
+ * Load file on Cloudinary.
+ */
+function cloudinary_stream_wrapper_load_file($public_id, $options = array()) {
+  $resource = array();
+
+  // Try to load file resource on Cloudinary.
+  try {
+    $api = new \Cloudinary\Api();
+    $data = (array) $api->resource($public_id, $options);
+    $resource = cloudinary_stream_wrapper_resource_file_structure($data);
+    \Drupal::moduleHandler()->invokeAll('cloudinary_stream_wrapper_resource_loaded', [$resource]);
+  }
+  catch (Exception $e) {
+    $options = [
+      '%file' => $public_id,
+      '%message' => $e->getMessage(),
+    ];
+    cloudinary_stream_wrapper_logger('Failed to load file [%file], [%message].', $options);
+  }
+
+  return $resource;
+}
+
+/**
+ * Rename file on Cloudinary.
+ */
+function cloudinary_stream_wrapper_rename_file($src_resource, $dst_public_id) {
+  $src_folder = dirname($src_resource['public_id']);
+  $dst_folder = dirname($dst_public_id);
+
+  try {
+    $data = \Cloudinary\Uploader::rename($src_resource['public_id'], $dst_public_id);
+    // Replace new tag if folder name different.
+    if ($src_folder != $dst_folder) {
+      $tag = CLOUDINARY_STREAM_WRAPPER_FOLDER_TAG_PREFIX . $dst_folder;
+      \Cloudinary\Uploader::replace_tag($tag, array($data['public_id']));
+    }
+    // Load new file resource.
+    $dst_resource = cloudinary_stream_wrapper_load_file($data['public_id'], array('resource_type' => $data['resource_type']));
+    \Drupal::moduleHandler()->invokeAll('cloudinary_stream_wrapper_resource_rename', [$src_resource, $dst_resource]);
+
+    return TRUE;
+  }
+  catch (Exception $e) {
+    $options = [
+      '%file' => $src_resource['public_id'],
+      '%newfile' => $dst_public_id,
+      '%message' => $e->getMessage()
+    ];
+    cloudinary_stream_wrapper_logger('Rename file [%file] to new file [%newfile] failed, [%message].', $options);
+  }
+
+  return FALSE;
+}
+
+/**
+ * Create new folder on Cloudinary.
+ */
+function cloudinary_stream_wrapper_create_folder($path) {
+  try {
+    $temp_public_id = $path . '/' . REQUEST_TIME;
+    \Cloudinary\Uploader::rename('sample', $temp_public_id);
+    \Cloudinary\Uploader::destroy($temp_public_id);
+    $resource = cloudinary_stream_wrapper_resource_folder_structure($path);
+    \Drupal::moduleHandler()->invokeAll('cloudinary_stream_wrapper_resource_create', [$resource]);
+
+    return TRUE;
+  }
+  catch (Exception $e) {
+    $options = [
+      '%folder' => $path,
+      '%message' => $e->getMessage(),
+    ];
+    cloudinary_stream_wrapper_logger('Failed to create folder [%folder], [%message].', $options);
+  }
+
+  return FALSE;
+}
+
+/**
+ * Delete files in folder on Cloudinary.
+ */
+function cloudinary_stream_wrapper_delete_folder($resource) {
+  if ($resource['mode'] != CLOUDINARY_STREAM_WRAPPER_FOLDER) {
+    return FALSE;
+  }
+
+  try {
+    $api = new \Cloudinary\Api();
+    $api->delete_resources_by_prefix($resource['public_id'], array('resource_type' => CLOUDINARY_STREAM_WRAPPER_RESOURCE_IMAGE));
+    $api->delete_resources_by_prefix($resource['public_id'], array('resource_type' => CLOUDINARY_STREAM_WRAPPER_RESOURCE_RAW));
+    \Drupal::moduleHandler()->invokeAll('cloudinary_stream_wrapper_resource_delete', [$resource]);
+
+    return TRUE;
+  }
+  catch (Exception $e) {
+    $options = [
+      '%folder' => $resource['public_id'],
+      '%message' => $e->getMessage(),
+    ];
+    cloudinary_stream_wrapper_logger('Delete folder [%folder] failed, [%message].', $options);
+  }
+
+  return FALSE;
+}
+
+/**
+ * Load sub-folders on Cloudinary to check parent folder exist.
+ */
+function cloudinary_stream_wrapper_load_folder($path) {
+  $data = cloudinary_stream_wrapper_get_folders($path);
+
+  if ($data !== FALSE && is_array($data)) {
+    $folders = array();
+
+    foreach ($data as $folder) {
+      $folders[] = $folder['name'];
+    }
+    // Load files in current path on Cloudinary.
+    $tag = CLOUDINARY_STREAM_WRAPPER_FOLDER_TAG_PREFIX . $path;
+    $image_files = cloudinary_stream_wrapper_load_folder_files($tag, array('resource_type' => CLOUDINARY_STREAM_WRAPPER_RESOURCE_IMAGE));
+    $raw_files = cloudinary_stream_wrapper_load_folder_files($tag, array('resource_type' => CLOUDINARY_STREAM_WRAPPER_RESOURCE_RAW));
+    $files = array_merge($image_files, $raw_files);
+
+    $resource = cloudinary_stream_wrapper_resource_folder_structure($path, $folders, $files);
+    \Drupal::moduleHandler()->invokeAll('cloudinary_stream_wrapper_resource_loaded', [$resource]);
+
+    return $resource;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Check the file is an image or not.
+ */
+function cloudinary_stream_wrapper_is_image($uri) {
+  return (bool) preg_match('/\.(jpe?g|png|gif|bmp|webp)$/i', $uri);
+}
+
+/**
+ * Get all root folders on Cloudinary.
+ *
+ * False if path not exist.
+ */
+function cloudinary_stream_wrapper_get_folders($path = '', $options = array()) {
+  $folders = FALSE;
+
+  try {
+    $api = new \Cloudinary\Api();
+    $data = (array) $api->subfolders($path, $options);
+
+    if (isset($data['folders'])) {
+      $folders = $data['folders'];
+    }
+  }
+  catch (Exception $e) {
+    $options = [
+      '%folder' => $path,
+      '%message' => $e->getMessage(),
+    ];
+    cloudinary_stream_wrapper_logger('Failed to get sub-folders under folder [%folder], [%message].', $options);
+  }
+
+  return $folders;
+}
+
+/**
+ * Convert drupal image style to Cloudinary transformation.
+ */
+function cloudinary_stream_wrapper_transformation($style_name, $resource) {
+  $transformations = &drupal_static(__FUNCTION__, array());
+
+  if (!isset($transformations[$style_name])) {
+    $effects = cloudinary_stream_wrapper_transformation_info();
+
+    if (empty($effects)) {
+      return FALSE;
+    }
+
+    $style_definition = ImageStyle::load($style_name);
+
+    $style_effects = $style_definition->getEffects();
+    $style_effects_config = $style_effects->getConfiguration();
+
+    if (empty($style_effects_config)) {
+      return FALSE;
+    }
+
+    $transformation = array();
+    $tmp_effect = array();
+
+    foreach ($style_effects_config as $effect) {
+      if (!isset($effects[$effect['id']])) {
+        continue;
+      }
+
+      $function = $effects[$effect['id']]['callback'];
+      $return = $function($effect, $tmp_effect, $resource);
+      // Ignore if return data is not an array or null data.
+      if (empty($return) || !is_array($return) || !isset($return['type'])) {
+        continue;
+      }
+
+      $datas = ($return['type'] == CLOUDINARY_STREAM_WRAPPER_TRANSFORMATION_MULTIPLE) ? $return['data'] : array($return);
+      foreach ($datas as $data) {
+        if ($data['type'] == CLOUDINARY_STREAM_WRAPPER_TRANSFORMATION_APPEND) {
+          $tmp_effect = array_merge($tmp_effect, $data['data']);
+        }
+        elseif ($data['type'] == CLOUDINARY_STREAM_WRAPPER_TRANSFORMATION_NEW) {
+          $transformation[] = $tmp_effect;
+          $tmp_effect = $data['data'];
+        }
+      }
+    }
+    // Merge into transformation if not null.
+    if ($tmp_effect) {
+      $transformation = array_merge(array_filter($transformation), $tmp_effect);
+      unset($tmp_effect);
+    }
+
+    $transformations[$style_name] = $transformation;
+  }
+
+  return isset($transformations[$style_name]) ? $transformations[$style_name] : FALSE;
+}
+
+/**
+ * Get all valid effect process.
+ *
+ * @see hook_cloudinary_stream_wrapper_transformation()
+ */
+function cloudinary_stream_wrapper_transformation_info() {
+  $effects = &drupal_static(__FUNCTION__);
+
+  if (!isset($effects)) {
+    $effects = \Drupal::moduleHandler()->invokeAll('cloudinary_stream_wrapper_transformation');
+    // Support alter, so that other modules can modify exist settings.
+    \Drupal::moduleHandler()->alter('cloudinary_stream_wrapper_transformation', $effects);
+
+    foreach ($effects as $key => $process) {
+      // Load extra process file.
+      if (isset($process['file']) && file_exists($process['file'])) {
+        include_once $process['file'];
+      }
+
+      if (!isset($process['callback']) || !function_exists($process['callback'])) {
+        unset($effects[$key]);
+      }
+    }
+  }
+
+  return $effects;
+}
+
+/**
+ * Get filesize, width, height of remote image.
+ */
+function cloudinary_stream_wrapper_remote_image_info($url, $filesize = FALSE) {
+  if (empty($url)) {
+    return FALSE;
+  }
+
+  $result = array();
+  $data_block = '';
+  $headers = array();
+
+  try {
+    $handle = fopen($url, 'rb');
+    if (!$handle) {
+      return FALSE;
+    }
+    // Get filesize form headers.
+    if ($filesize) {
+      $meta = stream_get_meta_data($handle);
+      if (is_array($meta['wrapper_data'])) {
+        $headers = isset($meta['wrapper_data']['headers']) ? $meta['wrapper_data']['headers'] : $meta['wrapper_data'];
+      }
+      elseif (is_object($meta['wrapper_data']) && isset($meta['wrapper_data']->stream_headers)) {
+        $headers = $meta['wrapper_data']->stream_headers;
+      }
+
+      foreach ($headers as $h) {
+        if (preg_match('/length/iU', $h)) {
+          $size = explode(':', $h);
+          $result['bytes'] = trim(array_pop($size));
+          break;
+        }
+      }
+    }
+    // Get image width and height.
+    while (!feof($handle)) {
+      $data_block .= fread($handle, 168);
+      $size = getimagesize('data://image/jpeg;base64,' . base64_encode($data_block));
+      if (!empty($size) && !empty($size[0])) {
+        $result['width'] = $size[0];
+        $result['height'] = $size[1];
+        break;
+      }
+    }
+
+    fclose($handle);
+  }
+  catch (Exception $e) {
+    $options = [
+      '%url' => $url,
+      '%message' => $e->getMessage(),
+    ];
+    cloudinary_stream_wrapper_logger('Failed to get remote image info [%url], [%message].', $options);
+  }
+
+  return $result;
+}
+
+/**
+ * Logging error messages.
+ *
+ * @param $message string
+ *   Error message.
+ * @param array $options
+ *   Message options.
+ */
+function cloudinary_stream_wrapper_logger($message, $options = []) {
+  $enable = \Drupal::config('cloudinary_sdk.settings')->get('cloudinary_stream_wrapper_logging');
+  if (!empty($enable)) {
+    \Drupal::logger('cloudinary_stream_wrapper')->error($message, $options);
+  }
+}
