@@ -1,0 +1,194 @@
+<?php
+
+/**
+ * @file
+ * Handles tierce functions for Commerce funds.
+ */
+
+use Drupal\commerce_payment\Entity\PaymentMethod;
+use Drupal\commerce_price\Calculator;
+use Drupal\Core\Url;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\commerce_funds\Exception\CurrencyInUseException;
+
+/**
+ * Implements hook_help().
+ */
+function commerce_funds_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.commerce_funds':
+      $output = '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Commerce Funds implements a Site Funds Management System using Drupal Commerce. It creates a site balance and user balances to store users money and allow them to perform different type of operations.') . '</p>';
+      $output .= '<p>' . t('Users will be able to:') . '</p>';
+      $output .= '<ul><li>' . t('Deposit Funds in their account,') . '</li>';
+      $output .= '<li>' . t('Transfer Funds and make Escrow Payment to other users from their account balance,') . '</li>';
+      $output .= '<li>' . t('Pay site products using their account balance') . '</li>';
+      $output .= '<li>' . t('Send withdrawal requests to administrator to withdraw Funds from their balance.') . '</li>';
+      $output .= '</ul>';
+      $output .= '<h3>' . t('Multicurrency') . '</h3>';
+      $output .= '<p>' . t('If several currencies are enabled on your Drupal Commerce site, you will be able to configure exchange rates so users can convert money from one currency to another.') . '</p>';
+      $output .= '<p>' . t('Any previous transactions described above will be available in all currencies enabled.') . '</p>';
+      $output .= '<h3>' . t('As an administrator you can') . '</h3>';
+      $output .= '<ul><li>' . t('<a href="@url">Configure fees applied to each transaction</a>,', ['@url' => Url::fromRoute('commerce_funds.settings_fees')->toString()]) . '</li>';
+      $output .= '<li>' . t('<a href="@url">Enable or disable available withdrawal methods</a>,', ['@url' => Url::fromRoute('commerce_funds.settings_withdrawal_methods')->toString()]) . '</li>';
+      $output .= '<li>' . t('<a href="@url">Configure the exchange rates for currency conversion</a>,', ['@url' => Url::fromRoute('commerce_funds.settings_exchange_rates')->toString()]) . '</li>';
+      $output .= '<li>' . t('<a href="@url">View all site transactions</a>,', ['@url' => Url::fromRoute('view.commerce_funds_transactions.transactions_list')->toString()]) . '</li>';
+      $output .= '<li>' . t('<a href="@url">Manage user withdrawal requests</a>,', ['@url' => Url::fromRoute('view.commerce_funds_transactions.withdrawal_requests')->toString()]) . '</li>';
+      $output .= '<li>' . t('<a href="@url">View all conversions made through the website</a>,', ['@url' => Url::fromRoute('view.commerce_funds_transactions.conversions')->toString()]) . '</li>';
+      $output .= '</ul>';
+
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function commerce_funds_theme($existing, $type, $theme, $path) {
+  return [
+    'admin_site_balance' => [
+      'variables' => [
+        'balance' => NULL,
+      ],
+    ],
+    'admin_user_balances' => [
+      'variables' => [
+        'balance' => NULL,
+      ],
+    ],
+    'user_balance' => [
+      'variables' => [
+        'balance' => NULL,
+      ],
+    ],
+    'user_operations' => [
+      'variables' => [
+        'withdrawal_methods' => NULL,
+        'exchange_rates' => NULL,
+      ],
+    ],
+    'commerce_funds_mail' => [
+      'template' => 'commerce-funds-mail',
+      'variables' => [
+        'message' => [],
+      ],
+    ],
+    'commerce_funds_deposit_completion_message' => [
+      'variables' => [
+        'order_entity' => NULL,
+        'payment_instructions' => NULL,
+        'amount' => NULL,
+        'currency_code' => NULL,
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_mail().
+ */
+function commerce_funds_mail($key, &$message, $params) {
+  switch ($key) {
+    case 'commerce_funds_transaction':
+      $message['from'] = \Drupal::config('system.site')->get('mail');
+      $message['headers']['Content-Type'] = 'text/html; charset=UTF-8; format=flowed; delsp=yes';
+      $message['subject'] = $params['subject'];
+      $message['title'] = $params['title'];
+      $message['body'] = $params['body'];
+      break;
+  }
+}
+
+/**
+ * Implements hook_commerce_checkout_pane_info_alter().
+ *
+ * Point $panes['payment_information'] to DepositPaymentInformation.
+ *
+ * @see Drupal\commerce_payment\Plugin\Commerce\CheckoutPane\PaymentInformation
+ * @see Drupal\commerce_funds\Plugin\Commerce\CheckoutPane\DepositPaymentInformation
+ */
+function commerce_funds_commerce_checkout_pane_info_alter(array &$panes) {
+  if ($panes['deposit_completion_message']) {
+    $panes['payment_information']['class'] = 'Drupal\commerce_funds\Plugin\Commerce\CheckoutPane\DepositPaymentInformation';
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Implements a new callback for payment validation.
+ *
+ * @see commerce_funds_payment_check_currency()
+ */
+function commerce_funds_form_commerce_checkout_flow_multistep_default_alter(&$form, &$form_state, $form_id) {
+  $form['#validate'][] = 'commerce_funds_payment_validate';
+}
+
+/**
+ * Callback for payment validation.
+ *
+ * Validate if :
+ *  - The user has enough funds to cover the transaction.
+ *  - The wallet currency is the same as the order.
+ *
+ * @see \Drupal\commerce_funds\Plugin\Commerce\PaymentGateway::validatePayment
+ */
+function commerce_funds_payment_validate(&$form, &$form_state) {
+
+  if ($form['#step_id'] == 'order_information' || $form['#step_id'] == 'review') {
+    $order = \Drupal::service('current_route_match')->getParameter('commerce_order');
+    $order_currency = $order->getTotalPrice()->getCurrencyCode();
+
+    if ($form['#step_id'] == 'order_information') {
+        $payment_method = PaymentMethod::load($form_state->getValue('payment_information')['payment_method']);
+    }
+    if ($form['#step_id'] == 'review' && $order->get('payment_method')->getValue()) {
+      $payment_method = PaymentMethod::load($order->get('payment_method')->getValue()[0]['target_id']);
+    }
+
+    if (isset($payment_method) && $payment_method && $payment_method->bundle() === 'funds_wallet') {
+      $balance = \Drupal::service('commerce_funds.transaction_manager')->loadAccountBalance($payment_method->getOwner());
+      $balance[$order_currency] = isset($balance[$order_currency]) ? $balance[$order_currency] : '0';
+
+      if ($order_currency !== $payment_method->get('currency')->getValue('target_id')[0]['target_id']) {
+        $form_state->setErrorByName('payment_information', t('You have chosen a wallet with a different currency, please convert your funds into @currency first.', [
+          '@currency' => $order_currency,
+        ]));
+        return;
+      }
+      if (Calculator::compare($balance[$order_currency], $order->getTotalPrice()->getNumber(), 2) < 0) {
+        $form_state->setErrorByName('payment_information', t('You don\'t have enough @currency to pay this order, please <a href="@url">make a deposit</a> first.', [
+          '@currency' => $order_currency,
+          '@url' => Url::fromRoute('commerce_funds.deposit')->toString(),
+        ]));
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_element_info_alter().
+ *
+ * Attach custom js librabry to delay ajax keyup on number fields.
+ */
+function commerce_funds_element_info_alter(array &$info) {
+  if (isset($info['number'])) {
+    $info['number']['#attached']['library'][] = 'commerce_funds/commerce_funds';
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_predelete().
+ *
+ * Avoid deletion of Currencies that are in use.
+ */
+function commerce_funds_commerce_currency_predelete(EntityInterface $entity) {
+  $currency_code = $entity->getCurrencyCode();
+  $site_balance = \Drupal::service('commerce_funds.transaction_manager')->loadSiteBalance();
+
+  if (array_key_exists($currency_code, $site_balance)) {
+    throw new CurrencyInUseException($currency_code . ' ' . 'currency is used by some of your users. Deletion impossible.');
+  }
+
+}
