@@ -1,0 +1,881 @@
+<?php
+
+/**
+ * @file
+ * Notify module sends e-mail digests of new content and comments.
+ *
+ * The notification module allows users to subscribe to periodic e-mails which
+ * include all new or revised content and/or comments much like the daily news
+ * letters sent by some websites.  Even if this feature is not configured for
+ * normal site users, it can be a useful feature for an administrator of a site
+ * to monitor content submissions and comment posts.
+ */
+
+use Drupal\Core\Mail\MailFormatHelper;
+
+if (!defined('NOTIFY_NODE_TYPE')) {
+  define('NOTIFY_NODE_TYPE', 'notify_node_type_');
+}
+
+/**
+ * Implements hook_help().
+ */
+function notify_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#notify':
+      $output = '<p>' . t('The notification module allows users to subscribe to periodic e-mails which include all new or revised content and/or comments much like the daily news letters sent by some websites.  Even if this feature is not configured for normal site users, it can be a useful feature for an administrator of a site to monitor content submissions and comment posts.') . '</p>';
+      $output .= '<p>' . t('The administrator sets the frequency of the e-mails in the notify administration interface. They can also set how many e-mail failures should occur before notify stops sending notifications.  Note that cron must be enabled for notifications to be sent out.') . '</p>';
+      $output .= '<p>'  . t('For more information please read the community documentation handbook <a href="@notifyhb">Notify page</a>.', array('@notifyhb' => url('http://www.drupal.org/handbook/modules/notify/'))) . '</p>';
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_cron().
+ *
+ */
+function notify_cron() {
+  $config = \Drupal::config('notify.settings');
+  $period = $config->get("notify_period");
+  if (-2 == $period) {
+    return;
+  }
+
+  if (-1 == $period) {
+    // Never notify.
+    return;
+  }
+
+  $send_last = $config->get('notify_send_last', 0);
+  $cron_next = $config->get('notify_cron_next', 0);
+  $doitp = $config->get('notify_users', array());
+
+  if ($period >= 86400) {
+    if ($doitp || ($cron_next < \Drupal::time()->getRequestTime())) {
+      $doitp = TRUE;
+    }
+    else {
+      return;
+    }
+  }
+  $next = _notify_next_notificaton($send_last);
+
+  if ((\Drupal::time()->getRequestTime() > $next) || $doitp) {
+    list($num_sent, $num_fail) = _notify_send();
+    $num_sent += $config->get('notify_num_sent');
+    $num_fail += $config->get('notify_num_failed');
+
+    $next = _notify_next_notificaton(\Drupal::time()->getRequestTime());
+    \Drupal::configFactory()->getEditable('notify.settings')
+      ->set('notify_num_sent', $num_sent)
+      ->set('notify_num_failed', $num_fail)
+      ->set('notify_cron_next', $next)
+      ->save();
+  }
+}
+
+/**
+ * Implements hook_user_cancel().
+ */
+function notify_user_cancel($edit, $account, $method) {
+  global $user;
+  \Drupal::database()->delete('notify')
+    ->condition('uid', $user->uid)
+    ->execute();
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function notify_form_user_register_form_alter(&$form, &$form_state, $form_id) {
+  $form += _notify_user_reg_fields();
+}
+
+/**
+ * Implements hook_user_insert().
+ */
+function notify_user_insert($account) {
+  $config = \Drupal::config('notify.settings');
+}
+
+/**
+ * Implements hook_mail().
+ */
+function notify_mail($key, &$message, $params) {
+  $config = \Drupal::config('notify.settings');
+  $siteconfig = \Drupal::config('system.site');
+  $username = $params['user']->getDisplayName();
+  $useruid = $params['user']->uid;
+  $viewmode = $params['viewmode'];
+  $sitename = $siteconfig->get('name');
+  $sitemail = $siteconfig->get('mail');
+  $upl = $params['user']->getPreferredLangcode();
+  $messagefrom = '"'. $sitename .'" <'. $sitemail .'>';
+
+  $message['headers']['MIME-Version'] = '1.0';
+  $message['headers']['Content-Type'] = 'text/html;charset=utf-8';
+  $message['headers']['From'] = $message['headers']['Sender'] = $message['headers']['Return-Path'] = $message['headers']['Errors-To'] = $message['headers']['Reply-to'] = $messagefrom;
+  $message['subject'] = t('New content notification for @username from @sitename', array(
+    '@username' => $username,
+    '@sitename' => $sitename,
+  ), array('langcode' => $upl));
+  $message['body'][] = \Drupal\Core\Render\Markup::create(t('Greetings @user,', array('@user' => $username,), array('langcode' => $upl)) . '<br /><br />');
+  $message['body'][] = \Drupal\Core\Render\Markup::create(t('this is a notification about new content from @sitename.', array('@sitename' => $sitename,), array('langcode' => $upl)) . '<br />');
+  $fulltext = t('Click on the links below to see the whole node/comment.', array(), array('langcode' => $upl));
+  if (0 == $viewmode) {
+    $message['body'][] = t('This e-mail only lists the titles.', array(), array('langcode' => $upl)) . ' ' . $fulltext;
+  }
+  elseif (1 == $viewmode) {
+    $message['body'][] = t('This e-mail may only shows excerpts.', array(), array('langcode' => $upl)) . ' ' . $fulltext;
+  }
+  else {
+    $message['body'][] = t('The full text is included in this e-mail, but to see the original node, you can click on the links below.', array(), array('langcode' => $upl));
+  }
+  $message['body'][] = \Drupal\Core\Render\Markup::create($params['content']);
+  $message['body'][] = \Drupal\Core\Render\Markup::create("-- <br />" . t('This is an automatic e-mail from @sitename.', array('@sitename' => $siteconfig->get('name')), array('langcode' => $upl)));
+}
+
+/**
+ * Implementation of hook_comment_insert().
+ *
+ * Add tracked newly created unpublished comments to the unpublished queue.
+ */
+function notify_comment_insert($comment) {
+  if ($comment->status == 0) {
+    \Drupal::database()->insert('notify_unpublished_queue')
+      ->fields(array(
+        'uid' => $comment->nid,
+        'cid' => $comment->cid,
+      ))
+      ->execute();
+  }
+}
+
+/**
+ * Implementation of hook_node_delete().
+ *
+ * Delete any unpublished contents in the queue associated with the
+ * node being deleted.
+ */
+function notify_node_delete($node) {
+  \Drupal::database()->delete('notify_unpublished_queue')
+    ->condition('nid', $node->id())
+    ->execute();
+}
+
+/**
+ * Implementation of hook_comment_delete().
+ *
+ * Delete the unpublished comment in the queue when the
+ * comment itself is deleted.
+ */
+function notify_comment_delete($comment) {
+  \Drupal::database()->delete('notify_unpublished_queue')
+    ->condition('cid', $comment->cid)
+    ->execute();
+}
+
+/**
+ * Helper function to get array of tracked types.
+ *
+ * @param array $ntype
+ *   Reference to array with tracked types.
+ *
+ * @param bool $foop
+ *   TRUE if we return full list if empty,
+ *
+ */
+function _notify_get_content_types(&$ntype, $foop) {
+  $config = \Drupal::config('notify.settings');
+  $ntype = array();
+  foreach (\Drupal\node\Entity\NodeType::loadMultiple() as $type => $object) {
+    if ($config->get(NOTIFY_NODE_TYPE . $type, 0)) {
+      $ntype[] = $type;
+    }
+  }
+  if ($foop && count($ntype) < 1) {
+    foreach (\Drupal\node\Entity\NodeType::loadMultiple() as $type => $name) {
+      $ntype[] = $type;
+    }
+  }
+}
+
+/**
+ * Count the carious types of content.
+ */
+function _notify_count($config) {
+  list($res_nodes, $res_comms, $res_nopub, $res_copub, $res_nounp, $res_counp) = _notify_select_content();
+
+  $np = ($res_nodes) ? count($res_nodes) : 0;
+  $cp = ($res_comms) ? count($res_comms) : 0;
+  $nn = ($res_nopub) ? count($res_nopub) : 0;
+  $cn = ($res_copub) ? count($res_copub) : 0;
+  $bu = ($res_nounp) ? count($res_nounp) : 0;
+  $cu = ($res_counp) ? count($res_counp) : 0;
+
+  return array($np, $cp, $nn, $cn, $bu, $cu);
+}
+
+/**
+ * Helper function to set up query objects to select content for
+ * counting and sending.
+ *
+ * Return array has six values:
+ * - ordinary published entities: nodes, comments;
+ * - in unpublished queue:
+ *   published nodes, published comments,
+ *   unpublished nodes, unpublished comments,
+ *
+ * @return array
+ *   res_nodes, res_comms, res_nopub, res_copub, res_nounp, res_counp
+ */
+function _notify_select_content() {
+  $config = \Drupal::config('notify.settings');
+  $batch_remain = count($config->get('notify_users', array()));
+  $since = $config->get('notify_send_last', 0);
+  if ($batch_remain) {
+    $send_start = $config->get('notify_send_start', 0);
+  }
+  else {
+    $send_start = \Drupal::time()->getRequestTime();
+  }
+  if (!$since) {
+    $period = $config->get('notify_period', 86400);
+    if ($period > 0) {
+      $since = $send_start - $period;
+    }
+  }
+
+  $all = \Drupal\node\Entity\NodeType::loadMultiple();
+  $ntype = array();
+  foreach ($all as $type => $object) {
+    $ntype[] = $type;
+  }
+
+  // Build query object to fetch new nodes.
+  $q = \Drupal::database()->select('node', 'n');
+  $q->join('node_field_data', 'u', 'n.nid = u.nid');
+  $q->fields('n', array('nid'));
+  if (count($ntype) >= 1) {
+    $q->condition('n.type', $ntype, 'IN');
+  }
+  if ($config->get('notify_include_updates', 1)) {
+    $q->condition(db_or()
+      ->condition(db_and()
+        ->condition('u.created', $since, '>')
+        ->condition('u.created', $send_start, '<='))
+      ->condition(db_and()
+        ->condition('u.changed', $since, '>')
+        ->condition('u.changed', $send_start, '<=')
+      ));
+    $q->orderBy('u.created', 'asc');
+    $q->allowRowCount = TRUE;
+    $res_nodes = $q->execute()->fetchAll();
+  }
+  else {
+    $q->condition('u.created', $since, '>');
+    $q->condition('u.created', $send_start, '<=');
+    $q->orderBy('u.created', 'asc');
+    $q->allowRowCount = TRUE;
+    $res_nodes = $q->execute()->fetchAll();
+  }
+
+  // Get published nodes in unpublished queue
+  $q = \Drupal::database()->select('notify_unpublished_queue', 'q');
+  $q->join('node', 'n', 'q.nid = n.nid');
+  $q->join('node_field_data', 'u', 'q.nid = u.nid');
+  $q->fields('q', array('nid','cid'));
+  $q->condition('u.status', 1, '=');
+  $q->condition('q.cid', 0, '=');
+  $q->orderBy('q.nid', 'asc');
+  $q->allowRowCount = TRUE;
+  $res_nopub = $q->execute()->fetchAll();
+
+  // Get unpublished nodes in unpublished queue
+  $q = \Drupal::database()->select('notify_unpublished_queue', 'q');
+  $q->join('node', 'n', 'q.nid = n.nid');
+  $q->join('node_field_data', 'u', 'q.nid = u.nid');
+  $q->fields('q', array('nid','cid'));
+  $q->condition('u.status', 0, '=');
+  $q->condition('q.cid', 0, '=');
+  $q->orderBy('q.nid', 'asc');
+  $q->allowRowCount = TRUE;
+  $res_nounp = $q->execute()->fetchAll();
+
+  if (\Drupal::service('module_handler')->moduleExists('comment')) {
+    // Fetch new published comments.
+    $q = \Drupal::database()->select('comment', 'c');
+    $q->join('comment_field_data', 'v', 'c.cid = v.cid');
+    $q->join('node', 'n', 'v.entity_id = n.nid');
+    $q->fields('c', array('cid'));
+    if (count($ntype) >= 1) {
+      $q->condition('n.type', $ntype, 'IN');
+    }
+    if ($config->get('notify_include_updates', 1)) {
+      $q->condition(db_or()
+        ->condition(db_and()
+          ->condition('v.created', $since, '>')
+          ->condition('v.created', $send_start, '<='))
+        ->condition(db_and()
+          ->condition('v.changed', $since, '>')
+          ->condition('v.changed', $send_start, '<=')));
+      $q->orderBy('v.created', 'asc');
+      $q->allowRowCount = TRUE;
+      $res_comms = $q->execute()->fetchAll();
+    }
+    else {
+      $q->condition('v.created', $since, '>');
+      $q->condition('v.created', $send_start, '<=');
+      $q->orderBy('v.created', 'asc');
+      $q->allowRowCount = TRUE;
+      $res_comms = $q->execute()->fetchAll();
+    }
+
+    // Get published comments in unpublished queue
+    $q = \Drupal::database()->select('notify_unpublished_queue', 'q');
+    $q->join('comment', 'c', 'q.cid = c.cid');
+    $q->join('comment_field_data', 'v', 'q.cid = v.cid');
+    $q->fields('q', array('nid','cid'));
+    $q->condition('v.status', 1, '=');
+    $q->orderBy('q.cid', 'asc');
+    $q->allowRowCount = TRUE;
+    $res_copub = $q->execute()->fetchAll();
+
+    // Get unpublished comments in unpublished queue
+    $q = \Drupal::database()->select('notify_unpublished_queue', 'q');
+    $q->join('comment', 'c', 'q.cid = c.cid');
+    $q->join('comment_field_data', 'v', 'q.cid = v.cid');
+    $q->fields('q', array('nid','cid'));
+    $q->condition('v.status', 0, '=');
+    $q->orderBy('q.cid', 'asc');
+    $q->allowRowCount = TRUE;
+    $res_counp = $q->execute()->fetchAll();
+  }
+  else {
+    $res_comms = $res_copub = $res_counp = NULL;
+  }
+
+  return array($res_nodes, $res_comms, $res_nopub, $res_copub, $res_nounp, $res_counp);
+}
+
+/**
+ * Compute the next time a notification should be sent.
+ *
+ * @param int $send_last
+ *   timestamp of last notification
+ *
+ * @return int
+ *   -1 never, 0 send instantly, else next time to notify.
+ */
+function _notify_next_notificaton($send_last) {
+  $config = \Drupal::config('notify.settings');
+  $period = $config->get('notify_period');
+  // Two special cases: Never and instantly.
+  if ($period < 0) {
+    return(-1);
+  }
+  elseif (!$period) {
+    return(0);
+  }
+  $next_time_to_send = $send_last + $period;
+  if ($period < 86400) {
+    if (\Drupal::time()->getRequestTime() >= $next_time_to_send) {
+      return(0);
+    }
+    else {
+      return($next_time_to_send);
+    }
+  }
+
+  // Interval >= 1 day.
+
+  $cron_next = $config->get('notify_cron_next', 0);
+  if (!$cron_next) {
+    $cron_next = _notify_cron_next($next_time_to_send);
+//    $config->set('notify_cron_next', $cron_next);
+    \Drupal::configFactory()->getEditable('notify.settings')
+      ->set('notify_cron_next', $cron_next)
+      ->save();
+  }
+
+  return($cron_next);
+}
+
+function _notify_cron_next($next_time_to_send) {
+  $config = \Drupal::config('notify.settings');
+  $send_hour  = $config->get('notify_send_hour',  9);
+  // Compute the next as the sending hour today.
+  $cron_next = strtotime(date('Y-m-d ', $next_time_to_send) . $send_hour . ':00:00');
+
+  return $cron_next;
+}
+
+/**
+ * Returns form fields to be added to User Regsitration form.
+ */
+function _notify_user_reg_fields() {
+  $config = \Drupal::config('notify.settings');
+  if (!\Drupal::currentUser()->hasPermission('access notify')) {
+    return array();
+  }
+
+  // Get the variable for how often the notifications are sent out.
+  $period = $config->get("notify_period");
+
+  // Add a fieldset containing a checkbox for users to accept getting updates on
+  // the registration form.
+  $fields['notify_agree'] = array(
+    '#weight' => $config->get('notify_weightur', 0),
+    '#type' => 'fieldset',
+    '#title' => t('E-mail Notifications'),
+  );
+
+  // Add the checkbox to the fieldset.
+  $fields['notify_agree']['notify_decision'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Receive e-mail notifications of new content posted to this site. Notifications are sent every @interval.', array('@interval' => \Drupal::service('date.formatter')->format($period))),
+    '#return_value' => 1,
+    '#default_value' => $config->get('notify_reg_default', 1),
+  );
+
+  return $fields;
+}
+
+/**
+ * Helper function to check whether user has custom subscriptions.
+ */
+function _notify_user_has_subscriptions($userprofile) {
+  $field = \Drupal::database()->select('notify_subscriptions', 'n')
+    ->fields('n', array('uid'))
+    ->condition('uid', $userprofile)
+    ->execute()->fetchObject();
+
+  $subscriber = $field ? TRUE : FALSE;
+
+  return $subscriber;
+}
+
+/**
+ * Formatting of body content.
+ *
+ * @param object $node
+ *   The node object to format.
+ *
+ * @param object $comment
+ *   The comment object to format.
+ *
+ * @param int $view_mode
+ *   view mode
+ *   0: Title only
+ *   1: Title + Teaser/Excerpt
+ *   2: Title + Body
+ *   3: Title + Body + Fields
+ */
+function _notify_content($node, $comment, $view_mode) {
+  $txt = '';
+  if (0 == $view_mode) {
+    return $txt;
+  }
+  elseif (3 == $view_mode && !$comment) {
+    $content = node_view($node, 'full');
+    // Run of all children so that every attached field is also included.
+    $children = element_children($content, TRUE);
+
+    foreach ($children as $child) {
+      if (isset($content[$child]['#title']) && isset($content[$child][0]['#markup']) && $content[$child]['#access']) {
+        //We don't want field name included in the e-mail.
+        //$txt .= $content[$child]['#title'] . ': ';
+        $txt .= $content[$child][0]['#markup'];
+      }
+    }
+    return MailFormatHelper::htmlToText($txt);
+  }
+
+  if (1 == $view_mode) {
+    $vmode = 'teaser';
+  }
+  else {
+    $vmode = 'full';
+  }
+
+  if ($comment) {
+    //@TODO Get trim_length from type.
+    if ('teaser' == $vmode) {
+      $comment->comment_body['und'][0]['value'] = text_summary($comment->comment_body['und'][0]['value'], NULL, 200);
+    }
+    $content = comment_view($comment, $node, $vmode);
+    if (isset($content['comment_body'][0]['#markup'])) {
+      $txt = $content['comment_body'][0]['#markup'];
+    }
+  }
+  else {
+    $content = node_view($node, $vmode);
+    if (isset($content['body'][0]['#markup'])) {
+      $txt = $content['body'][0]['#markup'];
+    }
+  }
+
+  return MailFormatHelper::htmlToText($txt);
+}
+
+/**
+ * Helper function to send the notification e-mail batch.
+ */
+function _notify_send() {
+  $user = \Drupal::currentUser();
+  $config = \Drupal::config('notify.settings');
+
+  $separator = "------------------------------------------------------------------------------<br />";
+  $mini_separator = "----<br />";
+
+  $send_start = $config->get('notify_send_start', 0);
+  $num_sent = 0;
+  $num_fail = 0;
+  list ($res_nodes, $res_comms, $res_nopub, $res_copub, $res_nounp, $res_counp) = _notify_select_content();
+
+  _notify_get_content_types($defaultlist, TRUE);
+
+  // Get the nodes and comments queued.
+  $count = 0;
+  $nodes = $comments = array();
+  // Ordinary nodes
+  foreach ($res_nodes as $row) {
+    $nodes[$row->nid] = \Drupal\node\Entity\Node::load($row->nid);
+    $count++;
+  }
+  // Ordinary comments
+  if ($res_comms) {
+    foreach ($res_nopub as $row) {
+      if (!isset($nodes[$row->nid])) {
+        $nodes[$row->nid] = \Drupal\node\Entity\Node::load($row->nid);
+        $count++;
+      }
+    }
+    foreach ($res_comms as $row) {
+      $comment = \Drupal\comment\Entity\Comment::load($row->cid);
+      $comments[$comment->get('entity_id')->target_id][$row->cid] = $comment;
+      $count++;
+    }
+    foreach ($res_copub as $row) {
+      if (!isset($comments[$row->nid][$row->cid])) {
+        $comments[$row->get('entity_id')->target_id][$row->cid] = \Drupal\comment\Entity\Comment::load($row->cid);
+        $count++;
+      }
+    }
+  }
+  // Published nodes in unpublished queue
+  foreach ($res_nopub as $row) {
+    if (!isset($nodes[$row->nid])) {
+      $nodes[$row->nid] = \Drupal\node\Entity\Node::load($row->nid);
+      $count++;
+    }
+  }
+  // Unpublished nodes in unpublished queue
+  foreach ($res_nounp as $row) {
+    if (!isset($nodes[$row->nid])) {
+      $nodes[$row->nid] = \Drupal\node\Entity\Node::load($row->nid);
+      $count++;
+    }
+  }
+
+  if ($count) {
+    $uresult = $config->get('notify_users', array());
+    if (empty($uresult)) {
+      // Set up for sending a new batch. Init all variables.
+      $result = \Drupal::database()->select('notify', 'n');
+      $result->join('users', 'u', 'n.uid = u.uid');
+      $result->join('users_field_data', 'v', 'n.uid = v.uid');
+      $result->fields('u', array('uid'));
+      $result->fields('v', array('name','mail'));
+      $result->fields('n', array('node','teasers', 'comment', 'status'));
+      $result->condition('v.status', 1);
+      $result->condition('n.status', 1);
+      $result->condition('n.attempts', 5, '<=');
+      $result->allowRowCount = TRUE;
+      $uresult = $result->execute()->fetchAll(PDO::FETCH_ASSOC);
+
+      \Drupal::configFactory()->getEditable('notify.settings')
+        ->set('notify_send_start', \Drupal::time()->getRequestTime())
+        ->set('notify_users', $uresult)
+        ->set('notify_num_sent', 0)
+        ->set('notify_num_failed', 0)
+        ->save();
+    }
+
+    $batchlimit = $config->get('notify_batch', 100);
+    $batchcount = 0;
+
+    // Allow to safely impersonate the recipient so that the node is rendered
+    // with correct field permissions.
+    $original_user = $user;
+    //TODO: Fix drupal_save_session() issue
+    if (NULL !== ($config->get('notify_skip_nodes'))) {
+      $notify_skip_nodes = $config->get('notify_skip_nodes', array());
+    }
+    else {
+      $notify_skip_nodes = array();
+    }
+
+    if (NULL !== ($config->get('notify_skip_comments'))) {
+      $notify_skip_comments = array();
+    }
+    else {
+      $notify_skip_comments = $config->get('notify_skip_comments', array());
+    }
+
+    foreach ($uresult as $index => $userrow) {
+
+      if (++$batchcount > $batchlimit) {
+        break;
+      }
+      $userobj = \Drupal\user\Entity\User::load($userrow['uid']);
+
+      // Intentionally replacing the Global $user.
+      $user = $userobj;
+      $upl = $userobj->getPreferredLangcode();
+
+      $node_body = $comment_body = '';
+
+      // Consider new node content if user has permissions and nodes are ready.
+      // $userrow['node']: user subscribes to nodes.
+      if ($userrow['node'] && $userobj->hasPermission('access content') && count($nodes)) {
+
+        $node_count = 0;
+        // Look at the node
+        foreach ($nodes as $node) {
+
+          // Skip to next if skip flag set for node.
+          if (in_array($node->id(), $notify_skip_nodes)){
+            continue;
+          }
+          // Skip to next if user is not allowed to view this node.
+          if (!$userobj->hasPermission('administer nodes') && 0 == $node->isPublished()) {
+            continue;
+          }
+          if (!$userobj->hasPermission('administer nodes') && !in_array($node->getType(), $defaultlist)) {
+            continue;
+          }
+
+          if (!$config->get('notify_unpublished', 1) && 0 == $node->isPublished()) {
+            continue;
+          }
+
+          if (!$node->access('view', $userobj)) {
+            continue;
+          }
+
+          if (_notify_user_has_subscriptions($userrow['uid'])) {
+            // Custom subscriptions exists, use those.
+            $field = \Drupal::database()->select('notify_subscriptions', 'n')
+              ->fields('n', array('uid','type'))
+              ->condition('uid', $userrow['uid'])
+              ->condition('type', $node->getType())
+              ->execute()->fetchObject();
+            $default = $field ? TRUE : FALSE;
+            if (!$default) {
+              continue;
+            }
+          }
+
+          $ml_level = $config->get('notify_multilingual', 1);
+          if (!$userobj->hasPermission('administer notify')) {
+            if ($ml_level && $node->tnid) {
+              if ($node->language != $upl) {
+                continue;
+              }
+            }
+            if ((2 == $ml_level) && (0 == $node->tnid) && ('und' != $node->language)) {
+              continue;
+            }
+            $ignore_unverified = $config->get('notify_unverified', 0);
+            if ($ignore_unverified && !$node->uid) {
+              continue;
+            }
+          }
+
+          $node_revs_list = \Drupal::entityTypeManager()->getStorage('node')->revisionIds($node);
+          $nrl_vals = array_values($node_revs_list);
+          $vers = array_shift($nrl_vals);
+          $node_revision = \Drupal::entityTypeManager()
+            ->getStorage('node')
+            ->loadRevision($vers);
+
+          $node_body .= '<strong>' . ++$node_count . '.</strong> ' . $node->label() . '. ';
+          if (count($node_revs_list) > 1) {
+            $update = '(' . t('last updated by @author', array(
+                '@author' => ($node_revision->getOwner()->getDisplayName() ? $node_revision->getOwner()->getDisplayName() : $config->get('anonymous', 'Anonymous')),
+              ), array('langcode' => $upl)) . ') ';
+          }
+          else {
+            $update = '';
+          }
+          if ($userobj->hasPermission('administer nodes')) {
+            $status = $node->isPublished() == 1 ? t('[Published]', array(), array('langcode' => $upl)) : t('[Unpublished]', array(), array('langcode' => $upl));
+          }
+          else {
+            $status = '';
+          }
+
+          $alias = \Drupal::languageManager()->isMultilingual() ? TRUE : FALSE;
+          $options = array(
+            'alias' => $alias,
+            'attributes' => ['class' => ['read-more']],
+            'absolute'   => TRUE,
+          );
+          $link = \Drupal\Core\Link::fromTextAndUrl(t('Read more'), \Drupal\Core\Url::fromUri('internal:/node/'. $node->id(), $options))->toString();
+
+          $node_body .= $link;
+
+          $node_body .= _notify_content($node, NULL, $userrow['teasers']) . "<br />";
+        }
+
+        // Prepend e-mail header as long as user could access at least one node.
+        if ($node_count > 0) {
+          $node_body = '<h3>' . t('Recent nodes - @count', array(
+              '@count' => \Drupal::translation()->formatPlural($node_count, '1 new post', '@count new posts', array(), array('langcode' => $upl)),
+            ), array('langcode' => $upl)) . "<br />" . '</h3>' . $node_body;
+        }
+      }
+      // Consider new comments if user has permissions and comments are ready.
+      if ($userrow['comment'] && $userobj->hasPermission('access comments') && count($comments)) {
+        $total_comment_count = 0;
+        $node_comment_count = 0;
+        // Look at the comment
+        foreach ($comments as $nid => $value) {
+          // If we don't already have the node, fetch it.
+          if (isset($nodes[$nid])) {
+            $node = $nodes[$nid];
+          }
+          else {
+            $node = \Drupal::entityTypeManager()->getStorage('node')->load($nid);
+          }
+          if (!$node->access('view', $userobj)) {
+            continue;
+          }
+
+          $comment_count = 0;
+          $onecomment = '';
+          // Look at the comment
+          foreach ($value as $commobj) {
+            if (in_array($commobj->id(), $notify_skip_comments)){
+              continue;
+            }
+            if (!$userobj->hasPermission('administer comments') && 0 == $commobj->isPublished()) {
+              continue;
+            }
+            if (!$userobj->hasPermission('administer comments') && !in_array($node->getType(), $defaultlist)) {
+              continue;
+            }
+            if (!$config->get('notify_unpublished', 1) && 0 == $commobj->isPublished()) {
+              continue;
+            }
+            // Determine whether to show comment status.
+            if ($userobj->hasPermission('administer comments')) {
+              $status = $commobj->isPublished() == 1 ? t('[Published]', array(), array('langcode' => $upl)) : t('[Unpublished]', array(), array('langcode' => $upl));
+            }
+            else {
+              $status = '';
+            }
+
+            $options = array(
+              'attributes' => ['class' => ['read-more']],
+              'fragment'   => 'comment-' . $commobj->id(),
+              'absolute'   => TRUE,
+            );
+            $link = \Drupal\Core\Link::fromTextAndUrl(t('Read more'), \Drupal\Core\Url::fromUri('internal:/node/'. $nid, $options))->toString();
+            $options2 = array(
+              'attributes' => ['class' => ['read-more']],
+              'fragment'   => 'comments-title',
+              'absolute'   => TRUE,
+            );
+            $shortlink = \Drupal\Core\Link::fromTextAndUrl(t('Read more'), \Drupal\Core\Url::fromUri('internal:/node/'. $nid, $options2))->toString();
+
+            $onecomment .= '   ' . ++$comment_count . '. ' . t('@title by @author @status', array(
+                '@title' => $commobj->label(),
+                '@author' => ($commobj->getOwner()->getDisplayName() ? $commobj->getOwner()->getDisplayName() : \Drupal::config('anonymous', 'Anonymous')),
+                '@status' => $status,
+              ), array('langcode' => $upl))
+              . $link . "<br />";
+
+            $total_comment_count++;
+            $onecomment .= _notify_content($node, $commobj,  $userrow['teasers']);
+          }
+
+          if ($comment_count) {
+            $comment_body .= '<strong>' . ++$node_comment_count . '.</strong> ';
+            $comment_body .= t('@title <span class="counter">(@count)</span>', array(
+                '@count' => \Drupal::translation()->formatPlural($comment_count, '1 new comment', '@count new comments'),
+                '@title' => $node->label(),
+                '@type'  => $node->type->entity->label(),
+                '@author' => $node->getOwner()->getDisplayName() ? $node->getOwner()->getDisplayName() : \Drupal::config('anonymous', 'Anonymous'),
+              ), array('langcode' => $upl)) . ' ' . $shortlink . "<br />";
+          }
+        }
+
+        if ($total_comment_count > 0) {
+          $comment_body = '<h3>' . t('Recent comments - @count', array(
+              '@count' => \Drupal::translation()->formatPlural($total_comment_count, '1 new comment', '@count new comments'),
+            ), array('langcode' => $upl)) . "<br />" . '</h3>' . $comment_body;
+        }
+      }
+
+      $body = $node_body . $comment_body;
+      // If there was anything new, send mail.
+      if ($body) {
+        $watchdog_level = $config->get('notify_watchdog', 0);
+        if (\Drupal::service('plugin.manager.mail')->mail('notify', 'notice', $userrow['mail'], $upl, array('content' => $body, 'user' => $userobj, 'viewmode' => $userrow['teasers']), NULL, true)) {
+          if ($watchdog_level == 0) {
+            \Drupal::logger('notify')->notice('User %name (%mail) notified successfully.', array('%name' => $userrow['name'], '%mail' => $userrow['mail']));
+          }
+          $num_sent++;
+        }
+        else {
+          $num_fail++;
+          $q = \Drupal::database()->update('notify');
+          $q->expression('attempts', 'attempts + 1');
+          $q->condition('uid', $userrow['uid']);
+          $q->execute();
+
+          if ($watchdog_level <= 2) {
+            \Drupal::logger('notify')->notice('User %name (%mail) could not be notified. Mail error.', array('%name' => $userrow['name'], '%mail' => $userrow['mail']));
+          }
+        }
+      }
+
+      unset($uresult[$index]);
+
+      \Drupal::configFactory()->getEditable('notify.settings')
+        ->set('notify_users', $uresult)
+        ->save();
+    }
+    // Restore the original user session.
+    $user = $original_user;
+  }
+  $rest = count($config->get('notify_users', array()));
+  // If $rest is empty, then set notify_send_last.
+  if (!$rest) {
+    $send_start = $config->get('notify_send_start', 0);
+
+    \Drupal::configFactory()->getEditable('notify.settings')
+      ->set('notify_send_last', $send_start)
+      ->set('notify_cron_next', 0) // Force reset
+      ->save();
+    list ($res_nodes, $res_comms, $res_nopub, $res_copub, $res_nounp, $res_counp) = _notify_select_content();
+    foreach ($res_nopub as $row) {
+      $q = \Drupal::database()->delete('notify_unpublished_queue');
+      $q->condition('cid', 0);
+      $q->condition('nid', $row->nid);
+      $q->execute();
+    }
+    if ($res_copub) {
+      foreach ($res_copub as $row) {
+        $q = \Drupal::database()->delete('notify_unpublished_queue');
+        $q->condition('cid', $row->cid);
+        $q->condition('nid', $row->nid);
+        $q->execute();
+      }
+    }
+  }
+
+  return array($num_sent, $num_fail);
+}
