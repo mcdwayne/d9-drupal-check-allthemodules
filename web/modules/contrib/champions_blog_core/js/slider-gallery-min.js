@@ -1,0 +1,1 @@
+jQuery(document).ready(function(){var o=jQuery(".js-owl-carousel");o.owlCarousel({items:1,loop:!0,autoplay:!0,autoplayTimeout:3e3,autoplayHoverPause:!0,responsiveClass:!0,dots:!0}),o.addClass("owl-carousel")});
