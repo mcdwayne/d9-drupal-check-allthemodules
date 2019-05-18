@@ -1,0 +1,742 @@
+<?php
+use Drupal\Core\Link;
+use Drupal\Core\Url;
+use Drupal\pp_graphsearch\PPGraphSearch;
+use Drupal\semantic_connector\SemanticConnector;
+
+/**
+ * Implements hook_theme().
+ */
+function pp_graphsearch_theme($existing, $type, $theme, $path) {
+  return array(
+    'pp_graphsearch_content' => array(
+      'variables' => array(
+        'results' => array(),
+        'config' => array(),
+        'config_id' => '',
+        'view_type' => 'default',
+      ),
+    ),
+    'pp_graphsearch_trends' => array(
+      'variables' => array(
+        'data' => '',
+        'config' => array(),
+      ),
+    ),
+  );
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ *
+ * @param \Drupal\node\Entity\Node $node
+ *   The node that gets inserted
+ */
+function pp_graphsearch_node_insert($node) {
+  // Only public nodes should be saved in the PoolParty GraphSearch index.
+  if ($node->isPublished()) {
+    if (!\Drupal\pp_graphsearch\PPGraphSearch::updateEntityPings($node, 'create')) {
+      \Drupal::messenger()->addMessage(t('Error while sending content to GraphSearch'), 'error');
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update().
+ *
+ * @param \Drupal\node\Entity\Node $node
+ *   The node that gets updated
+ */
+function pp_graphsearch_node_update($node) {
+  if ($node->isPublished()) {
+    if (!\Drupal\pp_graphsearch\PPGraphSearch::updateEntityPings($node, 'update')) {
+      \Drupal::messenger()->addMessage(t('Error while sending content to GraphSearch'), 'error');
+    }
+  }
+  else {
+    pp_graphsearch_node_delete($node);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ *
+ * @param \Drupal\node\Entity\Node $node
+ *   The node that gets deleted
+ */
+function pp_graphsearch_node_delete($node) {
+  if (!\Drupal\pp_graphsearch\PPGraphSearch::updateEntityPings($node, 'delete')) {
+    \Drupal::messenger()->addMessage(t('Error while sending content to GraphSearch'), 'error');
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ *
+ * @param \Drupal\user\Entity\User $account
+ *   The node that gets inserted
+ */
+function pp_graphsearch_user_insert($account) {
+  // Only public nodes should be saved in the PoolParty GraphSearch index.
+  if ($account->isActive()) {
+    if (!\Drupal\pp_graphsearch\PPGraphSearch::updateEntityPings($account, 'create')) {
+      \Drupal::messenger()->addMessage(t('Error while sending content to GraphSearch'), 'error');
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update().
+ *
+ * @param \Drupal\user\Entity\User $account
+ *   The node that gets updated
+ */
+function pp_graphsearch_user_update($account) {
+  if ($account->isActive()) {
+    if (!\Drupal\pp_graphsearch\PPGraphSearch::updateEntityPings($account, 'update')) {
+      \Drupal::messenger()->addMessage(t('Error while sending content to GraphSearch'), 'error');
+    }
+  }
+  else {
+    pp_graphsearch_user_delete($account);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ *
+ * @param \Drupal\user\Entity\User $account
+ *   The node that gets deleted
+ */
+function pp_graphsearch_user_delete($account) {
+  if (!\Drupal\pp_graphsearch\PPGraphSearch::updateEntityPings($account, 'delete')) {
+    \Drupal::messenger()->addMessage(t('Error while sending content to GraphSearch'), 'error');
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ *
+ * @param \Drupal\node\Entity\NodeType $node_type
+ *
+ * Delete the connection to the PP GraphSearch server if it is configured.
+ */
+function pp_graphsearch_node_type_delete($node_type) {
+  $config = \Drupal::configFactory()->getEditable('pp_graphsearch.settings');
+  $variables = $config->get('content_type_push');
+  if (isset($variables[$node_type->id()])) {
+    unset($variables[$node_type->id()]);
+    $config->set('content_type_push', $variables)
+      ->save();
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function pp_graphsearch_form_node_type_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  $content_type = $form['type']['#default_value'];
+
+  if ($content_type) {
+    // Add a new vertical tab for the PoolParty GraphSearch settings.
+    $form['pp_graphsearch'] = array(
+      '#type' => 'details',
+      '#title' => t('PoolParty GraphSearch settings'),
+      '#group' => 'additional_settings',
+      '#open' => TRUE,
+    );
+
+    // Add a custom validation handler.
+    $form['#validate'][] = 'pp_graphsearch_form_node_type_form_validate';
+
+    // Get all the PoolParty GraphSearch server.
+    $pp_connections = \Drupal\semantic_connector\Entity\SemanticConnectorPPServerConnection::loadMultiple();
+    $pp_server_options = array();
+    $pp_taxonomy_connections = array();
+    $gs_search_spaces = array();
+    /** @var \Drupal\semantic_connector\Entity\SemanticConnectorPPServerConnection $pp_connection */
+    foreach ($pp_connections as $pp_connection) {
+      $pp_config = $pp_connection->getConfig();
+      if (isset($pp_config['graphsearch_configuration']) && !empty($pp_config['graphsearch_configuration'])) {
+        $graphsearch_config = $pp_config['graphsearch_configuration'];
+        $pp_server_options[$pp_connection->id()] = $pp_connection->getTitle();
+
+        $search_spaces = SemanticConnector::getGraphSearchSearchSpaces($graphsearch_config);
+        foreach ($search_spaces as $search_space) {
+          $gs_search_spaces[$pp_connection->getId()][$search_space['id']] = (!empty($search_space['name']) ? $search_space['name'] : t('Default Search Space'));
+        }
+
+        // Get all the taxonomy connections between Drupal and PP.
+        if (\Drupal::moduleHandler()->moduleExists('pp_taxonomy_manager')) {
+          $taxonomy_manager_configs = \Drupal\pp_taxonomy_manager\Entity\PPTaxonomyManagerConfig::loadMultiple();
+          /** @var \Drupal\pp_taxonomy_manager\Entity\PPTaxonomyManagerConfig $taxonomy_manager_config */
+          foreach ($taxonomy_manager_configs as $taxonomy_manager_config) {
+            if ($taxonomy_manager_config->getConnectionId() == $pp_connection->id() && isset($graphsearch_config['projects'][$taxonomy_manager_config->getProjectId()])) {
+              $taxonomy_manager_configurations = $taxonomy_manager_config->getConfig();
+              $pp_taxonomy_connections[$pp_connection->getId()] = array_keys($taxonomy_manager_configurations['taxonomies']);
+            }
+          }
+        }
+      }
+    }
+
+    // Check if a PoolParty GraphSearch server is available.
+    if (empty($pp_server_options)) {
+      $form['pp_graphsearch']['pp_graphsearch_push'] = array(
+        '#markup' => t('Does not exist any PoolParty GraphSearch servers. Please add a @pp_server_connection_link interconnected with a PoolParty GraphSearch server.', array('@pp_server_connection_link' => Link::fromTextAndUrl(t('PoolParty server connection'), Url::fromRoute('semantic_connector.overview')))),
+      );
+      return;
+    }
+
+    // Get the settings.
+    $push_settings = \Drupal::config('pp_graphsearch.settings')
+      ->get('content_type_push');
+
+    $settings = array(
+      'active' => FALSE,
+      'connection_id' => 0,
+      'search_space_id' => NULL,
+      'taxonomies' => array(),
+      'fields' => [],
+      'label' => \Drupal\node\Entity\NodeType::load($content_type)->label(),
+    );
+    if (isset($push_settings[$content_type])) {
+      $settings = array_merge($settings, $push_settings[$content_type]);
+    }
+
+    $form['pp_graphsearch']['pp_graphsearch_push'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Push content of this content type to a PoolParty GraphSearch server.'),
+      '#default_value' => $settings['active'],
+    );
+    $form['pp_graphsearch']['pp_graphsearch_push_connection'] = array(
+      '#type' => 'radios',
+      '#title' => t('Select the PoolParty GraphSearch server to push to'),
+      '#options' => $pp_server_options,
+      '#default_value' => $settings['connection_id'],
+      '#states' => array(
+        'visible' => array(
+          ':input[name="pp_graphsearch_push"]' => array('checked' => TRUE),
+        ),
+      ),
+    );
+
+    foreach ($gs_search_spaces as $connection_id => $connection_search_spaces) {
+      $form['pp_graphsearch']['pp_graphsearch_push_search_space_' . str_replace(' ', '_', $connection_id)] = array(
+        '#type' => 'radios',
+        '#title' => t('Select the Search Space to use'),
+        '#options' => $connection_search_spaces,
+        '#default_value' => ($settings['connection_id'] == $connection_id ? $settings['search_space_id'] : NULL),
+        '#states' => array(
+          'visible' => array(
+            ':input[name="pp_graphsearch_push"]' => array('checked' => TRUE),
+            ':input[name="pp_graphsearch_push_connection"]' => array('value' => $connection_id),
+          ),
+        ),
+      );
+    }
+
+    $form['pp_graphsearch']['pp_graphsearch_push_label'] = [
+      '#type' => 'textfield',
+      '#title' => t('Label to use in Drupal'),
+      '#description' => t('This label will be used in the filters and output of GraphSearch in Drupal.'),
+      '#default_value' => $settings['label'],
+      '#states' => [
+        'visible' => [
+          ':input[name="pp_graphsearch_push"]' => ['checked' => TRUE],
+        ],
+      ],
+    ];
+
+    // Get all the taxonomies referenced by this content type.
+    $taxonomy_fields = array();
+    $taxonomies = PPGraphSearch::getAllReferencedTaxonomies($content_type);
+    /** @var \Drupal\taxonomy\Entity\Vocabulary $taxonomy */
+    foreach ($taxonomies as $taxonomy) {
+      $taxonomy_fields[$taxonomy->label()] = $taxonomy->id();
+    }
+
+    if (!empty($taxonomy_fields)) {
+      foreach ($pp_server_options as $connection_id => $connection_name) {
+        $taxonomy_options = $taxonomy_fields;
+        // Remove all the taxonomies which are connected with a PoolParty taxonomy.
+        if (isset($pp_taxonomy_connections[$connection_id])) {
+          $taxonomy_options = array_diff($taxonomy_options, $pp_taxonomy_connections[$connection_id]);
+        }
+
+        $form['pp_graphsearch']['pp_graphsearch_push_taxonomies_' . str_replace(' ', '_', $connection_id)] = array(
+          '#type' => 'checkboxes',
+          '#title' => t('Choose the vocabularies that are to be represented as facets.'),
+          '#description' => t('There are only those vocabularies displayed, which are referenced by this content type and are not connected with a PoolParty taxonomy.'),
+          '#options' => array_flip($taxonomy_options),
+          '#default_value' => array_keys($settings['taxonomies']),
+          '#states' => array(
+            'visible' => array(
+              ':input[name="pp_graphsearch_push"]' => array('checked' => TRUE),
+              ':input[name="pp_graphsearch_push_connection"]' => array('value' => $connection_id),
+            ),
+          ),
+        );
+      }
+    }
+
+    $field_options = PPGraphSearch::getSupportedPushFields('node', $content_type);
+    $form['pp_graphsearch']['pp_graphsearch_push_fields'] = [
+      '#type' => 'checkboxes',
+      '#title' => t('Select fields to extract content from'),
+      '#description' => t('Select the fields which are used for the content extraction.'),
+      '#options' => $field_options,
+      '#default_value' => $settings['fields'],
+      '#states' => array(
+        'visible' => array(
+          ':input[name="pp_graphsearch_push"]' => array('checked' => TRUE),
+        ),
+        'required' => array(
+          ':input[name="pp_graphsearch_push"]' => array('checked' => TRUE),
+        ),
+      ),
+    ];
+
+    if (empty($field_options)) {
+      $form['pp_graphsearch']['pp_graphsearch_push_fields']['#description'] = new \Drupal\Component\Render\FormattableMarkup('<div class="messages messages--error">' . t('There are no fields available for content extraction for this entity/content type.') . '</div>', array());
+    }
+  }
+}
+
+/**
+ * Custom validator handler for the node type form.
+ *
+ * Join all PoolParty GraphSearch settings into one variable instead of
+ * the standard multiple variables.
+ */
+function pp_graphsearch_form_node_type_form_validate($form, \Drupal\Core\Form\FormStateInterface &$form_state) {
+  $push_settings = \Drupal::config('pp_graphsearch.settings')->get('content_type_push');
+  $content_type = $form['type']['#default_value'];
+
+  // If a PoolParty GraphSearch server exists, add the selected data to
+  // the variable.
+  if ($form_state->getValue('pp_graphsearch_push')) {
+    // Check if a connection is given.
+    if (empty($form_state->getValue('pp_graphsearch_push_connection'))) {
+      $form_state->setErrorByName('pp_graphsearch_push_connection', t('"%field" can not be empty.', array('%field' => t('Select the PoolParty GraphSearch server to push to'))));
+      return;
+    }
+    $search_space_id = $form_state->getValue('pp_graphsearch_push_search_space_' . str_replace(' ', '_', $form_state->getValue('pp_graphsearch_push_connection')));
+    if (empty($search_space_id)) {
+      $form_state->setErrorByName('pp_graphsearch_push_search_space_' . str_replace(' ', '_', $form_state->getValue('pp_graphsearch_push_connection')), t('"%field" can not be empty.', array('%field' => t('Select the Search Space to use'))));
+      return;
+    }
+    $selected_fields = array_keys(array_filter($form_state->getValue('pp_graphsearch_push_fields')));
+    if (empty($selected_fields)) {
+      $form_state->setErrorByName('pp_graphsearch_push_fields', t('"%field" can not be empty.', array('%field' => t('Select fields to extract content from'))));
+      return;
+    }
+
+    // Get the count of the taxonomy connections.
+    $count_taxonomies = array();
+    foreach ($push_settings as $settings) {
+      if ($settings['active']) {
+        foreach ($settings['taxonomies'] as $vid => $taxonomy) {
+          if (!isset($count_taxonomies[$vid])) {
+            $count_taxonomies[$vid] = 0;
+          }
+          $count_taxonomies[$vid]++;
+        }
+      }
+    }
+
+    $taxonomies_name = 'pp_graphsearch_push_taxonomies_' . str_replace(' ', '_', $form_state->getValue('pp_graphsearch_push_connection'));
+    $selected_taxonomies = array();
+    $add_taxonomies = array();
+    $delete_taxonomies = array();
+
+    // Get the selected taxonomies and the new selected taxonomies
+    // for adding it to the custom search fields.
+    if (!empty($form_state->getValue($taxonomies_name))) {
+      $vids = array();
+      foreach ($form_state->getValue($taxonomies_name) as $taxonomy) {
+        if (!empty($taxonomy)) {
+          $vids[] = $taxonomy;
+        }
+      }
+
+      $vocabularies = \Drupal\taxonomy\Entity\Vocabulary::loadMultiple($vids);
+      /** @var \Drupal\taxonomy\Entity\Vocabulary $vocabulary */
+      foreach ($vocabularies as $vocabulary) {
+        $selected_taxonomies[$vocabulary->id()] = array(
+          'machine_name' => $vocabulary->id(),
+          'name' => $vocabulary->label()
+        );
+        if (!isset($count_taxonomies[$vocabulary->id()])) {
+          $add_taxonomies[] = $selected_taxonomies[$vocabulary->id()];
+        }
+      }
+    }
+
+    // Get all unused taxonomies for deleting it from the custom search fields.
+    if (!empty($push_settings[$content_type]['taxonomies'])) {
+      foreach ($push_settings[$content_type]['taxonomies'] as $vid => $taxonomy) {
+        $taxonomies_selected = array_keys(array_filter($form_state->getValue($taxonomies_name)));
+        if (!in_array($vid, $taxonomies_selected) && $count_taxonomies[$vid] <= 1) {
+          $delete_taxonomies[] = $taxonomy;
+        }
+      }
+    }
+
+    $new_settings = array(
+      'active' => $form_state->getValue('pp_graphsearch_push'),
+      'connection_id' => $form_state->getValue('pp_graphsearch_push_connection'),
+      'search_space_id' => $search_space_id,
+      'taxonomies' => $selected_taxonomies,
+      'fields' => $selected_fields,
+      'label' => $form_state->getValue('pp_graphsearch_push_label'),
+    );
+
+    $connection = \Drupal\semantic_connector\Entity\SemanticConnectorPPServerConnection::load($new_settings['connection_id']);
+    /** @var \Drupal\semantic_connector\Api\SemanticConnectorSonrApi $graphsearch_api */
+    $graphsearch_api = $connection->getApi('sonr');
+
+    // Add 'Content Types' to the custom search fields at the first time.
+    if ($new_settings['active'] && empty($push_settings)) {
+      $graphsearch_api->addCustomSearchField('Content Types', 'content_type', $push_settings[$content_type]['search_space_id']);
+    }
+
+    // Add taxonomies to the custom search fields.
+    if (!empty($add_taxonomies)) {
+      foreach ($add_taxonomies as $add_taxonomy) {
+        $graphsearch_api->addCustomSearchField($add_taxonomy['name'], $add_taxonomy['machine_name'], $push_settings[$content_type]['search_space_id']);
+      }
+    }
+
+    // Delete taxonomies from the custom search fields.
+    if (!empty($delete_taxonomies)) {
+      foreach ($delete_taxonomies as $delete_taxonomy) {
+        PPGraphSearch::disableCustomFacet($new_settings['connection_id'], $delete_taxonomy['machine_name']);
+        $graphsearch_api->deleteCustomSearchField($delete_taxonomy['machine_name'], $push_settings[$content_type]['search_space_id']);
+      }
+    }
+
+    // Save the settings to the variables.
+    $push_settings[$content_type] = $new_settings;
+    \Drupal::configFactory()->getEditable('pp_graphsearch.settings')
+      ->set('content_type_push', $push_settings)
+      ->save();
+
+    // Remove saved data from the $form_state.
+    foreach ($form_state->getValues() as $field_name => $values) {
+      if (strpos($field_name, 'pp_graphsearch_push') !== FALSE) {
+        $form_state->unsetValue($field_name);
+      }
+    }
+  }
+  // If no PoolParty GraphSearch server exists, delete existing data.
+  elseif (isset($push_settings[$content_type])) {
+    unset($push_settings[$content_type]);
+    \Drupal::configFactory()->getEditable('pp_graphsearch.settings')
+      ->set('content_type_push', $push_settings)
+      ->save();
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function pp_graphsearch_form_user_admin_settings_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  // Add a new vertical tab for the PoolParty GraphSearch settings.
+  $form['pp_graphsearch'] = array(
+    '#type' => 'details',
+    '#title' => t('PoolParty GraphSearch settings'),
+    '#group' => 'additional_settings',
+    '#open' => TRUE,
+  );
+
+  // Add a custom validation handler.
+  $form['#validate'][] = 'pp_graphsearch_user_admin_settings_form_validate';
+
+  // Get all the PoolParty GraphSearch server.
+  $pp_connections = \Drupal\semantic_connector\Entity\SemanticConnectorPPServerConnection::loadMultiple();
+  $pp_server_options = array();
+  $pp_taxonomy_connections = array();
+  $gs_search_spaces = array();
+  /** @var \Drupal\semantic_connector\Entity\SemanticConnectorPPServerConnection $pp_connection */
+  foreach ($pp_connections as $pp_connection) {
+    $pp_config = $pp_connection->getConfig();
+    if (isset($pp_config['graphsearch_configuration']) && !empty($pp_config['graphsearch_configuration'])) {
+      $graphsearch_config = $pp_config['graphsearch_configuration'];
+      $pp_server_options[$pp_connection->id()] = $pp_connection->getTitle();
+
+      $search_spaces = SemanticConnector::getGraphSearchSearchSpaces($graphsearch_config);
+      foreach ($search_spaces as $search_space) {
+        $gs_search_spaces[$pp_connection->getId()][$search_space['id']] = (!empty($search_space['name']) ? $search_space['name'] : t('Default Search Space'));
+      }
+
+      // Get all the taxonomy connections between Drupal and PP.
+      if (\Drupal::moduleHandler()->moduleExists('pp_taxonomy_manager')) {
+        $taxonomy_manager_configs = \Drupal\pp_taxonomy_manager\Entity\PPTaxonomyManagerConfig::loadMultiple();
+        /** @var \Drupal\pp_taxonomy_manager\Entity\PPTaxonomyManagerConfig $taxonomy_manager_config */
+        foreach ($taxonomy_manager_configs as $taxonomy_manager_config) {
+          if ($taxonomy_manager_config->getConnectionId() == $pp_connection->id() && isset($graphsearch_config['projects'][$taxonomy_manager_config->getProjectId()])) {
+            $taxonomy_manager_configurations = $taxonomy_manager_config->getConfig();
+            $pp_taxonomy_connections[$pp_connection->getId()] = array_keys($taxonomy_manager_configurations['taxonomies']);
+          }
+        }
+      }
+    }
+  }
+
+  // Check if a PoolParty GraphSearch server is available.
+  if (empty($pp_server_options)) {
+    $form['pp_graphsearch']['pp_graphsearch_push'] = array(
+      '#markup' => t('Does not exist any PoolParty GraphSearch servers. Please add a @pp_server_connection_link interconnected with a PoolParty GraphSearch server.', array('@pp_server_connection_link' => Link::fromTextAndUrl(t('PoolParty server connection'), Url::fromRoute('semantic_connector.overview')))),
+    );
+    return;
+  }
+
+  // Get the settings.
+  $push_settings = \Drupal::config('pp_graphsearch.settings')->get('content_type_push');
+  $content_type = 'user';
+
+  $settings = array(
+    'active' => FALSE,
+    'connection_id' => 0,
+    'search_space_id' => NULL,
+    'taxonomies' => array(),
+    'fields' => [],
+    'label' => 'User',
+  );
+  if (isset($push_settings[$content_type])) {
+    $settings = array_merge($settings, $push_settings[$content_type]);
+  }
+
+  $form['pp_graphsearch']['pp_graphsearch_push'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Push users to a PoolParty GraphSearch server.'),
+    '#default_value' => $settings['active'],
+  );
+  $form['pp_graphsearch']['pp_graphsearch_push_connection'] = array(
+    '#type' => 'radios',
+    '#title' => t('Select the PoolParty GraphSearch server to push to'),
+    '#options' => $pp_server_options,
+    '#default_value' => $settings['connection_id'],
+    '#states' => array(
+      'visible' => array(
+        ':input[name="pp_graphsearch_push"]' => array('checked' => TRUE),
+      ),
+    ),
+  );
+
+  foreach ($gs_search_spaces as $connection_id => $connection_search_spaces) {
+    $form['pp_graphsearch']['pp_graphsearch_push_search_space_' . str_replace(' ', '_', $connection_id)] = array(
+      '#type' => 'radios',
+      '#title' => t('Select the Search Space to use'),
+      '#options' => $connection_search_spaces,
+      '#default_value' => ($settings['connection_id'] == $connection_id ? $settings['search_space_id'] : NULL),
+      '#states' => array(
+        'visible' => array(
+          ':input[name="pp_graphsearch_push"]' => array('checked' => TRUE),
+          ':input[name="pp_graphsearch_push_connection"]' => array('value' => $connection_id),
+        ),
+      ),
+    );
+  }
+
+  $form['pp_graphsearch']['pp_graphsearch_push_label'] = [
+    '#type' => 'textfield',
+    '#title' => t('Label to use in Drupal'),
+    '#description' => t('This label will be used in the filters and output of GraphSearch in Drupal.'),
+    '#default_value' => $settings['label'],
+    '#states' => [
+      'visible' => [
+        ':input[name="pp_graphsearch_push"]' => ['checked' => TRUE],
+      ],
+    ],
+  ];
+
+  // Get all the taxonomies referenced by this content type.
+  $taxonomy_fields = array();
+  $taxonomies = PPGraphSearch::getAllReferencedTaxonomies($content_type);
+  /** @var \Drupal\taxonomy\Entity\Vocabulary $taxonomy */
+  foreach ($taxonomies as $taxonomy) {
+    $taxonomy_fields[$taxonomy->label()] = $taxonomy->id();
+  }
+
+  if (!empty($taxonomy_fields)) {
+    foreach ($pp_server_options as $connection_id => $connection_name) {
+      $taxonomy_options = $taxonomy_fields;
+      // Remove all the taxonomies which are connected with a PoolParty taxonomy.
+      if (isset($pp_taxonomy_connections[$connection_id])) {
+        $taxonomy_options = array_diff($taxonomy_options, $pp_taxonomy_connections[$connection_id]);
+      }
+
+      $form['pp_graphsearch']['pp_graphsearch_push_taxonomies_' . str_replace(' ', '_', $connection_id)] = array(
+        '#type' => 'checkboxes',
+        '#title' => t('Choose the vocabularies that are to be represented as facets.'),
+        '#description' => t('There are only those vocabularies displayed, which are referenced by this content type and are not connected with a PoolParty taxonomy.'),
+        '#options' => array_flip($taxonomy_options),
+        '#default_value' => array_keys($settings['taxonomies']),
+        '#states' => array(
+          'visible' => array(
+            ':input[name="pp_graphsearch_push"]' => array('checked' => TRUE),
+            ':input[name="pp_graphsearch_push_connection"]' => array('value' => $connection_id),
+          ),
+        ),
+      );
+    }
+  }
+
+  $field_options = PPGraphSearch::getSupportedPushFields('user', $content_type);
+  $form['pp_graphsearch']['pp_graphsearch_push_fields'] = [
+    '#type' => 'checkboxes',
+    '#title' => t('Select fields to extract content from'),
+    '#description' => t('Select the fields which are used for the content extraction.'),
+    '#options' => $field_options,
+    '#default_value' => $settings['fields'],
+    '#states' => array(
+      'visible' => array(
+        ':input[name="pp_graphsearch_push"]' => array('checked' => TRUE),
+      ),
+      'required' => array(
+        ':input[name="pp_graphsearch_push"]' => array('checked' => TRUE),
+      ),
+    ),
+  ];
+
+  if (empty($field_options)) {
+    $form['pp_graphsearch']['pp_graphsearch_push_fields']['#description'] = new \Drupal\Component\Render\FormattableMarkup('<div class="messages messages--error">' . t('There are no fields available for content extraction for this entity/content type.') . '</div>', array());
+  }
+}
+
+/**
+ * Custom validator handler for the node type form.
+ *
+ * Join all PoolParty GraphSearch settings into one variable instead of
+ * the standard multiple variables.
+ */
+function pp_graphsearch_user_admin_settings_form_validate($form, \Drupal\Core\Form\FormStateInterface &$form_state) {
+  $push_settings = \Drupal::config('pp_graphsearch.settings')->get('content_type_push');
+  $content_type = 'user';
+
+  // If a PoolParty GraphSearch server exists, add the selected data to
+  // the variable.
+  if ($form_state->getValue('pp_graphsearch_push')) {
+    // Check if a connection is given.
+    if (empty($form_state->getValue('pp_graphsearch_push_connection'))) {
+      $form_state->setErrorByName('pp_graphsearch_push_connection', t('"%field" can not be empty.', array('%field' => t('Select the PoolParty GraphSearch server to push to'))));
+      return;
+    }
+    $search_space_id = $form_state->getValue('pp_graphsearch_push_search_space_' . str_replace(' ', '_', $form_state->getValue('pp_graphsearch_push_connection')));
+    if (empty($search_space_id)) {
+      $form_state->setErrorByName('pp_graphsearch_push_search_space_' . str_replace(' ', '_', $form_state->getValue('pp_graphsearch_push_connection')), t('"%field" can not be empty.', array('%field' => t('Select the Search Space to use'))));
+      return;
+    }
+    $selected_fields = array_keys(array_filter($form_state->getValue('pp_graphsearch_push_fields')));
+    if (empty($selected_fields)) {
+      $form_state->setErrorByName('pp_graphsearch_push_fields', t('"%field" can not be empty.', array('%field' => t('Select fields to extract content from'))));
+      return;
+    }
+
+    // Get the count of the taxonomy connections.
+    $count_taxonomies = array();
+    foreach ($push_settings as $settings) {
+      if ($settings['active']) {
+        foreach ($settings['taxonomies'] as $vid => $taxonomy) {
+          if (!isset($count_taxonomies[$vid])) {
+            $count_taxonomies[$vid] = 0;
+          }
+          $count_taxonomies[$vid]++;
+        }
+      }
+    }
+
+    $taxonomies_name = 'pp_graphsearch_push_taxonomies_' . str_replace(' ', '_', $form_state->getValue('pp_graphsearch_push_connection'));
+    $selected_taxonomies = array();
+    $add_taxonomies = array();
+    $delete_taxonomies = array();
+
+    // Get the selected taxonomies and the new selected taxonomies
+    // for adding it to the custom search fields.
+    if (!empty($form_state->getValue($taxonomies_name))) {
+      $vids = array();
+      foreach ($form_state->getValue($taxonomies_name) as $taxonomy) {
+        if (!empty($taxonomy)) {
+          $vids[] = $taxonomy;
+        }
+      }
+
+      $vocabularies = \Drupal\taxonomy\Entity\Vocabulary::loadMultiple($vids);
+      /** @var \Drupal\taxonomy\Entity\Vocabulary $vocabulary */
+      foreach ($vocabularies as $vocabulary) {
+        $selected_taxonomies[$vocabulary->id()] = array(
+          'machine_name' => $vocabulary->id(),
+          'name' => $vocabulary->label()
+        );
+        if (!isset($count_taxonomies[$vocabulary->id()])) {
+          $add_taxonomies[] = $selected_taxonomies[$vocabulary->id()];
+        }
+      }
+    }
+
+    // Get all unused taxonomies for deleting it from the custom search fields.
+    if (!empty($push_settings[$content_type]['taxonomies'])) {
+      foreach ($push_settings[$content_type]['taxonomies'] as $vid => $taxonomy) {
+        $taxonomies_selected = array_keys(array_filter($form_state->getValue($taxonomies_name)));
+        if (!in_array($vid, $taxonomies_selected) && $count_taxonomies[$vid] <= 1) {
+          $delete_taxonomies[] = $taxonomy;
+        }
+      }
+    }
+
+    $new_settings = array(
+      'active' => $form_state->getValue('pp_graphsearch_push'),
+      'connection_id' => $form_state->getValue('pp_graphsearch_push_connection'),
+      'search_space_id' => $search_space_id,
+      'taxonomies' => $selected_taxonomies,
+      'fields' => $selected_fields,
+      'label' => $form_state->getValue('pp_graphsearch_push_label'),
+    );
+
+    $connection = \Drupal\semantic_connector\Entity\SemanticConnectorPPServerConnection::load($new_settings['connection_id']);
+    /** @var \Drupal\semantic_connector\Api\SemanticConnectorSonrApi $graphsearch_api */
+    $graphsearch_api = $connection->getApi('sonr');
+
+    // Add 'Content Types' to the custom search fields at the first time.
+    if ($new_settings['active'] && empty($push_settings)) {
+      $graphsearch_api->addCustomSearchField('Content Types', 'content_type', $push_settings[$content_type]['search_space_id']);
+    }
+
+    // Add taxonomies to the custom search fields.
+    if (!empty($add_taxonomies)) {
+      foreach ($add_taxonomies as $add_taxonomy) {
+        $graphsearch_api->addCustomSearchField($add_taxonomy['name'], $add_taxonomy['machine_name'], $push_settings[$content_type]['search_space_id']);
+      }
+    }
+
+    // Delete taxonomies from the custom search fields.
+    if (!empty($delete_taxonomies)) {
+      foreach ($delete_taxonomies as $delete_taxonomy) {
+        PPGraphSearch::disableCustomFacet($new_settings['connection_id'], $delete_taxonomy['machine_name']);
+        $graphsearch_api->deleteCustomSearchField($delete_taxonomy['machine_name'], $push_settings[$content_type]['search_space_id']);
+      }
+    }
+
+    // Save the settings to the variables.
+    $push_settings[$content_type] = $new_settings;
+    \Drupal::configFactory()->getEditable('pp_graphsearch.settings')
+      ->set('content_type_push', $push_settings)
+      ->save();
+
+    // Remove saved data from the $form_state.
+    foreach ($form_state->getValues() as $field_name => $values) {
+      if (strpos($field_name, 'pp_graphsearch_push') !== FALSE) {
+        $form_state->unsetValue($field_name);
+      }
+    }
+  }
+  // If no PoolParty GraphSearch server exists, delete existing data.
+  elseif (isset($push_settings[$content_type])) {
+    unset($push_settings[$content_type]);
+    \Drupal::configFactory()->getEditable('pp_graphsearch.settings')
+      ->set('content_type_push', $push_settings)
+      ->save();
+  }
+}
