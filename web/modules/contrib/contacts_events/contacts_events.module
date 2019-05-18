@@ -1,0 +1,256 @@
+<?php
+
+/**
+ * @file
+ * Contains contacts_events.module.
+ */
+
+use Drupal\commerce_order\Entity\OrderInterface;
+use Drupal\commerce_order\Entity\OrderItemInterface;
+use Drupal\contacts_events\Entity\EventInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\StringTranslation\TranslatableMarkup;
+use Drupal\entity\BundleFieldDefinition;
+
+include 'contacts_events.theme.inc';
+
+/**
+ * Implements hook_help().
+ */
+function contacts_events_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the contacts_events module.
+    case 'help.page.contacts_events':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Event promotion and booking functionality for Contacts suite.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function contacts_events_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'commerce_checkout_pane_info_alter') {
+    unset($implementations['commerce_payment']);
+  }
+}
+
+/**
+ * Implements hook_entity_type_build().
+ */
+function contacts_events_entity_type_build(array &$entity_types) {
+  /* @var \Drupal\Core\Entity\EntityTypeInterface[] $entity_types */
+  $entity_types['commerce_order']->setLinkTemplate('booking_process', '/booking/{commerce_order}');
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_create() for commerce_order_item.
+ */
+function contacts_events_commerce_order_item_create(OrderItemInterface $entity) {
+  // @todo: See if we can find a better place to do this.
+  $parameters = \Drupal::routeMatch()->getParameters();
+  if ($parameters->has('commerce_order')) {
+    /* @var \Drupal\commerce_order\Entity\OrderInterface $order */
+    $order = $parameters->get('commerce_order');
+    $entity->set('order_id', $order->id());
+  }
+}
+
+/**
+ * Implements hook_entity_field_storage_info().
+ */
+function contacts_events_entity_field_storage_info(EntityTypeInterface $entity_type) {
+  $fields = [];
+
+  if ($entity_type->id() == 'commerce_order_item') {
+    $fields['state'] = BundleFieldDefinition::create('state')
+      ->setName('state')
+      ->setLabel(new TranslatableMarkup('State'))
+      ->setTargetEntityTypeId('commerce_order_item');
+
+    $fields['confirmed'] = BundleFieldDefinition::create('timestamp')
+      ->setName('confirmed')
+      ->setLabel(new TranslatableMarkup('Confirmed'))
+      ->setTargetEntityTypeId('commerce_order_item');
+
+    $fields['mapped_price'] = BundleFieldDefinition::create('mapped_price_data')
+      ->setName('mapped_price')
+      ->setLabel(new TranslatableMarkup('Mapped price'))
+      ->setTargetEntityTypeId('commerce_order_item');
+  }
+
+  return $fields;
+}
+
+/**
+ * Implements hook_entity_bundle_field_info().
+ */
+function contacts_events_entity_bundle_field_info(EntityTypeInterface $entity_type, $bundle, array $base_field_definitions) {
+  $fields = [];
+
+  if ($entity_type->id() == 'commerce_order_item' && $bundle == 'contacts_ticket') {
+    $fields['state'] = BundleFieldDefinition::create('state')
+      ->setLabel(new TranslatableMarkup('State'))
+      ->setDescription(new TranslatableMarkup('The order item state.'))
+      ->setRequired(TRUE)
+      ->setSetting('max_length', 255)
+      ->setSetting('workflow', 'contacts_events_order_item_process')
+      ->setDisplayOptions('view', [
+        'label' => 'hidden',
+        'type' => 'state_transition_form',
+        'weight' => 10,
+      ])
+      ->setDisplayConfigurable('form', TRUE)
+      ->setDisplayConfigurable('view', TRUE);
+
+    $fields['confirmed'] = BundleFieldDefinition::create('timestamp')
+      ->setLabel(new TranslatableMarkup('Confirmed'))
+      ->setDescription(new TranslatableMarkup('The time when the order item was confirmed.'))
+      ->setReadOnly(TRUE)
+      ->setDisplayConfigurable('form', FALSE)
+      ->setDisplayConfigurable('view', TRUE);
+
+    $fields['mapped_price'] = BundleFieldDefinition::create('mapped_price_data')
+      ->setName('mapped_price')
+      ->setTargetEntityTypeId('commerce_order_item')
+      ->setTargetBundle('contacts_ticket')
+      ->setLabel(new TranslatableMarkup('Mapped price'))
+      ->setRequired(TRUE)
+      ->setDisplayOptions('form', ['region' => 'hidden'])
+      ->setDisplayOptions('view', ['region' => 'hidden'])
+      ->setDisplayConfigurable('form', TRUE)
+      ->setDisplayConfigurable('view', TRUE);
+  }
+
+  return $fields;
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert() for commerce_order.
+ */
+function contacts_events_commerce_order_insert(OrderInterface $entity) {
+  if ($entity->bundle() == 'contacts_booking') {
+    if (!$entity->getOrderNumber()) {
+      $number = $entity->get('event')->entity->code->value;
+      if ($number) {
+        $number .= '-';
+      }
+      $number .= str_pad($entity->id(), 8, '0', STR_PAD_LEFT);
+      $entity->setOrderNumber($number);
+      $entity->save();
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update() for contacts_event.
+ *
+ * @todo: See if we can make this not specific to event entities.
+ */
+function contacts_events_contacts_event_update(EventInterface $entity) {
+  \Drupal::service('contacts_events.price_calculator')
+    ->onEntityUpdate($entity, $entity->original);
+}
+
+/**
+ * Implements hook_cron().
+ */
+function contacts_events_cron() {
+  /* @var \Drupal\contacts_events\Cron\CronInterface $cron */
+  $cron = \Drupal::service('contacts_events.cron.recalculate_booking_windows');
+  $cron->invokeOnSchedule();
+}
+
+/**
+ * Implements hook_commerce_checkout_pane_info_alter().
+ */
+function contacts_events_commerce_checkout_pane_info_alter(&$definitions) {
+  if (isset($definitions['billing_information'])) {
+    $definitions['billing_information']['display_label'] = new TranslatableMarkup('Billing address');
+    if (!isset($definitions['billing_information']['review_link'])) {
+      $definitions['billing_information']['review_link'] = new TranslatableMarkup('Manage addresses');
+    }
+  }
+}
+
+/**
+ * Implements hook_field_widget_form_alter().
+ *
+ * Make the date field increment in minutes.
+ */
+function contacts_events_field_widget_form_alter(&$element, FormStateInterface $form_state, $context) {
+  $definition = $context['items']->getFieldDefinition();
+  /* @var \Drupal\Core\Field\FieldDefinitionInterface $definition */
+  if ($definition->getType() == 'daterange' && $definition->getTargetEntityTypeId() == 'contacts_event') {
+    if (isset($element['value']) && $element['value']['#type'] == 'datetime') {
+      $element['value']['#date_increment'] = 60;
+    }
+    if (isset($element['end_value']) && $element['end_value']['#type'] == 'datetime') {
+      $element['end_value']['#date_increment'] = 60;
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_presave() for commerce_order.
+ */
+function contacts_events_commerce_order_presave(EntityInterface $entity) {
+  \Drupal::service('contacts_events.entity_hooks.commerce_order')
+    ->presave($entity);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_access() for commerce_order_item.
+ */
+function contacts_events_commerce_order_item_access(EntityInterface $entity, $operation, AccountInterface $account) {
+  return \Drupal::service('contacts_events.entity_hooks.commerce_order_item')
+    ->access($entity, $operation, $account);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_create_access() for commerce_order_item.
+ */
+function contacts_events_commerce_order_item_create_access(AccountInterface $account, array $context, $entity_bundle) {
+  return \Drupal::service('contacts_events.entity_hooks.commerce_order_item')
+    ->createAccess($entity_bundle, $context, $account);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert() for commerce_payment.
+ */
+function contacts_events_commerce_payment_insert(EntityInterface $entity) {
+  \Drupal::service('contacts_events.entity_hooks.commerce_payment')
+    ->postSave($entity);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update() for commerce_payment.
+ */
+function contacts_events_commerce_payment_update(EntityInterface $entity) {
+  \Drupal::service('contacts_events.entity_hooks.commerce_payment')
+    ->postSave($entity, $entity->original);
+}
+
+/**
+ * Implements hook_views_data_alter().
+ */
+function contacts_events_views_data_alter(array &$data) {
+  $data['commerce_order']['contacts_events_balance'] = [
+    'title' => t('Order balance'),
+    'field' => [
+      'title' => t('Order balance'),
+      'help' => t('Displays the remaining balance for an order.'),
+      'id' => 'contacts_events_balance',
+    ],
+  ];
+
+  $data['commerce_order_item__state']['state_value']['filter']['id'] = 'contacts_state_machine_state';
+}

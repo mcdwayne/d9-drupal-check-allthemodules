@@ -1,0 +1,80 @@
+<?php
+
+/**
+ * @file
+ * Module related hook implementations for the contacts_dbs module.
+ */
+
+use Drupal\Core\Database\Query\SelectInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\contacts_dbs\Entity\DBSStatus;
+use Drupal\Core\Datetime\DrupalDateTime;
+use Drupal\contacts_dbs\Entity\DBSStatusInterface;
+use Drupal\Core\Site\Settings;
+use Drupal\Core\StringTranslation\TranslatableMarkup;
+
+/**
+ * Implements hook_query_TAG_alter() for dbs_status_active.
+ *
+ * All DBS active queries by default should exclude the archived status items.
+ */
+function contacts_dbs_query_dbs_status_active_alter(SelectInterface $query) {
+  $query->condition('archived', FALSE);
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Archive all expired dbs status items.
+ *
+ * @todo: Implement a throttled cron helper to avoid this constant pattern.
+ */
+function contacts_dbs_cron() {
+  // Check that its been a day since last run.
+  $cron_last_run = \Drupal::state()->get('contacts_dbs.cron_last_run');
+  $now = \Drupal::time()->getRequestTime();
+
+  if ($cron_last_run <= $now - 86400) {
+    $expiry = DrupalDateTime::createFromTimestamp($now);
+    // Get all expired status items.
+    $ids = \Drupal::entityQuery('dbs_status')
+      ->condition('expiry', $expiry->format(DBSStatusInterface::DATE_FORMAT), '<')
+      ->condition('status', DBSStatus::getClearedStatuses(), 'IN')
+      ->sort('expiry', 'ASC')
+      ->sort('id', 'DESC')
+      ->execute();
+
+    if (!empty($ids)) {
+      /* @var \Drupal\Core\Queue\QueueInterface $queue */
+      $queue = \Drupal::service('queue')->get('contacts_dbs_archive');
+
+      // Dont attempt to do too many items at once.
+      $batch_size = Settings::get('entity_update_batch_size', 50);
+      foreach (array_chunk($ids, $batch_size) as $queue_set) {
+        $queue->createItem($queue_set);
+      }
+    }
+
+    \Drupal::state()->set('contacts_dbs.cron_last_run', $now);
+  }
+}
+
+/**
+ * Implements hook_entity_operation().
+ */
+function contacts_dbs_entity_operation(EntityInterface $entity) {
+  $operations = [];
+
+  /* @var \Drupal\contacts_dbs\Entity\DBSStatus $entity */
+  // @todo There is no specific archive access check, everything is checked
+  // against the entity admin permission.
+  if ($entity instanceof DBSStatus && $entity->access('archive')) {
+    $operations['archive'] = [
+      'title' => new TranslatableMarkup('Archive'),
+      'weight' => 100,
+      'url' => $entity->toUrl('archive-form'),
+    ];
+  }
+
+  return $operations;
+}
