@@ -1,0 +1,252 @@
+<?php
+
+/**
+ * @file
+ * Inline macro tag processing and rendering API for Drupal.
+ *
+ * @todo Re-add tracking of which entity/field is used where in {inline}.
+ * @todo Confirm deletion of entities/fields that are inlined/embedded elsewhere.
+ * @todo Detect and delete removed inline macros from {inline}.
+ */
+
+use Drupal\inline\MacroInterface;
+
+/**
+ * Returns available macro implementations.
+ *
+ * @return array
+ *   An associative array containing available macro implementations.
+ */
+function inline_get_info() {
+  $implementations = &drupal_static(__FUNCTION__);
+
+  if (!isset($implementations)) {
+    $implementations = module_invoke_all('inline_info');
+    drupal_alter('inline_info', $implementations);
+  }
+  return $implementations;
+}
+
+/**
+ * Implements hook_inline_info().
+ */
+function inline_inline_info() {
+  $info['entity'] = array(
+    'class' => 'Drupal\inline\EntityMacro',
+  );
+  $info['field'] = array(
+    'class' => 'Drupal\inline\FieldMacro',
+  );
+  return $info;
+}
+
+/**
+ * Returns a macro parser instance.
+ *
+ * @return Drupal\inline\Parser\ParserInterface
+ *   The macro parser implementation to use.
+ */
+function inline_get_parser() {
+  $parser = &drupal_static(__FUNCTION__);
+
+  if (!isset($parser)) {
+    $parser_class = variable_get('inline_parser_class', 'Drupal\inline\Parser\DefaultParser');
+    $parser = new $parser_class();
+  }
+  return $parser;
+}
+
+/**
+ * Returns all inline macros in a given string.
+ *
+ * @return array
+ *   An associative array whose keys are the original macros in the string and
+ *   whose values are instances of Drupal\inline\MacroInterface.
+ */
+function inline_get_macros($text) {
+  $parser = inline_get_parser();
+  return $parser->parse($text, inline_get_info());
+}
+
+/**
+ * Return serialized representation for the given macro.
+ *
+ * @param Drupal\inline\MacroInterface $macro
+ *   An inline macro object.
+ *
+ * @return string
+ *   A string containing the serialized representation
+ */
+function inline_macro_serialize(MacroInterface $macro) {
+  $parser = inline_get_parser();
+  return $parser->serialize($macro);
+}
+
+/**
+ * Retrieve macro parameter value formats and validate user values against them.
+ *
+ * @param MacroInterface $macro
+ *   An inline macro object containing user supplied values.
+ * @param array $context
+ *   A context array where macro object is being validated.
+ *
+ * @return bool
+ *   Whether the supplied input is valid (TRUE) or not (FALSE or an error
+ *   message).
+ */
+function inline_macro_validate(MacroInterface $macro, array $context) {
+  // Perform basic validation of tag arguments.
+  $args = $macro->getParameters();
+  foreach ($args as $arg => $info) {
+    // Check if required arguments are set.
+    if (isset($info['#required']) && $info['#required'] && !isset($info['#default_value']) && (!isset($macro->params[$arg]) || $macro->params[$arg] === '')) {
+      return t('Missing argument %arg.', array('%arg' => $arg));
+    }
+    if (isset($macro->params[$arg])) {
+      // Keep only the first value if multiple flag is not set.
+      if ((!isset($info['#multiple']) || !$info['#multiple']) && is_array($macro->params[$arg])) {
+        $macro->params[$arg] = $macro->params[$arg][0];
+      }
+      // Check if supplied arguments are of an expected type.
+      // @todo Use a custom #validate property for this instead.
+      if (isset($info['#datatype'])) {
+        $typecheck = 'is_' . $info['#datatype'];
+        if (!function_exists($typecheck) || !$typecheck($macro->params[$arg])) {
+          return t('Wrong value type supplied for argument %arg.', array('%arg' => $arg));
+        }
+      }
+      // Check for simple enum options.
+      if (isset($info['#allowed_values']) && is_array($info['#allowed_values'])) {
+        $valid_values = array_keys($info['#allowed_values']);
+        if (!in_array($macro->params[$arg], $valid_values)) {
+          return t('Wrong value %value supplied for argument %arg. Allowed values: %allowed_values', array(
+            '%arg' => $arg,
+            '%value' => $macro->params[$arg],
+            '%allowed_values' => implode(', ', $valid_values),
+          ));
+        }
+      }
+    }
+  }
+  // Extended validation check by given module.
+  $module_validation = $macro->validate($context);
+  if (isset($module_validation)) {
+    if (is_string($module_validation)) {
+      return $module_validation;
+    }
+    elseif (is_bool($module_validation)) {
+      return $module_validation;
+    }
+  }
+
+  return TRUE;
+}
+
+/**
+ * Generate HTML for an inline macro.
+ *
+ * @param MacroInterface $macro
+ *   A validated inline macro.
+ *
+ * @return string
+ *   HTML presentation of the user supplied values.
+ */
+function inline_macro_render(MacroInterface $macro, array $context) {
+  // Allow the macro to prepare parameters prior to rendering.
+  $macro->prepareView($context);
+
+  // @todo prepareView() may not be successful; final validation before
+  //   rendering required.
+
+  // Generate a rendered representation for tag replacement.
+  $output = $macro->view($context);
+
+  // If an error occured during rendering, we expect the result to be FALSE.
+  if (!is_bool($output)) {
+    return $output;
+  }
+  else {
+    return '';
+  }
+}
+
+/**
+ * Implements hook_field_attach_view_alter().
+ */
+function inline_field_attach_view_alter(&$output, array $context) {
+  foreach (element_children($output) as $field_name) {
+    $element = &$output[$field_name];
+    if ($element['#field_type'] != 'text_with_summary') {
+      continue;
+    }
+    foreach ($element['#items'] as $delta => $item) {
+      $markup = $element[$delta]['#markup'];
+      foreach (inline_get_macros($markup) as $original => $macro) {
+        $markup = str_replace($original, inline_macro_render($macro, $context), $markup);
+      }
+      $element[$delta]['#markup'] = $markup;
+    }
+  }
+}
+
+/**
+ * Implements hook_field_attach_validate().
+ */
+function inline_field_attach_validate($entity_type, $entity, array &$errors) {
+  $instances = field_info_instances($entity_type, $entity->bundle());
+  $context = array(
+    'entity_type' => $entity_type,
+    'entity' => $entity,
+  );
+  foreach ($instances as $field => $info) {
+    if (isset($info['settings']['text_processing'])) {
+      $items = field_get_items($entity_type, $entity, $info['field_name']);
+      $context['field_name'] = $info['field_name'];
+      $context['instance'] = $info;
+      foreach ($items as $item) {
+        foreach (array('value', 'summary') as $delta) {
+          foreach (inline_get_macros($item[$delta]) as $original => $macro) {
+            // @todo Show the position for the erroneous macro? (Pos: 263) and
+            //   maybe a little context ala patch file?
+            $validation = inline_macro_validate($macro, $context);
+            if ($validation !== TRUE) {
+              $message = 'Inline macro ' . check_plain($original) . ': ' . $validation;
+              $errors[$info['field_name']][LANGUAGE_NOT_SPECIFIED][0][] = array(
+                'error' => 'inline_validation',
+                'message' => $message,
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_view_alter().
+ *
+ * Remove original fields as requested by 'render_original' macro parameter.
+ *
+ * @todo Find some way to move this to FieldMacro class?
+ */
+function inline_entity_view_alter(array &$build, $entity) {
+  if ($entity->entityType() == 'node') {
+    if (isset($entity->inline['remove_fields'])) {
+      foreach ($entity->inline['remove_fields'] as $field_name) {
+        unset($build[$field_name]);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_wysiwyg_include_directory().
+ */
+function inline_wysiwyg_include_directory($type) {
+  switch ($type) {
+    case 'plugins':
+      return $type;
+  }
+}
+
