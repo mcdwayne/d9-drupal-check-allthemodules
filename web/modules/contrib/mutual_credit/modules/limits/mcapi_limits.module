@@ -1,0 +1,189 @@
+<?php
+
+/**
+ * @file
+ * Hook functions for mcapi_limits module.
+ */
+
+use Drupal\Core\Render\BubbleableMetadata;
+use Drupal\mcapi\Entity\Currency;
+use Drupal\mcapi\Entity\Wallet;
+use Drupal\Core\Render\Markup;
+use Drupal\user\Entity\User;
+
+/**
+ * Implements hook_entity_type_alter().
+ *
+ * Append the limits constraint to the transaction constraints
+ */
+function mcapi_limits_entity_type_alter(array &$entity_types) {
+  $constraints = $entity_types['mcapi_transaction']->getConstraints();
+  $constraints['Limits'] = [];
+  $entity_types['mcapi_transaction']
+    ->setConstraints($constraints);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Add the limits section to the currency form.
+ */
+function mcapi_limits_form_mcapi_currency_edit_form_alter(&$form, $form_state) {
+  $form_state->loadInclude('mcapi_limits', 'inc');
+  _mcapi_limits_form_mcapi_currency_edit_form_alter($form, $form_state);
+}
+
+/**
+ * Implements hook_theme().
+ */
+function mcapi_limits_theme($existing, $type, $theme, $path) {
+  return [
+    'mcapi_limits_absolute' => [
+      'template' => 'mcapi_limits_absolute',
+      'variables' => [
+        'currency' => NULL,
+        'wallet' => NULL,
+      ],
+      'file' => 'mcapi_limits.inc',
+    ],
+    'mcapi_limits_relative' => [
+      'template' => 'mcapi_limits_relative',
+      'variables' => [
+        'currency' => NULL,
+        'wallet' => NULL,
+      ],
+      'file' => 'mcapi_limits.inc',
+    ],
+    // Only for exchange currencies.
+    'mcapi_limits_balanced' => [
+      'template' => 'mcapi_limits_balanced',
+      'variables' => [
+        'currency' => NULL,
+        'wallet' => NULL,
+        'size' => '100%',
+      ],
+      'file' => 'mcapi_limits.inc',
+    ],
+  ];
+}
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function mcapi_limits_entity_extra_field_info() {
+  return [
+    'mcapi_wallet' => [
+      'mcapi_wallet' => [
+        'display' => [
+          // Will display differently according to the limits settings.
+          'balance_limits' => [
+            'label' => t('Balance limits'),
+            'description' => t('Trading limits per currency'),
+            'weight' => 0,
+          ],
+        ],
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_view().
+ *
+ * Adds the extra_fields to the wallet view according to the display settings.
+ */
+function mcapi_limits_mcapi_wallet_view(&$build, $wallet, $display, $view_mode) {
+  if ($display->getComponent('balance_limits')) {
+    module_load_include('inc', 'mcapi_limits');
+    $build += mcapi_view_limits($wallet);
+  }
+}
+
+/**
+ * Implements hook_mail().
+ *
+ * Params are currency, exceeded_wallet, partner_wallet, message. Token types
+ * are user current-user, recipient, exceeded-wallet.
+ */
+function mcapi_limits_mail($key, &$message, $params) {
+  $data = [
+    'user' => $params['exceeded_wallet']->getOwner(),
+    'current-user' => User::load(\Drupal::currentUser()->id()),
+    'wallet' => $params['partner_wallet'],
+    'exceeded-wallet' => $params['exceeded_wallet'],
+  ];
+  $message['subject'] = \Drupal::token()->replace($params['subject'], $data);
+  $message['body'][] = str_replace('[user:name]', $params['exceeded_wallet']->getOwner()->getDisplayName(), "Hi [user:name]");
+  $message['body'][] = \Drupal::token()->replace($params['body'], $data);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ *
+ * A transaction is inserted but with balance limit warnings. Print them to
+ * screen and notify the holder of the 'other' wallet(s) by email.
+ *
+ * @temp
+ * @todo make a rules condition BalanceLimitsExceeded
+ */
+function mcapi_limits_mcapi_transaction_insert($transaction) {
+  if (isset($transaction->mailLimitsWarning)) {
+    foreach ($transaction->mailLimitsWarning as $wid => $warnings) {
+      foreach ($warnings as $curr_id => $warning_message) {
+        \Drupal::messenger()->addWarning(Markup::create($warning_message));
+      }
+      // Don't send the mail for now as we don't have the variables to hand.
+      return;
+      $owner = Wallet::load($wid)->getOwner();
+      if ($owner->id() != \Drupal::currentUser()->id()) {
+        $currency = Currency::load($curr_id);
+        \Drupal::service('plugin.manager.mail')->mail(
+          'mcapi_limits',
+          'warning',
+          $owner->getEmail(),
+          $owner->getPreferredLangcode(),
+          [
+            'subject' => $currency->getThirdPartySetting('mcapi_limits', 'warning_mail')['subject'],
+            'body' => t('A new transaction has put you close to your balance limits.'),
+            'exceeded_wallet' => $exceeded_wallet,
+            'partner_wallet' => $partner_wallet,
+            'message' => $message,
+          ]
+        );
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_tokens().
+ *
+ * Adds a new token enabling passing to 2 wallet params to the mail.
+ */
+function mcapi_limits_token_info() {
+  return [
+    'types' => [
+      'exceeded-wallet' => [
+        'name' => t('Exceeded wallet'),
+        'description' => t('The wallet whose limits were exceeded'),
+        'type' => 'mcapi_wallet',
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_tokens().
+ */
+function mcapi_limits_tokens($type, $tokens, array $data, array $options, BubbleableMetadata $bubbleable_metadata) {
+  if ($type == 'exceeded-wallet') {
+    $bubbleable_metadata->addCacheContexts(['mcapi_wallet']);
+    return \Drupal::token()->generate(
+      'wallet',
+      $tokens,
+      ['wallet' => $data['exceeded-wallet']],
+      $options,
+      $bubbleable_metadata
+    );
+  }
+}

@@ -1,0 +1,80 @@
+<?php
+
+namespace Drupal\mcapi_signatures\Controller;
+
+use Drupal\mcapi\Entity\Transaction;
+use Drupal\mcapi\Storage\TransactionStorage;
+use Drupal\user\Entity\User;
+use Drupal\Core\Controller\ControllerBase;
+use Symfony\Component\DependencyInjection\ContainerInterface;
+
+/**
+ * Add a signature from a user who may not be logged in.
+ *
+ * Depends on a token generated in the mcapi_signatures_mail().
+ */
+class RemoteSign extends ControllerBase {
+
+  private $signatures;
+
+
+  /**
+   * Constructor.
+   */
+  public function __construct($signatures) {
+    $this->signatures = $signatures;
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public static function create(ContainerInterface $container) {
+    return new static(
+      $container->get('mcapi.signatures')
+    );
+  }
+
+  /**
+   * Sign the transaction if the hash is correct.
+   *
+   * @param int $serial
+   *   Serial number of a transaction.
+   * @param int $uid
+   *   User ID.
+   * @param string $hash
+   *   Hash which hopefully corresponds to #serial and $uid.
+   */
+  public function sign($serial, $uid, $hash) {
+    if ($hash != mcapi_signature_hash($uid, $serial)) {
+      $this->messenger()->addStatus(t('Invalid link'));
+      return $this->redirect('entity.user.canonical', ['user' => User::load($uid)]);
+    }
+    $account = $this->currentUser();
+    if ($account->isAuthenticated()) {
+      // The current user is already logged in.
+      if ($account->id() != $uid) {
+        user_logout();
+      }
+    }
+    if ($account->isAnonymous()) {
+      $user = User::load($uid);
+      user_login_finalize($user);
+    }
+    $transaction = TransactionStorage::loadBySerial($serial);
+    if ($transaction instanceof Transaction) {
+      if ($this->signatures->setTransaction($transaction)->isWaitingOn($uid)) {
+        $this->signatures->sign($uid);
+        $transaction->save();
+      }
+      else {
+        $this->messenger()->addStatus(t('The signature had already been added.'));
+      }
+      return $this->redirect('entity.mcapi_transaction.canonical', ['mcapi_transaction' => $serial]);
+    }
+    else {
+      $this->messenger->addStatus('Transaction does not exist or has been deleted', 'error');
+    }
+    return $this->redirect('user.page');
+  }
+
+}

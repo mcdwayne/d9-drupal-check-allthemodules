@@ -1,0 +1,152 @@
+<?php
+
+/**
+ * @file
+ * Installation scripts.
+ */
+
+use Drupal\Core\Link;
+use \Drupal\Core\Url;
+use \Drupal\mcapi\Entity\Type;
+
+/**
+ * Implements hook_install().
+ */
+function mcapi_signatures_install() {
+  module_set_weight('mcapi_signatures', 2);
+  mcapi_signatures_configure_types();
+}
+
+/**
+ * Implements hook_modules_installed().
+ */
+function mcapi_signatures_modules_installed($modules) {
+  if (isset($modules['mcapi_signatures']) && !isset($modules['mcapi'])) {
+    \Drupal::messenger()->addStatus(t(
+      "Workflow settings should be reviewed to take account of transaction signing. @link",
+      [
+        '@link' => Link::fromTextAndUrl(
+        'admin/accounting/workflow',
+        Url::fromRoute('mcapi.admin.workflow')
+        ),
+      ]
+    ));
+  }
+}
+
+/**
+ * Implements hook_uninstall().
+ *
+ * @todo ideally we would prevent this module from uninstalling if ANY
+ * transactions were in pending state. Ideally any module providing a
+ * transaction state in use would not be uninstallable.
+ */
+function mcapi_signatures_uninstall() {
+  \Drupal::database()->update('mcapi_transaction')
+    ->fields(['state' => 'done'])
+    ->condition('state', 'pending')
+  // This isn't actually tested.
+    ->execute();
+  \Drupal::entityTypeManager()->getStorage('mcapi_transaction')
+    ->indexRebuild();
+  \Drupal::messenger()->addStatus(t("All pending transactions have been set to 'done'"));
+}
+
+/**
+ * Implements hook_schema().
+ *
+ * Creates a table for storing signatures needed on pending transactions.
+ */
+function mcapi_signatures_schema() {
+  $schema['mcapi_signatures'] = [
+    'description' => 'signatories needed on pending transactions',
+    'fields' => [
+      'serial' => [
+        'description' => 'the transaction to which this entry is attached',
+        'type' => 'varchar',
+        'not null' => TRUE,
+        'length' => 16,
+      ],
+      'uid' => [
+        'description' => 'the uid of the signatory',
+        'type' => 'int',
+        'size' => 'normal',
+        'not null' => TRUE,
+      ],
+      'signed' => [
+        'description' => 'when the signature was added',
+        'type' => 'int',
+        'size' => 'normal',
+        'not null' => FALSE,
+      ],
+    ],
+    'primary key' => ['serial', 'uid'],
+  ];
+  return $schema;
+}
+
+// @todo migrate notification mails from d7
+/*
+$mcapi_signed_off_notify_template = [
+  'subject' =>  t('Transaction signed off'),
+  'body' => t(
+     'The following transaction has been signed off: @token',
+    ['@token' => '[transaction:url]']
+  )
+);
+variable_set(
+  'mcapi_signed_off_notify_template',
+  $mcapi_signed_off_notify_template
+);
+$mcapi_sign_notify_template = [
+  'subject' =>  t('Your signature is required'),
+  'body' => t(
+    'Your signature is required on @token',
+     ['@token' => '[transaction:url]']
+    )
+  )
+];
+variable_set('mcapi_sign_notify_template', $mcapi_sign_notify_template);
+ */
+
+/**
+ * Utility
+ *
+ * Only works with the default database schema.
+ *
+ * @todo make this into a drush command
+ */
+function signature_integrity_check($modify = FALSE) {
+  // Set all pending transactions to completed.
+  \Drupal::database()->update('mcapi_transaction')
+    ->fields(['state' => 1])
+    ->condition('state', 'pending')->execute();
+  // Any transactions with pending signatures should be set back to pending.
+  $pending_serials = \Drupal::database()->select('mcapi_signatures', 's')
+    ->fields('s', ['serial'])
+    ->condition('pending', 1)
+    ->execute()->fetchCol();
+  if (empty($pending_serials)) {
+    return;
+  }
+  \Drupal::database()->update('mcapi_transaction')
+    ->fields(['state' => 'pending'])
+    ->condition('serial', $pending_serials)
+    ->execute();
+}
+
+/**
+ * Add default thirdparty Settings to each transaction type.
+ *
+ * Default transactions will require signatures from the payer AND the payee.
+ */
+function mcapi_signatures_configure_types() {
+  foreach (Type::loadMultiple() as $id => $type) {
+    $type->setThirdPartySetting(
+      'mcapi_signatures',
+      'signatures',
+      ($id == 'default') ? ['payer' => 'payer', 'payee' => 'payee'] : []
+    )
+    ->save();
+  }
+}

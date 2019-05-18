@@ -1,0 +1,1 @@
+google.charts.load("current", {packages:["corechart", "bar", "gauge"]});/* coreChart  is  deprecating, bar is new */

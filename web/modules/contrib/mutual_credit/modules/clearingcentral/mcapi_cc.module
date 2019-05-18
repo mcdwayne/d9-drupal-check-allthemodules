@@ -1,0 +1,328 @@
+<?php
+
+const TRANSACTION_STATE_HANGING = 'hanging';
+const CEN_SUCCESS = 1;//response code
+
+use Drupal\mcapi_cc\ClearingCentral;
+use Drupal\mcapi\Entity\Wallet;
+use Drupal\mcapi\Entity\Transaction;
+use Drupal\Core\Link;
+
+/**
+ * Implements hook_form_wallet_form_alter().
+ *
+ * Add the intertrading settings to designated wallets
+ */
+function mcapi_cc_form_wallet_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state) {
+  $wallet = $form_state->getFormObject()->getEntity();
+  if (!$wallet->system->value) {
+    return;
+  }
+  $used = FALSE;
+  foreach ($wallet->getSummaries() as $summary) {
+    if ($summary['trades']) {
+      $used = TRUE;
+      break;
+    }
+  }
+  $settings = \Drupal::keyValue('clearingcentral')->get($wallet->id());
+
+  $form['clearingcentral'] = [
+    '#title' => t('Clearing Central service'),
+    '#type' => 'details',
+    '#open' => !$used,
+    'curr_id' => [
+      '#title' => t('Currency used for intertrading'),
+      '#type' => 'mcapi_currency_select',
+      '#multiple' => FALSE,
+      '#disabled' => $used,
+      '#default_value' => $settings['curr_id']
+    ],
+    'ex_id' => [
+      '#type' => 'textfield',
+      '#title' => t('Exchange ID'),
+      '#description' => t(
+        'Network Identifier in the Community Exchange Network. For example: cen0123. You can check your account at %link.',
+        ['%link' => Link::fromTextAndUrl(t('Clearing Central'), \Drupal\Core\Url::fromUri(ClearingCentral::CLEARING_CENTRAL_URL))->toString()]
+      ),
+      '#size' => 15,
+      '#maxlength' => 7,
+      '#disabled' => $used,
+      '#default_value' => $settings['login'],
+      '#element_validate' => ['mcapi_cc_exchange_id_validate'],
+      '#weight' => 2
+    ],
+    'ex_pass' => [
+      '#title' => t('Password'),
+      '#type' => 'textfield',
+      '#description' => t('Password of the Community Exchange Network account for this exchange. Leave blank to keep the stored password.'),
+      '#size' => 15,
+      '#disabled' => $used,
+      '#default_value' => $settings['pass'],
+      '#weight' => 3
+    ]
+  ];
+  if (!$used) {
+    $form['actions']['submit']['#submit'][] = 'mcapi_cc_intertrading_wallet_submit';
+  }
+}
+
+/**
+ * Element validation callback for exchange id on clearing central
+ *
+ * Value must be 3 letters then 4 numbers.
+ */
+function mcapi_cc_exchange_id_validate(&$element, $form_state) {
+  if (!preg_match('/[a-zA-Z]{3}[0-9]{4}/', $element['#value'])) {
+    $form_state->setError($element, 'Badly formatted login: '.$element['#value']);
+  }
+}
+
+/**
+ * Additional form submit callback for wallet_form.
+ *
+ * Saves additional settings for intertrading wallets.
+ */
+function mcapi_cc_intertrading_wallet_submit($form, $form_state) {
+  mcapi_cc_save_wallet_settings(
+    $form_state->getFormObject()->getEntity()->id(),
+    $form_state->getValue('curr_id'),
+    $form_state->getValue('ex_id'),
+    $form_state->getValue('ex_pass')
+  );
+}
+
+function mcapi_cc_save_wallet_settings($wid, $curr_id, $ex_id, $ex_pass) {
+  $settings = [
+    'curr_id' => $curr_id,
+    'ex_id' => $ex_id,
+    'ex_pass' => $ex_pass
+  ];
+  \Drupal::keyValue('clearingcentral')
+    ->set($wid, $settings);
+}
+
+/**
+ * Implements hook_entity_type_build().
+ */
+function mcapi_cc_entity_type_build(array &$entity_types) {
+  if (isset($entity_types['mcapi_transaction'])) {
+    $entity_types['mcapi_transaction']
+      ->setFormClass('remote_bill', 'Drupal\mcapi_cc\RemoteTransactionBillForm')
+      ->setFormClass('remote_credit', 'Drupal\mcapi_cc\RemoteTransactionCreditForm');
+  }
+}
+
+/**
+ * Implements mcapi hook_mcapi_form_list().
+ */
+function mcapi_cc_mcapi_form_list() {
+  $forms['remotecredit'] = [
+    'link' => Link::fromTextAndUrl(t('Buy from a remote account'), \Drupal\Core\Url::fromRoute('mcapi_cc.remote.credit', [])),
+    'operations' => []
+  ];
+  $forms['remotebill'] = [
+    'link' => Link::fromTextAndUrl(t('Bill a remote account'), \Drupal\Core\Url::fromRoute('mcapi_cc.remote.bill', [])),
+    'operations' => []
+  ];
+  return $forms;
+}
+
+/**
+ * Implements hook_ENTITY_insert().
+ *
+ * Saves the CC metadata and sends the transaction to clearing central
+ */
+function mcapi_cc_mcapi_transaction_insert($transaction)  {
+  if ($transaction->type->target_id == 'remote') {
+    if (isset($transaction->remote_exchange_id) && isset($transaction->remote_user_id)) {
+      //write the transaction's remote fields
+      \Drupal::database()->insert('mcapi_cc')->fields([
+        'xid' => $transaction->id(),
+        'serial' => $transaction->serial->value,
+        'txid' => $transaction->uuid->value,
+        'remote_exchange_id' => $transaction->remote_exchange_id,
+        'remote_user_id' => $transaction->remote_user_id,
+        'remote_user_name' => $transaction->remote_user_name ?: $transaction->remote_user_id
+      ])->execute();
+    }
+    else {
+      throw new \Exception('Cannot insert remote transaction without remote properties: '.print_r($transaction->toArray(), 1));
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ *
+ * Create an intertrading wallet for every exchange.
+ */
+function mcapi_cc_group_insert($entity) {
+  if ($entity->bundle() == 'exchange') {
+    Wallet::create([
+      'system' => TRUE,
+      'holder' => $entity
+    ])->save();
+  }
+}
+
+/**
+ * Implements hook_ENTITY_load();
+ */
+function mcapi_cc_mcapi_transaction_load($transactions) {
+  foreach ($transactions as $xid => $transaction) {
+    if ($transaction->type->target_id != 'remote') {
+      return;
+    }
+    $extra = \Drupal::database()
+      ->select('mcapi_cc', 't')
+      ->fields('t', ['remote_exchange_id', 'remote_user_id', 'remote_user_name'])
+      ->condition('xid', $transaction->id())
+      ->execute()->fetchAssoc();
+    foreach ($extra as $fieldname => $value) {
+      $transaction->{$fieldname} = $value;
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_view_alter().
+ * rewrite the wallet name when the transaction is viewed
+ */
+function mcapi_cc_mcapi_transaction_view_alter(array &$build, $entity, $display) {
+  if ($entity->getEntityTypeId() == 'mcapi_transaction') {
+    if ($entity->type->target_id == 'remote') {
+      $store = \Drupal::keyValue('clearingcentral');
+      if ($store->get($entity->payer->target_id)) {
+        $build['payer'] = mcapi_cc_wallet_name($entity->payer);
+      }
+      elseif($store->get($entity->payee->target_id))  {
+        $build['payee'] = mcapi_cc_wallet_name($entity->payee);
+      }
+      if ($entity->outgoing && $entity->isNew()) {
+        $build['worth'] = ['#markup' => t(
+          '@num @exchange units',
+          ['@num' => $entity->amount, '@exchange' => $entity->remote_exchange_id]
+        )];
+      }
+    }
+  }
+}
+
+
+/**
+ * Implements hook entity_build_display().
+ *
+ * @param array $build
+ * @param array $context
+ * @see \Drupal\Core\Entity\Entity\EntityViewDisplay::buildMultiple
+ *
+ * @note if the transaction is coming from views it didn't run hook_mcapi_transaction_load()
+ */
+function mcapi_cc_entity_display_build_alter(&$build, $context) {
+  if ($context['entity']->getEntityTypeId() == 'mcapi_transaction') {
+    $transaction = $context['entity'];
+    if ($transaction->type->target_id == 'remote') {
+      $store = \Drupal::keyValue('clearingcentral');
+      if (mcapi_cc_settings($transaction->payer->target_id)) {
+        $build['payer'] = mcapi_cc_wallet_name($transaction->payer);
+      }
+      elseif($store->get($transaction->payee->target_id))  {
+        $build['payee'] = mcapi_cc_wallet_name($transaction->payee);
+      }
+    }
+  }
+}
+
+function mcapi_cc_settings($wid) {
+  return \Drupal::keyValue('clearingcentral')->get($wid);
+}
+
+/**
+ * Get the name of a remote user.
+ *
+ * @param FieldItemList $field_items
+ * @return array[]
+ *   A renderable array
+ */
+function mcapi_cc_wallet_name(Drupal\Core\Field\FieldItemList $field_items) {
+  $transaction = $field_items->getEntity();
+  //the entity may not be fully loaded if we are come via views
+  if (!isset($transaction->remote_user_name) && !$transaction->isNew())  {
+    $transactions = [$transaction];
+    mcapi_cc_mcapi_transaction_load($transactions);
+    $transaction = reset($transactions);
+  }
+  $exchange_name = \Drupal::keyValue('exchangeNames')
+      ->get($transaction->remote_exchange_id) ? : $transaction->remote_exchange_id;
+  return [
+    '#markup' => t(
+      '%name of %exchange',
+      [
+        '%name'  => $transaction->remote_user_name,
+        '%exchange' => $exchange_name
+      ]
+    )
+  ];
+}
+
+/**
+ * Get the Clearing Central service
+ *
+ * @param int $intertrading_wallet_id
+ * @return Drupal\mcapi_cc\ClearingCentral
+ */
+function clearingCentral($intertrading_wallet_id) {
+  $settings = mcapi_cc_settings($intertrading_wallet_id);
+  return \Drupal::service('mcapi_cc.clearing_central')
+    ->init($settings['curr_id'], $settings['login'], $settings['pass']);
+}
+
+/**
+ * Test whether a transaction is intertrading
+ *
+ * @param Transaction $transaction
+ *
+ * @return The exchange of the intertrading wallet, or true if mcapi_exchanges
+ * module is not installed.
+ */
+function is_intertrading_transaction($transaction) {
+  die('is_intertrading_transaction() yet to be written.');
+  foreach (['payer', 'payee'] as $wallet) {
+    if ($transaction->{$wallet}->entity->system->value) {
+      return $entity->getHolder();
+    }
+  }
+}
+
+/**
+ * Get the id of the intertrading wallet for a given exchange.
+ *
+ * If an exchange is specified, that means mcapi_exchanges.module is installed.
+ * Exceptionally, this can't be done with entityQuery because it filters out
+ * intertrading wallets.
+ *
+ * @param int $exchange_id
+ *   The ID of the exchange.
+ *
+ * @todo in the future, intertrading wallets will be identified using config.
+ */
+function intertrading_wallet_id($exchange_id = NULL) {
+  $query = db_select('mcapi_wallet', 'w')
+    ->fields('w', ['wid'])
+    ->condition('system', TRUE);
+  if (\Drupal::moduleHandler()->moduleExists('mcapi_exchanges') && $exchange_id) {
+    // Find the system wallet belonging to the given exchange.
+    // Note this should really be in WalletStorage class
+    $query
+      ->condition('holder_entity_type', 'group')
+      ->condition('holder_entity_id', $exchange_id);
+  }
+  else {
+    // There can be only one and it belongs to user 1
+    $query
+      ->condition('holder_entity_type', 'user')
+      ->condition('holder_entity_id', 1);
+  }
+  return $query->execute()->fetchField();
+}
