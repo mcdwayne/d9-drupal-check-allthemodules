@@ -1,0 +1,189 @@
+<?php
+
+/**
+ * @file
+ * Users related email confirmation module.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\email_confirmer\EmailConfirmationInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Url;
+use Drupal\Component\Utility\Unicode;
+
+/**
+ * Implements hook_ENTITY_TYPE_presave().
+ */
+function email_confirmer_user_user_presave(EntityInterface $entity) {
+  /** @var \Drupal\user\UserInterface $entity */
+  // Do nothing if no user email update, currently in a confirmer operation or
+  // email change confirmation is disabled.
+  if (!isset($entity->original)
+    || drupal_static('email_confirmer_user_' . $entity->id())
+    || ($new_email = $entity->getEmail()) == ($old_email = $entity->original->getEmail())
+    || !($config = \Drupal::config('email_confirmer_user.settings')->get('user_email_change'))
+    || !$config['enabled']) {
+    return;
+  }
+
+  // Accept email change when updated by an admin user.
+  if (\Drupal::currentUser()->hasPermission('email confirmer user bypass email change')) {
+    // Remove any pending email change confirmation on this user.
+    \Drupal::service('user.data')->delete('email_confirmer_user', $entity->id(), 'email_change_new_address');
+    return;
+  }
+
+  // Check for previous confirmations for the new email address.
+  if ($config['consider_existent']
+    && !empty($confirmations = \Drupal::service('email_confirmer')->getConfirmations($new_email, 'confirmed', 0, $config['limit_user_realm'] ? 'email_confirmer_user' : ''))) {
+    // Limit to user's own confirmations.
+    /** @var \Drupal\email_confirmer\EmailConfirmationInterface $confirmation */
+    foreach ($confirmations as $confirmation) {
+      if ($confirmation->uid->target_id == $entity->id()) {
+        return;
+      }
+    }
+  }
+
+  // Save the new email on user data space.
+  \Drupal::service('user.data')->set('email_confirmer_user', $entity->id(), 'email_change_new_address', $new_email);
+  // Restore original email address.
+  $entity->setEmail($old_email);
+  // Launch the confirmation for the new email address.
+  $confirmation = \Drupal::service('email_confirmer')->createConfirmation($new_email);
+  $confirmation->setRealm('email_confirmer_user')
+    ->setProperty('user', $entity->id())
+    ->setPrivate()
+    ->setResponseUrl($entity->toUrl('edit-form'), 'confirm')
+    ->sendRequest();
+  $confirmation->save();
+  drupal_set_message(t('A message has been sent to the new email address %email to confirm the change. Until confirmed, your current address will be used.', ['%email' => $new_email]));
+
+  // Send notification to the current email address.
+  if ($config['notify_current']) {
+    \Drupal::service('plugin.manager.mail')->mail('email_confirmer_user',
+      'notify_current',
+      (Unicode::substr(PHP_OS, 0, 3) == 'WIN') ? $old_email : '"' . addslashes(Unicode::mimeHeaderEncode(\Drupal::config('system.site')->get('name'))) . '" <' . $old_email . '>',
+      \Drupal::languageManager()->getDefaultLanguage()->getId(),
+      ['context' => ['email_confirmer_confirmation' => $confirmation, 'user' => $entity]]);
+  }
+}
+
+/**
+ * Implements hook_email_confirmer().
+ */
+function email_confirmer_user_email_confirmer($op, EmailConfirmationInterface $confirmation) {
+  /** @var \Drupal\user\UserInterface $user */
+  if ($confirmation->getRealm() == 'email_confirmer_user'
+    && ($config = \Drupal::config('email_confirmer_user.settings')->get('user_email_change'))
+    && $config['enabled']
+    && ($user_id = $confirmation->getProperty('user'))
+    && ($new_email = \Drupal::service('user.data')->get('email_confirmer_user', $user_id, 'email_change_new_address'))
+    && $new_email == $confirmation->getEmail()
+    && ($user = \Drupal::entityTypeManager()->getStorage('user')->load($user_id))) {
+    // Delete the requested new email from user data.
+    \Drupal::service('user.data')->delete('email_confirmer_user', $user_id, 'email_change_new_address');
+
+    switch ($op) {
+      case 'confirm':
+        // User's email address must be unique on the site.
+        if (user_load_by_mail($new_email)) {
+          drupal_set_message(t('The email address %value is already taken.', ['%value' => $new_email]), 'error');
+          break;
+        }
+
+        $user->setEmail($new_email);
+        // Prevents from cycling email change confirmation.
+        drupal_static('email_confirmer_user_' . $user_id, TRUE);
+        $user->save();
+        drupal_set_message(\Drupal::currentUser()->id() == $user_id
+          ? t('Your email address has been updated to %mail', ['%mail' => $new_email])
+          : t("%user's email address has been updated to %mail", ['%user' => $user->getDisplayName(), '%mail' => $new_email]));
+        break;
+
+      case 'cancel':
+        \Drupal::logger('email_confirmer_user')->warning('Requested user email change for %user has been rejected by the %mail email address owner.', ['%user' => $user->getDisplayName(), '%mail' => $new_email]);
+        break;
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function email_confirmer_user_form_user_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $config = \Drupal::config('email_confirmer_user.settings')->get('user_email_change');
+  /** @var \Drupal\user\UserInterface $user */
+  $user = $form_state->getFormObject()->getEntity();
+
+  // Nothing to do with new accounts.
+  if ($user->isNew()) {
+    return;
+  }
+
+  // Tell the user about email changes pending confirmation.
+  /** @var \Drupal\email_confirmer\EmailConfirmationInterface $confirmation */
+  if ($config['enabled']
+    && ($new_email = \Drupal::service('user.data')->get('email_confirmer_user', $user->id(), 'email_change_new_address'))
+    && !empty($confirmations = \Drupal::service('email_confirmer')->getConfirmations($new_email, 'pending', 0, 'email_confirmer_user'))) {
+    foreach ($confirmations as $confirmation) {
+      if ($confirmation->uid->target_id == $user->id()) {
+        $confirmation_url = Url::fromRoute('entity.email_confirmer_confirmation.resend', ['confirmation' => $confirmation->id()], ['query' => \Drupal::destination()->getAsArray()])->toString();
+        $form['account']['mail']['#description'] = t(
+          '<strong>An update of your email address to %mail is pending of confirmation</strong>. <a href=":resend_url">Resend confirmation email</a> or <a href=":cancel_url">cancel the pending change</a>.',
+          [
+            '%mail' => $new_email,
+            ':resend_url' => $confirmation_url,
+            ':cancel_url' => Url::fromRoute('entity.user.cancel_email_change', ['user' => $user->id()])->toString(),
+          ]
+        ) . ' ' . $form['account']['mail']['#description'];
+        break;
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_user_login().
+ */
+function email_confirmer_user_user_login($account) {
+  $config = \Drupal::config('email_confirmer_user.settings')->get('user_login');
+
+  // Register a confirmed email confirmation for new created accounts on their
+  // first access or when a user logins through a one time login link.
+  /** @var \Drupal\Core\Session\AccountInterface $account */
+  if (((!$account->getLastAccessedTime() && $config['sync_core_confirmation'])
+      || (\Drupal::routeMatch()->getRouteName() == 'user.reset.login' && $config['sync_core_onetimeloginlinks']))
+    && !\Drupal::service('email_confirmer')->getConfirmation($account->getEmail(), 'confirmed')) {
+    \Drupal::entityTypeManager()->getStorage('email_confirmer_confirmation')->create([
+      'email' => $account->getEmail(),
+      'realm' => 'email_confirmer_user',
+      'sent' => REQUEST_TIME,
+      'confirmed' => EmailConfirmationInterface::CONFIRMED,
+    ])->save();
+  }
+}
+
+/**
+ * Implements hook_mail().
+ */
+function email_confirmer_user_mail($key, &$message, $params) {
+  switch ($key) {
+    case 'notify_current':
+      $context = $params['context'];
+
+      // @todo recipient name?
+      $message['to'] = $context['user']->getEmail();
+      $message['subject'] = \Drupal::token()->replace(t('Email change request for your user account at [site:name]'), $context, ['sanitize' => FALSE]);
+      $message['body'][] = \Drupal::token()->replace(t('A request to change your email address has been made at [site:name]. In order to confirm the update of your email address you will need to follow the instructions sent to your new email address.'), $context, ['sanitize' => FALSE]);
+      break;
+  }
+}
+
+/**
+ * Implements hook_entity_type_alter().
+ */
+function email_confirmer_user_entity_type_alter(array &$entity_types) {
+  /** @var \Drupal\Core\Entity\EntityTypeInterface[] $entity_types */
+  $entity_types['user']->setFormClass('cancel_email_change', '\Drupal\email_confirmer_user\Form\UserEmailChangeCancelForm');
+}
