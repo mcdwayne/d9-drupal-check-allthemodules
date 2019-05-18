@@ -1,0 +1,269 @@
+<?php
+
+use Drupal\getresponse\Service\Api;
+
+/**
+ * Implements hook_menu().
+ */
+function getresponse_menu()
+{
+    $items['getresponse']        = [
+        'title'      => 'GetResponse',
+        'route_name' => 'getresponse.settings_form',
+    ];
+    $items['getresponse/config'] = [
+        'title'      => 'Getresponse Configuration',
+        'route_name' => 'getresponse.settings_form',
+    ];
+
+    return $items;
+}
+
+/**
+ * @param array $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+function getresponse_form_comment_form_alter(&$form, &$form_state)
+{
+    if (\Drupal::config('getresponse.settings')->get('comment_on') == 1) {
+
+        if (\Drupal::currentUser()->isAnonymous()) {
+            $form['mail'] = ['#type' => 'textfield', '#title' => 'E-mail'];
+        }
+
+        $text                                 = \Drupal::config('getresponse.settings')->get('comment_label');
+        $form['getresponse_comment_checkbox'] = ['#type' => 'checkbox', '#title' => $text];
+
+        $input = $form_state->getUserInput();
+
+        if (!empty($input) && isset($input['getresponse_comment_checkbox']) && $input['getresponse_comment_checkbox'] == 1) {
+            if (!empty($input['mail'])) {
+                $email = $input['mail'];
+                $name = $input['name'];
+            } else if (!\Drupal::currentUser()->isAnonymous()) {
+                $email = \Drupal::currentUser()->getEmail();
+                $name = \Drupal::currentUser()->getDisplayName();
+                $name = (strlen($name) < 3) ? null : $name;
+            }
+
+            if (empty($email)) {
+                return;
+            }
+
+            $api_key = \Drupal::config('getresponse.settings')->get('api_key');
+            $domain  = \Drupal::config('getresponse.settings')->get('domain');
+            $api_url = \Drupal::config('getresponse.settings')->get('api_url');
+            $api     = new Api($api_key, $api_url, $domain);
+
+            $data = [
+                'email'             => $email,
+                'campaign'          => [
+                    'campaignId' => \Drupal::config('getresponse.settings')->get('comment_campaign')
+                ],
+                'customFieldValues' => [
+                    [
+                        'customFieldId' => getresponse_get_origin_custom_id($api_key, $api_url, $domain),
+                        'value'         => ['drupal']
+                    ]
+                ]
+            ];
+
+            if (!empty($name)) {
+                $data['name'] = $name;
+            }
+
+            $api->addContact($data);
+        }
+    }
+}
+
+/**
+ * @param string $api_key
+ * @param string $api_url
+ * @param string $domain
+ *
+ * @return string
+ */
+function getresponse_get_origin_custom_id($api_key, $api_url, $domain)
+{
+    $api = new Api($api_key, $api_url, $domain);
+
+    $custom = end($api->getCustomFields(['fields' => 'name', 'query[name]' => 'origin']));
+
+    if (!isset($custom->customFieldId)) {
+        $custom = $api->setCustomField([
+            'name'   => 'origin',
+            'hidden' => false,
+            'type'   => 'text',
+            'value'  => ['drupal']
+        ]);
+    }
+
+    return $custom->customFieldId;
+}
+
+/**
+ * @param array $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+function getresponse_form_user_register_form_alter(&$form, &$form_state)
+{
+    if (\Drupal::config('getresponse.settings')->get('register_user') == 1) {
+        $text                                  = \Drupal::config('getresponse.settings')->get('register_label');
+        $form['getresponse_register_checkbox'] = ['#type' => 'checkbox', '#title' => $text];
+
+        $input = $form_state->getUserInput();
+
+        if (!empty($input) && isset($input['getresponse_register_checkbox']) && $input['getresponse_register_checkbox'] == 1) {
+            $api_key = \Drupal::config('getresponse.settings')->get('api_key');
+            $api_url = \Drupal::config('getresponse.settings')->get('api_url');
+            $domain  = \Drupal::config('getresponse.settings')->get('domain');
+
+            $api = new Api($api_key, $api_url, $domain);
+            $api->addContact([
+                'name'              => $input['name'],
+                'email'             => $input['mail'],
+                'campaign'          => [
+                    'campaignId' => \Drupal::config('getresponse.settings')->get('register_campaign')
+                ],
+                'customFieldValues' => [
+                    [
+                        'customFieldId' => getresponse_get_origin_custom_id($api_key, $api_url, $domain),
+                        'value'         => ['drupal']
+                    ]
+                ]
+            ]);
+        }
+    }
+}
+
+/**
+ * Returns all GetResponse lists (campaigns) for a given key. Lists are cached.
+ *
+ * @param array $list_ids
+ *   An array of list IDs to filter the results by.
+ * @param bool $reset
+ *   Force a cache reset.
+ *
+ * @return array
+ *   An array of list data arrays.
+ */
+function getresponse_get_lists($list_ids = array(), $reset = FALSE) {
+  $lists = array();
+  $cache = \Drupal::cache('getresponse');
+  $cached_data = $reset ? NULL : $cache->get('lists');
+
+  // Return cached lists.
+  if ($cached_data && $cached_data->data) {
+    $lists = $cached_data->data;
+  }
+  else {
+    try {
+      $api_key = \Drupal::config('getresponse.settings')->get('api_key');
+      $api = new Api($api_key);
+      $result = $api->getCampaigns();
+
+      foreach ($result as $list) {
+        $lists[$list->campaignId] = $list;
+      }
+
+      uasort($lists, '_getresponse_list_cmp');
+
+      $cache->set('lists', $lists);
+    }
+    catch (Exception $e) {
+      \Drupal::logger('getresponse')->error('An error occurred requesting list information from GetResponse. "{message}"', array(
+        'message' => $e->getMessage()));
+    }
+  }
+
+  // Filter by given IDs.
+  if (!empty($list_ids)) {
+    $filtered_lists = array();
+
+    foreach ($list_ids as $id) {
+      if (array_key_exists($id, $lists)) {
+        $filtered_lists[$id] = $lists[$id];
+      }
+    }
+
+    return $filtered_lists;
+  }
+  else {
+    return $lists;
+  }
+}
+
+/**
+ * Returns all GetResponse custom fields. Fields are cached.
+ *
+ * @param array $field_ids
+ *   (Optional) An array of field IDs to filter the results by.
+ * @param bool $reset
+ *   Force a cache reset.
+ *
+ * @return array
+ *   An array of custom field data arrays.
+ */
+function getresponse_get_custom_fields($field_ids = array(), $reset = FALSE) {
+  $fields = array();
+  $cache = \Drupal::cache('getresponse');
+  $cached_data = $reset ? NULL : $cache->get('custom_fields');
+  if ($cached_data && $cached_data->data) {
+    $fields = $cached_data->data;
+  }
+  else {
+    try {
+      $api_key = \Drupal::config('getresponse.settings')->get('api_key');
+      $api = new Api($api_key);
+      $result = $api->getCustomFields();
+
+      foreach ($result as $field) {
+        $fields[$field->customFieldId] = $field;
+      }
+
+      uasort($fields, '_getresponse_list_cmp');
+
+      $cache->set('custom_fields', $fields);
+    }
+    catch (Exception $e) {
+      \Drupal::logger('getresponse')->error('An error occurred requesting custom fields from GetResponse. "{message}"', array(
+        'message' => $e->getMessage()));
+    }
+  }
+
+  // Filter by given IDs.
+  if (!empty($field_ids)) {
+    $filtered = array();
+
+    foreach ($field_ids as $id) {
+      if (array_key_exists($id, $fields)) {
+        $filtered[$id] = $fields[$id];
+      }
+    }
+
+    return $filtered;
+  }
+  else {
+    return $fields;
+  }
+}
+
+/**
+ * Helper function used by uasort() to sort lists alphabetically by name.
+ *
+ * @param array $a
+ *   An array representing the first list.
+ * @param array $b
+ *   An array representing the second list.
+ *
+ * @return int
+ *   One of the values -1, 0, 1
+ */
+function _getresponse_list_cmp($a, $b) {
+  if ($a->name == $b->name) {
+    return 0;
+  }
+
+  return ($a->name < $b->name) ? -1 : 1;
+}
