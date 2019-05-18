@@ -1,0 +1,524 @@
+<?php
+/**
+ * @file
+ * Contains abookings.module.
+ */
+
+/**
+ * CONTENTS
+ *
+ * abookings_help()
+ * abookings_theme()
+ * booking_form_validate()
+ * validate_promo()
+ * create_promo_line_item()
+ * submission_apply_promotion()
+ * abookings_node_form_submit()
+ * abookings_mail()
+ * abookings_cron()
+ * check_provisional_bookings()
+ * expire_booking()
+ * check_confirmed_bookings()
+ * complete_booking()
+ * // abookings_entity_update()
+ * attach_booking_data()
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\node\Entity\Node;
+
+use Drupal\Core\Mail\MailManagerInterface;
+use Drupal\Component\Utility\SafeMarkup;
+use Drupal\Component\Utility\Html;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Datetime\DrupalDateTime;
+
+use Symfony\Component\HttpKernel\Exception\BadRequestHttpException;
+
+module_load_include('inc', 'abookings', 'includes/emails');
+module_load_include('inc', 'abookings', 'includes/template_codes');
+module_load_include('inc', 'abookings', 'includes/queries');
+
+
+
+/**
+ * Implements hook_help().
+ */
+function abookings_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the abookings module.
+    case 'help.page.abookings':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Booking system for guest-houses and other accommodation with rooms.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+
+
+/**
+ * Implements hook_theme().
+ */
+function abookings_theme() {
+  return [
+    'abookings' => [
+      'template' => 'abookings',
+      'render element' => 'children',
+    ],
+  ];
+}
+
+
+
+/**
+ * Form validation handler for booking node forms. Only used for booking nodes.
+ */
+function booking_form_validate($form, FormStateInterface &$form_state) {
+  // kint('booking_form_validate()');
+  // kint($form, '$form');
+  // kint($form_state, '$form_state');
+
+  $booking = $form_state->getFormObject()->getEntity();
+  // kint($booking, '$booking');
+
+  // Validate promotion
+
+  $promo_code_provided = $form_state->getValue('field_promo_code_provided')[0]['value'];
+  $checkin_date = $form_state->getValue('field_checkin_date')[0]['value'];
+  $nights = $form_state->getValue('field_num_nights')[0]['value'];
+
+  $current_promo = $booking->get('field_promo_code_provided')->getValue()[0];
+
+  if ($promo_code_provided && empty($current_promo)) {
+    validate_promo($form_state, $promo_code_provided, $checkin_date, $nights);
+  }
+
+  $bookable_nid_val = $form_state->getValue('field_bookable_unit');
+  // kint($bookable_nid_val, '$bookable_nid_val');
+  if (! $bookable_nid_val) {
+    $message = t('A bookable unit was not selected. Please select a bookable.');
+    $form_state->setErrorByName('field_bookable_unit', $message);
+    return NULL;
+  }
+  $bookable = NULL;
+  if (in_array('target_id', $bookable_nid_val[0])) {
+    $bookable_nid = $bookable_nid_val[0]['target_id'];
+    $bookable = node_load($bookable_nid);
+  }
+
+  // If booking was confirmed
+
+  $previous_booking_status = $booking->get('field_booking_status')->getValue()[0]['value'];
+  // kint($previous_booking_status, '$previous_booking_status');
+
+  // Save previous booking status, since the field value above will change after _validate().
+  $form_state->set('previous_booking_status', $previous_booking_status);
+
+  $submitted_booking_status = $form_state->getValue('field_booking_status')[0]['value'];
+  // kint($submitted_booking_status, '$submitted_booking_status');
+}
+
+
+
+/**
+ * Form submission validation for promotion nodes.
+ */
+function validate_promo($form_state, $promo_code_provided, $checkin_date, $nights) {
+  $promo;
+  try {
+    $promo = get_promo($promo_code_provided, $checkin_date, $nights);
+  }
+  catch (BadRequestHttpException $e) {
+    // kint($promo, '$promo');
+    $message = t("Promo code `%promo_code_provided` has error: %error.",
+      ['%promo_code_provided' => $promo_code_provided,
+      '%error' => $e->getMessage()]);
+    // throw new Exception($message, 1);
+    $form_state->setErrorByName('abookings', $message);
+  }
+
+  if (! $promo) {
+    $message = t("Promo code `%promo_code_provided` is not a valid promo code.", ['%promo_code_provided' => $promo_code_provided]);
+    // throw new Exception($message);
+    $form_state->setErrorByName('abookings', $message);
+    return NULL;
+  }
+
+
+  // submission_apply_promotion($promo, $form_state);
+
+  $discount_percentage = floatval(
+    $promo->get('field_promo_discount')->getValue()[0]['value']);
+  // kint($discount_percentage, '$discount_percentage');
+  $booking_total = floatval($form_state->getValue('field_base_cost')[0]['value']);
+  // kint($booking_total, '$booking_total');
+  $discount = $booking_total * ($discount_percentage / 100) . "";
+  // kint($discount, '$discount');
+  $booking = $form_state->getFormObject()->getEntity();
+  // kint($booking, '$booking');
+  $promo = create_promo_line_item($promo_code_provided, $discount, $booking, $checkin_date);
+  $promo->save();
+}
+
+
+
+function create_promo_line_item($code, $amount, $booking, $date) {
+  // kint($code, '$code');
+  // kint($booking, '$booking');
+  // kint($date, '$date');
+
+  // Create node object with attached file.
+  $promo = Node::create([
+    'type'                      => 'line_item',
+    'title'                     => 'Promo ' . $code . '-' . $booking->getTitle(),
+    'field_type'                => 'promotion',
+    'field_amount'              => $amount,
+    'field_booking'             => $booking,
+    'field_date'                => $date->format('Y-m-d H:i:s'),
+  ]);
+  // kint($promo, '$promo');
+  return $promo;
+}
+
+
+
+/**
+ * Applies a promotion's discount to the total cost of a new booking.
+ *
+ * @param \Drupal\node\Entity\Node $promo
+ *   The promotion node that whose discount should be applied.
+ * @param FormStateInterface $form_state
+ *   The booking form submission that should have its total cost discounted.
+ */
+function submission_apply_promotion($promo, FormStateInterface &$form_state) {
+  // Apply promotion
+
+  if (! $promo) {
+    throw new InvalidArgumentException("Parameter `promo`, " . $promo . ", needs to be a node.", 1);
+  }
+
+  $discount = floatval($promo->get('field_promo_discount')->getValue()[0]['value']);
+  // kint($discount, '$discount');
+  $booking_total = floatval($form_state->getValue('field_base_cost')[0]['value']);
+  // kint($booking_total, '$booking_total');
+  $new_total = $booking_total * (100 - $discount) / 100 . "";
+  // kint($new_total, '$new_total');
+  $form_state->setValue('field_base_cost', [[
+    'value' => $booking_total * (100 - $discount) / 100,
+  ]]);
+  // $form_state->setValueForElement($form['field_base_cost'], $new_total);
+  // kint($form_state, '$form_state');
+}
+
+
+
+/**
+ * Form submission handler for node forms. Only used for booking nodes.
+ */
+function abookings_node_form_submit($form, FormStateInterface &$form_state) {
+  // kint($form, '$form');
+  // kint($form_state, '$form_state');
+
+  $booking = $form_state->getFormObject()->getEntity();
+  // kint($booking, '$booking');
+
+  $bookable_nid = $form_state->getValue('field_bookable_unit')[0]['target_id'];
+
+  $bookable = node_load($bookable_nid);
+
+  $amount_due = get_booking_costs($booking)['amount_due'];
+  // kint($amount_due, '$amount_due');
+  // $form_state->setValue('field_amount_due', $amount_due);
+  $booking->set('field_amount_due', $amount_due);
+  $booking->save();
+
+
+  // $previous_booking_status = $booking->get('field_booking_status')->getValue()[0]['value'];
+  $previous_booking_status = $form_state->get('previous_booking_status');
+  // kint($previous_booking_status, '$previous_booking_status');
+  $submitted_booking_status = $form_state->getValue('field_booking_status')[0]['value'];
+  // kint($submitted_booking_status, '$submitted_booking_status');
+
+  $status_email_send = $form_state->getValue('status_email_send');
+  // kint($status_email_send, '$status_email_send');
+
+  if ( $previous_booking_status  == 'expired'
+    && $submitted_booking_status != 'expired') {
+    $dateTime = new DrupalDateTime();
+    // kint($dateTime, '$dateTime');
+    $form_state->setValue('created', [[$dateTime]]);
+  }
+
+  if (($status_email_send === 'send')
+    && ($previous_booking_status !== $submitted_booking_status)) {
+    switch ($submitted_booking_status) {
+      case 'provisional':
+        send_provis_booking_email($booking, $bookable);
+        break;
+
+      case 'expired':
+        send_expired_booking_email($booking, $bookable);
+        break;
+
+      case 'confirmed':
+        send_confirmation_email($booking, $bookable);
+        break;
+
+      case 'cancelled':
+        // @todo Set up a generic notice email perhaps?
+        // Could have been cancelled by guest or owner...
+        log_event_to_history($booking, 'other', 'Booking cancelled');
+        break;
+
+      case 'completed':
+        send_completed_booking_email($booking, $bookable);
+        break;
+    }
+  }
+}
+
+
+
+/**
+* Implements hook_mail().
+*
+* Provides a 'from' email address, subject, and body for booking emails.
+*/
+function abookings_mail($key, &$message, $params) {
+  // kint($key, '$key');
+  // kint($message, '$message');
+  // kint($params, '$params');
+
+  $options = array(
+    'langcode' => $message['langcode'],
+  );
+  switch ($key) {
+    case 'provisional_booking_guest':
+    case 'expired_booking_guest':
+    case 'booking_feedback_guest':
+    case 'deposit_reminder_guest':
+    case 'confirmed_booking_guest':
+      $message['from'] = \Drupal::config('system.site')->get('mail');
+      $message['subject'] = t('@subject', array('@subject' => $params['subject']), $options);
+      $message['body'][] = Html::escape($params['body']);
+      break;
+  }
+}
+
+
+/**
+ * Implements hook_cron().
+ *
+ * Triggers checks on provisional and confirmed bookings.
+ */
+function abookings_cron() {
+  // kint('abookings_cron()');
+  check_provisional_bookings();
+  check_confirmed_bookings();
+}
+
+
+
+/**
+ * Checks if provisional bookings should be reminded about or expired.
+ */
+function check_provisional_bookings() {
+  // Fetch all bookings that have a status of 'provisional'
+  $results = get_bookings('provisional');
+
+  // Loop through them
+  foreach ($results as $rid => $nid) {
+    $booking = node_load($nid);
+    $booking_time = $booking->getCreatedTime(); // string timestamp
+    // kint($booking_time, '$booking_time');
+
+    $bookable_nid = $booking->get('field_bookable_unit')->getValue()[0]['target_id'];
+    $bookable = node_load($bookable_nid);
+
+    $deposit_email_sent = $booking->get('field_reminder_sent_deposit')->getValue()[0]['value'];
+
+    if (! $deposit_email_sent) {
+
+      // If "reminder hours" have passed, send reminder email.
+
+      $deposit_reminder_hours = \Drupal::config('abookings.bookingsettings')->get('deposit_reminder_hours');
+      $deposit_due_timestamp = intval($booking_time) + ($deposit_reminder_hours * 60 * 60);
+      // kint((time() - $deposit_due_timestamp) / 60 / 60, 'deposit_reminder_hours hours ago');
+
+      // If current time exceeds (created time + deposit reminder hours as seconds)
+      if (time() > $deposit_due_timestamp) {
+        send_reminder_email($booking, $bookable);
+
+        $booking->set('field_reminder_sent_deposit', TRUE);
+        $booking->save();
+      }
+    }
+
+    // If "deposit hours" have passed, expire the booking.
+
+    $deposit_hours = \Drupal::config('abookings.bookingsettings')->get('deposit_hours');
+    $deposit_reminder_timestamp = intval($booking_time) + ($deposit_hours * 60 * 60);
+    // kint((time() - $deposit_reminder_timestamp) / 60 / 60, 'deposit_due_timestamp hours ago');
+
+    // If current time exceeds (created time + deposit hours as seconds)
+    if (time() > $deposit_reminder_timestamp) {
+      expire_booking($booking, $bookable);
+    }
+  }
+}
+
+
+
+/**
+ * Sends emails to notify guest and owner about expired booking, then sets the booking status to expired.
+ *
+ * @param \Drupal\node\Entity\Node $booking
+ *   The booking that has expired
+ * @param \Drupal\node\Entity\Node $bookable
+ *   The bookable unit that the booking is for
+ */
+function expire_booking($booking, $bookable) {
+
+  // Send expire email to guest
+  send_expired_booking_email($booking, $bookable);
+
+  // Set booking status to expired
+
+  $booking->set('field_booking_status', 'expired');
+  $booking->save();
+
+  \Drupal::logger('abookings')->notice('Booking with ID %id expired.',
+    array('%type' => $booking->getEntityTypeId(), '%id' => $booking->id()));
+}
+
+
+
+/**
+ * Checks if confirmed bookings have passed their check-out date and time, and if so, completes them.
+ */
+function check_confirmed_bookings() {
+  // kint('check_confirmed_bookings()');
+
+  // Fetch all bookings that have a status of 'confirmed'
+  $results = get_bookings('confirmed');
+
+  // Loop through them
+  foreach ($results as $rid => $nid) {
+    $booking = node_load($nid);
+
+    $bookable_nid = $booking->get('field_bookable_unit')->getValue()[0]['target_id'];
+    $bookable = node_load($bookable_nid);
+
+    $checkout_date = $booking->get('field_checkout_date')->getValue()[0]['value'];
+    // kint($checkout_date, '$checkout_date');
+    $checkout_time = $bookable->get('field_checkout_time')->getValue()[0]['value'];
+    // kint($checkout_time, '$checkout_time');
+
+    $checkin_date = $booking->get('field_checkin_date')->getValue()[0]['value'];
+    // kint($checkout_date, '$checkout_date');
+    $checkin_time = $bookable->get('field_checkin_time')->getValue()[0]['value'];
+    // kint($checkout_time, '$checkout_time');
+
+
+    // If within the pre-arrival hours, send pre-arrival email
+
+    $prearrival_hours = \Drupal::config('abookings.bookingsettings')->get('prearrival_hours');
+    // kint($prearrival_hours, '$prearrival_hours');
+    $checkin_timestamp = \Drupal\Core\Datetime\DrupalDateTime
+      ::createFromFormat('Y-m-d:H:i', $checkin_date . ':' . $checkin_time)->format('U');
+    // kint($checkin_timestamp, '$checkin_timestamp');
+    $prearrival_timestamp = intval($checkin_timestamp) - ($prearrival_hours * 60 * 60);
+    // kint($prearrival_timestamp, '$prearrival_timestamp');
+
+
+    $prearrival_sent = search_history($booking, 'Pre-arrival info');
+    // If current time exceeds (prearrival hours before check-in time)
+    if (time() > $prearrival_timestamp && ! $prearrival_sent) {
+      // kint('Sending prearrival email');
+      send_prearrival_email($booking, $bookable);
+    }
+
+
+    // If past checkout time, complete the booking process
+
+    $checkout_date_timestamp = \Drupal\Core\Datetime\DrupalDateTime
+      ::createFromFormat('Y-m-d:H:i', $checkout_date . ':' . $checkout_time)->format('U');
+    // kint($checkout_date_timestamp, '$checkout_date_timestamp');
+
+    // If current time exceeds check-out date + time
+    if (time() > $checkout_date_timestamp) {
+      complete_booking($booking, $bookable);
+    }
+  }
+}
+
+
+
+/**
+ * Performs cleanup for a booking that has just been completed.
+ *
+ * Sends emails to get feedback from guest and to notify owner about completed booking, then sets the booking status to completed.
+ *
+ * @param \Drupal\node\Entity\Node $booking
+ *   The booking that has completed
+ * @param \Drupal\node\Entity\Node $bookable
+ *   The bookable unit that the booking is for
+ */
+function complete_booking($booking, $bookable) {
+
+  send_completed_booking_email($booking, $bookable);
+
+  // Change status to completed
+
+  $booking->set('field_booking_status', 'completed');
+  $booking->save();
+}
+
+
+
+/**
+ * Implements hook_entity_update().
+ */
+// function abookings_entity_update(Drupal\Core\Entity\EntityInterface $entity) {
+
+//   if ($entity->getEntityTypeId() !== 'node') {
+//     return NULL;
+//   }
+
+//   switch ($entity->bundle()) {
+//     case 'booking':
+//       kint($entity, '$entity');
+
+//       break;
+//   }
+// }
+
+
+/**
+ * Provides booking-related data needed by JS to any renderable object (such as a form).
+ */
+function attach_booking_data(&$renderable) {
+  $renderable['#attached']['drupalSettings'] = [
+    'seasons' => get_seasons_data(),
+    'bookings' => get_bookings_data(),
+  ];
+
+  // Get the URL of the site that will store the bookings. If not defined, use this site.
+  $booking_settings = \Drupal::config('abookings.bookingsettings');
+  $backend_url = $booking_settings->get('backend_url');
+  if (! $backend_url) {
+    global $base_url;
+    $backend_url = $base_url;
+  }
+
+  $renderable['#attached']['drupalSettings']['booking_settings'] = [
+    'backend_url' => $backend_url,
+  ];
+
+  $renderable['#attached']['drupalSettings']['route'] = [
+    'name' => \Drupal::routeMatch()->getRouteName(),
+  ];
+}
