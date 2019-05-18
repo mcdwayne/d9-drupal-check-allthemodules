@@ -1,0 +1,535 @@
+<?php
+
+/**
+ * @file
+ * Integrate mailman api into Drupal.
+ */
+
+use Drupal\Core\Url;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\mailman_integration\MailmanIntegration;
+use Drupal\Core\Session\AccountInterface;
+
+/**
+ * Implements hook_help().
+ */
+function mailman_integration_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.mailman_integration':
+      return check_markup(file_get_contents(dirname(__FILE__) . "/README.txt"));
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function mailman_integration_cron() {
+  $config = \Drupal::config('mailman_integration.settings');
+  if ($config->get('mailman_integration_auto_sync') && !$config->get('mailman_connection_error')) {
+    $list = mailman_integration_get_mail_list();
+    $list_name = isset($list[0]['name']) ? $list[0]['name'] : '';
+    if ($list_name) {
+      $authenticate_pass = mailman_integration_get_auth_pass();
+      $admin_url = mailman_integration_get_admin_url();
+      $mailman  = new MailmanIntegration($admin_url, '', $authenticate_pass, $list_name);
+      $list_val  = $mailman->getMailmanListGeneral();
+      if (!isset($list_val['real_name']) || strtolower($list_val['real_name']) != strtolower($list_name)) {
+        \Drupal::configFactory()->getEditable('mailman_integration.settings')->set('mailman_connection_error', 1)->save();
+      }
+      else {
+        mailman_integration_migrate_maillist();
+      }
+    }
+    else {
+      \Drupal::configFactory()->getEditable('mailman_integration.settings')->set('mailman_connection_error', 1)->save();
+    }
+  }
+}
+
+/**
+ * Inserts list data into Mailman Integration Custom table.
+ */
+function mailman_integration_migrate_maillist() {
+  $list = mailman_integration_get_mail_list();
+  $params = array();
+  $params['entity_id']    = '';
+  $params['entity_type']  = '';
+  $params['bundle']       = '';
+  $params['listname']     = '';
+  $params['list_type']    = 1;
+  $mailman_data       = \Drupal::service('mailman_integration.mailman_controler')->selectListData($params);
+  $changecase_mm_data = array_change_key_case($mailman_data, CASE_LOWER);
+  $insert_list = array();
+  foreach ($list as $key => $value) {
+    $list_name = strtolower($value['name']);
+    if (!array_key_exists($list_name, $changecase_mm_data) && $list_name) {
+      $list_val                   = mailman_integration_get_list_general($list_name);
+      $owner = isset($list_val['owner']) ? $list_val['owner'] : '';
+      $insert_list[$key]['name']  = $list_name;
+      $insert_list[$key]['owner'] = $owner;
+      $insert_list[$key]['desc']  = $value['desc'];
+    }
+  }
+  // Insert manually created list from Mailman into Custom table.
+  foreach ($insert_list as $key => $list) {
+    if ($list['name']) {
+      $params = array();
+      $params['entity_id']    = '';
+      $params['entity_type']  = '';
+      $params['bundle']       = 'manual';
+      $params['listname']     = $list['name'];
+      $params['list_owner']   = $list['owner'];
+      $params['list_desc']    = $list['desc'];
+      \Drupal::service('mailman_integration.mailman_controler')->insertListData($params);
+    }
+  }
+}
+
+/**
+ * Get all Mailman lists.
+ */
+function mailman_integration_get_mail_list() {
+  $admin_url = mailman_integration_get_admin_url();
+  try {
+    $mailman = new MailmanIntegration($admin_url);
+    $lists = $mailman->getMailmanlists();
+    return $lists;
+  }
+  catch (MailmanIntegrationException $e) {
+    mailman_integration_set_error_msg($e);
+  }
+}
+
+/**
+ * Mailman Lists page Header.
+ */
+function mailman_integration_list_header() {
+  $build  = '<div class="mailman-button-link">';
+  $build .= '<ul class="action-links">';
+  if (\Drupal::currentUser()->hasPermission('administer mailman_integration')) {
+    $build .= '<li>';
+    $url = Url::fromRoute('mailman_integration.create_list_form');
+    $build .= \Drupal::l(t('Add Manual Mailing List'), $url);
+    $build .= '</li>';
+    $build .= '<li>';
+    $url_role = Url::fromRoute('mailman_integration.add_rolelist_form');
+    $build .= \Drupal::l(t('Add Role Based Mailing List'), $url_role);
+    $build .= '</li>';
+  }
+  $build .= '</ul>';
+  $build .= '</div>';
+  return $build;
+}
+
+/**
+ * Get the mailman admin url.
+ */
+function mailman_integration_get_admin_url() {
+  $admin_url = \Drupal::config('mailman_integration.settings')->get('mailman_integration_admin_url');
+  return $admin_url;
+}
+
+/**
+ * Get the mailman authentication password.
+ */
+function mailman_integration_get_auth_pass() {
+  $auth = \Drupal::config('mailman_integration.settings')->get('mailman_integration_authenticate_password');
+  return $auth;
+}
+
+/**
+ * Check given member exists in mentioned lists.
+ *
+ * @param string $list_name
+ *   The list name.
+ * @param string $email
+ *   User email address.
+ */
+function mailman_integration_is_member_inlist($list_name, $email = '') {
+  $admin_url = mailman_integration_get_admin_url();
+  $authenticate_pass = mailman_integration_get_auth_pass();
+  try {
+    $mailman = MailmanIntegration::getInstance($admin_url, '', $authenticate_pass, $list_name);
+    $lists_member = $mailman->getMemberInList($email);
+    return $lists_member;
+  }
+  catch (MailmanIntegrationException $e) {
+    mailman_integration_set_error_msg($e);
+  }
+}
+
+/**
+ * API call for user general set option.
+ */
+function mailman_integration_set_user_option($list_name, $user_mail, $opt, $val) {
+  $admin_url = mailman_integration_get_admin_url();
+  if (!$admin_url) {
+    return array();
+  }
+  $authenticate_pass = mailman_integration_get_auth_pass();
+  try {
+    $mailman = MailmanIntegration::getInstance($admin_url, '', $authenticate_pass, $list_name);
+    $set_option = $mailman->setMailmanUserOption($user_mail, $opt, $val);
+    return $set_option;
+  }
+  catch (MailmanIntegrationException $e) {
+    mailman_integration_set_error_msg($e);
+  }
+}
+
+/**
+ * Subcribe the member to given list.
+ *
+ * @param string $list_name
+ *   The list name.
+ * @param string $email
+ *   User email address.
+ */
+function mailman_integration_subscribe($list_name, $email = '') {
+  $admin_url = mailman_integration_get_admin_url();
+  $authenticate_pass = mailman_integration_get_auth_pass();
+  try {
+    $mailman = MailmanIntegration::getInstance($admin_url, '', $authenticate_pass, $list_name);
+    $mailman->subscribeMember($email);
+  }
+  catch (MailmanIntegrationException $e) {
+    mailman_integration_set_error_msg($e);
+  }
+}
+
+/**
+ * Unsubcribe the member to given list.
+ *
+ * @param string $list_name
+ *   The list name.
+ * @param string $email
+ *   User email address.
+ */
+function mailman_integration_unsubscribe($list_name, $email = '') {
+  $admin_url = mailman_integration_get_admin_url();
+  $authenticate_pass = mailman_integration_get_auth_pass();
+  try {
+    $mailman = MailmanIntegration::getInstance($admin_url, '', $authenticate_pass, $list_name);
+    $unsubscribe = $mailman->unSubscribeMember($email);
+    return $unsubscribe;
+  }
+  catch (MailmanIntegrationException $e) {
+    mailman_integration_set_error_msg($e);
+  }
+}
+
+/**
+ * Remove the list from mailman.
+ *
+ * @param string $list_name
+ *   The list name.
+ */
+function mailman_integration_remove_list($list_name) {
+  $admin_url = mailman_integration_get_admin_url();
+  $authenticate_pass = mailman_integration_get_auth_pass();
+  try {
+    $mailman = MailmanIntegration::getInstance($admin_url, '', $authenticate_pass, $list_name);
+    $upd_params = [];
+    $upd_params['delarchives'] = 1;
+    $rm_list = $mailman->mailmanRemoveList($upd_params);
+    // $rm_list = $mailman->removeMailmanListByCmd($upd_params);
+    if ($rm_list['status']) {
+      $list_id = mailman_integration_get_list_id($list_name);
+      // Delete Mailman data.
+      $params = [];
+      $params['entity_id']    = '';
+      $params['entity_type']  = '';
+      $params['bundle']       = '';
+      $params['listname']     = $list_name;
+      \Drupal::service('mailman_integration.mailman_controler')->deleteListData($params);
+      // Delete Mailman Roles record.
+      $params = [];
+      $params['role_id']    = '';
+      $params['list_id']    = $list_id;
+      $params['listname']   = $list_name;
+      \Drupal::service('mailman_integration.mailman_controler')->deleteListRole($params);
+      // Delete List Users  table.
+      \Drupal::service('mailman_integration.mailman_controler')->removeListUsers($list_name, 0, $list_id, 1);
+    }
+    return $rm_list['status'];
+  }
+  catch (MailmanIntegrationException $e) {
+    mailman_integration_set_error_msg($e);
+  }
+}
+
+/**
+ * Get the mailman list id using list name from mailman custom table.
+ *
+ * @param string $list_name
+ *   List name.
+ */
+function mailman_integration_get_list_id($list_name) {
+  if (!$list_name) {
+    return '';
+  }
+  $params = [];
+  $params['entity_id']    = '';
+  $params['entity_type']  = '';
+  $params['bundle']       = '';
+  $params['listname']     = $list_name;
+  $list                   = \Drupal::service('mailman_integration.mailman_controler')->selectListData($params);
+  $list_id                = $list[0]->list_id;
+  return $list_id;
+}
+
+/**
+ * Parse mailman list description.
+ */
+function mailman_integration_match_desc($desc = '') {
+  $match_value = array();
+  if (stripos($desc, 'no description available') !== FALSE) {
+    $desc = '';
+  }
+  $match_value['description'] = $desc;
+  return $match_value;
+}
+
+/**
+ * API call for getting mailman list general option.
+ *
+ * @param string $list_name
+ *   List name.
+ *
+ * @return array
+ *   Array of list option.
+ */
+function mailman_integration_get_list_general($list_name) {
+  $admin_url = mailman_integration_get_admin_url();
+  if (!$admin_url) {
+    return array();
+  }
+  $authenticate_pass = mailman_integration_get_auth_pass();
+  try {
+    $mailman = new MailmanIntegration($admin_url, '', $authenticate_pass, $list_name);
+    $list_val = $mailman->getMailmanListGeneral();
+    return $list_val;
+  }
+  catch (MailmanIntegrationException $e) {
+    mailman_integration_set_error_msg($e);
+  }
+}
+
+/**
+ * API call for create mailman list.
+ */
+function mailman_integration_createlist($values) {
+  $admin_url = mailman_integration_get_admin_url();
+  $list_pass = ($values['initial_list_password']) ? $values['initial_list_password'] : mailman_integration_get_auth_pass();
+  $authenticate_pass = mailman_integration_get_auth_pass();
+  try {
+    $mailman = MailmanIntegration::getInstance($admin_url, $list_pass, $authenticate_pass, $values['name_of_list']);
+    $params = array();
+    $params['autogen'] = 0;
+    $params['doit']    = 'Create List';
+    $params['langs']   = 'en';
+    $params['listname'] = $values['name_of_list'];
+    $params['moderate'] = 0;
+    $params['notify']  = 1;
+    $params['owner']   = $values['list_mail_address'];
+    $create = $mailman->mailmanListCreate($params);
+    // $create = $mailman->mailmanListCreateByCmd($params);
+    // Update the list once created.
+    if ($create) {
+      $list_desc  = $values['list_description'];
+      $upd_params = array();
+      $upd_params['description'] = $list_desc;
+      $upd_params['real_name'] = $values['name_of_list'];
+      $mailman->mailmanListUpdate($upd_params);
+      // By Default List creadted by Public - Visible to public.
+      /*
+      $upd_params = array();
+      $upd_params['description'] = $list_desc;
+      // 0 => private, 1 => public
+      $upd_params['advertised'] = 0;
+      $update_privacy = $mailman->mailmanListSetPrivate($upd_params);
+       */
+    }
+    return $create;
+  }
+  catch (MailmanIntegrationException $e) {
+    mailman_integration_set_error_msg($e);
+  }
+}
+
+/**
+ * Mailman connection error.
+ */
+function mailman_integration_set_error_msg($e) {
+  drupal_set_message(t('Unable to connect Mailman.'), 'error', FALSE);
+}
+
+/**
+ * Mailman connection Status.
+ */
+function mailman_integration_connection_status() {
+  $connection_err = \Drupal::config('mailman_integration.settings')->get('mailman_connection_error');
+  if (!isset($connection_err) || $connection_err != 0) {
+    return 0;
+  }
+  return 1;
+}
+
+/**
+ * Implements hook_user_update().
+ */
+function mailman_integration_user_update($account) {
+  $uid    = $account->id();
+  $name   = $account->getAccountName();
+  $mail   = $account->getEmail();
+  $submitted_roles  = $account->getRoles();
+  $old_roles         = ($account->original->getRoles());
+
+  $removed_role      = array_diff($old_roles, $submitted_roles);
+  $added_role        = array_diff($submitted_roles, $old_roles);
+  if (count($added_role)) {
+    foreach ($added_role as $role_val) {
+      $params = array();
+      $params['role_id']      = $role_val;
+      $params['list_id']      = '';
+      $params['listname']     = '';
+      $mailman_add_roles        = \Drupal::service('mailman_integration.mailman_controler')->selectListRoles($params);
+      foreach ($mailman_add_roles as $val) {
+        $list_name = $val->list_name;
+        $already_member = mailman_integration_is_member_inlist($list_name, $mail);
+        if (!count($already_member)) {
+          mailman_integration_subscribe($list_name, $mail);
+          // Update user option.
+          mailman_integration_set_user_option($list_name, $mail, 'fullname', $name);
+          // Insert into mailman user table.
+          \Drupal::service('mailman_integration.mailman_controler')->insertUsers($list_name, $mail, 0, $uid);
+        }
+      }
+    }
+  }
+  if (count($removed_role)) {
+    foreach ($removed_role as $role_val) {
+      $params = array();
+      $params['role_id']      = $role_val;
+      $params['list_id']      = '';
+      $params['listname']     = '';
+      $mailman_roles           = \Drupal::service('mailman_integration.mailman_controler')->selectListRoles($params);
+      foreach ($mailman_roles as $val) {
+        $list_name = $val->list_name;
+        $params = array();
+        $params['role_id']      = '';
+        $params['list_id']      = '';
+        $params['listname']     = $list_name;
+        $params['role_list']    = 1;
+        $mailman_list_roles       = \Drupal::service('mailman_integration.mailman_controler')->selectListRoles($params);
+        $is_deleted = 1;
+        foreach ($mailman_list_roles as $listed_role) {
+          if (in_array($listed_role, $submitted_roles)) {
+            $is_deleted = 0;
+          }
+        }
+        if ($is_deleted) {
+          mailman_integration_unsubscribe($list_name, $mail);
+          // Remove from mailman user table.
+          \Drupal::service('mailman_integration.mailman_controler')->removeListUsers($list_name, $mail, 0);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_user_insert().
+ */
+function mailman_integration_user_insert($account) {
+  $uid    = $account->id();
+  $name   = $account->getAccountName();
+  $mail   = $account->getEmail();
+  $roles  = $account->getRoles();
+  $authenticated_role = AccountInterface::AUTHENTICATED_ROLE;
+  if (($key = array_search($authenticated_role, $roles)) !== FALSE) {
+    unset($roles[$key]);
+  }
+  if (count($roles)) {
+    foreach ($roles as $role_val) {
+      $params = array();
+      $params['role_id']      = $role_val;
+      $params['list_id']      = '';
+      $params['listname']     = '';
+      $mailman_roles           = \Drupal::service('mailman_integration.mailman_controler')->selectListRoles($params);
+      foreach ($mailman_roles as $val) {
+        $list_name = $val->list_name;
+        $already_member = mailman_integration_is_member_inlist($list_name, $mail);
+        if (!count($already_member)) {
+          mailman_integration_subscribe($list_name, $mail);
+          // Update user option.
+          mailman_integration_set_user_option($list_name, $mail, 'fullname', $name);
+          // Insert into mailman user table.
+          \Drupal::service('mailman_integration.mailman_controler')->insertUsers($list_name, $mail, 0, $uid);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_user_delete().
+ *
+ * Remove the member from mail lists when admin delete the users.
+ */
+function mailman_integration_user_delete($account) {
+  $user_mail = $account->getEmail();
+  if ($user_mail) {
+    $lists = \Drupal::service('mailman_integration.mailman_controler')->getUserlist($account->id());
+    foreach ($lists as $list) {
+      mailman_integration_unsubscribe($list->list_name, $user_mail);
+      // Remove from mailman user table.
+      \Drupal::service('mailman_integration.mailman_controler')->removeListUsers($list->list_name, $user_mail, $list->list_id);
+    }
+  }
+}
+
+/**
+ * Implements hook_user_role_delete().
+ */
+function mailman_integration_user_role_delete($role) {
+  $role_id = $role->id();
+  $params = array();
+  $params['role_id']      = $role_id;
+  $params['list_id']      = '';
+  $params['listname']     = '';
+  $mailman_roles          = \Drupal::service('mailman_integration.mailman_controler')->selectListRoles($params);
+  $removed_role_list      = \Drupal::service('mailman_integration.mailman_controler')->getRoleList(array($role_id));
+  foreach ($mailman_roles as $val) {
+    $list_name = $val->list_name;
+    $params = array();
+    $params['role_id']      = '';
+    $params['list_id']      = '';
+    $params['listname']     = $list_name;
+    $params['role_list']    = 1;
+    $mailman_del_roles        = \Drupal::service('mailman_integration.mailman_controler')->selectListRoles($params);
+    if (count($mailman_del_roles) == 1) {
+      if ($list_name) {
+        mailman_integration_remove_list($list_name);
+      }
+    }
+    else {
+      $other_role_list  = \Drupal::service('mailman_integration.mailman_controler')->getRoleList($mailman_del_roles);
+      $want_to_remove_mailman = array_diff($removed_role_list, $other_role_list);
+      // Need to work: removed rl=other rl.
+      if (count($want_to_remove_mailman)) {
+        // Unsubcribe $want_to_remove_mailman list.
+        foreach ($want_to_remove_mailman as $mail => $name) {
+          mailman_integration_unsubscribe($list_name, $mail);
+          // Remove from mailman user table.
+          \Drupal::service('mailman_integration.mailman_controler')->removeListUsers($list_name, $mail, 0);
+        }
+      }
+      $params = array();
+      $params['role_id']    = $role_id;
+      $params['list_id']    = '';
+      $params['listname']   = $list_name;
+      \Drupal::service('mailman_integration.mailman_controler')->deleteListRole($params);
+    }
+  }
+}
