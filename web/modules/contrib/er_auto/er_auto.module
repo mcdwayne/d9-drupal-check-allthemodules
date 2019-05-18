@@ -1,0 +1,299 @@
+<?php
+
+/**
+ * @file
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Entity\ContentEntityType;
+use Drupal\Core\Entity\EntityForm;
+use Drupal\Core\Entity\ContentEntityBase;
+
+/**
+ * Get Entity Reference Field Definitions.
+ *
+ * This function was designed to retrieve a list of all Entity Reference fields
+ * groups by their target type. We are no longer going with that sort of
+ * interface since we decided it was better to target only the fields on the
+ * current Entity Bundle. Keeping this function around incase we need this data
+ * for future features.
+ *
+ * @return array[]
+ *   Nested array of FieldDefiniations grouped by target Entity Type.
+ */
+function _er_auto_entity_Reference_fields() {
+  static $fields = NULL;
+  if (is_null($fields)) {
+    /* @var EntityFieldManager */
+    $efm = \Drupal::service('entity_field.manager');
+
+    // Get filtered data on Reference Fields.
+    $ref_fields = $efm->getFieldMapByFieldType('entity_reference');
+
+    // Get field definions dince $ref_fields does not have them.
+    foreach ($ref_fields as $entity_type => $entity_ref_fields) {
+      $entity_fields = $efm->getBaseFieldDefinitions($entity_type);
+      foreach ($entity_ref_fields as $field_id => $field_data) {
+        $first_bundle = $field_data["bundles"][array_keys($field_data["bundles"])[0]];
+        $field = $efm->getFieldDefinitions($entity_type, $first_bundle)[$field_id];
+        $field_target = $field->getSetting("target_type");
+        $fields[$field_target][$entity_type][$field_id] = $field;
+      }
+    }
+
+  }
+  return $fields;
+}
+
+/**
+ * Get All Entity Reference fields for a bundle type.
+ *
+ * @param string $entity_type
+ *   Entity Type id.
+ * @param string $bundle
+ *   Bundle Machine name.
+ *
+ * @return array[]
+ *   Nested array of FieldDefiniations grouped by target Entity Type.
+ */
+function _er_auto_bundle_entity_reference_fields($entity_type, $bundle) {
+  static $fields = [];
+  if (!isset($fields[$entity_type]) or !isset($fields[$entity_type][$bundle])) {
+    $efm = \Drupal::service('entity_field.manager');
+
+    $host_fields = $efm->getFieldDefinitions($entity_type, $bundle);
+
+    foreach ($host_fields as $field_id => $field) {
+      if ($field->getType() === "entity_reference") {
+        $fields[$entity_type][$bundle][$field_id] = $field;
+      }
+    }
+  }
+  return $fields[$entity_type][$bundle];
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Alter the field storage config form to add a setting for automation.
+ */
+function er_auto_form_field_config_edit_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // Get form object and field we are editing.
+  $form_obj = $form_state->getFormObject();
+  $form_field = $form_obj->getEntity();
+
+  if ($form_field->getType() !== "entity_reference") {
+    // We only want to modify entity reference fields. If not, exit.
+    return $form;
+  }
+
+  $er_config = $form_field->getThirdPartySetting('er_auto', 'automation');
+  if (empty($er_config)) {
+    $er_config = ["enabled" => FALSE, "source" => [], "automated" => []];
+  }
+
+  $entityTypeManager = \Drupal::service('entity_type.manager');
+  $target_type = $form_field->getSetting("target_type");
+
+  if (empty($target_type)) {
+    // We can't determine the reference type. Stop trying.
+    return $form;
+  }
+
+  $target_type_obj = $entityTypeManager->getDefinition($target_type);
+
+  // We only want to display this form if the refrenced content type is
+  // fieldable. Otherwise, there is no point since none fieldable types won't
+  // have any entity reference fields.
+  if ($target_type_obj instanceof ContentEntityType) {
+    $form["er_auto"] = [
+      '#type' => 'fieldset',
+      '#title' => t('Reference Automation'),
+    ];
+    $form["er_auto"]["er_auto_enable"] = [
+      '#type' => 'checkbox',
+      '#title' => t('Enable Automation based on this field?'),
+      '#default_value' => $er_config["enabled"],
+    ];
+
+    // Get the list of Entity Type labels for use in the form.
+    $type_labels = \Drupal::entityManager()->getEntityTypeLabels();
+
+    $host_type = $form_field->getTargetEntityTypeId();
+    $host_bundle = $form_field->getTargetBundle();
+    // Get host fields.
+    $host_er_fields = _er_auto_bundle_entity_reference_fields($host_type, $host_bundle);
+
+    $handler_settings = $form_field->getSetting("handler_settings");
+    $target_bundles = (isset($handler_settings["target_bundles"])) ? $handler_settings["target_bundles"] : [];
+    $target_bundle_fields = [];
+    if (empty($target_bundles)) {
+      $target_bundles = [$target_type => $target_type];
+      $target_bundle_fields = _er_auto_bundle_entity_reference_fields($target_type, NULL);
+    }
+    else {
+      $target_bundle_fields = [];
+      foreach ($target_bundles as $bundle) {
+        $target_bundle_fields += _er_auto_bundle_entity_reference_fields($target_type, $bundle);
+      }
+    }
+
+    // Automation source select list.
+    if (count($target_bundle_fields)) {
+      // Only display select area if there are options.
+      // Build select list of Entity Reference fields on Target Type.
+      $options = [];
+      foreach ($target_bundle_fields as $field_id => $field) {
+        $options[$field_id] = $field->getLabel();
+      }
+      $form["er_auto"]["er_auto_field_selectors"]["er_auto_source"] = [
+        '#type' => 'select',
+        '#title' => t("Automation Source Fields on " . $type_labels[$target_type]),
+        '#multiple' => TRUE,
+        '#options' => $options,
+        '#default_value' => $er_config["source"],
+        '#description' => t('Select the fields that this field should manipulate, when values are changed. If fields are missing, please ensure that the Reference Type is set below.'),
+        '#states' => [
+          'visible' => [
+            'input[name=er_auto_enable]' => ['checked' => TRUE],
+          ],
+        ],
+      ];
+    }
+    else {
+      // If there are no options, display a message to the user.
+      $form["er_auto"]["er_auto_field_selectors"]["er_auto_source"] = [
+        '#type' => 'container',
+        '#states' => [
+          'visible' => [
+            'input[name=er_auto_enable]' => ['checked' => TRUE],
+          ],
+        ],
+      ];
+      $form["er_auto"]["er_auto_field_selectors"]["er_auto_source"]["markup"] = [
+        '#markup' => 'No Automation Source Fields Available on ' . $type_labels[$target_type] . ".",
+      ];
+    }
+
+    // Automated Fields select list.
+    if (count($host_er_fields)) {
+      // Only display select area if there are options.
+      // Build select list of Entity Reference fields on Host Type.
+      $options = [];
+      foreach ($host_er_fields as $field_id => $field) {
+        if ($field->isReadOnly()) {
+          // Skip read only fields (Content Type).
+          continue;
+        }
+        $options[$field_id] = $field->getLabel();
+      }
+      $form["er_auto"]["er_auto_field_selectors"]["er_auto_automated"] = [
+        '#type' => 'select',
+        '#title' => t("Fields to Automate"),
+        '#multiple' => TRUE,
+        '#options' => $options,
+        '#default_value' => $er_config["automated"],
+        '#description' => t('Select the fields that this field should manipulate, when values are changed.'),
+        '#states' => [
+          'visible' => [
+            'input[name=er_auto_enable]' => ['checked' => TRUE],
+          ],
+        ],
+      ];
+    }
+    else {
+      // If there are no options, display a message to the user.
+      $form["er_auto"]["er_auto_field_selectors"]["er_auto_automated"] = [
+        '#type' => 'container',
+        '#states' => [
+          'visible' => [
+            'input[name=er_auto_enable]' => ['checked' => TRUE],
+          ],
+        ],
+      ];
+      $form["er_auto"]["er_auto_field_selectors"]["er_auto_automated"]["markup"] = [
+        '#markup' => 'No Available Fields to Automate.',
+      ];
+    }
+
+    $form['actions']['submit']['#submit'][] = "er_auto_form_field_config_edit_form_submit";
+  }
+  return $form;
+}
+
+/**
+ * Submit handler for Automation config on field config edit form.
+ */
+function er_auto_form_field_config_edit_form_submit($form, FormStateInterface $form_state) {
+  // Get form object and field we are editing.
+  $form_obj = $form_state->getFormObject();
+  $form_field = $form_obj->getEntity();
+
+  $values = $form_state->getValues();
+
+  $enabled = $values["er_auto_enable"];
+
+  $source = array_keys($values["er_auto_source"]);
+  $automated = array_keys($values["er_auto_automated"]);
+
+  $settings = ["enabled" => $enabled, "source" => $source, "automated" => $automated];
+  $form_field->setThirdPartySetting('er_auto', 'automation', $settings)->save();
+}
+
+/**
+ * Alter Entity Form to add automation functionality.
+ */
+function er_auto_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $form_obj = $form_state->getFormObject();
+  if ($form_obj instanceof EntityForm && $form_obj->getOperation() === "edit") {
+    $entity = $form_obj->getEntity();
+    if ($entity instanceof ContentEntityBase) {
+      $efm = \Drupal::service('entity_field.manager');
+      $host_fields = $efm->getFieldDefinitions($entity->getEntityTypeId(), $entity->bundle());
+
+      foreach ($host_fields as $field_id => $field) {
+        $field_config = $field->getConfig($entity->bundle());
+        $er_config = $field_config->getThirdPartySetting('er_auto', 'automation');
+        if (!empty($er_config) && in_array($field_id, array_keys($form))) {
+          $source_type = $field_config->getSetting("target_type");
+          $source_storage = Drupal::service("entity_type.manager")->getStorage($source_type);
+
+          // Mapping data for js. Stores field option to target(s) field values
+          // $taget_map[$field_option][$automated_field] = array($automated_value)
+          $target_map = [];
+          if (isset($form[$field_id]["widget"]) && isset($form[$field_id]["widget"]["#options"])) {
+            foreach ($form[$field_id]["widget"]["#options"] as $option_id => $option) {
+              if ($option_id === "_none") {
+                // Skip "None" option in select lists.
+                continue;
+              }
+              $source_entity = $source_storage->load($option_id);
+              $source_fields = $efm->getFieldDefinitions($source_type, $source_entity->bundle());
+              foreach ($er_config["source"] as $source) {
+                foreach ($er_config["automated"] as $automated) {
+                  if (isset($source_fields[$source])) {
+                    if ($source_fields[$source]->getSetting("target_type") == $host_fields[$automated]->getSetting("target_type")) {
+                      if (!isset($target_map[$option_id][$automated])) {
+                        $target_map[$option_id][$automated] = [];
+                      }
+                      $target_map[$option_id][$automated] += array_map(function ($value) {
+                        return $value["target_id"];
+                      }, $source_entity->get($source)->getValue());
+                    }
+                  }
+                }
+              }
+            }
+          }
+          $form[$field_id]['#attached']['library'][] = 'er_auto/field-automation';
+          $form[$field_id]['#attached']['drupalSettings']['er_auto']['automation'][$field_id] = $target_map;
+          $form[$field_id]['#attributes']['class'][] = 'erAutoSource';
+          $form[$field_id]['#attributes']['data-er-auto-field-id'] = $field_id;
+          if (isset($form[$field_id]["widget"]) && isset($form[$field_id]["widget"]["#type"])) {
+            $form[$field_id]['#attributes']['data-er-auto-field-type'] = $form[$field_id]["widget"]["#type"];
+          }
+        }
+      }
+    }
+  }
+}
