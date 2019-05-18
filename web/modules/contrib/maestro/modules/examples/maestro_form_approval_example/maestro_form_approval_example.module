@@ -1,0 +1,241 @@
+<?php 
+
+//You need this if you want to simply use MaestroEngine in code calls as we do
+use Drupal\maestro\Engine\MaestroEngine;
+use Drupal\Core\Url;  //for using URL in our form handler
+
+/**
+ * Implements hook_maestro_interactive_handlers
+ *
+ * @return array
+ * array of function names and help text that will be displayed
+ * in the edit task form under the handler field
+ */
+function maestro_form_approval_example_maestro_interactive_handlers() {
+  return [
+    'maestro_form_approval_example_manager_approval_form' => t('Review Request (identifier: request) - provides an Accept and Reject action buttons.'),
+  ];
+}
+
+
+
+/**
+ * Implements hook_form_alter
+ */
+function maestro_form_approval_example_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  //just a quick and easy way to override the submit button for our example.
+  //for regular users, don't give them the option to unpublish etc.
+  
+  //as per the note in maestro.module, this IF statement should also test to see if 
+  //the content type we're editing is attached to a process, regardless if the maestro and 
+  //queueid keys exist in the URL.
+  //for the purposes of this demo, testing to see if the query string has the 2 keys we need
+  //is sufficient
+  $storage = $form_state->getStorage();
+  if(array_key_exists('form_display', $storage)) {
+    $thisForm = $storage['form_display']->get('bundle');
+  }
+  else {
+    $thisForm = NULL;
+  }
+  $queueID = intval(\Drupal::request()->query->get('queueid', 0));
+  $isMaestro = intval(\Drupal::request()->query->get('maestro', 0));
+  $templateTask = MaestroEngine::getTemplateTaskByQueueID($queueID);
+  if(  $isMaestro > 0 
+       && $queueID > 0 
+       && $templateTask['tasktype'] == 'MaestroContentType'
+       && MaestroEngine::canUserExecuteTask($queueID, \Drupal::currentUser()->id())
+       && $templateTask['data']['content_type'] == $thisForm
+      ) {  //both these keys need to exist
+    $form['actions']['submit']['#value'] = t('Submit Request');
+    $form['actions']['publish']['#value'] = t('Submit Request');
+    $form['actions']['unpublish']['#value'] = t('Submit Request');
+  }
+  
+}
+
+/**
+ * The manager approval form used in the workflow.
+ * 
+ * @param unknown $form
+ * @param number $queueID
+ */
+function maestro_form_approval_example_manager_approval_form(&$form, $queueID = 0, $obj) {
+  $form['queueID'] = array(
+      '#type' => 'hidden',
+      '#title' => 'the queue ID in the event we need it in later processing',
+      '#default_value' => $queueID,
+      '#description' => ('queueID'),
+  );
+
+  //overriding the "Accept" default label with the "complete" text
+  $form['actions']['submit']['#value'] = t('Accept Request');
+  
+  //adding our own reject button
+  $form['actions']['reject'] = array(
+    '#type' => 'submit',
+    '#value' => t('Reject and send back to Employee'),
+    '#ajax' => array(
+      'callback' => [$obj, 'completeForm'],
+      'wrapper' => '',
+        ),
+  );
+  //change the title of the modal popup from the default bland Maestro title
+  $form['#title'] = t('Review the Employee Request');
+  //we are going to give the user a link to the approval form here.  We do this by loading the 
+  //queue and fetching off the approval form and providing a link to it.
+  $processID = MaestroEngine::getProcessIdFromQueueId($queueID);
+  $entityID = MaestroEngine::getEntityIdentiferByUniqueID($processID, 'request');
+  $url = Url::fromUserInput('/node/' . $entityID, array('attributes' => array('target' => '_new'))); //[0] is the unique key, [1] is the type, [2] is the node ID
+  
+  $node = node_load($entityID); //load the node
+  $build = \Drupal::entityTypeManager()->getViewBuilder('node')->view($node, 'full' ); //generate a view of the node
+  
+  $form['node'] = $build; //attach the node to the form for viewing
+  $form['node']['#prefix'] = '<div id="manager-approval-node">';  //wrapper to beautify it
+  $form['node']['#suffix'] = '</div>';
+  
+  $form['url'] = array (  //we throw this link in here ot show that you can still link directly to the node if you want
+    '#type' => 'link',
+    '#title' => t('(View Request in full page)'),
+    '#url' => $url,  //will open in new tab
+    '#target' => '_new',
+    '#suffix' => '<br><br>'
+  );
+  
+  $form['#attached']['library'][] = 'maestro_form_approval_example/maestro_approval_form_css';  //our own css for node form beautification
+  
+  return $form;
+}
+
+
+
+/**
+ * This is the submit handler passed off to us from the Maestro Engine.
+ *
+ * @param array $form
+ * @param FormStateInterface $form_state
+ * @param number $queueID
+ */
+function maestro_form_approval_example_manager_approval_form_submit(&$form, &$form_state, $queueID = 0) {
+  
+  //In our custom submit handler, **WE** are responsible for telling the engine what to do.
+  //This is a pretty simple process by just using the API to tell the engine to complete the task
+  //However, we can also set "fancy" status like cancelling as we've done here by detecting
+  //if the submit button was hit or not.
+  
+  $queueID = intval($form_state->getValue('maestro_queue_id'));
+  $triggeringElement = $form_state->getTriggeringElement();
+  if(strstr($triggeringElement['#id'], 'edit-submit') !== FALSE && $queueID > 0) {
+    MaestroEngine::completeTask($queueID, \Drupal::currentUser()->id());
+  }
+  else {
+    //we'll complete the task, but we'll also flag it as TASK_STATUS_CANCEL
+    MaestroEngine::completeTask($queueID, \Drupal::currentUser()->id());
+    MaestroEngine::setTaskStatus($queueID, TASK_STATUS_CANCEL);
+  }
+
+}
+
+/**
+ * Callback function for the batch function in the template
+ * @param int $processID
+ * @param int $queueID
+ */
+function maestro_form_approval_example_set_flow_name_batch($processID, $queueID) {
+
+  
+  //For the purposes of this demo flow, we are assuming that the ONLY identifier we care about is the request identifier.
+  $entityID = MaestroEngine::getEntityIdentiferByUniqueID($processID, 'request');
+  
+  if($node = node_load($entityID)) {
+    $account = user_load($node->getOwnerId());
+    MaestroEngine::setProcessLabel($processID, $account->getUsername() . '  submitted Request');
+  }
+  return TRUE;
+}
+
+
+/**
+ * Implements hook_maestro_task_console_interactive_link_alter
+ * @param array $templateTask
+ * @param entity $queueRecord
+ * @param entity $templateMachineName
+ */
+function maestro_form_approval_example_maestro_task_console_interactive_link_alter(&$link, $templateTask, $queueRecord, $templateMachineName) {
+  /*
+   * We have the link, the task detail record, queue record and the templateName available to us to alter the link
+   * First, we should check if this is the workflow or template that we want to change
+   * the active task action for, else we will affect all tasks.
+   */
+  if($templateMachineName == 'form_approval_flow') {
+    $processID = $queueRecord->process_id->getString();
+    $processVariable = MaestroEngine::getProcessVariable('rejected', $processID);
+    if ($processVariable == '0' && $templateTask['id'] == 'submit_request') {
+      //the task is our submit request AND we have a process variable set means it was either saved and not completed or rejected by the manager
+      $link = 'Create your request';
+    }
+    elseif ($processVariable == '1' && $templateTask['id'] == 'submit_request') {
+      //First time through
+      $link = 'Your request was rejected. Please edit and resubmit';
+    }
+
+    //the second task we have for a manager is the approval task.  We can alter that link text too
+    if ($templateTask['id'] == 'manager_approval') {
+      $link = 'Manager Approval';
+    }
+  }
+}
+
+/**
+ * Implements hook_maestro_task_console_alter_execution_link
+ * @param array $existing_execution_form_elements
+ * @param array $templateTask
+ * @param entity $queueRecord
+ * @param entity $templateMachineName
+ */
+function maestro_form_approval_example_maestro_task_console_alter_execution_link(&$existing_execution_form_elements, $templateTask, $queueRecord, $templateMachineName) {
+  /*
+   * Example of how you can add your own custom links in the actions/operations task console or alter the action form completely for this task.
+   * It's a drupal form and you are passed in $form as rendered by the the taskconsole for this task.
+   *
+   * By Default, the drupal console will use the FORM API Element type 'operations' which is a special use-case of the dropbutton eleement
+   * that can have multiple links or actions that appear as part of the button.
+   * https://api.drupal.org/api/drupal/core%21lib%21Drupal%21Core%21Render%21Element%21Dropbutton.php/class/Dropbutton/8.2.x
+   *
+   *
+   * For this specific example use: There's already a link to view the report in the approval form,
+   * We will show how to provide it as an extra action to the dropButton links.
+   *
+   * If one did not want to use the dropButton 'operations' element, then you fully alter it here and change the way the actions appear
+   * in the task console.
+   */
+
+
+  /*
+   * We're simply picking off the entity in our process variable.
+   * see the maestro_form_approval_example_manager_approval_form function above for more explanation.
+   *
+   * First, we should check if this is the workflow or template that we want to change
+   * the active task action for, else we will affect all tasks.
+   */
+  if($templateMachineName == 'form_approval_flow' && $templateTask['id'] == 'manager_approval') {
+    $processID = $queueRecord->process_id->getString();
+    $entityID = MaestroEngine::getEntityIdentiferByUniqueID($processID, 'request');
+    $url = Url::fromUserInput('/node/' . $entityID, array('attributes' => array('target' => '_new')));
+
+    /*
+     * We are appending our link to data element['#links']
+     */
+    $existing_execution_form_elements['data']['#links']['custom_link'] = array(
+      'title' => t('View Request in separate page'),
+      'url' => $url,
+    );
+
+
+  }
+
+
+}
+
+

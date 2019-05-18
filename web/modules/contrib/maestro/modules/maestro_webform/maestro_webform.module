@@ -1,0 +1,190 @@
+<?php
+
+/**
+ * @file
+ * Contains maestro_webform.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\maestro\Engine\MaestroEngine;
+use Drupal\Core\Routing\TrustedRedirectResponse;
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_help().
+ * Provided empty and NULL default values due to https://www.drupal.org/project/webform/issues/2958479
+ */
+function maestro_webform_help($route_name = '', RouteMatchInterface $route_match = NULL) {
+  switch ($route_name) {
+    // Main module help for the maestro_webform module.
+    case 'help.page.maestro_webform':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Maestro Webform Module') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function maestro_webform_theme() {
+  return [
+      'webform_handler_maestro_summary' => [
+          'variables' => ['settings' => NULL, 'handler' => [], 'status' => NULL],
+      ],
+  ];
+}
+
+
+/**
+ * Implements hook_form_alter
+ */
+function maestro_webform_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  $queueID = intval(\Drupal::request()->query->get('queueid', 0));
+  $isMaestro = intval(\Drupal::request()->query->get('maestro', 0));
+  if(  $isMaestro && $queueID   ) {  //both these keys need to exist
+    $templateTask = MaestroEngine::getTemplateTaskByQueueID($queueID);
+    if($templateTask && $templateTask['tasktype'] == 'MaestroWebform') {  //we only care about Maestro Webform tasks
+      $storage = $form_state->getStorage();
+      if($storage) {
+        $webformTypes = \Drupal::entityTypeManager()->getStorage('node_type')->loadMultiple();
+        $thisForm = $storage['form_display']->get('bundle');
+        $targetEntityType = $storage['form_display']->get('targetEntityType');
+        if( $isMaestro == 1 && 
+            $targetEntityType == 'webform_submission' && 
+            $templateTask['data']['webform_machine_name'] == $thisForm) {
+          //we now know this is a webform submission.  We are going to add in our own form fields here.
+          $form['maestro'] = array (
+            '#tree' => TRUE,
+          );
+              
+          $form['maestro']['type'] = array(
+            '#type' => 'hidden',
+            '#default_value' => $thisForm,
+            '#required' => TRUE,
+          );
+          
+          $form['maestro']['queue_id'] = array(
+            '#type' => 'hidden',
+            '#default_value' => $queueID,
+            '#required' => TRUE,
+          );
+          
+          $form['maestro']['process_id'] = array(
+            '#type' => 'hidden',
+            '#default_value' => MaestroEngine::getProcessIdFromQueueId($queueID),
+            '#required' => TRUE,
+          );
+          
+          $form['actions']['submit']['#submit'][] = 'maestro_webform_webform_type_task_submit';
+         
+        }
+      }
+    }
+  }  
+}
+
+
+/**
+ * Implements maestro_webform's hook form alter's submission
+ */
+function maestro_webform_webform_type_task_submit(&$form, \Drupal\Core\Form\FormStateInterface $form_state) {
+  //We have hooked into the webform submission by explicitly telling the webform to execute
+  //this submission handler
+  //get the identifiers here for Maestro
+  $maestroElements = $form_state->getValue('maestro');
+  if($maestroElements) {
+    $queueID = $maestroElements['queue_id'];
+    $processID = $maestroElements['process_id'];
+    $webformType = $maestroElements['type'];
+    $templateTask = MaestroEngine::getTemplateTaskByQueueID($queueID);
+    if($templateTask) {
+      //We have a valid submission and can attach to the template task
+      //We determine if the entity identifier exists in our maestro_entity_identifiers entity.
+      //If it doesn't exist, we create it.
+      
+      if(!MaestroEngine::getEntityIdentiferByUniqueID($processID, $templateTask['data']['unique_id'])) {
+        //create the entry in the process variable
+        //Get the Webform identifiers here:
+        $form_object = $form_state->getFormObject();
+        $webform_submission = $form_object->getEntity();
+        MaestroEngine::createEntityIdentifier($processID, $webform_submission->getEntityTypeId(), $webform_submission->bundle(), $templateTask['data']['unique_id'], $webform_submission->id());
+      }
+      else {
+        //This is the case where the entry already exists.  Need to do anything?
+      }
+      
+      //Now that the process variable has been set and we've saved the webform, we can complete the task.
+      MaestroEngine::completeTask($queueID, \Drupal::currentUser()->id());
+      $response = new TrustedRedirectResponse('/taskconsole');
+        if(isset($templateTask['data']['redirect_to']) && $templateTask['data']['redirect_to'] != '') {
+          $response = new TrustedRedirectResponse('/' . $templateTask['data']['redirect_to']);
+          $form_state->setResponse($response);
+          $form_state->setRedirect(Url::fromUserInput('/' . $templateTask['data']['redirect_to']));
+        }
+        else {
+          $response = new TrustedRedirectResponse('/taskconsole');
+          $form_state->setResponse($response);
+          $form_state->setRedirect(Url::fromUserInput('/taskconsole'));
+        }
+    }  
+  }
+  else {
+    //can't bind to a template.  Throw an error?
+  }
+}
+
+/**
+ * Implements hook_local_tasks_alter
+ */
+function maestro_webform_menu_local_tasks_alter(&$data, $route_name) {
+  //if we're viewing/editing a node AND we have a maestro and queueid query parameter
+  $queueID = intval(\Drupal::request()->query->get('queueid', 0));
+  $isMaestro = intval(\Drupal::request()->query->get('maestro', 0));
+
+  if(($route_name == 'entity.webform_submission.edit_form' || $route_name == 'entity.webform_submission.canonical') && ($isMaestro > 0 || $queueID > 0)) {
+
+    $oldUrl = $data['tabs'][0]['entity.webform_submission.edit_form']['#link']['url'];
+    $oldRouteParameters = $oldUrl->getRouteParameters();
+
+    $oldurl = $data['tabs'][0]['entity.webform_submission.edit_form']['#link']['url'];
+    $oldRouteParms = $oldurl->getRouteParameters(); 
+    $url =  \Drupal\Core\Url::fromRoute('entity.webform_submission.edit_form', $oldRouteParameters,['query' => ['maestro' => 1, 'queueid' => $queueID]]);
+    $data['tabs'][0]['entity.webform_submission.edit_form']['#link']['url'] = $url;
+    
+    $oldurl = $data['tabs'][0]['entity.webform_submission.canonical']['#link']['url'];
+    $oldRouteParms = $oldurl->getRouteParameters();
+    $url =  \Drupal\Core\Url::fromRoute('entity.webform_submission.canonical', $oldRouteParameters,['query' => ['maestro' => 1, 'queueid' => $queueID]]);
+    $data['tabs'][0]['entity.webform_submission.canonical']['#link']['url'] = $url;
+  }
+}
+
+/**
+ * Set Process Variable (SPV) function which uses the webform's unique identifier referenced in the Maestro "webforms" process variable
+ * to read a value from the webform submission and return it to the SPV task to set the process variable in the task.
+ * 
+ * The "webforms" process variable is set by the Maestro Webforms submission handler which sets a "submission:xxx" value in the "webforms" process variable 
+ * (where "xxx" is the unique ID of the submission), or is set by the Maestro Webform Task Type's "Unique Identifier" setting when editing a Maestro Webform Task.
+ * 
+ * 
+ * @param string $uniqueWebformIdentifier  The webform's "Unique Identifier" as stored in the "webforms" process variable.
+ * @param string $webformFieldMachineName  The webform field's machine name (listed as "KEY" in the webform builder) you wish to pull the value out of.
+ * @param int $queueID  Provided by the executing SPV task -- the QueueID of the SPV task.
+ * @param int $processID  Provided by the executing SPV task -- the ProcessID of the workflow running the SPV task.
+ */
+function maestro_webform_spv_fetch_submission_value($uniqueWebformIdentifier, $webformFieldMachineName, $queueID, $processID) {
+  $returnValue = 'unset';
+  $sid = FALSE;  //This is the submission we're eventually after
+  $sid = MaestroEngine::getEntityIdentiferByUniqueID($processID, $uniqueWebformIdentifier);
+  if($sid) $webform_submission = \Drupal\webform\Entity\WebformSubmission::load($sid);
+  if($webform_submission && array_key_exists($webformFieldMachineName, $webform_submission->getData() )){
+    $returnValue = $webform_submission->getData()[$webformFieldMachineName];
+  }
+  //at this point, the submission's value OR 'unset' is in the $returnValue
+  return $returnValue;
+}
+
+

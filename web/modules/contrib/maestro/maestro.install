@@ -1,0 +1,162 @@
+<?php 
+/**
+ * @file
+ * Install, update and uninstall functions for the Maestro module.
+ */
+
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\views\Entity\View;
+use Symfony\Component\Yaml\Yaml;
+use Drupal\maestro\Engine\MaestroEngine;
+
+/**
+ * Update 8001 - Create maestro_process_status entity.
+ */
+function maestro_update_8001() {
+  //check if the table exists first.  If not, then create the entity.
+  if(!db_table_exists('maestro_process_status')) {
+    \Drupal::entityTypeManager()->clearCachedDefinitions();
+    \Drupal::entityDefinitionUpdateManager()
+      ->installEntityType(\Drupal::entityTypeManager()->getDefinition('maestro_process_status'));
+    //now add the required variables to each of the templates.  Existing in-production templates will not be affected
+    $templates = MaestroEngine::getTemplates();
+    foreach($templates as $template) {
+      $variables = $template->variables;
+      if(!array_key_exists('workflow_timeline_stage_count', $variables)) {
+        $template->variables['workflow_timeline_stage_count'] = ['variable_id' => 'workflow_timeline_stage_count', 'variable_value' => ''];
+      }
+      if(!array_key_exists('workflow_current_stage', $variables)) {
+        $template->variables['workflow_current_stage'] = ['variable_id' => 'workflow_current_stage', 'variable_value' => ''];
+      }
+      if(!array_key_exists('workflow_current_stage_message', $variables)) {
+        $template->variables['workflow_current_stage_message'] = ['variable_id' => 'workflow_current_stage_message', 'variable_value' => ''];
+      }
+      $template->save();
+    }
+    
+  }
+  else {
+    return 'Process Status entity already exists';
+  }
+}
+
+/**
+ * Update 8002 - Add timestamp field to maestro_process_status entity
+ */
+function maestro_update_8002() {
+  
+  if(!\Drupal::entityDefinitionUpdateManager()->getFieldStorageDefinition('completed', 'maestro_process_status')) {
+    $storage_definition = BaseFieldDefinition::create('integer')
+      ->setLabel(t('Completed'))
+      ->setDescription(t('The time that the task associated to this status was completed.'))
+      ->setSettings(array(
+        'default_value' => '0',
+      ));
+      
+    \Drupal::entityDefinitionUpdateManager()
+      ->installFieldStorageDefinition('completed', 'maestro_process_status', 'maestro_process_status', $storage_definition);
+  }
+  else {
+    return 'Completed field already exists in maestro_process_status';
+  }
+}
+
+/**
+ * Update 8003 - Create maestro_entity_identifiers entity.
+ */
+function maestro_update_8003() {
+  //check if the table exists first.  If not, then create the entity.
+  if(!db_table_exists('maestro_entity_identifiers')) {
+    \Drupal::entityTypeManager()->clearCachedDefinitions();
+    \Drupal::entityDefinitionUpdateManager()
+    ->installEntityType(\Drupal::entityTypeManager()->getDefinition('maestro_entity_identifiers'));
+    
+    //now to update the new entity identifiers entity with any existing entity_identifiers data.
+    //we will assume that all of the identifiers have an entity type of 'node'
+    $query = \Drupal::entityQuery('maestro_process_variables')
+      ->condition('variable_name', 'entity_identifiers');
+    $entityIDs = $query->execute();
+    foreach($entityIDs as $entity_id) {
+      $record = \Drupal::entityTypeManager()->getStorage('maestro_process_variables')->load($entity_id);
+      if($record) {
+        //inject into the new maestro_entity_identifiers entity
+        if($record->variable_value->getString() != '') {
+          //parse out the entity entries
+          $arr = explode(',', $record->variable_value->getString());  
+          foreach($arr as $eids) {
+            $entry = explode(':', $eids);
+            $entityType = $entry[0];
+            $uniqueID = $entry[1];
+            $entityID = $entry[2];
+            $values = array (
+              'process_id' => $record->process_id->getString(),
+              'unique_id' => $uniqueID,
+              'entity_type' => $entityType,
+              'entity_id' => $entityID,
+              'bundle' => 'node',  //we're forcing it to node as this is all we've had implemented as of this writing
+              );
+            $new_entry = \Drupal::entityTypeManager()->getStorage('maestro_entity_identifiers')->create($values);
+            $new_entry->save();
+          }
+        }
+      }
+    }
+  }
+  else {
+     return 'Entity Identifiers entity already exists';
+  }
+}
+
+
+/**
+ * Update 8004 - Create new view for Maestro Completed Tasks.
+ */
+function maestro_update_8004() {
+  $message = NULL;
+  if (\Drupal::moduleHandler()->moduleExists('views') && !View::load('maestro_completed_tasks')) {
+    $config_path = drupal_get_path('module', 'maestro') . '/config/install/views.view.maestro_completed_tasks.yml';
+    $data = Yaml::parse(file_get_contents($config_path));
+    \Drupal::configFactory()->getEditable('views.view.maestro_completed_tasks')->setData($data)->save(TRUE);
+    $message = 'The new Maestro Completed Tasks view has been created.';
+  }
+  else {
+    $message = 'Not creating the Maestro Completed Tasks view since it already exists.';
+  }
+  return $message;
+}
+
+/**
+ * Update 8005 - Create new view for Maestro Entity Identifiers "Items Attached to Workflow" and configure each template to use 2 views.
+ */
+function maestro_update_8005() {
+  $message = NULL;
+  if (\Drupal::moduleHandler()->moduleExists('views') && !View::load('maestro_entity_identifiers')) {
+    $config_path = drupal_get_path('module', 'maestro') . '/config/install/views.view.maestro_entity_identifiers.yml';
+    $data = Yaml::parse(file_get_contents($config_path));
+    \Drupal::configFactory()->getEditable('views.view.maestro_entity_identifiers')->setData($data)->save(TRUE);
+    $message = 'The new Maestro Entity Identifiers view for the Task Console has been created.';
+  }
+  else {
+    $message = 'Not creating the Maestro Entity Identifiers "Items Attached to Workflow" view since it already exists.';
+  }
+  \Drupal::entityTypeManager()->clearCachedDefinitions();
+  $templates = MaestroEngine::getTemplates();
+  foreach($templates as $template) {
+    $template->views_attached = [
+      'maestro_completed_tasks' => [
+        'view_machine_name' => 'maestro_completed_tasks',
+        'view_weight' => -9,
+        'view_display' => 'default;Master',
+      ],
+      'maestro_entity_identifiers' => [
+        'view_machine_name' => 'maestro_entity_identifiers',
+        'view_weight' => -10,
+        'view_display' => 'taskconsole_display;Task Console Display',
+      ],
+    ];
+    $template->save();
+  }
+
+  
+  return $message;
+}

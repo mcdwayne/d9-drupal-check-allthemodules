@@ -1,0 +1,778 @@
+<?php
+
+use Drupal\maestro\Engine\MaestroEngine;
+use Symfony\Component\HttpFoundation\RedirectResponse;
+use Drupal\Core\Entity\EntityInterface;
+
+//Maestro internal task completion status codes used during task plugin execution
+const MAESTRO_TASK_COMPLETION_NORMAL = 0;
+const MAESTRO_TASK_COMPLETION_USE_FALSE_BRANCH = 1;
+
+//Maestro queue status codes for task execution status
+const TASK_STATUS_ACTIVE = 0;
+const TASK_STATUS_SUCCESS = 1;
+const TASK_STATUS_CANCEL = 2;
+const TASK_STATUS_HOLD = 3;
+const TASK_STATUS_ABORTED = 4;
+
+//Maestro archive flag value for tasks
+const TASK_ARCHIVE_ACTIVE = 0;
+const TASK_ARCHIVE_NORMAL = 1;
+const TASK_ARCHIVE_REGEN = 2;
+
+//Maestro status codes for processes
+const PROCESS_STATUS_COMPLETED = 1;
+const PROCESS_STATUS_ABORTED = 2;
+
+
+
+/**
+ * Implements hook_theme
+ *
+ */
+function maestro_theme($existing, $type, $theme, $path) {
+  return [
+    'maestro_status_bar' => [
+      'variables' => [
+        'stage_count' => 0,
+        'stage_messages' => [],
+        'current_stage' => 0,
+        'current_stage_message' => ''],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_user_update
+ */
+function maestro_user_update($account) {
+  $old_account = $account->original;
+  $old_name = $old_account->getAccountName();
+  if($old_account->getAccountName() != $account->getAccountName()) {
+    //we have to update our production assignments
+    $query = \Drupal::entityQuery('maestro_production_assignments')
+      ->condition('assign_id', $old_name);
+    $assignmentIDs = $query->execute();
+    foreach($assignmentIDs as $assignmentID) {
+      $assignRecord = \Drupal::entityTypeManager()->getStorage('maestro_production_assignments')->load($assignmentID);
+      $assignRecord->set('assign_id', $account->getAccountName());
+      $assignRecord->save();
+    }
+  }
+}
+
+/**
+ * Set Process Variable built-in helper function to use the maestro_entity_identifiers entity to load the first node of type $content_type and pick off the $field value
+ * and set that as the process variable's value.
+ * This function requires that the maestro_entity_identifiers entity actually be set with an appropriate entity ID inside of it for
+ * a node of type $content_type passed into this function.
+ *
+ * @param string $uniqueIdentifier  The unique identifier set by the task for the entity identifiers entity.
+ * @param string $field  The field name of the node in question.
+ * @param int $queueID  The queue ID of the task calling this function
+ * @param int $processID  The process ID of the tatsk calling this function
+
+ * @return string  The resulting value that the set process variable custom function requires
+ *
+ */
+function maestro_spv_content_value_fetch($uniqueIdentifier, $field, $queueID, $processID) {
+  $returnValue = '';
+  
+  $entityID = intval(MaestroEngine::getEntityIdentiferByUniqueID($processID, $uniqueIdentifier));
+  
+  $node = entity_load('node', $entityID);
+  if($node) {
+    //we have a match.  let's do our work now on this content type
+    $field_ref = $node->{$field};
+    $returnValue = $field_ref->getValue();  //TODO: getValue also get taxonomy?  What about nested entity refs? 
+    if(is_array($returnValue)) {
+      $returnValue = current($returnValue)['value'];  //bail out once we know we have a value
+    }
+  }
+
+  return $returnValue;
+}
+
+
+
+
+
+/**
+ * Implements hook_maestro_post_variable_save
+ * For the Maestro Engine, this hook will redo the production assignments for a changed variable
+ *
+ * @param string $variableName
+ * @param string $variableValue
+ * @param int $processID
+ */
+function hook_maestro_post_variable_save($variableName, $variableValue, $processID) {
+
+  //This is an example of what a post-process-variable-save hook looks like
+}
+
+/**
+ * Implements hook_maestro_post_production_assignments
+ */
+function maestro_maestro_post_production_assignments($templateMachineName, $taskID, $queueID) {
+  global $base_url;
+
+  //For our Maestro implementation, we are concerned only with the content type task
+  //We need to detect if there is an already existing task that has created a piece of content
+  //that matches the unique_id and content type.  If so, we alter the handler from the
+  //default handler the task template provided to a handler that allows the console to edit the existing
+  //content and still tack on the appropriate maestro hooks.
+  $task = MaestroEngine::getTemplateTaskByID($templateMachineName, $taskID);
+  if($task['tasktype'] == 'MaestroContentType') {
+    //let's see if this process has any variables that align to the template task's uniqueID requirements for the content type task
+    $processID = MaestroEngine::getProcessIdFromQueueId($queueID);
+    $uniqueIdentifier = $task['data']['unique_id'];
+    $contentType = $task['data']['content_type'];
+    
+    $entityIdentifier = MaestroEngine::getEntityIdentiferByUniqueID($processID, $uniqueIdentifier);
+    if($entityIdentifier) {
+      //we have a match.  adjust the queue item's handler to suit
+      $queueRecord = \Drupal::entityTypeManager()->getStorage('maestro_queue')->load($queueID);
+      if(isset($task['data']['link_to_edit']) && $task['data']['link_to_edit'] == 1) {
+        $queueRecord->set('handler', $base_url . '/node/' . intval($entityIdentifier) . '/edit?maestro=1&queueid=' . $queueID);
+      }
+      else {
+        $queueRecord->set('handler', $base_url . '/node/' . intval($entityIdentifier) . '?maestro=1');
+      }
+      
+      $queueRecord->save();
+    }
+                  
+  }
+}
+
+
+/**
+ * Implements hook_form_alter
+ */
+function maestro_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  //we are detecting if we have a form where the incoming URL has a parameter called "maestro" in it.
+  $queueID = intval(\Drupal::request()->query->get('queueid', 0));
+  $isMaestro = intval(\Drupal::request()->query->get('maestro', 0));
+  //nodeIsInUse signifies if we're looking at a node edit page and it is attached to a 
+  //maestro workflow that is still active.
+  $nodeIsInUse = FALSE;
+  //lets see if the node is being used by a maestro workflow
+  $build_info = $form_state->getBuildInfo();
+  if(array_key_exists('base_form_id', $build_info) && $build_info['base_form_id'] == 'node_form' ) {
+    $form_obj = $form_state->getFormObject();
+    $node = $form_obj->getEntity();
+    $bundle = 'node';
+    $type = $node->getType();
+    
+    $query = \Drupal::service('entity.query')
+      ->get('maestro_entity_identifiers')
+      ->condition('entity_type', $bundle)  
+      ->condition('bundle', $type)
+      ->condition('entity_id', $node->id());
+    $entity_ids = $query->execute();
+    if(count($entity_ids)) {
+      $record = \Drupal::entityTypeManager()->getStorage('maestro_entity_identifiers')->load(current($entity_ids));
+      if($record) {
+        $processID = $record->process_id->getString();
+        $processRecord = MaestroEngine::getProcessEntryById($processID);
+        if($processRecord->complete->getString() == '0') $nodeIsInUse = TRUE;
+      }
+    }
+  }
+  if($nodeIsInUse && !($isMaestro > 0 && $queueID > 0)) {
+    //do we signal the user that saving this node outside of a maestro controlled flow may cause issues?
+    //do we use a hook to let devs set the signal?
+    //do we have another option on the task definition?
+    $form['maestro_information'] = [
+      '#type' => 'fieldset',
+      '#title' => t('Information about this content'),
+      '#markup' => t('This content is attached to an active workflow. Saving this form may alter the active workflow that relies on this content.
+          Saving the content will not complete any open workflow tasks.'),
+      '#weight' => -100,
+    ];
+  }
+
+  $templateTask = MaestroEngine::getTemplateTaskByQueueID($queueID);
+  if($isMaestro > 0 
+      && $queueID > 0 
+      && MaestroEngine::canUserExecuteTask($queueID, \Drupal::currentUser()->id())
+      && $templateTask['tasktype'] == 'MaestroContentType'
+      ) {  //url keys, execute assigned, it's a content type task 
+    $storage = $form_state->getStorage();
+    if($isMaestro == 1) {  //populate this form if its a content type
+      $contentTypes = \Drupal::entityTypeManager()->getStorage('node_type')->loadMultiple();
+      if(array_key_exists('form_display', $storage)) {
+        $thisForm = $storage['form_display']->get('bundle'); 
+      }
+      else {
+        $thisForm = NULL;
+      }
+            
+      if(array_key_exists($thisForm, $contentTypes) && $templateTask['data']['content_type'] == $thisForm) {  //we have a content type match
+       //add our fields to the content type
+       
+        $form['maestro'] = array (
+          '#tree' => TRUE,
+        );
+        
+        $form['maestro']['type'] = array(
+          '#type' => 'hidden',
+          '#default_value' => $thisForm,
+          '#required' => TRUE,
+        );
+        
+        $form['maestro']['queue_id'] = array(
+          '#type' => 'hidden',
+          '#default_value' => $queueID,
+          '#required' => TRUE,
+        );
+        
+        $form['maestro']['process_id'] = array(
+          '#type' => 'hidden',
+          '#default_value' => MaestroEngine::getProcessIdFromQueueId($queueID),
+          '#required' => TRUE,
+        );
+        
+        //add our own submit handler to the submit, publish and unpublish handlers
+        $form['actions']['submit']['#submit'][] = 'maestro_content_type_task_submit';
+        $form['actions']['publish']['#submit'][] = 'maestro_content_type_task_submit';
+        $form['actions']['unpublish']['#submit'][] = 'maestro_content_type_task_submit';
+        //now we add our own button that helps signify if we want to NOT end this task, only if the template says so
+        $task = MaestroEngine::getTemplateTaskByQueueID($queueID);
+        if(array_key_exists('save_edit_later', $task['data']) && $task['data']['save_edit_later'] ==1) {
+          $form['actions']['save_edit_later'] = array (
+            '#type' => 'submit',
+            '#value' => t('Save and Edit Later'),
+            '#submit' => $form['actions']['submit']['#submit'],
+          );
+        }
+      }
+    }
+  }
+}
+
+function maestro_node_view_alter(array &$build, Drupal\Core\Entity\EntityInterface $entity, \Drupal\Core\Entity\Display\EntityViewDisplayInterface $display)  {
+  $queueID = intval(\Drupal::request()->query->get('queueid', 0));
+  $isMaestro = intval(\Drupal::request()->query->get('maestro', 0));
+  if($display->getEntityTypeId() == 'entity_view_display' && $isMaestro > 0 && $queueID > 0 && MaestroEngine::canUserExecuteTask($queueID, \Drupal::currentUser()->id())) {
+   $task = MaestroEngine::getTemplateTaskByQueueID($queueID);
+   if($task['tasktype'] == 'MaestroContentType' && isset($task['data']['show_maestro_buttons_on_view']) && $task['data']['show_maestro_buttons_on_view'] == 1) {
+     $build['maestro_form'] = \Drupal::formBuilder()->getForm('Drupal\maestro\Form\MaestroContentTypeCompleteTask', $queueID );
+     $build['maestro_form']['#weight'] = 1000;
+   }
+ }
+    
+}
+
+function maestro_menu_local_tasks_alter(&$data, $route_name) {
+  //if we're viewing/editing a node AND we have a maestro and queueid query parameter
+  $queueID = intval(\Drupal::request()->query->get('queueid', 0));
+  $isMaestro = intval(\Drupal::request()->query->get('maestro', 0));
+  if(($route_name == 'entity.node.edit_form' || $route_name == 'entity.node.canonical') && ($isMaestro > 0 || $queueID > 0) && MaestroEngine::canUserExecuteTask($queueID, \Drupal::currentUser()->id())) {
+    $oldurl = $data['tabs'][0]['entity.node.edit_form']['#link']['url'];
+    $oldRouteParms = $oldurl->getRouteParameters(); 
+    $url =  \Drupal\Core\Url::fromRoute('entity.node.edit_form', ['node' => $oldRouteParms['node']], ['query' => ['maestro' => 1, 'queueid' => $queueID]]);
+    $data['tabs'][0]['entity.node.edit_form']['#link']['url'] = $url;
+    
+    $oldurl = $data['tabs'][0]['entity.node.canonical']['#link']['url'];
+    $oldRouteParms = $oldurl->getRouteParameters();
+    $url =  \Drupal\Core\Url::fromRoute('entity.node.canonical', ['node' => $oldRouteParms['node']], ['query' => ['maestro' => 1, 'queueid' => $queueID]]);
+    $data['tabs'][0]['entity.node.canonical']['#link']['url'] = $url;
+    
+  }
+}
+
+/**
+ * Handling the submission from a content type task.  This will offload the saving from the content type task plugin
+ * 
+ * @param array $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+function maestro_content_type_task_submit(&$form, \Drupal\Core\Form\FormStateInterface $form_state) {
+  global $base_url;
+  $trigger = $form_state->getTriggeringElement();
+  $maestroElements = $form_state->getValue('maestro');
+  $queueID = $maestroElements['queue_id'];
+  $processID = $maestroElements['process_id'];
+  $contentType = $maestroElements['type'];
+  
+  $storage = $form_state->getStorage();
+  if(intval($storage['nid']) > 0) {  //we have a node ID
+    $task = MaestroEngine::getTemplateTaskByQueueID($queueID);
+    $uniqueIdentifier = $task['data']['unique_id'];
+    
+    $entityIdentifier = MaestroEngine::getEntityIdentiferByUniqueID($processID, $uniqueIdentifier);
+    if(!$entityIdentifier) { //doesn't exist in our entity identifiers entity
+      MaestroEngine::createEntityIdentifier($processID, 'node', $contentType, $uniqueIdentifier, $storage['nid']);
+      //since we don't have this combo set in our entity identifiers, we then need to set the handler too to point to the content
+      $queueRecord = \Drupal::entityTypeManager()->getStorage('maestro_queue')->load($queueID);
+      $queueRecord->set('handler', $base_url . '/node/' . $storage['nid'] . '/edit?maestro=1');
+      $queueRecord->save();
+    }
+    
+    if($trigger['#id'] != 'edit-save-edit-later') {
+      //we want to complete the task here and redirect to the redirection location specified
+      drupal_set_message(t('Content added and your task has been completed!'));
+      MaestroEngine::completeTask($queueID, \Drupal::currentUser()->id());
+      if(isset($task['data']['redirect_to'])) {
+        $response = new RedirectResponse('/' . ltrim($task['data']['redirect_to'], '/'));
+        $response->send();
+      }
+    }
+    else {  //we've saved and edited for later settings... ie, not completed the task.  do a redirect
+      if(isset($task['data']['redirect_to']) && $task['data']['redirect_to'] != '' ) {
+        //we need to change the handler for this task to go to the content edit page.
+        
+        drupal_set_message(t('Content added and your task is still open for completion!'));
+        $response = new RedirectResponse('/' . ltrim($task['data']['redirect_to'], '/') . '/' . $queueID);
+        $response->send();
+      }
+    }
+  }
+}
+
+
+/**
+ * Implements hook_maestro_template_validation_check
+ * @param string $templateMachineName
+ * @param array $validation_failure_tasks
+ * @param array $validation_information_tasks
+ */
+function maestro_maestro_template_validation_check($templateMachineName, &$validation_failure_tasks, &$validation_information_tasks) {
+  //for our purposes, we will check to see if the template has any tasks that are set to have status turned on even though we have the 
+  //number of status stages set to 0.
+  //Also check for tasks with a status number of 0.
+  $notice = [];
+  $taskStatusIsSet = FALSE;
+  $templateStatusIsOn = FALSE;
+  $template = MaestroEngine::getTemplate($templateMachineName);
+  
+  if(isset($template->default_workflow_timeline_stage_count) && $template->default_workflow_timeline_stage_count > 0) {
+    $templateStatusIsOn = TRUE;
+  }
+  foreach($template->tasks as $task) {
+    if(isset($task['participate_in_workflow_status_stage']) && $task['participate_in_workflow_status_stage'] == true ) {
+      $taskStatusIsSet = TRUE;
+      if(isset($task['workflow_status_stage_number']) && $task['workflow_status_stage_number'] == 0) {
+        $validation_information_tasks[] = [
+          'taskID' => $task['id'],
+          'taskLabel' => $task['label'],
+          'reason' => t('The task is set to participate in the setting of status messages, however, 
+              the task has 0 set for the task stage.  This will not set any status stage message.'),
+        ];
+      }
+    }
+  }
+  if(!$templateStatusIsOn && $taskStatusIsSet) {
+    //make our template warning first
+    $notice[] = [
+      'taskID' => t('Entire Template'),
+      'taskLabel' => t('Entire Template'),
+      'reason' => t('The template has the "The default number of stages you wish to show this workflow having" option set to 0, 
+          however, there are tasks that set status. This will cause no status to show for newly spawned processes of this template.'),
+    ];
+    $validation_information_tasks = array_merge($notice, $validation_information_tasks);
+  }
+  
+}
+
+
+
+/**
+ * Implements hook_mail().
+ */
+function maestro_mail($key, &$message, $params) {
+  $options = array(
+      'langcode' => $message['langcode'],
+  );
+  
+  //Dev note:
+  //use hook_mail_alter to set a different subject line
+  
+  $message['headers']['Content-Type'] = 'text/html; charset=UTF-8; format=flowed; delsp=yes';
+
+  switch ($key) {
+    case 'assignment_notification':
+      $message['from'] = \Drupal::config('system.site')->get('mail');
+      $message['subject'] = t('You have a new task assignment');
+      $message['body'][] = \Drupal\Component\Utility\SafeMarkup::checkPlain($params['message']);
+      $message['headers']['Content-Type'] = 'text/html; charset=UTF-8; format=flowed; delsp=yes';
+      break;
+      
+    case 'reminder_notification':
+      $message['from'] = \Drupal::config('system.site')->get('mail');
+      $message['subject'] = t('A reminder that you have outstanding tasks');
+      $message['body'][] = \Drupal\Component\Utility\SafeMarkup::checkPlain($params['message']);
+      $message['headers']['Content-Type'] = 'text/html; charset=UTF-8; format=flowed; delsp=yes';
+      break;
+      
+    case 'escalation_notification':
+      $message['from'] = \Drupal::config('system.site')->get('mail');
+      $message['subject'] = t('A task has been escalated to you');
+      $message['body'][] = \Drupal\Component\Utility\SafeMarkup::checkPlain($params['message']);
+      $message['headers']['Content-Type'] = 'text/html; charset=UTF-8; format=flowed; delsp=yes';
+      break;
+  }
+}
+
+
+/**
+ * Implements hook_toolbar().
+ * Add the Maestro toolbar
+ */
+function maestro_toolbar() {
+  $items = [];
+
+  $items['Maestro'] = [
+    '#cache' => [
+      'contexts' => ['user.permissions'],
+    ],
+  ];
+
+  // Need at least this permission to view the maestro toolbar
+  if (!\Drupal::currentUser()->hasPermission('view maestro task console')) {
+    return $items;
+  }
+
+  $items['Maestro'] += [
+    '#type' => 'toolbar_item',
+    '#weight' => 1,
+    'tab' => [
+      '#type' => 'link',
+      '#title' => 'Maestro',
+      '#url' => \Drupal\Core\Url::fromRoute("<front>"),
+      '#attributes' => [
+        'title' => 'Maestro menu',
+        'class' => ['toolbar-icon', 'toolbar-icon-devel'],
+      ],
+    ],
+    'tray' => [
+      'configuration' => [],
+      '#attached' => array(
+        'library' => array(
+          'maestro/maestro-toolbar',
+        ),
+      ),
+    ],
+  ];
+
+  if (\Drupal::moduleHandler()->moduleExists('maestro_taskconsole')) {
+    $items['Maestro']['tray']['configuration'][] = [
+      '#type' => 'link',
+      '#title' => 'Task Console',
+      '#url' => \Drupal\Core\Url::fromUri("internal:/taskconsole"),
+    ];
+  }
+
+  // Add more toolbar menu items depending on access
+  if (\Drupal::currentUser()->hasPermission('administer maestro templates')) {
+    if (\Drupal::moduleHandler()->moduleExists('maestro_template_builder')) {
+      $items['Maestro']['tray']['configuration'][] = [
+        '#type' => 'link',
+        '#title' => 'Template Builder',
+        '#url' => \Drupal\Core\Url::fromUri("internal:/maestro/templates/list"),
+      ];
+    }
+  }
+
+  if (\Drupal::currentUser()->hasPermission('administer maestro queue entities')) {
+    $config = \Drupal::config('maestro.settings');
+    $token = $config->get('maestro_orchestrator_token');
+    $items['Maestro']['tray']['configuration'][] = [
+      '#type' => 'link',
+      '#title' => 'Run Orchestrator',
+      '#url' => \Drupal\Core\Url::fromRoute("maestro.orchestrator", array('token' => $token)),
+    ];
+    $items['Maestro']['tray']['configuration'][] = [
+      '#type' => 'link',
+      '#title' => 'Outstanding Tasks',
+      '#url' => \Drupal\Core\Url::fromUri("internal:/outstanding-tasks"),
+    ];
+    $items['Maestro']['tray']['configuration'][] = [
+      '#type' => 'link',
+      '#title' => 'All Active Tasks',
+      '#url' => \Drupal\Core\Url::fromUri("internal:/maestro-all-in-production-tasks"),
+    ];
+    $items['Maestro']['tray']['configuration'][] = [
+      '#type' => 'link',
+      '#title' => 'Workflow History',
+      '#url' => \Drupal\Core\Url::fromUri("internal:/maestro-all-flows"),
+    ];
+
+
+  }
+
+  return $items;
+
+}
+
+/**
+ * Implements hook_token_info
+ */
+function maestro_token_info() {
+  $type = array(
+    'name' => t('Maestro'),
+    'description' => t('Tokens for use in Maestro notification messages.'),
+    'needs-data' => 'maestro',
+  );
+
+  $maestro = [];
+  
+  $maestro['task-url'] = [
+    'name' => t('Executable URL'),
+    'description' => t('The string URL of the task.'),
+  ];
+  
+  $maestro['task-id'] = [
+    'name' => t('Task Machine Name'),
+    'description' => t('The task ID or machine name from the template.'),
+  ];
+  
+  $maestro['task-name'] = [
+    'name' => t('Task Label'),
+    'description' => t('The name/label given to the task in the workflow editor.'),
+  ];
+  
+  $maestro['queueid'] = [
+    'name' => t('QueueID'),
+    'description' => t('The queueID of the task in question.'),
+  ];
+  
+  $maestro['template-name'] = [
+    'name' => t('Template Name'),
+    'description' => t('The name of the template.'),
+  ];
+  
+  $maestro['assigned-user-names'] = [
+    'name' => t('Task assigned usernames'),
+    'description' => t('The usernames of the assigned actor(s).'),
+  ];
+  
+  $maestro['assigned-user-emails'] = [
+    'name' => t('Task assigned email address'),
+    'description' => t('The email addresses of the assigned actor(s).'),
+  ];
+  
+  $maestro['assigned-roles'] = [
+    'name' => t('Task assigned roles'),
+    'description' => t('The roles assigned to this task.'),
+  ];
+  
+  $maestro['template-name'] = [
+    'name' => t('Template Name'),
+    'description' => t('The name of the template.'),
+  ];
+  
+  $maestro['entity-identifier'] = [
+    'name' => t('Entity Identifier'),
+    'description' => t('Use the Entity Identifier to pull a value out of a field.  example: maestro:entity-identifier:uniqueid:field_machine_name.'),
+  ];
+  
+  
+  
+  return array(
+    'types' => array('maestro' => $type),
+    'tokens' => array(
+      'maestro' => $maestro,
+    ) 
+  );
+}
+
+/**
+ * Implements hook_tokens
+ */
+function maestro_tokens($type, $tokens, array $data, array $options, \Drupal\Core\Render\BubbleableMetadata $bubbleable_metadata) {
+  $token_service = \Drupal::token();
+
+  $url_options = array('absolute' => TRUE);
+  if (isset($options['langcode'])) {
+    $url_options['language'] = \Drupal::languageManager()->getLanguage($options['langcode']);
+    $langcode = $options['langcode'];
+  }
+  else {
+    $langcode = NULL;
+  }
+  $replacements = array();
+  
+  if ($type == 'maestro' && !empty($data['maestro'])) {
+    $task = $data['maestro']['task'];
+    $queueID = $data['maestro']['queueID'];
+    $processID = MaestroEngine::getProcessIdFromQueueId($queueID);
+    
+    foreach ($tokens as $name => $original) {
+      switch ($name) {
+        case 'task-url': 
+          $url = \Drupal\maestro\Utility\TaskHandler::getHandlerURL($queueID);
+          $url = ltrim($url, '/');
+          $replacements[$original] = $url;
+          break;
+       
+        case 'task-id':
+          $replacements[$original] = $task['id'];
+          break;
+          
+        case 'task-name':
+          $replacements[$original] = $task['label'];
+          break;
+          
+        case 'template-name':
+          $templateMachineName = MaestroEngine::getTemplateIdFromProcessId($processID);
+          $template = MaestroEngine::getTemplate($templateMachineName);
+          $replacements[$original] = $template->label;
+          break;
+          
+        case 'queueid':
+          $replacements[$original] = $queueID;
+          break;
+          
+        case 'assigned-user-names':
+          $replace = '';
+          $assignments = MaestroEngine::getAssignedNamesOfQueueItem($queueID, TRUE);
+          foreach($assignments as $name => $arr) {
+            if($arr['assign_type'] == 'user') {
+              if($replace != '') $replace .= ', ';
+              $replace .= $name;
+            }
+          }
+          $replacements[$original] = $replace;
+          break;
+          
+        case 'assigned-user-emails':
+          $replace = '';
+          $assignments = MaestroEngine::getAssignedNamesOfQueueItem($queueID, TRUE);
+          foreach($assignments as $name => $arr) {
+            if($arr['assign_type'] == 'user') {
+              $usr = user_load_by_name($name);
+              if($replace != '') $replace .= ', ';
+              $replace .= $usr->mail->getString();
+            }
+          }
+          $replacements[$original] = $replace;
+          break;
+          
+        case 'assigned-roles':
+          $replace = '';
+          $assignments = MaestroEngine::getAssignedNamesOfQueueItem($queueID, TRUE);
+          foreach($assignments as $name => $arr) {
+            if($arr['assign_type'] == 'role') {
+              if($replace != '') $replace .= ', ';
+              $replace .= $name;
+            }
+          }
+          $replacements[$original] = $replace;
+          break;
+          
+        //we will use this section to detect the 'entity-identifier' token which uses a few dynamic parameters
+        //that associate the entity identifier unique ID and the field you wish to pull its value for display 
+        default:
+          $replace = '';
+          $token_parts = explode(':', $name);
+          if(count($token_parts) > 1) {
+            //we know there's a multi-part token.  [0] should be 'entity-identifier'.  if so, continue.
+            if($token_parts[0] == 'entity-identifier') {
+              //let's be sure there's enough parts here.
+              if(count($token_parts) == 3) {
+                //part [1] will be the unique ID and [2] will be the field to pull the value out of the entity
+                
+                
+                $uniqueIdentifier = MaestroEngine::getEntityIdentiferFieldsByUniqueID($processID, $token_parts[1]);
+                $entity = entity_load($uniqueIdentifier[$token_parts[1]]['entity_type'], $uniqueIdentifier[$token_parts[1]]['entity_id']);
+                if($entity) {
+                  //we have a match.  
+                  //we can support 2 different types of entities our of the box here.  Content types and webforms.
+                  //if we don't have one of those types of entities, we'll just provide a hook so you can 
+                  //take care of the fetching.  We'll expand these in-code as required over time.
+                
+                  switch($entity->getEntityTypeId() ) {
+                    case 'webform_submission':
+                      if (\Drupal::moduleHandler()->moduleExists('maestro_webform')) {
+                        $webform_submission = \Drupal\webform\Entity\WebformSubmission::load($entity->id());
+                        $replace = $webform_submission->getElementData($token_parts[2]);
+                      }
+                      break;
+                      
+                    case 'node':
+                      $field_ref = $entity->{$token_parts[2]};
+                      $replace = $field_ref->getValue();
+                      if(is_array($replace)) {
+                        $replace = current($replace)['value'];  //bail out once we know we have a value
+                      }
+                      break;
+                      
+                  }
+                  //let's pass off the fetching of the data to any hooks that wish to do any work on the entity type
+                  \Drupal::moduleHandler()->invokeAll('maestro_get_entity_token_value', array($entity, $name, $original, $token_parts, &$replacements));
+                  
+                }
+              }
+            }
+          }
+          $replacements[$original] = $replace;
+          break;
+      }
+    }
+  }
+  
+  return $replacements;
+}
+
+/**
+ * Implements hook_theme_suggestions_hook_alter
+ */
+function maestro_theme_suggestions_views_view_table_alter(array &$suggestions, array $variables) {
+  //We are adding our own suggestion ONLY if the current view is our all flows view AND the current display is the all_flows_full.
+  $view = $variables['view'];
+  if($view->current_display == 'all_flows_full' && $view->id() == 'maestro_all_flows') {
+    $suggestions[] = 'maestro_views_view_table';
+  }
+}
+
+/**
+ * Implements hook_theme_registry_alter
+ */
+function maestro_theme_registry_alter(&$theme_registry) {
+  //We need to rely on the rest of what Views does for us as we're mimicing the table output
+  //so we'll first tell the theme registry to have the same settings as the original views table
+  $theme_registry['maestro_views_view_table'] = $theme_registry['views_view_table'];
+  
+  //Now, we actually want to use our own template, which is inside of our Maestro module templates folder.
+  $theme_registry['maestro_views_view_table']['template'] = 'maestro-views-view-table';
+  $path = drupal_get_path('module', 'maestro');
+  $theme_registry['maestro_views_view_table']['path'] = $path . '/templates';
+}
+
+/*
+
+//here's how you will access the Maestro Engine:
+* $engine = new \Drupal\maestro\Engine\MaestroEngine();
+* $engine->whatever();
+
+ 
+//here's how to get the maestro task plugins:
+*
+* $manager = \Drupal::service('plugin.manager.maestro_tasks');
+$plugins = $manager->getDefinitions();
+
+The plugins array is keyed by the task type.  For example, MaestroStart, MaestroEnd etc.
+ 
+//here's how you create an instance of the task once you've created the plugin manager refs above:
+* $task = $manager->createInstance($plugins[$taskClassName]['id'], array($processID, $queueID));
+
+
+//here's how, in a task, you can determine which other templates point to the task:
+*     $pointers = $this->whoPointsToMe(MaestroEngine::getTemplateIdFromProcessId($this->processID), MaestroEngine::getTaskIdFromQueueId($this->queueID));
+pointers then holds an array of task machine names from the template
+whoPointsToMe is in the MaestroTaskTrait
+
+
+//here's how you get a process variable:
+* $var = MaestroEngine::getProcessVariable('initiator', 7);
+*
+ 
+ 
+//here's how to deterimine who points to a task inside of the task interface:
+* $pointers = $this->whoPointsToMe($templateMachineName, $taskMachineName);
+
+ 
+*/
+
