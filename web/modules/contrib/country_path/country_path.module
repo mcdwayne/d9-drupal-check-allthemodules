@@ -1,0 +1,208 @@
+<?php
+
+/**
+ * @file
+ * Contains country_path.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\domain\Entity\Domain;
+use Drupal\domain\DomainInterface;
+use Drupal\domain\DomainNegotiator;
+
+/**
+ * Implements hook_help().
+ */
+function country_path_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the country_path module.
+    case 'help.page.country_path':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Adds custom path prefix for multi countries sites.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_entity_type_build().
+ *
+ * @var $entity_types \Drupal\Core\Entity\EntityTypeInterface[]
+ */
+function country_path_entity_type_build(array &$entity_types) {
+  // Override default domain entity class.
+  if (isset($entity_types['domain'])) {
+    $entity_types['domain']->setClass('Drupal\country_path\Entity\CountryPathDomain');
+  }
+}
+
+/**
+ * Implements hook_entity_type_alter().
+ *
+ * @var $entity_types \Drupal\Core\Entity\EntityTypeInterface[]
+ */
+function country_path_entity_type_alter(array &$entity_types) {
+  // Override default domain entity default form class.
+  if (!empty($entity_types['domain'])) {
+    $entity_types['domain']->setHandlerClass('form', [
+      'default' => 'Drupal\country_path\CountryPathDomainForm',
+      'edit' => 'Drupal\country_path\CountryPathDomainForm',
+      'delete' => 'Drupal\domain\Form\DomainDeleteForm',
+    ]);
+
+    $entity_types['domain']->setListBuilderClass('\Drupal\country_path\CountryPathDomainListBuilder');
+  }
+
+  // Override default domain_alias entity default form class.
+  if (!empty($entity_types['domain_alias'])) {
+    $entity_types['domain_alias']->setHandlerClass('form', [
+      'default' => 'Drupal\country_path\CountryPathDomainAliasForm',
+      'edit' => 'Drupal\country_path\CountryPathDomainAliasForm',
+      'delete' => 'Drupal\domain_alias\Form\DomainAliasDeleteForm',
+    ]);
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function country_path_theme() {
+  $theme = [];
+
+  return $theme;
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function country_path_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  if ($form_id === 'domain_add_form' || $form_id === 'domain_edit_form') {
+    country_path_domain_form_alter($form, $form_state, $form_id);
+  }
+
+  if (in_array($form_id, ['domain_alias_add_form', 'domain_alias_edit_form', 'domain_alias_form'])) {
+    country_path_domain_alias_form_alter($form, $form_state, $form_id);
+  }
+}
+
+/**
+ * Handles the form alter for the domain_alias_add_form and domain_alias_edit_form forms.
+ */
+function country_path_domain_alias_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $form['pattern']['#description'] = t(
+    'The matching pattern for this alias,
+    using the full <em>subdomain.example.com</em> format.
+    Leave off the http:// and the trailing slash and do not include any paths.<br />
+    If the domain is detected using country code in path, you could specify it here, e.g.: <em>example.com/usa </em>. <br />
+    Otherwise country code will be added automatically to the pattern.<br />
+    <strong>Do not add country code for patterns that ends with "*", e.g.: <em>example.*</em></strong> <br />
+    '
+  );
+}
+
+/**
+ * Handles the form alter for the domain_add_form and domain_edit_form forms.
+ */
+function country_path_domain_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $domain = $form_state->getFormObject()->getEntity();
+  $domain_suffix = $domain->getThirdPartySetting('country_path', 'domain_path');
+  if (!empty($domain_suffix)) {
+    $form['hostname']['#default_value'] = $domain->getCanonical() . "/$domain_suffix";
+  }
+
+  $form['hostname']['#description'] = t(
+    'The canonical hostname,
+ using the full <em>subdomain.example.com</em> format.
+ Leave off the http:// and the trailing slash and do not include any paths.<br />
+ If this domain uses a custom http(s) port, you should specify it here, e.g.: <em>subdomain.example.com:1234</em><br />
+ The hostname may contain only lowercase alphanumeric characters, dots, dashes, and a colon (if using alternative ports).
+ <br />
+ If the domain is detected using country code in path, you should specify it here, e.g.: <em>example.com/usa </em>.
+ Your hostname will be <em>example.com</em> and country path - <em>usa</em>.
+ '
+  );
+  $form['domain_path'] = [
+    '#type' => 'hidden',
+    '#disabled' => TRUE,
+    '#title' => t('Country path'),
+    '#description' => t('Domain from the URL (Path prefix). Added automatically'),
+    '#default_value' => $domain_suffix,
+    '#weight' => 1,
+  ];
+
+  $form['#entity_builders'][] = 'country_path_save_domain_configs';
+
+}
+
+/**
+ * Entity builder for Domain configuration entity.
+ *
+ * See \Drupal\Domain\Entity\Domain.
+ */
+function country_path_save_domain_configs($entity_type, Domain $domain, &$form, FormStateInterface $form_state) {
+  if ($form_state->getValue('domain_path')) {
+    $domain->setThirdPartySetting('country_path', 'domain_path', $form_state->getValue('domain_path'));
+    return;
+  }
+
+  $domain->unsetThirdPartySetting('country_path', 'domain_path');
+}
+
+/**
+ * Implements hook_domain_request_alter().
+ */
+function country_path_domain_request_alter(DomainInterface &$domain) {
+  // @see https://www.drupal.org/project/country_path/issues/3013778
+  $request_path = ( \Drupal::hasRequest() )
+    ? \Drupal::request()->getPathInfo() : FALSE;
+
+  if (!$request_path) { return; }
+
+  $path_info = explode('/', $request_path);
+  if (empty($path_info[1])) {
+    // Nothing to do here.
+    return;
+  }
+
+  $path_prefix = $path_info[1];
+  // Get hostname.
+  $hostname = \Drupal::request()->getHost();
+  // Check alias match.
+  if (\Drupal::service('module_handler')->moduleExists('domain_alias')) {
+    $alias_storage = \Drupal::service('entity_type.manager')->getStorage('domain_alias');
+    $domain_storage = \Drupal::service('entity_type.manager')->getStorage('domain');
+
+    /** @var \Drupal\domain_alias\Entity\DomainAlias $alias */
+    if (
+      ($alias = $alias_storage->loadByHostname($hostname . "/$path_prefix"))
+      || ($alias = $alias_storage->loadByHostname($hostname))
+    ) {
+      /** @var \Drupal\domain\Entity\Domain $domain */
+      if ($domain = $domain_storage->load($alias->getDomainId())) {
+        $domain->addProperty('alias', $alias);
+        $domain->setMatchType(DomainNegotiator::DOMAIN_MATCH_ALIAS);
+        $redirect = $alias->getRedirect();
+        if (!empty($redirect)) {
+          $domain->setRedirect($redirect);
+        }
+        return;
+      }
+    }
+  }
+  // Run domain match.
+  $possible_domains = \Drupal::entityTypeManager()
+    ->getStorage('domain')
+    ->loadByProperties(['hostname' => $hostname]);
+
+  foreach ($possible_domains as $possible_domain) {
+    $country_path = $possible_domain->getThirdPartySetting('country_path', 'domain_path');
+    if ($path_prefix === $country_path) {
+      // Change detected domain.
+      $domain = $possible_domain;
+      return;
+    }
+  }
+}
