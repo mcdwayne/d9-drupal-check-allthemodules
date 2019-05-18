@@ -1,0 +1,128 @@
+<?php
+
+/**
+ * @file
+ * Contains the hooks used in this module.
+ */
+
+use Drupal\user\Entity\User;
+
+/**
+ * Implements hook_cron().
+ */
+function mask_user_data_cron() {
+  if (
+    Drupal::config('mask_user_data.settings')->get('enabled') &&
+    Drupal::config('mask_user_data.settings')->get('already_masked') !== TRUE
+  ) {
+    $map_array = Drupal::config('mask_user_data.settings')->get('map_array') ?: NULL;
+    if (!(empty($map_array) || !is_array($map_array))) {
+      mask_user_data_setup_batch();
+    }
+  }
+}
+
+/**
+ * Sets up a batch to process all users in the system and mask their data.
+ *
+ * @see https://www.metaltoad.com/blog/using-drupal-batch-api
+ */
+function mask_user_data_setup_batch() {
+  $all_users = Drupal::database()
+    ->query("SELECT uid FROM users WHERE uid > 0")
+    ->fetchCol();
+
+  // Break up all of our data so each process does not time out.
+  $chunks = array_chunk($all_users, 20);
+  $operations = [];
+  $count_chunks = count($chunks);
+
+  // For every chunk, assign some method to run on that chunk of data.
+  $i = 0;
+  foreach ($chunks as $chunk) {
+    $i++;
+    $operations[] = [
+      "mask_user_data_mask_users",
+      [
+        $chunk,
+        t(
+          '(Masking users: chunk @chunk  of @count)',
+          [
+            '@chunk ' => $i,
+            '@count' => $count_chunks,
+          ]
+        ),
+      ],
+    ];
+  }
+
+  // Put all that information into our batch array.
+  $batch = [
+    'operations' => $operations,
+    'title' => t('Import batch'),
+    'init_message' => t('Initializing'),
+    'error_message' => t('An error occurred'),
+    'finished' => 'mask_user_data_finished_method',
+  ];
+
+  // Let's run the batch now.
+  // Because we are doing this on the back-end, we set progressive to false.
+  if (PHP_SAPI === 'cli') {
+    drush_log(dt('Updating all the fields and properties of the existing users. This may take some time.'), 'success');
+  }
+  batch_set($batch);
+  $batch =& batch_get();
+  if (PHP_SAPI === 'cli') {
+    $batch['progressive'] = FALSE;
+    drush_backend_batch_process();
+  }
+  else {
+    $batch['progressive'] = FALSE;
+    batch_process();
+  }
+
+}
+
+/**
+ * Masks a group of users.
+ *
+ * @param array $chunk
+ *   List of uids.
+ * @param string $operation_details
+ *   Message.
+ * @param object $context
+ *   Operation context.
+ */
+function mask_user_data_mask_users(array $chunk, $operation_details, &$context) {
+  $map_array = Drupal::config('mask_user_data.settings')->get('map_array') ?: NULL;
+  $user = User::load(1);
+  $user_fields = $user->getFields();
+
+  foreach ($chunk as $uid) {
+    Drupal::service('mask_user_data.mask_user')->mask($uid, $map_array, $user_fields);
+  }
+
+  $context['message'] = $operation_details;
+}
+
+/**
+ * Callback function when the batch completes.
+ *
+ * @param mixed $success
+ *   Success information.
+ * @param mixed $results
+ *   Results information.
+ * @param mixed $operations
+ *   Operations information.
+ */
+function mask_user_data_finished_method($success, $results, $operations) {
+  Drupal::configFactory()->getEditable('mask_user_data.settings')
+    ->set('already_masked', TRUE)->save();
+
+  if (PHP_SAPI === 'cli') {
+    drush_log(dt('Update completed, all data has been masked.'), 'success');
+  }
+  else {
+    drupal_set_message(t('Update completed, all data has been masked.'));
+  }
+}
