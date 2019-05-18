@@ -1,0 +1,710 @@
+<?php
+
+/**
+ * @file
+ * The module that search form, including enforcing search restrictions by content type.
+ */
+
+use Drupal\Component\Utility\Html;
+use Drupal\Core\Database\Query\Condition;
+use Drupal\Core\Database\Query\SelectInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\Url;
+use Drupal\node\NodeInterface;
+
+/**
+ * Implements hook_theme().
+ */
+function search_config_theme() {
+  return [
+    'search-config-admin-label-form' => [
+      'render element' => 'form',
+    ],
+  ];
+}
+
+/**
+ * Implements hook_node_search_results().
+ *
+ * The only reason for this hook is to record if there are any active
+ * search results found.
+ */
+function search_config_node_search_result(NodeInterface $node) {
+  global $search_config_node_results;
+  $search_config_node_results [$node->id()] = $node->id();
+}
+
+/**
+ * Implements of hook_query_node_access_alter().
+ */
+function search_config_query_node_access_alter(SelectInterface $query) {
+  $user = \Drupal::currentUser();
+  if ($user->id() == 1) {
+    return;
+  }
+  $search = FALSE;
+  $node = FALSE;
+  foreach ($query->getTables() as $alias => $table) {
+    if ($table['table'] == 'search_index') {
+      $search = $alias;
+    }
+    elseif ($table['table'] == 'node') {
+      $node = $alias;
+    }
+  }
+
+  if ($node && $search) {
+    if ($user->id() != 1) {
+      if (!\Drupal::currentUser()->hasPermission('search all content')) {
+        $excluded_content_types = [];
+        foreach (search_config_content_types() as $type => $label) {
+          if (!\Drupal::currentUser()->hasPermission("search $type content")) {
+            $excluded_content_types[] = $type;
+          }
+        }
+
+        // A core bug results in a DB error if we use the following: Ref: #1210072
+        // $query->condition($node . '.type', array($excluded_content_types), 'NOT IN');
+        if (!empty($excluded_content_types)) {
+          $db_and = new Condition('AND');
+          foreach ($excluded_content_types as $type) {
+            $db_and->condition($node . '.type', $type, '!=');
+          }
+          $query->condition($db_and);
+        }
+      }
+
+      if (!\Drupal::currentUser()
+        ->hasPermission('search all excluded entities')
+      ) {
+        // Join into the {} table to see if it is excluded.
+        $query->leftJoin('search_config_exclude', 'sc', $node . '.nid = sc.entity_id AND sc.entity_type = :type', [':type' => 'node']);
+        $query->isNull('sc.entity_id');
+      }
+    }
+
+    if (get_class($query) == 'PagerDefault' || is_subclass_of($query, 'PagerDefault')) {
+      $settings = search_config_node_settings();
+      if (!empty($settings['results']['limit'])) {
+        $query->range($settings['results']['limit']);
+      }
+    }
+  }
+}
+
+/**
+ * Implements of hook_form_FORM_alter().
+ */
+function search_config_form_search_form_alter(&$form, $form_state) {
+  // Update the node search form.
+  if (isset($form['module']['#value']) && $form['module']['#value'] == 'node') {
+    module_load_include('inc', 'search_config', 'search_config.node');
+    _search_config_set_string_overrides($form, $form_state);
+    if (isset($form['advanced'])) {
+      $settings = search_config_node_settings();
+      if (!empty($settings['restrictions']['remove_advanced'])) {
+        $form['advanced']['#access'] = FALSE;
+      }
+      else {
+        _search_config_advanced_form($form, $form_state);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_alter()
+ */
+function search_config_form_search_admin_settings_alter(&$form, $form_state) {
+  $string_overrides = search_config_string_overrides();
+  $form['search_config_string_overrides'] = [
+    '#type' => 'details',
+    '#theme' => 'search_config_admin_label_form',
+    '#title' => t('Labels and string overrides'),
+    '#open' => FALSE,
+    'labels' => [],
+    'title_display' => [],
+    '#tree' => TRUE,
+  ];
+  $title_display_options = [
+    'default' => t('Default'),
+    'invisible' => t('Hidden'),
+    'description' => t('Below'),
+  ];
+  $slabels = [
+    'basic' => [t('Keywords'), t('Enter your keywords')],
+    'basic_with_keys' => [
+      t('Keywords (with search keys)'),
+      t('Enter your keywords'),
+    ],
+    'basic_submit' => [t('Submit button'), t('Search')],
+    'advanced_fieldset' => [t('Wrapping fieldset'), t('Advanced search')],
+    'advanced_fieldset_with_keys' => [
+      t('Wrapping fieldset (with search keys)'),
+      t('Advanced search'),
+    ],
+    'advanced_any' => [
+      t('Containing any ...'),
+      t('Containing any of the words'),
+    ],
+    'advanced_phrase' => [
+      t('Containing the phrase'),
+      t('Containing the phrase'),
+    ],
+    'advanced_none' => [
+      t('Containing none ...'),
+      t('Containing none of the words'),
+    ],
+    'advanced_type' => [t('Types'), t('Only of the type(s)')],
+    'advanced_language' => [t('Language selector'), t('Languages')],
+    'advanced_submit' => [t('Submit button'), t('Advanced search')],
+  ];
+  $form['search_config_string_overrides']['#field-labels'] = $slabels;
+  foreach ($slabels as $skey => $slabel) {
+    $form['search_config_string_overrides']['labels'] += [
+      $skey => [
+        '#type' => 'textfield',
+        '#title' => $slabel[0],
+        '#default_value' => $string_overrides['labels'][$skey],
+        '#description' => t('t() string: !translation',
+          [
+            '%label' => $slabel[1],
+            '!translation' => '!search_config:' . $skey,
+          ]),
+        '#size' => 40,
+      ],
+    ];
+    if (isset($string_overrides['title_display'][$skey])) {
+      $form['search_config_string_overrides']['title_display'] += [
+        $skey => [
+          '#type' => 'radios',
+          '#title' => $slabel[0],
+          '#default_value' => $string_overrides['title_display'][$skey],
+          '#options' => $title_display_options,
+        ],
+      ];
+    }
+  }
+  $settings = search_config_node_settings();
+  $form['content_node_search_config'] = [
+    '#type' => 'details',
+    '#tree' => TRUE,
+    '#title' => t('Additional Node Search Configuration'),
+    '#open' => FALSE,
+    'info' => [
+      '#markup' => t('<p>The basic search form is the keyword and search button that is shown to all users. The additional fields are all part of the advanced search form that is only shown to users that have the "%advsearch" permission. <em>This module does not override these permissions!</em></p>',
+        [
+          '%usesearch' => t('Use search'),
+          '%advsearch' => t('Use advanced search'),
+        ]),
+    ],
+    'forms' => [
+      '#type' => 'item',
+      '#title' => t('Form control'),
+      'toggle_forms' => [
+        '#type' => 'checkbox',
+        '#title' => t('Only show one form at a time'),
+        '#description' => t('This will hide the basic search form if the advanced search form is present.'),
+        '#default_value' => $settings['forms']['toggle_forms'],
+      ],
+      'move_keyword_search' => [
+        '#type' => 'checkbox',
+        '#title' => t('Move basic keyword search'),
+        '#description' => t('This will move the keyword search field, (%label), into the advanced form and hide the rest of the basic form.'),
+        '#default_value' => $settings['forms']['move_keyword_search'],
+      ],
+      'advanced_populate' => [
+        '#type' => 'checkbox',
+        '#title' => t('Populate the advanced form with default values'),
+        '#description' => t('By default the advanced form is always empty after a submission. This option will pull the values from the basic search form and use these to populate the advanced search form fields.'),
+        '#default_value' => $settings['forms']['advanced_populate'],
+      ],
+      'remove_containing_wrapper' => [
+        '#type' => 'radios',
+        '#title' => t('Remove all <em>Containing ...</em> keyword options'),
+        '#default_value' => $settings['forms']['remove_containing_wrapper'],
+        '#options' => [
+          'default' => t('No change'),
+          'remove' => t('Remove unconditionally'),
+          'empty' => t('Remove wrapper if no containing fields'),
+        ],
+      ],
+      'advanced_expand' => [
+        '#type' => 'radios',
+        '#title' => t('Control how the advanced form initially renders'),
+        '#default_value' => $settings['forms']['advanced_expand'],
+        '#options' => [
+          'default' => t('Always collapsed (no modification)'),
+          'remove' => t('Remove the collapsible wrapper and title'),
+          'expand_always' => t('Force it to stay open, but keep the open look and feel'),
+          'expand_on_first' => t('Expand initially, then collapsed'),
+          'expand_if_empty' => t('Expand initially or when there are zero results'),
+        ],
+      ],
+    ],
+    'fields' => [
+      '#type' => 'item',
+    ],
+  ];
+  $fields = [
+    'containing_any' => t('Containing any of the words'),
+    'containing_phrase' => t('Containing the phrase'),
+    'containing_none' => t('Containing none of the words'),
+    'types' => t('Only of the type(s)'),
+    'category' => t('By category'), // @todo: Find correct field naming
+    'language' => t('Languages'),
+  ];
+  foreach ($fields as $key => $label) {
+    $form['content_node_search_config']['fields'][$key] = [
+      '#type' => 'details',
+      '#title' => t('%field settings', ['%field' => $label]),
+      '#open' => FALSE,
+      'remove' => [
+        '#type' => 'checkbox',
+        '#title' => t('Hide this field', ['%field' => $label]),
+        '#default_value' => $settings['fields'][$key]['remove'],
+      ],
+      'roles' => [
+        '#type' => 'checkboxes',
+        '#title' => t('Override the above option by selecting one or more roles that should see this field:'),
+        '#options' => array_map('Drupal\Component\Utility\Html::escape', user_role_names()),
+        '#default_value' => $settings['fields'][$key]['roles'],
+      ],
+    ];
+    if ($key == 'category') {
+      $form['content_node_search_config']['fields'][$key]['#access'] = FALSE;
+    }
+    if ($key == 'types') {
+      $groupings = [];
+      foreach ($settings['fields'][$key]['groupings'] as $gtypes => $glabels) {
+        $groupings [] = $gtypes . '|' . $glabels;
+      }
+      $groupings_type_help_items = [];
+      foreach (search_config_content_types() as $gtype => $glabel) {
+        $groupings_type_help_items[] = t('!type|%label', [
+          '!type' => $gtype,
+          '%label' => $glabel,
+        ]);
+      }
+      $groupings_type_help_items[] = t('&lt;other-types&gt;|Search for all other content types not used already in a grouping that is allowed by the type filter.');
+      $groupings_type_help_items[] = t('&lt;all-types&gt;|Search for every content types allowed by the type filter.');
+
+      $groupings_type_help = t('<p>Enter one grouping per line, in the format "%format". The key, %key, is a comma separated list of node content types. The %label is used in the search form display. There are two special key values, &lt;other-types&gt; and &lt;all-types&gt;, described below. A full list of value options are:</p>',
+        [
+          '%format' => t('machine name(s)') . '|' . t('label'),
+          "%key" => t('machine name(s)'),
+          '%label' => t('label'),
+        ]);
+      $item_list = [
+        '#type' => 'item_list',
+        '#items' => $groupings_type_help_items,
+      ];
+      $groupings_type_help .= \Drupal::service('renderer')->render($item_list);
+      $groupings_type_help .= t('<p>Leave empty to use the standard type options.</p>');
+      $form['content_node_search_config']['fields'][$key] += [
+        'filter' => [
+          '#type' => 'checkboxes',
+          '#title' => t('Hide the following content types from the %field filter:', ['%field' => $label]),
+          '#description' => t('<strong>This only limits the filter options</strong>. You must set the <a href=":url">permissions here</a> to enforce search restrictions per content types. These permissions are also used to filter the options shown to the user.',
+            [':url' => Url::fromRoute('user.admin_permissions')->toString()]),
+          '#options' => search_config_content_types(),
+          '#default_value' => $settings['fields'][$key]['filter'],
+        ],
+        'groupings' => [
+          '#title' => t('Replace type options with custom type groups'),
+          '#type' => 'textarea',
+          '#rows' => 5,
+          '#default_value' => implode("\n", $groupings),
+          '#element_validate' => ['element_node_search_config_groupings_validate'],
+          '#description' => $groupings_type_help,
+        ],
+      ];
+    }
+  }
+
+  // Provide some additional help for groupings setting.
+
+  // Restrictions and a summary of search config permissions
+  $form['content_node_search_config']['results'] = [
+    '#type' => 'details',
+    '#title' => t('Results'),
+    '#open' => FALSE,
+    'limit' => [
+      '#type' => 'select',
+      '#title' => t('Pager limit'),
+      '#description' => t('This option alters the number of results per page on the search results page.'),
+      '#default_value' => $settings['results']['limit'],
+      '#options' => [0 => t('Do not alter')] + array_combine(array_merge(range(1, 25, 1), range(30, 100, 5), range(150, 1000, 25)), array_merge(range(1, 25, 1), range(30, 100, 5), range(150, 1000, 25))),
+    ],
+  ];
+  $permissions = [];
+  $roles = array_map('check_plain', user_roles());
+  $search_config_permission = [];
+//  $search_config_permission = array_filter(\Drupal::service('search_config.permissions')
+//    ->getPermissions(), function ($v) {
+//    return $v['provider'] == 'search_config';
+//  }
+//  );
+  foreach ($search_config_permission as $permission => $info) {
+    $permissions[$permission] = [];
+    foreach (search_config_get_roles_by_permission($permission) as $rid) {
+      $permissions[$permission][$rid] = $roles[$rid];
+    }
+  }
+  $items = [];
+  $all_permissions = [
+    AccountInterface::ANONYMOUS_ROLE => $roles[AccountInterface::ANONYMOUS_ROLE],
+    AccountInterface::AUTHENTICATED_ROLE => $roles[AccountInterface::AUTHENTICATED_ROLE],
+  ];
+  $search_all = [];
+  foreach ($permissions['search all content'] as $rid => $role) {
+    $search_all[$rid] = $role . '<sup>*</sup>';
+    if (isset($all_permissions)) {
+      $all_permissions[$rid] = $search_all[$rid];
+    }
+  }
+  foreach ($permissions as $perm_key => $permission) {
+    $t_args = [
+      '!permission' => $search_config_permission[$perm_key]['title'],
+    ];
+    $permission = $search_all + $permission;
+    if (count($permission)) {
+      // We can reduce this down to just the two roles.
+      if (isset($permission[AccountInterface::AUTHENTICATED_ROLE])) {
+        $permission = array_intersect_key($all_permissions, $permission);
+      }
+
+      if (isset($permission[AccountInterface::AUTHENTICATED_ROLE]) && isset($permission[AccountInterface::ANONYMOUS_ROLE])) {
+        $items[] = t('!permission<br /><strong><em>Everyone</em></strong>', $t_args);
+      }
+      else {
+        // Remove the note flag on these.
+        if ($perm_key == 'search all content') {
+          $permission = array_intersect_key($roles, $permission);
+        }
+        $t_args['!roles'] = implode(', ', $permission);
+        $items[] = t('!permission<br />!roles', $t_args);
+      }
+    }
+    else {
+      $items[] = t('!permission<br /><strong><em>No one</em></strong>', $t_args);
+    }
+  }
+  $itemList = ['#type' => 'item_list', '#items' => $items];
+  // Restrictions and a summary of search config permissions
+  $form['content_node_search_config']['restrictions'] = [
+    '#type' => 'details',
+    '#title' => t('Restrictions'),
+    '#open' => FALSE,
+    'remove_advanced' => [
+      '#type' => 'checkbox',
+      '#title' => t('Remove advanced search unconditionally'),
+      '#description' => t('This option removes the advanced search form irrespective of any other setting or user permission.'),
+      '#default_value' => $settings['restrictions']['remove_advanced'],
+    ],
+    'admin_bypass' => [
+      '#type' => 'checkbox',
+      '#title' => t('Admin bypass (primary user with id 1)'),
+      '#description' => t('This option bypasses all form configuration settings; i.e. the entire advanced form unaltered.'),
+      '#default_value' => $settings['restrictions']['admin_bypass'],
+    ],
+    'type_restrictions' => [
+      '#type' => 'details',
+      '#title' => t('Content type permission overview', ['%field' => $label]),
+      'permissions' => [
+          '#markup' => t('This is an overview of what roles can search each content type.') .
+            \Drupal::service('renderer')->render($itemList),
+        ]
+        . t('<p><strong><sup>*</sup></strong>Note: These users are allowed to search all content items.</p><p>To update these, edit the %module module <a href=":url">permissions</a>.</p>',
+          [
+            '%module' => t('Search configuration'),
+            ':url' => Url::fromRoute('user.admin_permissions')->toString(),
+          ]),
+      '#open' => FALSE,
+    ],
+  ];
+  $form['#submit'][] = 'search_config_search_admin_settings_submit';
+}
+
+/**
+ * Additional submit handler to save the additional fields added by the form alter.
+ */
+function search_config_search_admin_settings_submit(&$form, &$form_state) {
+  \Drupal::configFactory()
+    ->getEditable('search_config.settings')
+    ->set('search_config_string_overrides', $form_state['values']['search_config_string_overrides'])
+    ->save();
+  \Drupal::configFactory()
+    ->getEditable('search_config.node_content_settings')
+    ->set('search_config', $form_state['values']['content_node_search_config']);
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function search_config_form_node_form_alter(&$form, $form_state) {
+  if (!\Drupal::currentUser()->hasPermission('admin node search exclusions')) {
+    return;
+  }
+
+  $node = $form['#node'];
+  $default_value = 0;
+  $db = \Drupal::database();
+  $query = 'SELECT 1 FROM {search_config_exclude} WHERE entity_id = :id AND entity_type = :type';
+  if (!empty($node->nid)) {
+    $default_value = (int) $db->queryRange($query, 0, 1, [
+      ':id' => $node->nid,
+      ':type' => 'node',
+    ])->fetchField();
+  }
+  $element = [
+    '#type' => 'checkbox',
+    '#title' => t('Exclude from search'),
+    '#default_value' => $default_value,
+  ];
+
+  // Align with normal publishing options if possible.
+  if (\Drupal::currentUser()->hasPermission('administer nodes')) {
+    $form['options']['search_config_exclude'] = $element;
+  }
+  else {
+    $form['search_config_exclude'] = $element;
+    // Pushes the element to sit just above the vertical tabs.
+    if (!empty($form['additional_settings']['#weight'])) {
+      $form['search_config_exclude']['#weight'] = $form['additional_settings']['#weight'] - 1;
+    }
+  }
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function search_config_node_insert(\Drupal\node\NodeInterface $node) {
+  if (!empty($node->search_config_exclude)) {
+    $record = [
+      'entity_type' => 'node',
+      'entity_id' => $node->id(),
+      'exclude' => 1,
+    ];
+    \Drupal::database()
+      ->insert('search_config_exclude')
+      ->fields($record)
+      ->execute();
+  }
+}
+
+/*
+ * Implements hook_node_update().
+ */
+function search_config_node_update(\Drupal\node\NodeInterface $node) {
+  if (isset($node->search_config_exclude)) {
+    $db = \Drupal::database();
+    $db->delete('search_config_exclude')
+      ->condition('entity_id', $node->id())
+      ->condition('entity_type', 'node')
+      ->execute();
+    search_config_node_insert($node);
+  }
+}
+
+/**
+ * Element validate callback for groupings list.
+ *
+ * User friendly display of key|value listings element validation.
+ *
+ * @param $element
+ * @param FormStateInterface $form_state
+ */
+function element_node_search_config_groupings_validate($element, FormStateInterface &$form_state) {
+  $list = explode("\n", $element['#value']);
+  // Pre-tidy the options list.
+  $list = array_filter(array_map('trim', $list), 'strlen');
+
+  $values = [];
+  $content_types = search_config_content_types();
+  $found_types = [];
+  $errors = [];
+  $empty_pairs = [];
+  foreach ($list as $text) {
+    if (preg_match('/([a-z0-9_,\-<>]{1,})\|(.{1,})/', $text, $matches)) {
+      $key = trim($matches[1]);
+      $value = trim($matches[2]);
+      if (empty($key) || empty($value)) {
+        $empty_pairs [] = Html::escape($matches[0]);
+      }
+      else {
+        $found_types = [];
+        $unknown_types = [];
+        $types = array_filter(array_map('trim', explode(',', $key)), 'strlen');
+
+        foreach ($types as $name) {
+          if (isset($content_types[$name]) || $name == '<other-types>' || $name == '<all-types>') {
+            $found_types[] = $name;
+          }
+          else {
+            $unknown_types[] = $name;
+          }
+        }
+        if (count($unknown_types)) {
+          $errors[] = t('The key contains one or more invalid content types: %types [line: %line]',
+            [
+              '%types' => implode(', ', $unknown_types),
+              '%line' => $matches[0],
+            ]);
+        }
+        elseif (count($found_types)) {
+          $values[implode(',', $found_types)] = $value;
+        }
+        else {
+          $errors[] = t('No types could be found. [line: %line]',
+            ['%line' => $matches[0]]);
+        }
+      }
+    }
+    else {
+      $empty_pairs [] = Html::escape($text);
+    }
+  }
+
+  if (!empty($empty_pairs)) {
+    $item_list = [
+      '#type' => 'item_list',
+      '#items' => $empty_pairs,
+    ];
+    $errors [] = t('Each line must contain a "type|value" pair. Types must contain one or more content type machine codes separated by commas and values must be non-empty strings. This error was seen on the following lines: !list',
+      ['!list' => \Drupal::service('renderer')->render($item_list)]);
+  }
+  if (!empty($errors)) {
+    $item_list = [
+      '#type' => 'item_list',
+      '#items' => $errors,
+    ];
+    $form_state->setErrorByName($element, t('The following errors were detected in the group options: !list',
+      ['!list' => \Drupal::service('renderer')->render($item_list)]));
+  }
+  else {
+    $form_state->setErrorByName($element, $values);
+  }
+}
+
+/**
+ * Helper function to get the settings.
+ */
+function search_config_node_settings() {
+  $search_config_settings = \Drupal::config('search_config.settings');
+
+  $settings['forms'] = [
+    'toggle_forms' => 0,            // Show adv if both forms are present
+    'move_keyword_search' => 0,     // Move keyword search into adv form
+    'advanced_populate' => 0,       // Try and repopulate the adv form
+    'advanced_expand' => 'default', // Control the presentation of adv form
+    // Controls all 3 'Containing...' fields.
+    'remove_containing_wrapper' => 'default',
+  ];
+  $settings['fields'] = [
+    'containing_any' => [],
+    'containing_phrase' => [],
+    'containing_none' => [],
+    'types' => [],
+    'category' => [],
+    'language' => [],
+  ];
+  $settings['results'] = [
+    'limit' => '10',
+  ];
+  $settings['restrictions'] = [
+    'admin_bypass' => 1,
+    'remove_advanced' => 0,
+  ];
+
+  foreach ($settings['fields'] as $field => $info) {
+    $settings['fields'][$field] = [
+      'remove' => 0,                  // Hides the field
+      'roles' => []              // Readds it if role selected
+    ];
+    if ($field == 'types') {
+      $settings['fields'][$field] = [
+        'filter' => [],          // Content type to HIDE
+        'groupings' => [],       // Combine type filters into groupings
+      ];
+    }
+    // @todo: What features do we need here?
+    if ($field == 'category') {
+      $settings['fields'][$field] = [
+        'filter' => [],          // Vocabs to HIDE
+        'widget' => 'textfield',      // Autocomplete?
+      ];
+    }
+  }
+  return $settings;
+}
+
+/**
+ * Helper function to get an array of safe to use content type names
+ */
+function search_config_content_types() {
+  return array_map('Drupal\Component\Utility\Html::escape', node_type_get_names());
+}
+
+/**
+ * Helper function to get the settings
+ */
+function search_config_string_overrides($key = NULL) {
+  $overrides = \Drupal::config('search_config.stringoverrides')
+    ->get('search_config_string_overrides');
+  $overrides += [
+    'labels' => [
+      'basic' => '',
+      'basic_with_keys' => '',
+      'basic_submit' => '',
+      'advanced_fieldset' => '',
+      'advanced_fieldset_with_keys' => '',
+      'advanced_any' => '',
+      'advanced_phrase' => '',
+      'advanced_none' => '',
+      'advanced_type' => '',
+      'advanced_language' => '',
+      'advanced_submit' => '',
+    ],
+    'title_display' => [
+      'basic' => 'default',
+      'advanced_any' => 'default',
+      'advanced_phrase' => 'default',
+      'advanced_none' => 'default',
+      'advanced_type' => 'default',
+      'advanced_language' => 'default',
+    ],
+    'menu' => [
+      'node' => '',
+      'user' => '',
+    ],
+  ];
+  if (isset($key)) {
+    return array_filter($overrides[$key]);
+  }
+  return $overrides;
+}
+
+/**
+ * Helper function to test the users configured access rights to a field.
+ */
+function search_config_get_access($remove, $grant) {
+  $user = \Drupal::currentUser();
+  if ($remove) {
+    return (bool) array_intersect_key($user->getRoles(), array_filter($grant));
+  }
+  return TRUE;
+}
+
+/**
+ * Helper function to get the roles by permission.
+ */
+function search_config_get_roles_by_permission($permission) {
+  foreach ([
+             AccountInterface::ANONYMOUS_ROLE,
+             AccountInterface::AUTHENTICATED_ROLE,
+           ] as $rid) {
+    return $rid->hasPermission($permission);
+  }
+}
