@@ -1,0 +1,654 @@
+<?php
+
+/**
+* @file
+* Allows to alter entities from comment form.
+*/
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\field\Entity\FieldConfig;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Form\FormState;
+use Drupal\comment\CommentInterface;
+use Drupal\diff\EntityComparisonBase;
+use Drupal\Component\Diff\Diff;
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function comment_alter_form_field_config_edit_form_alter(&$form, FormStateInterface $form_state) {
+  /** @var FieldConfig $field */
+  $field = $form_state->getFormObject()->getEntity();
+
+  $form['third_party_settings']['comment_alter']['comment_alter_enabled'] = [
+    '#type' => 'checkbox',
+    '#title' => t('User may alter this field from comment.'),
+    '#weight' => 0,
+    '#default_value' => $field->getThirdPartySetting('comment_alter', 'comment_alter_enabled', FALSE),
+    '#description' => t('This allows user to alter this field from comment attached to the parent entity'),
+  ];
+  $form['third_party_settings']['comment_alter']['comment_alter_hide'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Hide alterations of this field from diffs.'),
+    '#weight' => 1,
+    '#default_value' => $field->getThirdPartySetting('comment_alter', 'comment_alter_hide', FALSE),
+    '#description' => t('Allows user to hide the differences shown on the comment. Instead of the differences a link to the revision comparison is displayed for nodes and for rest of the entities "Changes are hidden" is shown.'),
+    '#states' => [
+      'invisible' => [':input[name="third_party_settings[comment_alter][comment_alter_enabled]"]' => ['checked' => FALSE]],
+    ],
+  ];
+  $form['third_party_settings']['#weight'] = $form['required']['#weight'] + 0.7;
+
+  // Previously (in the D7 version) these three checkboxes were available on the
+  // node type edit form. It's not only complicated to add them there in D8, but
+  // D8 even allows comments to be posted to any fieldable content entities.
+  // Because of that, it makes more sense to place these checkboxes on the
+  // comment field itself.
+  $entity_type = explode('.', $field->getOriginalId());
+  if ($field->getType() == 'comment') {
+    $form['third_party_settings']['comment_alter']['comment_alter_default'] = [
+      '#type' => 'checkbox',
+      '#title' => t('Use the latest revision as the default values for comment alterable fields (if any)'),
+      '#weight' => 2,
+      '#default_value' => $field->getThirdPartySetting('comment_alter', 'comment_alter_default', FALSE),
+      '#description' => t('Loads the field values from the latest revision of the node (instead of the current revision) when the comment form is displayed.'),
+    ];
+    $form['third_party_settings']['comment_alter']['comment_alter_diff_link'] = [
+      '#type' => 'checkbox',
+      '#title' => t('Add a link to the usual diff of the two revisions to the links area of the comment'),
+      '#weight' => 3,
+      '#default_value' => $field->getThirdPartySetting('comment_alter', 'comment_alter_diff_link', FALSE),
+    ];
+    $form['third_party_settings']['comment_alter']['comment_alter_reply'] = [
+      '#type' => 'checkbox',
+      '#title' => t('Allow altering fields when submitting reply comments (if replying allowed)'),
+      '#weight' => 4,
+      '#default_value' => $field->getThirdPartySetting('comment_alter', 'comment_alter_reply', FALSE),
+    ];
+  }
+
+  // Clearing cache to ensure that cache is removed if we select comment alter
+  // option for a field.
+  \Drupal::cache()->delete('comment_alter_fields:' . $entity_type[0] . ':' . $entity_type[1]);
+
+}
+
+/**
+ * Returns the comment alterable fields for an entity.
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ *   Entity object for the parent entity.
+ *
+ * @return array
+ *   An array of comment alterable fields on parent entity.
+ */
+function comment_alter_get_alterable_fields($entity_type, $bundle) {
+  $cid = 'comment_alter_fields:' . $entity_type . ':' . $bundle;
+  $comment_alter_fields = &drupal_static(__FUNCTION__);
+  if (!isset($comment_alter_fields[$entity_type][$bundle])) {
+    if ($cache = \Drupal::cache()->get($cid)) {
+      $comment_alter_fields[$entity_type][$bundle] = $cache->data;
+    }
+    else {
+      $field_definitions = \Drupal::entityManager()->getFieldDefinitions($entity_type, $bundle);
+      foreach ($field_definitions as $field_name => $field_item) {
+        // Check if we are dealing with an actual field. The
+        // getThirdPartySetting method is available only for an actual field.
+        if (is_a($field_item, 'Drupal\field\Entity\FieldConfig') && $field_item->getThirdPartySetting('comment_alter', 'comment_alter_enabled', FALSE)) {
+          $comment_alter_fields[$entity_type][$bundle][$field_name] = $field_name;
+        }
+      }
+      if (!isset($comment_alter_fields[$entity_type][$bundle])) {
+        $comment_alter_fields[$entity_type][$bundle] = [];
+      }
+      \Drupal::cache()->set($cid, $comment_alter_fields[$entity_type][$bundle]);
+    }
+  }
+
+  return $comment_alter_fields[$entity_type][$bundle];
+}
+
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function comment_alter_form_comment_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  /** @var \Drupal\comment\Entity\Comment $comment_entity */
+  $comment_entity = $form_state->getFormObject()->getEntity();
+  $parent_entity = $comment_entity->getCommentedEntity();
+  $entity_type = $parent_entity->getEntityTypeId();
+  /** @var FieldConfig $comment_field */
+  $comment_field = $parent_entity->getFieldDefinition($comment_entity->getFieldName());
+  // Load the latest revision instead of the current if asked for.
+  if ($comment_field->getThirdPartySetting('comment_alter', 'comment_alter_default', FALSE) && $parent_entity->getEntityType()->hasKey('revision')) {
+    // Retrieve the revision and ID keys for the parent entity.
+    $parent_entity_keys = $parent_entity->getEntityType()->getKeys();
+    $revision_id = \Drupal::database()->select($entity_type . '_revision', 'per')
+      ->fields('per', [$parent_entity_keys['revision']])
+      ->condition($parent_entity_keys['id'], $parent_entity->id())
+      ->orderBy($parent_entity_keys['revision'], 'DESC')
+      ->range(0, 1)
+      ->execute()
+      ->fetchField();
+    $parent_entity = \Drupal::entityTypeManager()->getStorage($entity_type)->loadRevision($revision_id);
+  }
+
+  if (!$comment_entity->isNew()) {
+      return;
+  }
+  elseif ($comment_entity->hasParentComment() && !$comment_field->getThirdPartySetting('comment_alter', 'comment_alter_reply', FALSE)) {
+    // Bail out early if comment_altering is disallowed when posting replies.
+    return;
+  }
+  else {
+    $bundle = $parent_entity->bundle();
+    $comment_alterable_fields = comment_alter_get_alterable_fields($entity_type, $bundle);
+    if (empty($comment_alterable_fields)) {
+      return;
+    }
+    // The _comment_alter_submit_node_fields() function needs these two arrays.
+    // This one is a list of comment_alterable fields.
+    $alterable_fields = [];
+    // It turns out that we don't need to retrieve pseudo field's weight as
+    // here Drupal assigns the weight of pseudo fields automatically. So,
+    // we may reorder the pseudo fields and Drupal will take care of the
+    // position of its widget. Hence, we are not assigning the weight property
+    // to the field widgets that are created here.
+    $parent_form_display = entity_get_form_display($parent_entity->getEntityTypeId(), $parent_entity->bundle(), 'default');
+    // Attach parent entity fields to the comment form. Do it on a copy of the
+    // $form, so that we know we are only getting the field element itself and
+    // no other side-effects.
+    $parent_form = $form;
+    // To support same name fields on both comment and parent entity, provide
+    // #parent property so that submitted field values for our alterable field
+    // widgets appears at different location not at the top level of
+    // $form_state->getValues().
+    $parent_form['#parents'] = ['comment_alter_fields'];
+    $parent_form_display->buildForm($parent_entity, $parent_form, $form_state);
+    foreach ($comment_alterable_fields as $alterable_field_name) {
+      if (empty($parent_form[$alterable_field_name])) {
+        continue;
+      }
+      $form[$entity_type . '_' . $bundle . '_' . 'comment_alter_' . $alterable_field_name] = $parent_form[$alterable_field_name];
+      // Remember that this field is alterable.
+      $alterable_fields[$alterable_field_name] = $alterable_field_name;
+    }
+    if (!empty($alterable_fields)) {
+      $form['comment_alter'] = [
+        '#type' => 'value',
+        '#value' => [
+          'fields' => $alterable_fields,
+          'old_vid' => $parent_entity->getRevisionId(),
+        ],
+      ];
+      // Adding our own afterBuild call to this form, so we could add the
+      // column information into the $form itself.
+      $form['#after_build'][] = 'comment_alter_form_comment_form_alter_after_build';
+      $form['#validate'][] = 'comment_alter_form_comment_form_alter_validate';
+      $form['actions']['submit']['#submit'][] = 'comment_alter_form_comment_form_alter_submit';
+    }
+  }
+}
+
+/**
+ * Custom #after_build callback for comment_form to add comment alterable
+ * columns info and values.
+ */
+function comment_alter_form_comment_form_alter_after_build(&$form, FormStateInterface &$form_state) {
+  $parent_entity = $form_state->getFormObject()->getEntity()->getCommentedEntity();
+  $entity_type = $parent_entity->getEntityTypeId();
+  $bundle = $parent_entity->bundle();
+  // This one informs about comment_alterable columns per comment_alterable
+  // fields. First-level key is the field name, second-level keys (and values)
+  // are the columns which do have their form elements.
+  $alterable_columns = [];
+  foreach ($form['comment_alter']['#value']['fields'] as $alterable_field) {
+    // Store the old/current column value for this alterable field.
+    $form_state->setValue(['comment_alter_fields', 'comment_alter_' . $alterable_field . '_old'], $parent_entity->$alterable_field->getValue());
+    $field_widget = $form[$entity_type . '_' . $bundle . '_' . 'comment_alter_' . $alterable_field]['widget'];
+    // Store the column information also.
+    $field_items = Element::children($field_widget);
+    // For select list/checkboxes we have #key_column which stores the column
+    // information of the field so, get it from there and continue.
+    if (isset($field_widget['#key_column'])) {
+      $alterable_columns[$alterable_field][$field_widget['#key_column']] = $field_widget['#key_column'];
+      continue;
+    }
+    // If there is no column info available like in case of select list bail
+    // out early or Element::children() will produce an fatal error.
+    if (is_null($field_items['0'])) {
+      continue;
+    }
+    // Get the column info from first level if it is available there else get
+    // it from the first item. In case it is available at the first level then
+    // field_items should be string there.
+    $columns = (is_string($field_items['0'])) ? $field_items : Element::children($field_widget['0']);
+    foreach ($columns as $column) {
+      $alterable_columns[$alterable_field][$column] = $column;
+    }
+  }
+  $form_state->setValue('comment_alterable_columns', $alterable_columns);
+
+  return $form;
+}
+
+/**
+ * Helper function to clean up field values for comparison.
+ *
+ * Removes and non-alterable columns so we can compare the old and new field
+ * values and find changes.
+ *
+ * @param array $values
+ *   Array whose elements should be cleaned up.
+ * @param string $field_name
+ *   Clean up this field of the array.
+ * @param string $old
+ *   (optional) Suffix for old value cleanup.
+ * @param string $prefix
+ *   (optional) Prefix for old value cleanup.
+ */
+function _comment_alter_cleanup_field_values(&$values, $field_name, $old = '', $prefix = '') {
+  // Sort the Multiple valued field via there column _weight and then remove
+  // the weight column from values.
+  if (isset($values['comment_alterable_columns'][$prefix . $field_name . $old]['_weight'])) {
+    usort($values['comment_alter_fields'][$prefix . $field_name . $old], 'comment_alter_cmp');
+  }
+  foreach ($values['comment_alter_fields'][$prefix . $field_name . $old] as $level => $deltas) {
+    // Remove the non-alterable columns from comparison.
+    foreach ($values['comment_alter_fields'][$prefix . $field_name . $old][$level] as $column => $value) {
+      // Unset the _weight column from $values as our stored old alterable
+      // column value doesn't contain _weight column.
+      if (!isset($values['comment_alterable_columns'][$field_name][$column]) || $column === '_weight') {
+          unset($values['comment_alter_fields'][$prefix . $field_name . $old][$level][$column]);
+          continue;
+      }
+    }
+  }
+  _comment_alter_cleanup_arrays($values['comment_alter_fields'][$prefix . $field_name . $old]);
+}
+
+/**
+ * usort comparison function.
+ *
+ * @link http://php.net/manual/en/function.usort.php @endlink
+ */
+function comment_alter_cmp($a, $b) {
+  if ($a['_weight'] == $b['_weight']) {
+      return 0;
+  }
+  return ($a['_weight'] < $b['_weight']) ? -1 : 1;
+}
+
+/**
+ * Helper function to recursively clean up semi-empty arrays.
+ *
+ * Eg. array('foo' => array('bar' => array('baz' => ''))) becomes array().
+ *
+ * @param array $a
+ *   Array whose empty elements should be removed.
+ */
+function _comment_alter_cleanup_arrays(&$a) {
+  if (is_array($a)) {
+    foreach ($a as $key => &$value) {
+      if (is_array($value)) {
+        _comment_alter_cleanup_arrays($value);
+      }
+      if (empty($value)) {
+        unset($a[$key]);
+      }
+    }
+  }
+}
+
+/**
+ * Validation callback for the altered comment form.
+ */
+function comment_alter_form_comment_form_alter_validate($form, FormStateInterface &$form_state) {
+  $original_value = $form_state->getValues();
+  $parent_entity = $form_state->getFormObject()->getEntity()->getCommentedEntity();
+  $parent_form_display = entity_get_form_display($parent_entity->getEntityTypeId(), $parent_entity->bundle(), 'default');
+  $parent_form = [];
+  $parent_form_state = new FormState();
+  $parent_form_display->buildForm($parent_entity, $parent_form, $parent_form_state);
+  foreach ($original_value['comment_alter']['fields'] as $alterable_field) {
+    $parent_form_state->setValue($alterable_field, $original_value['comment_alter_fields'][$alterable_field]);
+  }
+  $parent_form_display->extractFormValues($parent_entity, $parent_form, $parent_form_state);
+  $parent_form_display->validateFormValues($parent_entity, $parent_form, $parent_form_state);
+
+}
+
+/**
+ * Submit callback for the altered comment form.
+ */
+function comment_alter_form_comment_form_alter_submit($form, FormStateInterface &$form_state) {
+  $original_value = $form_state->getValues();
+  $values = $original_value;
+  // Do not try to save anything if there is nothing that was allowed to be
+  // changed from the comment form.
+  if (isset($values['comment_alter'])) {
+    $changed_fields = [];
+    foreach ($values['comment_alter']['fields'] as $field_name) {
+      _comment_alter_cleanup_field_values($values, $field_name);
+      _comment_alter_cleanup_field_values($values, $field_name, '_old', 'comment_alter_');
+      // If field values have changed, add it to the list.
+      if ($values['comment_alter_fields']['comment_alter_' . $field_name . '_old'] != $values['comment_alter_fields'][$field_name]) {
+        $changed_fields[$field_name] = $field_name;
+      }
+    }
+    if (!empty($changed_fields)) {
+      // Creating parent entity display form again rather than storing in cache
+      // or something as it would take a lot of resources and cache invalidation
+      // is another issue.
+      $parent_entity = $form_state->getFormObject()->getEntity()->getCommentedEntity();
+      $parent_form_display = entity_get_form_display($parent_entity->getEntityTypeId(), $parent_entity->bundle(), 'default');
+      // Build parent entity form display again and copy the values of
+      // alterable fields from altered comment form into it, then save the form.
+      $parent_form = [];
+      $parent_form_state = new FormState();
+      $parent_form_display->buildForm($parent_entity, $parent_form, $parent_form_state);
+      foreach ($original_value['comment_alter']['fields'] as $alterable_field) {
+        $parent_form_state->setValue($alterable_field, $original_value['comment_alter_fields'][$alterable_field]);
+      }
+      $parent_form_display->extractFormValues($parent_entity, $parent_form, $parent_form_state);
+      // If the parent entity does not support revisions, just save the changes
+      // and return. For revisionable parent entities, create a new revision
+      // with the appropriate user and date, then save both the old and new
+      // revisions' ID for displaying the changes.
+      if (!$parent_entity->getEntityType()->hasKey('revision')) {
+        $parent_entity->save();
+        return;
+      }
+      $parent_entity->setNewRevision(TRUE);
+      if ($parent_entity instanceof \Drupal\Core\Entity\RevisionLogInterface) {
+        $parent_entity->setRevisionCreationTime(REQUEST_TIME);
+        $parent_entity->setRevisionUserId(\Drupal::currentUser()->id());
+      }
+      $parent_entity->save();
+      // Store in comment_alter database table the old and new revision IDs
+      // of the parent entity along with comment ID.
+      $comment_alter = [
+        'old_vid' => $values['comment_alter']['old_vid'],
+        'new_vid' => $parent_entity->getRevisionId(),
+        'cid' => $original_value['cid'],
+        'parent_entity_type' => $parent_entity->getEntityTypeId(),
+      ];
+      db_insert('comment_alter')->fields($comment_alter)->execute();
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_load().
+ */
+function comment_alter_comment_load($comments) {
+  $result = \Drupal::database()->select('comment_alter', 'c')
+    ->fields('c', array('cid', 'old_vid', 'new_vid'))
+    ->condition('cid', array_keys($comments), 'IN')
+    ->execute();
+  foreach ($result as $row) {
+    $comments[$row->cid]->comment_alter['old_vid'] = $row->old_vid;
+    $comments[$row->cid]->comment_alter['new_vid'] = $row->new_vid;
+  }
+}
+
+/**
+ * Returns a table showing the differences committed with a particular comment.
+ *
+ * Uses the 'Diff' module to actually generate the differences.
+ *
+ * @param \Drupal\comment\CommentInterface $comment
+ *   The comment object.
+ *
+ * @return array
+ *   Table showing the differences made by the comment on the parent entity.
+ */
+function comment_alter_get_changed_fields(CommentInterface $comment) {
+  $changed_fields = [];
+
+  if (isset($comment->comment_alter) && isset($comment->comment_alter['new_vid'])) {
+    $parent_entity = $comment->getCommentedEntity();
+    $entity_type = $parent_entity->getEntityTypeId();
+    $bundle = $parent_entity->bundle();
+    $entity_storage = \Drupal::entityTypeManager()->getStorage($entity_type);
+    $old_entity = $entity_storage->loadRevision($comment->comment_alter['old_vid']);
+    $new_entity = $entity_storage->loadRevision($comment->comment_alter['new_vid']);
+    $comment_alter_fields = comment_alter_get_alterable_fields($entity_type, $bundle);
+
+    // Use diff module's function to generate the row-wise differences between
+    // the two revisions.
+    $container = \Drupal::getContainer();
+    $entity_comparison = EntityComparisonBase::create($container);
+    $fields = $entity_comparison->compareRevisions($old_entity, $new_entity);
+    // Build the diff rows for each field and append the field rows
+    // to the changed field array as new and old values.
+    $diff_rows = [];
+    $filter = 'raw';
+    foreach ($fields as $field_name => $field) {
+      // Because of some core changes the format of $field_name changed. For
+      // some entities it became 'EntityType.ActualFieldName' and for the rest
+      // it was still the actual field name. Get the field name from both of
+      // these cases.
+      $field_name_array = explode('.', $field_name);
+      $actual_field_name = $field_name_array[sizeof($field_name_array)-1];
+      if (isset($comment_alter_fields[$actual_field_name]) && !empty($field['#name'])) {
+        $field_diff_rows = comment_alter_get_rows_diff(
+          $field['#states'][$filter]['#left'],
+          $field['#states'][$filter]['#right']
+        );
+        // Hide the differences if user chooses to hide them.
+        $parent_field = $parent_entity->getFieldDefinition($actual_field_name);
+        if ($parent_field->getThirdPartySetting('comment_alter', 'comment_alter_hide', FALSE)) {
+          $changes = t('Changes are hidden');
+          if ($parent_entity->getEntityTypeId() == 'node') {
+            $url = Url::fromUserInput('/node/' . $parent_entity->id() . '/revisions/view/' . $comment->comment_alter['old_vid'] . '/' . $comment->comment_alter['new_vid']);
+            $changes = \Drupal\Core\Link::fromTextAndUrl(t('View Changes'), $url);
+          }
+          $changed_fields[] = [
+            'name' => ['data' => ['#markup' => '<b>' . $field['#name'] . '</b>']],
+            'changes' => $changes,
+          ];
+          continue;
+        }
+        $line = 0;
+        foreach ($field_diff_rows as $row) {
+          $changed_fields[] = [
+            'name' => $line ? '' : ['data' => ['#markup' => '<b>' . $field['#name'] . '</b>']],
+            'old' => ['data' => empty($row[1]['data']) ? '' : $row[1]['data']],
+            'arrow' => ['data' => ['#markup' => '&Rightarrow;']],
+            'new' => ['data' => empty($row[3]['data']) ? '' : $row[3]['data']],
+          ];
+          $line++;
+        }
+      }
+    }
+  }
+
+  if (!empty($changed_fields)) {
+    return [
+      '#type' => 'table',
+      '#rows' => $changed_fields,
+      '#attributes' => ['class' => ['comment-alter-diff']],
+    ];
+  }
+}
+
+/**
+ * Prepare the table rows for theme 'table'.
+ *
+ * @param string $a
+ *   The source string to compare from.
+ * @param string $b
+ *   The target string to compare to.
+ * @param boolean $show_header
+ *   Display diff context headers. For example, "Line x".
+ * @param array $line_stats
+ *   This structure tracks line numbers across multiple calls to DiffFormatter.
+ *
+ * @return array
+ *   Array of rows usable with theme('table').
+ */
+function comment_alter_get_rows_diff($a, $b, $show_header = FALSE, &$line_stats = NULL) {
+  $a = is_array($a) ? $a : explode("\n", $a);
+  $b = is_array($b) ? $b : explode("\n", $b);
+
+  // Temporary workaround: when comparing with an empty string, Diff Component
+  // returns a change OP instead of an add OP.
+  if (count($a) == 1 && $a[0] == "") {
+    $a = [];
+  }
+  if (!isset($line_stats)) {
+    $line_stats = [
+      'counter' => ['x' => 0, 'y' => 0],
+      'offset' => ['x' => 0, 'y' => 0],
+    ];
+  }
+
+  // Header is the line counter.
+  $container = \Drupal::getContainer();
+  $diff_formatter = $container->get('diff.diff.formatter');
+  $diff_formatter->show_header = $show_header;
+  $diff = new Diff($a, $b);
+
+  return $diff_formatter->format($diff);
+}
+
+/**
+ * Implements hook_comment_links_alter().
+ */
+function comment_alter_comment_links_alter(array &$links, CommentInterface $comment, array &$context) {
+  // Since Diff module shows the differences for nodes only so create diff link
+  // for nodes.
+  $parent_entity = $comment->getCommentedEntity();
+  if ($parent_entity->getEntityTypeId() == 'node') {
+    $comment_field = $parent_entity->getFieldDefinition($comment->getFieldName());
+    if (!$comment_field->getThirdPartySetting('comment_alter', 'comment_alter_diff_link', FALSE)) {
+      return;
+    }
+    $links['comment_alter'] = [
+      '#attributes' => ['class' => ['links', 'inline']],
+      '#links' => [
+        'comment-diff' => [
+          'title' => t('Diff'),
+          'url' => Url::fromUserInput('/node/' . $parent_entity->id() . '/revisions/view/' . $comment->comment_alter['old_vid'] . '/' . $comment->comment_alter['new_vid']),
+        ],
+      ],
+    ];
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_view().
+ */
+function comment_alter_comment_view(&$build, EntityInterface $comment, \Drupal\Core\Entity\Display\EntityViewDisplayInterface $display, $view_mode) {
+  // Show the differences irrespective of the view modes.
+  if ($display->getComponent('comment_alter')) {
+    $build['#attached']['library'][] = 'comment_alter/comment_alter.diff';
+    $build['comment_alter'] = comment_alter_get_changed_fields($comment);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ */
+function comment_alter_comment_delete(EntityInterface $comment) {
+  \Drupal::database()->delete('comment_alter')
+    ->condition('cid', $comment->id())
+    ->execute();
+}
+
+/**
+ * Implements hook_entity_revision_delete().
+ */
+function comment_alter_entity_revision_delete(EntityInterface $entity) {
+  // Delete entries from the comment_alter table when a parent entity revision
+  // is deleted.
+  $conditions = new \Drupal\Core\Database\Query\Condition('OR');
+  if ($entity->getEntityType()->hasKey('revision')) {
+    \Drupal::database()->delete('comment_alter')
+      ->condition('parent_entity_type', $entity->getEntityTypeId())
+      ->condition($conditions
+        ->condition('old_vid', $entity->getRevisionId())
+        ->condition('new_vid', $entity->getRevisionId())
+      )
+      ->execute();
+  }
+
+}
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function comment_alter_entity_extra_field_info() {
+  $extra = [];
+  $comment_bundles = [];
+  foreach (\Drupal::entityManager()->getDefinitions() as $entity_type => $entity_definition) {
+    // Handle only non-comment content entity types.
+    if (!$entity_definition instanceof Drupal\Core\Entity\ContentEntityTypeInterface || $entity_type == 'comment') {
+      continue;
+    }
+    // Store the comment type or the comment bundle using FieldStorageDefinition
+    // associated with this entity type, which can be accessed for any of its
+    // bundle using the field machine name.
+    $field_storage_definitions = \Drupal::entityManager()->getFieldStorageDefinitions($entity_type);
+    foreach ($field_storage_definitions as $field_name => $field_storage_definition) {
+      if (!$field_storage_definition instanceof Drupal\Core\Field\BaseFieldDefinition && $field_storage_definition->getType() == 'comment') {
+        $comment_bundles[$entity_type][$field_name] = $field_storage_definition->getSetting('comment_type');
+        $weight[$comment_bundles[$entity_type][$field_name]] = 0;
+      }
+    }
+    // No need to further processing if there are no comment fields on this
+    // content entity bundle.
+    if (empty($comment_bundles[$entity_type])) {
+      continue;
+    }
+    foreach (entity_get_bundles($entity_type) as $bundle => $bundle_info) {
+      // Retrieve the list of comment_alterable_fields for this entity_type's
+      // current bundle.
+      $comment_alterable_fields = comment_alter_get_alterable_fields($entity_type, $bundle);
+      // Skip to the next bundle if there are no comment_alterable_fields.
+      if (empty($comment_alterable_fields)) {
+        continue;
+      }
+      // If this content entity type and bundle has any comment_alterable
+      // field, then _ALL_ the comment types (bundles) should have the extra
+      // field info on them (about _ALL_ these comment_alterable fields). But:
+      // only those comment types (bundles) should have this info, which are
+      // attached to this content entity type and bundle.
+      // To retrieve the list of comment types (bundles) attached to this
+      // entity type and bundle, we'll use the above created comment_bundles
+      // array. So, we need to store all the comment fields for this entity type
+      // and bundle in order to get comment bundle for the corresponding field.
+      $comment_fields = [];
+      $field_definitions = \Drupal::entityManager()->getFieldDefinitions($entity_type, $bundle);
+      foreach ($field_definitions as $field_name => $field_definition) {
+        if ($field_definition->getType() == 'comment') {
+          $comment_fields[] = $field_name;
+        }
+      }
+
+      // Now that we have all the info needed, let's build the extra field
+      // info array.
+      foreach ($comment_fields as $comment_field) {
+        foreach ($comment_alterable_fields as $field_name) {
+          $field = FieldConfig::loadByName($entity_type, $bundle, $field_name);
+          $extra['comment'][$comment_bundles[$entity_type][$comment_field]]['form'][$entity_type . '_' . $bundle . '_' . 'comment_alter_' . $field_name] = [
+            'label' => t('Comment alter: %type . %bundle : %label', ['%type' => $entity_type, '%bundle' => $bundle, '%label' => $field->getLabel()]),
+            'description' => $field->getDescription(),
+            'weight' => $weight[$comment_bundles[$entity_type][$comment_field]],
+          ];
+          $weight[$comment_bundles[$entity_type][$comment_field]]++;
+        }
+        $extra['comment'][$comment_bundles[$entity_type][$comment_field]]['display']['comment_alter'] = [
+          'label' => t('Comment changes'),
+          'description' => t('Changes made to the parent node\'s fields in this comment.'),
+          'weight' => -1,
+        ];
+      }
+    }
+  }
+
+  return $extra;
+}
