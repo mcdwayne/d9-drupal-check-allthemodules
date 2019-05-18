@@ -1,0 +1,134 @@
+<?php
+
+/**
+ * @file
+ * Hooks for personal_digest module.
+ *
+ * @todo use Drupal's assessment of the first day of the week, not php.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function personal_digest_entity_extra_field_info() {
+  return ['user' => ['user' => ['form' => [
+    'personal_digest' => [
+      'label' => t('Digest settings'),
+      'description' => t('User configures their regular content notifications'),
+      'weight' => 8
+    ]
+  ]]]];
+}
+
+/**
+ * Implements hook_user_form_alter().
+ *
+ * @todo forbid access to user/%/digest if there are no views displays
+ */
+function personal_digest_form_user_form_alter(&$form, FormStateInterface $form_state) {
+  if ($info = $form_state->get('form_display')->getComponent('personal_digest')) {
+    $uid = $form_state->getFormObject()->getEntity()->id();
+    Drupal::service('personal_digest.settings_manager')
+      ->userFormElement($form, $uid, $info['weight']);
+  }
+}
+
+
+/**
+ * Implements hook_cron().
+ *
+ * Queue the digest emails.
+ *
+ * @todo this will run out of memory if there is a large number of users.
+ */
+function personal_digest_cron() {
+
+  $timeService = \Drupal::time();
+  $dayOfWeek = date('l', $timeService->getRequestTime());
+  $now = $timeService->getCurrentTime();
+
+  // If it's the first time the cron runs, set the last_cron 24 hours ago.
+  $last_cron = \Drupal::state()->get('personal_digest_last_cron', strtotime("- 24 hours", $now));
+  $global_settings = \Drupal::config('personal_digest.settings');
+
+  // The cron should run only after the hour saved at the $settings,
+  // so create a $date object with the today date and the hour saved in the
+  // settings.
+  $date = new DateTime();
+  $date->setTimestamp($now);
+  $date->setTime($global_settings->get('hour'), 0);
+  $hour = $date->getTimestamp();
+
+  // If $now is on a different day than the last time the last cron ran and the
+  // current time is after the hour selected in the settings.
+  if (date('z', $now) != date('z', $last_cron) && $now > $hour) {
+    $num = \Drupal::service('personal_digest.settings_manager')->dispatch();
+  }
+
+  \Drupal::state()->set('personal_digest_last_cron', $now);
+}
+
+function personal_digest_generator(Drupal\user\UserInterface $account) {
+  return Drupal::service('personal_digest.generator')->setAccount($account);
+}
+
+/**
+ * Implements hook_mail().
+ *
+ * $params should be [
+ *   user => UserInterface,
+ *   since => show content since this date
+ *   settings => array from the userData store
+ */
+function personal_digest_mail($key, &$message, $params) {
+  if ($key == 'digest') {
+    $user = $params['user'];
+    $generator = personal_digest_generator($user);
+
+    // Building the email.
+    $message['subject'] = t(
+      '%site_name digest since @date',
+      [
+        '%site_name' => \Drupal::config('system.site')->get('name'),
+        '@date' => \Drupal::service('date.formatter')->format($params['since'], 'short'),
+      ],
+      ['langcode' => $user->getPreferredLangcode()]
+    );
+    $message['body']['greet'] = t(
+      'Greetings @name',
+      ['@name' => $user->getDisplayName()],
+      ['langcode' => $user->getPreferredLangcode()]
+    );
+    // Add the body or cancel the message if there is no body
+    if ($items = $generator->body($params['settings']['displays'], $params['since'])) {
+      $message['body'] += $items;
+    }
+    else {
+      $message['send'] = FALSE;
+      return;
+    }
+
+    // Include the "change your settings" link in the mail.
+    if (\Drupal::config('personal_digest.settings')->get('include_change_settings_link') and personal_digest_user_settings_form_mode()) {
+      $message['body']['link'] = $generator->loginLink(t('Change your digest settings', [], $user->getPreferredLangcode()));
+    }
+  }
+}
+/**
+ * Identify whichever user form display has the digest settings.
+ *
+ * @return string
+ *   The id of the display
+ */
+function personal_digest_user_settings_form_mode() {
+  $form_displays = \Drupal::entityTypeManager()
+    ->getStorage('entity_form_display')
+    ->loadByProperties(['targetEntityType' => 'user']);
+  foreach ($form_displays as $display) {
+    if (getComponent('personal_digest')) {
+      return $display->id();
+    }
+  }
+}
