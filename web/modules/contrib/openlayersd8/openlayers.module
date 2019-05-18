@@ -1,0 +1,549 @@
+<?php 
+
+/*
+ * Function to change default display of the inline entity form table
+ */
+function openlayers_inline_entity_form_table_fields_alter(&$fields, $context) {
+  // Make sure there's a stock field on each of the allowed product types.
+  $is_my_content_type = FALSE;
+  $type = null;
+  foreach ($context['allowed_bundles'] as $bundle) {
+    if ($bundle == 'openlayers_layeroptions' || $bundle == 'openlayers_controloptions') {
+      $is_my_content_type = TRUE;
+      $type = $bundle;
+    }
+  }
+  if ($is_my_content_type) {
+    unset($fields['label']);  
+    if ($type == 'openlayers_layeroptions') {
+      $fields['layer_ref'] = array(                   // This part adds the body field with a label 'description'
+        'type' => 'field',
+        'label' => t('Layer'),
+        'weight' => 1,
+      );
+    }
+    if ($type == 'openlayers_controloptions') {
+      $fields['control_ref'] = array(                   // This part adds the body field with a label 'description'
+        'type' => 'field',
+        'label' => t('Control'),
+        'weight' => 1,
+      );
+    }
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+
+function openlayers_theme($existing, $type, $theme, $path) {
+  return array(
+    'openlayers_map' => array(
+      'variables' => array(
+        'map_id' => NULL,
+        'height' => '888px',
+        'map' => array(),
+      ),
+    ),
+    'openlayers-map-geofield-input' => [
+      'render element' => 'form',
+      'variables' => array(
+        'map_id' => NULL,
+        'height' => '888px',
+        'map' => array(),
+      ),
+    ],
+  );
+}
+
+/**
+ * Load all openLayers required client files and return markup for a map.
+ *
+ * @param array $map
+ * @param array $features
+ * @param string $height
+ *
+ * @return array render array
+ */
+function openlayers_render_map($mapid, $map, $items = array(), $height = '450px', $input = false) {
+	
+  $libs = [];
+  foreach ($map['navbar']['controls'] as $control) {
+    if($control['type'] === 'custom') {
+      array_push($libs, $control['factory'].'/'.'ol.'.$control['namespace'].'.'.$control['machine']);
+    }
+  }
+  array_push($libs,'openlayers/openlayers-drupal');
+
+  $features = null;
+  if(isset($items)) {
+    $features = array_values($items);
+  }
+  $settings[$mapid] = array(
+    'mapId' => $mapid,
+    'map' => $map,
+    // JS only works with arrays, make sure we have one with numeric keys.
+    'features' => $features,
+    'input' => $input,
+  );
+  
+  $olmap = array(
+    '#theme' => 'openlayers_map',
+    '#map_id' => $mapid,
+    '#height' => $height,
+    '#map' => $map,
+    '#attached' => array(
+      'library' => $libs,
+        'drupalSettings' => array(
+          'openlayers' => $settings,
+      ),
+    ),
+  );
+  return $olmap;
+}
+/**
+ * Get all available OpenLayers map definitions.
+ *
+ * @param string $map
+ */
+function openlayers_map_get_info($map = NULL) {
+  static $drupal_static_fast;
+  $map_ = array();
+  if(isset($map)) {
+    array_push($map_,$map);
+  }
+  if (!isset($drupal_static_fast)) {
+    $drupal_static_fast['openlayers_map_info'] = &drupal_static(__FUNCTION__);
+  }
+   
+  $map_info = &$drupal_static_fast['openlayers_map_info'];
+  
+  if (empty($map_info)) {
+    
+    if ($cached = Drupal::cache()->get('openlayers_map_info')) {
+      $map_info = $cached->data;
+    }
+    else {
+      $map_info = Drupal::moduleHandler()->invokeAll('openlayers_map_info',$map_);
+      // Let other modules alter the map info.
+      Drupal::moduleHandler()->alter('openlayers_map_info', $map_info);
+      //Drupal::cache()->set('openlayers_map_info', $map_info);  //damit sollte nichts mehr im Cache sein
+    }
+  }
+  if (empty($map)) {
+    return $map_info;
+  }
+  elseif (isset($map_info[$map])) {
+    return $map_info[$map];
+  }
+}
+    
+/**
+ * Implements hook_openlayers_map_info() to return a default map.
+ *
+ * @return array
+ */
+ function openlayers_openlayers_map_info($mapid = null) {
+     
+  $storage = \Drupal::entityManager()->getStorage('openlayers_map');
+  
+  $entity_query = null;
+  if(isset($mapid)) {
+    $entity_query = \Drupal::entityQuery('openlayers_map')
+      ->condition('uuid', $mapid)
+      ->execute();
+  } else {
+    $entity_query = \Drupal::entityQuery('openlayers_map')
+      ->execute();
+  }
+  
+  $entities = $storage->loadMultiple($entity_query);
+  $maps = array();
+
+  foreach ($entities as $key => $entity) { 
+    $tmp = openlayers_map_getLayersandSources($entity->layer_ref_base->getValue(),$entity->layer_ref_overlay->getValue());
+    $maps[$entity->uuid->value] = array(
+      'label' => $entity->map_name->value,
+      'entityID' => $entity->id->value,
+      'description' => t('Openlayers Map'),
+      'sources' => $tmp['sources'],
+      'layers' => $tmp['layers'],
+      'navbar' => array(
+        'settings' => array(),
+        'controls' => openlayers_map_getControls($entity->control_ref->getValue()),
+      ),
+      'settings' => array(
+        'mapheight' => $entity->map_height->value,
+        'zoom' => $entity->zoom->value,
+        'minzoom' => $entity->minzoom->value,
+        'maxzoom' => $entity->maxzoom->value,
+        'max_extent' => $entity->max_extent->value,
+        'center' => $entity->center->value,
+      ),
+    );
+  }
+  return $maps;
+}
+
+function openlayers_map_getLayersandSources($layerids, $layeroptionids) {
+  $storage_layer = \Drupal::entityTypeManager()->getStorage('openlayers_layer');
+  $storage_layeroptions = \Drupal::entityTypeManager()->getStorage('openlayers_layeroptions');
+  $storage_sources = \Drupal::entityTypeManager()->getStorage('openlayers_source');
+  $sourceIDs = array();
+  $layers = array();
+  $sources = array();
+  $i = 0;
+  // load base layers
+  foreach($layerids as $layerid) {
+    $layer = $storage_layer->load($layerid['target_id']);
+    $machinelayer = '';
+    foreach ($layer->layer_machine as $item) {
+      $machinelayer = $machinelayer . ',' .$item->value;
+    }
+    $machinelayer = substr($machinelayer, 1);
+    if($i === 0) {
+      if(isset($layer)) {
+        $view = null;
+        if(isset($layer->layer_view_ref->getValue()[0]['target_id'])) {
+            $view = $layer->layer_view_ref->getValue()[0]['target_id'];
+        }
+        
+        $node = null;
+        if(isset($layer->layer_node_ref->getValue()[0]['target_id'])) {
+            $node = $layer->layer_node_ref->getValue()[0]['target_id'];
+        }
+        
+        $layers[$layer->uuid->value] = getLayer($layer->layer_type->value, $layer->layer_source_ref->getValue()[0]['target_id'], $layer->layer_name->value, $machinelayer, $layer->id->value, true, true, 100,$node, $view);
+        array_push($sourceIDs,$layer->layer_source_ref->getValue()[0]['target_id']);
+      }        
+    }
+    else {
+      $view = null;
+      if(isset($layer->layer_view_ref->getValue()[0]['target_id'])) {
+        $view = $layer->layer_view_ref->getValue()[0]['target_id'];
+      }
+
+      $node = null;
+      if(isset($layer->layer_node_ref->getValue()[0]['target_id'])) {
+        $node = $layer->layer_node_ref->getValue()[0]['target_id'];
+      }
+      $layers[$layer->uuid->value] = getLayer($layer->layer_type->value, $layer->layer_source_ref->getValue()[0]['target_id'], $layer->layer_name->value, $machinelayer, $layer->id->value, true, false, 100,$node, $view);
+      array_push($sourceIDs,$layer->layer_source_ref->getValue()[0]['target_id']);
+    }
+    $i++;
+  }
+  // load overlay layers
+  foreach ($layeroptionids as $layeroptionid) {
+    $layeroption = $storage_layeroptions->load($layeroptionid['target_id']);
+    $layer = $storage_layer->load($layeroption->layer_ref->getValue()[0]['target_id']);
+    $machinelayer = '';
+    foreach ($layer->layer_machine as $item) {
+      $machinelayer = $machinelayer . ',' .$item->value;
+    }
+    $machinelayer = substr($machinelayer, 1);
+    $view = null;
+    if(isset($layer->layer_view_ref->getValue()[0]['target_id'])) {
+      $view = $layer->layer_view_ref->getValue()[0]['target_id'];
+    }
+
+    $node = null;
+    if(isset($layer->layer_node_ref->getValue()[0]['target_id'])) {
+      $node = $layer->layer_node_ref->getValue()[0]['target_id'];
+    }
+    $layers[$layer->uuid->value] = getLayer($layer->layer_type->value, $layer->layer_source_ref->getValue()[0]['target_id'], $layer->layer_name->value, $machinelayer, $layer->id->value, false, $layeroption->layer_active->value, $layeroption->layer_opacity->value,$node,$view);
+    array_push($sourceIDs,$layer->layer_source_ref->getValue()[0]['target_id']);
+  }
+
+  $sourceIDs = array_unique($sourceIDs);
+  //load source information
+  foreach($sourceIDs as $sourceid){
+    $source = $storage_sources->load($sourceid);
+    $sources[$source->id->value] = array(
+      'id' => $source->id->value,
+      'title' => $source->source_name->value,
+      'type' => $source->source_type->value,
+      'url' => $source->source_url->value,
+      'uuid' => $source->uuid->value,
+      'serverType' => $source->server_type->value,
+    );
+    }
+  $result = array();
+  $result['sources'] = $sources;
+  $result['layers'] = $layers;
+  return $result;
+}
+    
+function getLayer($type, $source, $title, $layer, $id, $isBase, $isActive, $opacity, $node, $view) {
+  $features = null;
+  switch ($type) {
+    case 'node':
+      $features = getFeaturefromNode($node);
+      break;
+    case 'view':
+      $features = getFeaturesfromView($view);
+      break;
+  }
+  return array(
+    'type' => $type,
+    'source' => $source,
+    'title' => $title,
+    'layer' => $layer,
+    'id' => $id,
+    'isBase' => $isBase,
+    'isActive' => $isActive,
+    'opacity' => $opacity/100,
+    'features' => $features,
+  );
+}
+/*
+* 
+*/
+function getFeaturesfromView($vid) {
+  
+  $features = array();
+
+  $view = entity_load('view', $vid);
+  $fields = $view->get('display')['default']['display_options']['fields'];
+  $geofields = array();
+  foreach($fields as $field_name => $field) {
+    if($field['type'] === 'geofield_default' || $field['type'] === 'geofield' ) {
+      array_push($geofields, $field_name);
+    }
+  }
+  $view =  \Drupal\views\Views::getView($vid);
+  $view->execute();
+  $result = $view->result;
+
+  for ($i = 0; $i < count($result); $i++) {
+    for ($n = 0; $n < count($geofields); $n++) {
+      $fieldName = $geofields[$n];
+      array_push($features, $result[$i]->_entity->$fieldName->value);
+    }
+  }
+  return $features;
+}
+/*
+* 
+*/
+function getFeaturefromNode($nid) {
+  $entityManager = \Drupal::service('entity_field.manager');
+  $features = array();
+  $node = \Drupal\node\Entity\Node::load($nid);
+  if($node) {
+    $fields = $entityManager->getFieldDefinitions('node', $node->getType());
+    foreach($fields as $field_name => $field) {
+      if($field->getType() === 'geofield') {
+        $fieldName = $field->getName();
+        array_push($features, $node->$fieldName->value);
+      }
+    }
+  }
+  return $features;
+}
+
+function openlayers_map_getControls($controloptions) {
+  $controls = array();
+  $storage_controloptions = \Drupal::entityManager()->getStorage('openlayers_controloptions');
+  $storage_control = \Drupal::entityManager()->getStorage('openlayers_control');
+  foreach($controloptions as $key => $entity) {
+    $options = $storage_controloptions->load($entity['target_id']);
+    $olcontrol = $storage_control->load($options->control_ref->getValue()[0]['target_id']);
+    $controls[$key]['name'] = $olcontrol->control_name->getValue()[0]['value'];
+    $controls[$key]['machine'] = $olcontrol->machine_name->getValue()[0]['value'];
+    $controls[$key]['type'] = $olcontrol->control_type->getValue()[0]['value'];
+    $controls[$key]['namespace'] = $olcontrol->control_namespace->getValue()[0]['value'];
+    $controls[$key]['factory'] = $olcontrol->control_factory->getValue()[0]['value'];
+    
+    if($options->tooltip->getValue()[0]['value'] == '') {
+      $controls[$key]['tooltip'] = $olcontrol->tooltip->getValue()[0]['value'];
+    } else {
+      $controls[$key]['tooltip'] = $options->tooltip->getValue()[0]['value'];
+    }
+    if($options->icon->getValue()[0]['value'] == '') {
+      $controls[$key]['icon'] = $olcontrol->icon->getValue()[0]['value'];
+    } else {
+      $controls[$key]['icon'] = $options->icon->getValue()[0]['value'];
+    }
+  }
+  return $controls;
+}
+
+/**
+ * Convert a geofield into an array of map points.
+ *
+ * The map points can then be fed into openlayers_render_map().
+ *
+ * @param mixed $items
+ *   A single vlaue or array of geo values, each as a string in any of the
+ *   supported formats or as an array of $item elements, each with a
+ *   $item['wkt'] field.
+ *
+ * @return array
+ */
+function openlayers_process_geofield($items = array()) {
+  if (!is_array($items)) {
+    $items = array($items);
+  }
+  return $items;
+}
+
+/**
+ * Implements hook_requirements().
+ */
+
+function openlayers_requirements($phase) {
+  $requirements = array();
+  if ($phase != 'runtime') {
+    return $requirements;
+  }
+  $library = Drupal::service('library.discovery')
+    ->getLibraryByName('openlayers', 'openlayers');
+
+  $requirements['openlayers'] = array(
+    'title' => Drupal::translation()->translate('OpenLayers library')
+  );
+  $maps_info = Drupal::translation()->translate('@maps available.', array(
+    '@maps' => Drupal::translation()
+      ->formatPlural(count(openlayers_map_get_info()), 'One map', '@count maps')
+  )
+  );
+
+  // Check the defined type of the ol.js file; if it is external then
+  // assume that we are using a CDN version.
+  if ($library['js'][0]['type'] == 'external') {
+    $requirements['openlayers']['value'] = Drupal::translation()
+      ->translate('Using CDN version @version.', array(
+        '@version' => $library['version']
+      )) . ' ' . $maps_info;
+  }
+  // If ol.js is defined to be a local file, check that it exists and show
+  // an error if it does not exist.
+  else {
+    if (file_exists($library['js'][0]['data'])) {
+      $requirements['openlayers']['value'] = Drupal::translation()
+        ->translate('OpenLayers @version library installed at @path.', array(
+          '@version' => $library['version'],
+          '@path' => $library['js'][0]['data'],
+        )) . ' ' . $maps_info;
+      $requirements['openlayers']['severity'] = REQUIREMENT_OK;
+    }
+    else {
+      $requirements['openlayers']['value'] = Drupal::translation()
+        ->translate('OpenLayers @version library not found at @path. Please !download it to @directory, or undo your changes to the libraries registry to use the CDN version.',
+          array(
+            '@version' => $library['version'],
+            '@path' => $library['js'][0]['data'],
+            '@directory' => dirname($library['js'][0]['data']),
+            '!download' => Drupal::l('download', Drupal\Core\Url::fromUri($library['remote'])),
+          )
+        );
+      $requirements['openlayers']['severity'] = REQUIREMENT_ERROR;
+    }
+  }
+  return $requirements; 
+}
+
+//Install and Uninstall management
+
+function openlayers_install() {
+  $uuid_service = \Drupal::service('uuid');
+  
+  //Controls
+  $entity_control = array(
+    'uuid' => $uuid_service->generate(),
+    'control_name' => 'Zoom Buttons',
+    'machine_name' => 'Zoom',
+    'control_namespace' => 'control',
+    'control_factory' => 'openlayers',
+    'control_type' => 'base',
+    'description' => 'A control with 2 buttons, one for zoom in and one for zoom out. This control is one of the default controls of a map.',
+    'tooltip' => 'Zoom in | Zoom out',
+    'icon' => '',
+  );
+  $new_entity = \Drupal::entityManager()->getStorage('openlayers_control')->create($entity_control);
+  $new_entity->save();
+  
+  $entity_control = array(
+    'uuid' => $uuid_service->generate(),
+    'control_name' => 'Zoom to Extent',
+    'machine_name' => 'ZoomToExtent',
+    'control_namespace' => 'control',
+    'control_factory' => 'openlayers',
+    'control_type' => 'base',
+    'description' => 'A button control which, when pressed, changes the map view to a specific extent.',
+    'tooltip' => 'Zoom to Extent',
+    'icon' => '',
+  );
+  $new_entity = \Drupal::entityManager()->getStorage('openlayers_control')->create($entity_control);
+  $new_entity->save();   
+  
+  $entity_control = array(
+    'uuid' => $uuid_service->generate(),
+    'control_name' => 'FullScreen',
+    'machine_name' => 'FullScreen',
+    'control_type' => 'base',
+    'control_factory' => 'openlayers',
+    'control_namespace' => 'control',
+    'description' => 'Provides a button that when clicked fills up the full screen with the map.',
+    'tooltip' => 'FullScreen',
+    'icon' => '',
+  );
+  $new_entity = \Drupal::entityManager()->getStorage('openlayers_control')->create($entity_control);
+  $new_entity->save(); 
+  
+  $entity_control = array(
+    'uuid' => $uuid_service->generate(),
+    'control_name' => 'Attribution',
+    'machine_name' => 'Attribution',
+    'control_type' => 'base',
+    'control_factory' => 'openlayers',
+    'control_namespace' => 'control',
+    'description' => 'Control to show all the attributions associated with the layer sources in the map.',
+    'tooltip' => 'Attribution',
+    'icon' => '',
+  );
+  $new_entity = \Drupal::entityManager()->getStorage('openlayers_control')->create($entity_control);
+  $new_entity->save();
+  
+  $entity_control = array(
+    'uuid' => $uuid_service->generate(),
+    'control_name' => 'Rotate',
+    'machine_name' => 'Rotate',
+    'control_factory' => 'openlayers',
+    'control_type' => 'custom',
+    'control_namespace' => 'customcontrol',
+    'description' => 'Example for a custom control.',
+    'tooltip' => 'Rotate',
+    'icon' => '',
+  );
+  $new_entity = \Drupal::entityManager()->getStorage('openlayers_control')->create($entity_control);
+  $new_entity->save();
+  
+  $entity_control = array(
+    'uuid' => $uuid_service->generate(),
+    'control_name' => 'ZoomIn',
+    'machine_name' => 'ZoomIn',
+    'control_factory' => 'openlayers',
+    'control_type' => 'custom',
+    'control_namespace' => 'customcontrol',
+    'description' => 'Zoom to the map.',
+    'tooltip' => 'ZoomIn',
+    'icon' => '',
+  );
+  $new_entity = \Drupal::entityManager()->getStorage('openlayers_control')->create($entity_control);
+  $new_entity->save();
+  
+  $entity_control = array(
+    'uuid' => $uuid_service->generate(),
+    'control_name' => 'ZoomOut',
+    'machine_name' => 'ZoomOut',
+    'control_factory' => 'openlayers',
+    'control_type' => 'custom',
+    'control_namespace' => 'customcontrol',
+    'description' => 'Zoom out of the map.',
+    'tooltip' => 'ZoomOut',
+    'icon' => '',
+  );
+  $new_entity = \Drupal::entityManager()->getStorage('openlayers_control')->create($entity_control);
+  $new_entity->save();
+}
