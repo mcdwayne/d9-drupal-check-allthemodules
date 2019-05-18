@@ -1,0 +1,398 @@
+<?php
+
+/**
+ * @file
+ * SAML Drupal Login.
+ *
+ * Uses the SAML Service Provider module to provide a Drupal-login
+ * authentication module.
+ */
+
+use Drupal\Core\Render\Element;
+use Drupal\Core\Link;
+use Drupal\Core\Messenger\MessengerInterface;
+use Drupal\Core\Url;
+use Drupal\saml_sp\Entity\Idp;
+use Drupal\user\Entity\User;
+use Drupal\user\UserInterface;
+use Symfony\Component\HttpFoundation\RedirectResponse;
+use OneLogin\Saml2\Response;
+
+/*
+// Used by commented code in function saml_sp_user_logout():
+use OneLogin\Saml2\LogoutRequest;
+use OneLogin\Saml2\Settings;
+use OneLogin\Saml2\Utils;
+/**/
+
+/**
+ * Implements hook_menu().
+ */
+function saml_sp_drupal_login_menu() {
+  $items = [];
+
+  // Allow a user to request an account.
+  $items['saml/request_account'] = [
+    'title'           => 'Request an Account',
+    'page callback'   => 'drupal_get_form',
+    'page arguments'  => ['saml_sp_drupal_login__request_access'],
+    'access callback' => 'user_is_anonymous',
+    'file'            => 'saml_sp_drupal_login.pages.inc',
+  ];
+
+  return $items;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function saml_sp_drupal_login_form_user_login_form_alter(&$form, $form_state, $form_id) {
+  $config = \Drupal::config('saml_sp_drupal_login.config');
+  $idps = $config->get('idp');
+  $enabled_idps = [];
+  if (!empty($idps)) {
+    foreach ($idps as $key => $value) {
+      if ($value) {
+        $enabled_idps[$key] = $key;
+      }
+    }
+  }
+
+  if (empty($enabled_idps)) {
+    // There are no enabled IdPs, so we aren't doing anything to the form.
+    return;
+  }
+  if ($config->get('force_saml_only')) {
+    // Disable caching of the login page.
+    \Drupal::service('page_cache_kill_switch')->trigger();
+    // only SAML logins are accepted, so don't show the form
+    foreach (Element::children($form) AS $key) {
+      $form[$key]['#access'] = FALSE;
+    }
+    if (count($enabled_idps) == 1) {
+      // There is only one IdP so redirect to its login page to remove one step.
+      $redirect_url = \Drupal::url('saml_sp_drupal_login.login', ['idp' => array_shift($enabled_idps)]);
+
+      $response = new RedirectResponse($redirect_url);
+      $response->send();
+    }
+  }
+
+  $idps = saml_sp__load_all_idps();
+  $links = [];
+  foreach ($enabled_idps as $value) {
+    $links[] = Link::createFromRoute(t('Login to @site_name using %idp.', [
+      '@site_name' => \Drupal::config('system.site')->get('name'),
+      '%idp' => $idps[$value]->label(),
+    ]), 'saml_sp_drupal_login.login', ['idp' => $value]);
+  }
+
+  $form['saml_sp_drupal_login_links'] = [
+    '#theme' => 'item_list',
+    '#items' => $links,
+  ];
+  $form['#cache']['tags'] = array_merge($form['#cache']['tags'], $config->getCacheTags());
+}
+
+/**
+ * SAML authentication callback.
+ */
+function saml_sp_drupal_login__saml_authenticate($is_valid, Response $saml_response, Idp $idp) {
+  if ($is_valid) {
+    $attributes = $saml_response->getAttributes();
+
+    // Default language is English.
+    $language = 'en';
+    // If language attribute is set on IdP, then use that language.
+    if (isset($attributes['language'])) {
+      $language = $attributes['language'][0];
+    }
+    // Get the NameID value from response.
+    $name_id = $saml_response->getNameId();
+    if (\Drupal::config('saml_sp.settings')->get('debug')) {
+      _saml_sp__debug('Response NameId', $name_id);
+    }
+
+    // If email address is not used to identify user,
+    // it has to be in the attributes.
+    if ($idp->getNameIdField() != 'mail') {
+      // Try to get email from SAML response attributes.
+      try {
+        $email = $attributes['mail'][0];
+      }
+      catch (Exception $e) {
+        \Drupal::logger('saml_sp')->error('No mail attribute available, please check IdP configuration, %exception', ['%exception' => $e->message]);
+      }
+    }
+    else {
+      $email = $saml_response->getNameId();
+    }
+    if ($account = saml_sp_drupal_login_get_uid($name_id, $idp->getNameIdField(), $email)) {
+      user_login_finalize($account);
+      return new RedirectResponse(\Drupal::url('<front>'));
+      /*
+      // @codingStandardsIgnoreStart
+      // TODO Make this work as expected and allow the code to be processed.
+      // Update email address if it has changed on IdP.
+      if (\Drupal::config('saml_sp_drupal_login.config')->get('update_email') && $account->mail != $email) {
+        \Drupal::logger('saml_sp')->notice('Updating email address from %old_email to %new_email for UID %uid', array('%old_email' => $account->mail, '%new_email' => $email, '%uid' => $account->uid));
+        $wrapper = entity_metadata_wrapper('user', $account);
+        $wrapper->mail->set($email);
+        $wrapper->save();
+        // Showing message for user about the update which happened on IdP.
+        $message = t('Your email address is now @new_email', array('@new_email' => $email));
+        \Drupal::messenger()->addMessage($message);
+      }
+      // Update language if it has changed on IdP.
+      if (\Drupal::config('saml_sp_drupal_login.config')->get('update_language') && $account->language != $language) {
+        \Drupal::logger('saml_sp')->notice('Updating language from %old_lang to %new_lang for UID %uid', array('%old_lang' => $account->language, '%new_lang' => $language, '%uid' => $account->uid));
+        $wrapper = entity_metadata_wrapper('user', $account);
+        $wrapper->language->set($language);
+        $wrapper->save();
+      }
+      // @codingStandardsIgnoreEnd
+      /**/
+    }
+    elseif (\Drupal::config('user.settings')->get('register') != UserInterface::REGISTER_ADMINISTRATORS_ONLY) {
+      // New user, register.
+      $language = \Drupal::languageManager()->getCurrentLanguage()->getId();
+      $user = User::create();
+
+      // Mandatory:
+      $user->setPassword('password');
+      $user->enforceIsNew();
+      $user->setEmail($email);
+      $user->setUsername($email);
+
+      // Optional:
+      $user->set('init', $email);
+      $user->set('langcode', $language);
+      $user->set('preferred_langcode', $language);
+      $user->set('preferred_admin_langcode', $language);
+      /*
+      $user->set('setting_name', 'setting_value');
+      $user->addRole('rid');
+      /**/
+      $user->activate();
+      // Save user account.
+      $result = $user->save();
+      \Drupal::logger('saml_sp')->notice('New SSO user account for %mail with UID %uid', ['%mail' => $email, '%uid' => $user->iddebt]);
+    }
+    elseif (\Drupal::config('saml_sp_drupal_login.config')->get('no_account_authenticated_user_role')  && \Drupal::config('saml_sp_drupal_login.config')->get('no_account_authenticated_user_account')) {
+      // The user has no account but the setting allows for them
+      // to get an authenticated role.
+      $account = user_load_by_name(\Drupal::config('saml_sp_drupal_login.config')->get('no_account_authenticated_user_account'));
+    }
+    else {
+      // Only Administrators can register new users.
+      $tokens = [
+        '%mail'     => $email,
+        '%idp_label' => $idp->label(),
+        '@account_request_url' => Url::fromRoute('user.register', ['query' => ['email' => $email]])->toString(),
+      ];
+      $no_account_message = t('No account matching %mail has been found. Please contact a site administrator.', $tokens);
+      $user_may_request_account_message = t('No account matching %mail has been found. <a href="@account_request_url">Click here to apply for an account.</a>', $tokens);
+      if (\Drupal::config('saml_sp_drupal_login.config')->get('request_account')) {
+        $no_account_message = $user_may_request_account_message;
+      }
+      \Drupal::messenger()->addMessage($no_account_message, MessengerInterface::TYPE_WARNING);
+      \Drupal::logger('saml_sp')->warning("User attempting to login through %idp_label with %mail which doesn't match any accounts.", $tokens);
+      return FALSE;
+    }
+
+    // @see user_login_name_validate().
+    if (user_is_blocked($account->getAccountName())) {
+      \Drupal::messenger()->addMessage(t('The username %name has not been activated or is blocked.', ['%name' => $account->getAccountName()]));
+      if (\Drupal::config('saml_sp.settings')->get('debug')) {
+        _saml_sp__debug('Account', $this);
+        _saml_sp__debug('Response NameId', $name_id);
+      }
+      return FALSE;
+    }
+
+    // Reset any flood control.
+    // @see user_login_final_validate().
+    if (variable_get('user_failed_login_identifier_uid_only', FALSE)) {
+      $identifier = $account->uid;
+    }
+    else {
+      $identifier = $account->uid . '-' . ip_address();
+    }
+    /*
+    $flood = \Drupal::flood();
+    flood_clear_event('failed_login_attempt_user', $identifier);
+    /**/
+    // @see user_login_submit().
+    global $user;
+    $user = user_load($account->uid);
+
+    $edit = [];
+    // Adding redirect path to where user started the login from:
+    $edit['redirect'] = $_POST['RelayState'];
+    \Drupal::logger('saml_sp')->notice(
+      'User %name logging in through SAML via %idp_name. with NameID %mail',
+      [
+        '%name' => $user->name,
+        '%idp_name' => $idp->label(),
+        '%mail' => $email,
+      ]);
+
+    // Store the fact that the user logged in via the SAML SP module.
+    $_SESSION['authenticated_via_saml_sp'] = TRUE;
+
+    user_login_finalize($edit);
+  }
+  return new RedirectResponse(\Drupal::url('<front>'));
+}
+
+/**
+ * Return whether the user is currently authenticated by the SAML SP module.
+ *
+ * @return bool
+ *   TRUE if the user is currently authenticated.
+ */
+function saml_sp_drupal_login_is_authenticated() {
+  return isset($_SESSION['authenticated_via_saml_sp']) &&
+    $_SESSION['authenticated_via_saml_sp'] === TRUE;
+}
+
+/**
+ * Get the uid from either users table or custom field.
+ *
+ * Custom field should be used if the users need to be able to change the email
+ * address on IdP, because then it cannot be used for identifying a user.
+ * Email address can be used as a backup method if user is singing in for the
+ * first time and their NameID value has not been stored to the given field yet.
+ *
+ * @param string $name_id
+ *   The NameID value which SSO server provides in SAML response.
+ * @param string $field_name
+ *   The name of the field in Drupal where NameID is stored.
+ * @param string $email
+ *   User email address which is only used if NameID cannot be found.
+ *
+ * @return string|false
+ *   The user ID in Drupal which matches the NameID or email address, or
+ *   FALSE if it cannot be found.
+ */
+function saml_sp_drupal_login_get_uid($name_id, $field_name, $email = NULL) {
+  if ($field_name == 'mail') {
+    return user_load_by_mail($name_id);
+  }
+  else {
+    // Find the uid from the field where it is supposed to be stored.
+    $db_field = 'field_data_' . $field_name;
+    $column = $field_name . '_value';
+    $uid = db_select($db_field, 'nameid')
+      ->fields('nameid', ['entity_id'])
+      ->condition($column, $name_id, '=')
+      ->execute()
+      ->fetchField();
+
+    // If uid is not found, try to find it from the users table with the email.
+    // This might be the case if existing users are exported to new IdP,
+    // then they will not have ID from IdP on their first login.
+    if (empty($uid)) {
+      $uid = db_query("SELECT uid FROM {users} WHERE mail = :mail", [
+        ':mail' => $email,
+      ])->fetchField();
+      if (!empty($uid)) {
+        $user = user_load($uid);
+        $wrapper = entity_metadata_wrapper('user', $user);
+        $wrapper->field_nameid->set($name_id);
+        $wrapper->save();
+      }
+      else {
+        return FALSE;
+      }
+    }
+    return $uid;
+  }
+}
+
+/**
+ * Implements hook_user_logout().
+ */
+function saml_sp_user_logout($account) {
+  /*
+  // @codingStandardsIgnoreStart
+  // Load the IdP to authenticate against.
+  $idp = saml_sp_drupal_login__get_id();
+
+  // what is the authentication method?
+  switch ($idp->getAuthnContextClassRef()) {
+    case 'urn:federation:authentication:windows':
+      // the user is logged in through their Windows account
+      // it is impractical to log out of the IdP system as well
+      return;
+      break;
+  }
+
+  if (!variable_get('saml_sp_drupal_login__logout', TRUE)) {
+    // the site doesn't want the IdP to be signed out of,
+    // so just log out of Drupal
+    return;
+  }
+  global $language;
+  global $base_url;
+
+
+  // Settings is an array
+  $settings = saml_sp__get_settings($idp);
+  // Creating Saml2 Settings object from array
+  $saml_settings = new Settings($settings);
+  $idp_data = $saml_settings->getIdPData();
+
+  // Checking if logout url is configured
+  if (isset($idp_data['singleLogoutService']) && isset($idp_data['singleLogoutService']['url'])) {
+    $slo_url = $idp_data['singleLogoutService']['url'];
+  }
+  else {
+    throw new Exception("The IdP does not support Single Log Out");
+  }
+
+  // Creating a logout request to be passed to IdP
+  if (isset($_SESSION['IdPSessionIndex']) && !empty($_SESSION['IdPSessionIndex'])) {
+    $logout_request = new LogoutRequest($saml_settings, NULL, NULL ,$_SESSION['IdPSessionIndex']);
+  }
+  else {
+    $logout_request = new LogoutRequest($saml_settings);
+  }
+
+  $saml_request = $logout_request->getRequest();
+  $parameters = array('SAMLRequest' => $saml_request);
+  // Checking current language, so that user can be redirected to front page
+  // in same language
+  $parameters['RelayState'] = $base_url . '/' . $language->prefix;
+  $url = Utils::redirect($slo_url, $parameters, TRUE);
+  \Drupal::logger('saml_sp')->notice('Session closed for %name (%uid) and starting SAML SLO.', array('%name' => $account->name, '%uid' => $account->uid));
+  // Force redirection in drupal_goto().
+  unset($_GET['destination']);
+  if(!empty($saml_request)) {
+    drupal_goto($url);
+  }
+  // @codingStandardsIgnoreEnd
+  /**/
+}
+
+/**
+ * Implements hook_mail().
+ */
+function saml_sp_drupal_login_mail($key, &$message, $params) {
+  $langcode = $message['language']->language;
+  switch ($key) {
+    case 'account_request':
+      $replacements = [
+        '@site_name'   => variable_get('site_name', 'Drupal'),
+        '@mail'        => $params['mail'],
+        '@name'        => $params['name'],
+        '@explanation' => $params['explanation'],
+      ];
+      $message['subject'] = t('Account request for @site_name.', $replacements, ['langcode' => $langcode]);
+      $message['body'][] = t('@name would like an account set up on @site_name using the e-mail address @mail.', $replacements, ['langcode' => $langcode]);
+      $message['body'][] = t('The explanation given is:', $replacements, ['langcode' => $langcode]);
+      $message['body'][] = t('@explanation', $replacements, ['langcode' => $langcode]);
+      break;
+  }
+
+}
