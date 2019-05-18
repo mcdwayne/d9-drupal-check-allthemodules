@@ -1,0 +1,245 @@
+<?php
+
+/**
+ * @file
+ * Module file for Commerce Amazon Pay.
+ */
+
+use Drupal\commerce_checkout\Entity\CheckoutFlowInterface;
+use Drupal\commerce_payment\Entity\PaymentGatewayInterface;
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\views\Form\ViewsForm;
+
+/**
+ * Implements hook_entity_base_field_info().
+ */
+function commerce_amazon_lpa_entity_base_field_info(EntityTypeInterface $entity_type) {
+  if ($entity_type->id() === 'commerce_order') {
+    $fields['amazon_order_reference'] = BaseFieldDefinition::create('string')
+      ->setLabel(t('Amazon Order Reference ID'))
+      ->setDisplayOptions('form', [
+        'type' => 'hidden',
+        'weight' => 0,
+      ])
+      ->setDisplayConfigurable('view', FALSE)
+      ->setDisplayConfigurable('form', FALSE);
+    return $fields;
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_access().
+ */
+function commerce_amazon_lpa_commerce_payment_gateway_access(EntityInterface $entity, $operation, AccountInterface $account) {
+  if ($entity instanceof PaymentGatewayInterface) {
+    if ($entity->id() == 'amazon_pay') {
+      return AccessResult::forbidden();
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_access().
+ */
+function commerce_amazon_lpa_commerce_checkout_flow_access(EntityInterface $entity, $operation, AccountInterface $account) {
+  if ($entity instanceof CheckoutFlowInterface) {
+    if ($entity->id() == 'amazon_pay') {
+      return AccessResult::forbiddenIf($operation == 'delete');
+    }
+  }
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function commerce_amazon_lpa_page_attachments(array &$attachments) {
+  $merchant_configuration = \Drupal::service('commerce_amazon_lpa.current_merchant_account')->resolve();
+  if (!empty($merchant_configuration)) {
+    $widget_js_urls = [
+      'US' => [
+        'test' => 'https://static-na.payments-amazon.com/OffAmazonPayments/us/sandbox/js/Widgets.js',
+        'live' => 'https://static-na.payments-amazon.com/OffAmazonPayments/us/js/Widgets.js',
+      ],
+      'UK' => [
+        'test' => 'https://static-eu.payments-amazon.com/OffAmazonPayments/uk/sandbox/lpa/js/Widgets.js',
+        'live' => 'https://static-eu.payments-amazon.com/OffAmazonPayments/uk/lpa/js/Widgets.js',
+      ],
+      'DE' => [
+        'test' => 'https://static-eu.payments-amazon.com/OffAmazonPayments/de/sandbox/lpa/js/Widgets.js',
+        'live' => 'https://static-eu.payments-amazon.com/OffAmazonPayments/de/lpa/js/Widgets.js',
+      ],
+    ];
+
+    $amazon_pay_config = \Drupal::config('commerce_amazon_lpa.settings');
+    $attachments['#attached']['drupalSettings']['amazonPay'] = [
+      'widgetsJsUrl' => $widget_js_urls[$merchant_configuration['region']][$amazon_pay_config->get('mode')],
+      'merchantId' => $merchant_configuration['merchant_id'],
+      'clientId' => $merchant_configuration['lwa_client_id'],
+      'langcode' => $merchant_configuration['langcode'],
+    ];
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function commerce_amazon_lpa_form_user_login_form_alter(&$form, FormStateInterface $form_state) {
+  $config = \Drupal::configFactory()->get('commerce_amazon_lpa.settings');
+  $buttons = $config->get('buttons');
+  $form['login_with_amazon'] = [
+    '#type' => 'amazon_login',
+    '#weight' => 200,
+    '#access' => $config->get('operation_mode') == 'pay_lwa',
+    '#size' => !empty($buttons['login']['size']) ? $buttons['login']['size'] : NULL,
+    '#style' => !empty($buttons['login']['size']) ? $buttons['login']['style'] : NULL,
+  ];
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function commerce_amazon_lpa_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  if ($form_id == 'commerce_checkout_flow_add_form') {
+    if (isset($form['plugin']['#options']['amazon_pay'])) {
+      unset($form['plugin']['#options']['amazon_pay']);
+      $form['plugin']['#default_value'] = key($form['plugin']['#options']);
+    }
+  }
+  elseif ($form_id == 'commerce_checkout_flow_edit_form') {
+    $form['plugin']['#access'] = FALSE;
+  }
+  elseif ($form_state->getFormObject() instanceof ViewsForm) {
+    /** @var \Drupal\views\ViewExecutable $view */
+    $view = reset($form_state->getBuildInfo()['args']);
+    // Only add the Checkout button if the cart form view has order items.
+    if ($view->storage->get('tag') == 'commerce_cart_form' && !empty($view->result)) {
+      $config = \Drupal::configFactory()->get('commerce_amazon_lpa.settings');
+      $buttons = $config->get('buttons');
+
+      $form['actions']['amazon_pay'] = [
+        '#type' => 'amazon_pay',
+        '#order_id' => $view->args[0],
+        '#weight' => 10,
+        '#size' => !empty($buttons['pay']['size']) ? $buttons['pay']['size'] : NULL,
+        '#style' => !empty($buttons['pay']['size']) ? $buttons['pay']['style'] : NULL,
+      ];
+    }
+  }
+}
+
+/**
+ * Implements hook_commerce_amazon_lpa_request_params_alter().
+ */
+function commerce_amazon_lpa_commerce_amazon_lpa_request_params_alter(array &$params, $data) {
+  // We must be in sandbox, and have simulation turned on to alter the params
+  // and set simulation messages.
+  $config = \Drupal::config('commerce_amazon_lpa.settings');
+  $simulation_mode = $config->get('simulation_mode');
+  $capture_mode = $config->get('capture_mode');
+
+  if (!$config->get('mode') || $config->get('mode') !== 'test' || $simulation_mode == '_none') {
+    return;
+  }
+  // Do not run simulations during IPN.
+  if (isset($_SERVER['HTTP_X_AMZ_SNS_MESSAGE_TYPE'])) {
+    return;
+  }
+  switch ($data['op']) {
+    case 'authorize':
+      switch ($simulation_mode) {
+        case 'Authorizations_InvalidPaymentMethod':
+          $params['seller_authorization_note'] = '{"SandboxSimulation": {"State":"Declined", "ReasonCode":"InvalidPaymentMethod", "PaymentMethodUpdateTimeInMins":1}}';
+          break;
+
+        case 'Authorizations_AmazonRejected':
+          $params['seller_authorization_note'] = '{"SandboxSimulation": {"State":"Declined", "ReasonCode":"AmazonRejected"}}';
+          break;
+
+        case 'Authorizations_AmazonClosed':
+          $params['seller_authorization_note'] = '{"SandboxSimulation": {"State":"Closed", "ReasonCode":"AmazonClosed"}} ';
+          break;
+
+        case 'Authorizations_TransactionTimedOut':
+          $params['seller_authorization_note'] = '{"SandboxSimulation": {"State":"Declined", "ReasonCode":"TransactionTimedOut"}}';
+          break;
+
+        case 'Captures_Pending':
+          if ($capture_mode == 'auth_capture') {
+            $params['seller_authorization_note'] = '{"SandboxSimulation": {"State":"Pending"}}';
+          }
+          break;
+
+        case 'Captures_AmazonRejected':
+          if ($capture_mode == 'auth_capture') {
+            $params['seller_authorization_note'] = '{"SandboxSimulation": {"State":"Declined", "ReasonCode":"AmazonRejected"}}';
+          }
+          break;
+
+        case 'Captures_AmazonClosed':
+          if ($capture_mode == 'auth_capture') {
+            $params['seller_authorization_note'] = '{"SandboxSimulation": {"State":"Closed", "ReasonCode":"AmazonClosed"}}';
+          }
+          break;
+
+        case 'Authorizations_ExpiredUnused':
+          $params['seller_authorization_note'] = '{"SandboxSimulation": {"State":"Closed", "ReasonCode":"ExpiredUnused", "ExpirationTimeInMins":1}}';
+          break;
+      }
+      break;
+
+    case 'cancel_order_reference':
+      break;
+
+    case 'capture':
+      switch ($simulation_mode) {
+        case 'Captures_Pending':
+          $params['seller_capture_note'] = '{"SandboxSimulation": {"State":"Pending"}}';
+          break;
+
+        case 'Captures_AmazonRejected':
+          $params['seller_capture_note'] = '{"SandboxSimulation": {"State":"Declined", "ReasonCode":"AmazonRejected"}}';
+          break;
+
+        case 'Captures_AmazonClosed':
+          $params['seller_capture_note'] = '{"SandboxSimulation": {"State":"Closed", "ReasonCode":"AmazonClosed"}}';
+          break;
+      }
+      break;
+
+    case 'close_authorization':
+      break;
+
+    case 'close_order_reference':
+      switch ($simulation_mode) {
+        case 'OrderReference_AmazonClosed':
+          $params['closure_reason'] = '{"SandboxSimulation": {"State":"Closed", "ReasonCode":"AmazonClosed"}}';
+          break;
+      }
+      break;
+
+    case 'confirmOrderReference':
+      break;
+
+    case 'get_capture_details':
+      break;
+
+    case 'getOrderReference':
+      break;
+
+    case 'refund':
+      switch ($simulation_mode) {
+        case 'Refund_AmazonRejected':
+          $params['seller_refund_note'] = '{"SandboxSimulation": {"State":"Declined", "ReasonCode":"AmazonRejected"}}';
+          break;
+      }
+      break;
+
+    case 'setOrderReference':
+      break;
+  }
+}
