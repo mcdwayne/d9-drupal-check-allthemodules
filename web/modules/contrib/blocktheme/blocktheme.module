@@ -1,0 +1,341 @@
+<?php
+
+/**
+ * @file
+ * Provides a configuration option to select custom themes for blocks
+ *
+ * BlockTheme allows an admin to define tpl files for standard block templates
+ * and provides a select box on the block configure form so the user can select
+ * a tpl file to use as opposed to having to override the templates by block ID.
+ *
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Url;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Render\Element;
+
+/**
+ * Implements hook_help().
+ */
+function blocktheme_help($route_name, RouteMatchInterface $route_match) {
+  $output = '';
+
+  switch ($route_match->getRouteName()) {
+    case 'admin_blocktheme_config':
+      $output .= t('BlockTheme allows an admin to define twig files for standard block templates and provides a select box on the block configure form so the user can select a twig file to use as opposed to having to override the templates by block ID.');
+      break;
+  }
+
+  switch ($route_name) {
+    case 'help.page.blocktheme':
+      $output .= t('Allows the admin to define re-usable block templates that can be configured from block config screen.');
+      $items = array();
+      $items[] = \Drupal::l(t('Block Theme'), Url::fromRoute('admin_blocktheme_config'));
+      $output .= '<h3>' . t('Block Theme administration pages') . '</h3>';
+      $item_list = array(
+        '#theme' => 'item_list',
+        '#items' => $items,
+      );
+      $output .= \Drupal::service('renderer')->render($item_list);
+      break;
+  }
+
+  return $output;
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK().
+ */
+function blocktheme_theme_suggestions_block(array $variables) {
+  $form_id = $variables['elements']['#id'];
+  if ($custom_block_theme = blocktheme_get_theme($form_id)) {
+    $template_name = 'block__blocktheme__' . str_replace('-', '_', $custom_block_theme);
+    return $template_name;
+  }
+
+  return NULL;
+}
+
+/**
+ * Implements hook_preprocess_block().
+ */
+function blocktheme_preprocess_block(&$variables) {
+  $form_id = $variables['elements']['#id'];
+  if ($custom_block_vars = blocktheme_get_theme_vars($form_id)) {
+    $variables['blocktheme'] = blocktheme_get_theme($form_id);
+    $variables['blocktheme_vars'] = $custom_block_vars;
+    $variables['attributes']['class'][] = blocktheme_get_theme($form_id);
+  }
+}
+
+/**
+ * Form for updating a block.
+ */
+function blocktheme_form_block_form_alter(&$form, FormStateInterface &$form_state, $form_id) {
+  $var_name = $form['id']['#default_value'];
+  $options = blocktheme_get_blockthemes();
+  $blocktheme = blocktheme_get();
+  $blocktheme_vars = blocktheme_get_vars();
+  $form['settings']['#weight'] = -2;
+  $form['regions']['#weight'] = -1;
+  $form['custom_block_theme'] = array(
+    '#type' => 'details',
+    '#title' => t('Block Theme'),
+    '#weight' => 0,
+    '#collapsed' => FALSE,
+    '#open' => TRUE,
+  );
+  $form['custom_block_theme']['blocktheme'] = array(
+    '#type' => 'select',
+    '#title' => t('Custom theme'),
+    '#default_value' => isset($blocktheme[$var_name]) ? $blocktheme[$var_name] : '',
+    '#options' => $options,
+  );
+  $form['custom_block_theme']['blocktheme_vars'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Custom block variables'),
+    '#description' => t('Enter one entry per line, in the format: <em>variable_name|variable_content</em>.'),
+    '#wysiwyg' => FALSE,
+    '#default_value' => isset($blocktheme_vars[$var_name]) ? blocktheme_format_vars_admin($blocktheme_vars[$var_name]) : '',
+  );
+
+  $form['actions']['submit']['#submit'][] = 'blocktheme_update';
+}
+
+/**
+ * Form for adding a new block.
+ */
+function blocktheme_form_basic_block_content_form_alter(&$form, FormStateInterface &$form_state, $form_id) {
+  $options = blocktheme_get_blockthemes();
+
+  $form['settings']['#weight'] = -2;
+  $form['regions']['#weight'] = -1;
+  $form['custom_block_theme'] = array(
+    '#type' => 'details',
+    '#title' => t('Block Theme'),
+    '#weight' => 0,
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE,
+    '#open' => TRUE,
+  );
+  $form['custom_block_theme']['blocktheme'] = array(
+    '#type' => 'select',
+    '#title' => t('Custom theme'),
+    '#options' => $options,
+  );
+  $form['custom_block_theme']['blocktheme_vars'] = array(
+    '#type' => 'textarea',
+    '#default_value' => '',
+    '#title' => t('Custom block variables'),
+    '#description' => t('Enter one entry per line, in the format: <em>variable_name|variable_content</em>.'),
+    '#wysiwyg' => FALSE,
+  );
+
+  $form['actions']['submit']['#submit'][] = 'blocktheme_save';
+}
+
+/**
+ * Add new column with name of template to the blocks list page.
+ */
+function blocktheme_form_block_admin_display_form_alter(&$form, FormStateInterface &$form_state, $form_id) {
+  $config = \Drupal::config('blocktheme.settings')
+    ->get('blocktheme_show_custom_block_theme');
+  if (!empty($config)) {
+    $form['blocks']['#header'][] = t('Custom theme');
+    foreach ($form['blocks'] as $block => $parametrs) {
+
+      if (isset($parametrs['message'])) {
+        $form['blocks'][$block]['message']['#wrapper_attributes']['colspan']++;
+      }
+      if (isset($parametrs['title'])) {
+        $form['blocks'][$block]['title']['#wrapper_attributes']['colspan']++;
+      }
+      if (isset($parametrs['weight'])) {
+        $template = blocktheme_get_theme_name($block);
+        $form['blocks'][$block][] = array(
+          '#markup' => !empty($template) ? $template : '',
+        );
+      }
+    }
+  }
+}
+
+/**
+ * Set Block Theme custom block settings.
+ */
+function blocktheme_set($blocktheme, $blocktheme_vars = NULL) {
+  $config = \Drupal::configFactory()->getEditable('blocktheme.settings');
+  $config->set('blocktheme', $blocktheme)
+    ->save();
+  if ($blocktheme_vars !== NULL) {
+  $config->set('blocktheme_vars', $blocktheme_vars)
+    ->save();
+  }
+}
+
+/**
+ * Get Block Theme custom block settings.
+ */
+function blocktheme_get() {
+  static $blocktheme;
+  $config = Drupal::config('blocktheme.settings');
+  if (empty($blocktheme)) {
+    $blocktheme = $config->get('blocktheme');
+    if (is_null($blocktheme)) {
+      $blocktheme = array();
+    }
+  }
+
+  return $blocktheme;
+}
+
+/**
+ * Get Block Theme custom block variables settings.
+ */
+function blocktheme_get_vars() {
+  static $blocktheme_vars;
+  $config = Drupal::config('blocktheme.settings');
+  if (empty($blocktheme_vars)) {
+    $blocktheme_vars = $config->get('blocktheme_vars');
+    if (is_null($blocktheme_vars)) {
+      $blocktheme_vars =  array();
+    }
+  }
+
+  return $blocktheme_vars;
+}
+
+/**
+ * Update an existing block after the block form has been submitted.
+ */
+function blocktheme_update($form, FormStateInterface &$form_state) {
+  $var_name = $form_state->getValue('id');
+
+  $blocktheme = blocktheme_get();
+  $blocktheme_vars = blocktheme_get_vars();
+  if (!$form_state->getValue('custom_block_theme')['blocktheme']) {
+     unset($blocktheme[$var_name]);
+  }
+  else {
+    $blocktheme[$var_name] = $form_state->getValue('custom_block_theme')['blocktheme'];
+  }
+  if (!$form_state->getValue('custom_block_theme')['blocktheme_vars']) {
+    unset($blocktheme_vars[$var_name]);
+  }
+  else {
+    $blocktheme_vars[$var_name] = blocktheme_format_vars($form_state->getValue('custom_block_theme')['blocktheme_vars']);
+  }
+
+  blocktheme_set($blocktheme, $blocktheme_vars);
+  drupal_theme_rebuild();
+}
+
+/**
+ * Save a new block a after the block form has been submitted.
+ */
+function blocktheme_save($form, FormStateInterface &$form_state) {
+  $var_name = $form_state->getValue('info')[0]['value'];
+  $blocktheme = blocktheme_get();
+  $blocktheme_vars = blocktheme_get_vars();
+  if ($form_state->getValue('blocktheme')) {
+    $blocktheme[$var_name] = $form_state->getValue('blocktheme');
+  }
+  if ($form_state->getValue('blocktheme_vars')) {
+    $blocktheme_vars[$var_name] = blocktheme_format_vars($form_state->getValue('blocktheme_vars'));
+  }
+
+  blocktheme_set($blocktheme, $blocktheme_vars);
+  drupal_theme_rebuild();
+}
+
+/**
+ * Get the defined blockthemes and return an array to be used in a select list.
+ */
+function blocktheme_get_blockthemes() {
+  $options = array();
+  $config = Drupal::config('blocktheme.settings');
+  $blockthemes = $config->get('blocktheme_themes');
+
+  $options[] = t('- None -');
+  if ($blockthemes) {
+    $_sets = explode("\n", $blockthemes);
+
+    foreach ($_sets as $key => $value) {
+      $set = explode('|', $value);
+      $options[$set[0]] = $set[1];
+    }
+  }
+
+  return $options;
+}
+
+/**
+ * Formats custom variables as an array to be used in the block template.
+ */
+function blocktheme_format_vars($block_vars) {
+  $formatted_vars = array();
+  if ($block_vars) {
+    $_sets = explode("\n", $block_vars);
+    foreach ($_sets as $key => $value) {
+      $set = explode('|', $value);
+      $formatted_vars[$set[0]] = $set[1];
+    }
+  }
+
+  return $formatted_vars;
+}
+
+/**
+ * Formats custom variables for displaying in a block configuration form.
+ */
+function blocktheme_format_vars_admin($block_vars) {
+  $formatted_vars = '';
+  if ($block_vars) {
+    $_formatted_vars = array();
+    foreach ($block_vars as $key => $value) {
+      $_formatted_vars[] = $key . '|' . $value;
+    }
+    $formatted_vars = implode("\n", $_formatted_vars);
+  }
+
+  return $formatted_vars;
+}
+
+/**
+ * Get custom theme for a block.
+ */
+function blocktheme_get_theme($block) {
+  $blocktheme = blocktheme_get();
+  if (isset($blocktheme[$block])) {
+    return $blocktheme[$block];
+  }
+
+  return NULL;
+}
+
+/**
+ * Get custom variables for a block.
+ */
+function blocktheme_get_theme_vars($block) {
+  $blocktheme_vars = blocktheme_get_vars();
+  if (!empty($blocktheme_vars[$block])) {
+    return $blocktheme_vars[$block];
+  }
+
+  return NULL;
+}
+
+/**
+ * Get template name of block.
+ */
+function blocktheme_get_theme_name($block) {
+  $blockthemes = blocktheme_get_blockthemes();
+  $template = blocktheme_get_theme($block);
+  if (!empty($blockthemes[$template])) {
+    $blocktheme_name = $blockthemes[$template];
+    return $blocktheme_name;
+  }
+
+  return NULL;
+}
