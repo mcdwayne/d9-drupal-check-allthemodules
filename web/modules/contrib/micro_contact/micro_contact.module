@@ -1,0 +1,253 @@
+<?php
+
+/**
+ * @file
+ * Contains micro_contact.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\contact\ContactFormInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\contact\Entity\ContactForm;
+
+/**
+ * Implements hook_help().
+ */
+function micro_contact_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the micro_contact module.
+    case 'help.page.micro_contact':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Integrate contact form with micro site') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_entity_base_field_info().
+ */
+function micro_contact_entity_base_field_info(EntityTypeInterface $entity_type) {
+
+  $fields = [];
+  if ($entity_type->id() === 'site') {
+
+    /** @var \Drupal\micro_contact\MicroContactManagerInterface $micro_contact_manager */
+    $micro_contact_manager = \Drupal::service('micro_contact.manager');
+    $contactForms = $micro_contact_manager->getContactFormAllowed('canonical', TRUE);
+    $options = ['_none' => t('- None -')];
+    foreach ($contactForms as $id => $contactForm) {
+      $options[$id] = $contactForm->label();
+    }
+
+    $fields['contact_id'] = BaseFieldDefinition::create('list_string')
+      ->setLabel(t('Contact form'))
+      ->setSettings(array(
+        'allowed_values' => $options
+      ))
+      ->setDefaultValue('_none')
+      ->setDisplayOptions('form', array(
+        'type' => 'options_select',
+        'weight' => -3,
+      ))
+      ->setDisplayConfigurable('form', TRUE)
+      ->setDisplayConfigurable('view', FALSE);
+  }
+
+
+  // @TODO only with contact storage enable ?
+//  if ($entity_type->id() === 'contact_message') {
+//    $fields['site_id'] = BaseFieldDefinition::create('entity_reference')
+//      ->setLabel(t('Site ID'))
+//      ->setDescription(t('The site on which the message is created.'))
+//      ->setSetting('target_type', 'site')
+//      ->setReadOnly(TRUE)
+//      ->setDefaultValueCallback('Drupal\micro_contact\MicroContactManager::getCurrentSiteId');
+//  }
+
+  return $fields;
+}
+
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function micro_contact_form_site_form_alter(&$form, FormStateInterface $form_state) {
+  /** @var \Drupal\micro_site\Entity\SiteInterface $site */
+  $site = $form_state->getFormObject()->getEntity();
+  /** @var \Drupal\micro_site\Entity\SiteTypeInterface $site_type */
+  $site_type = $site->type->entity;
+
+  if (isset($form['contact_id'])) {
+
+    // Contact form wrapper.
+    $form['site_contact_form'] = [
+      '#type' => 'details',
+      '#title' => t('Contact form'),
+      '#group' => 'advanced',
+      '#attributes' => [
+        'class' => ['site-form-contact'],
+      ],
+      '#weight' => 102,
+      '#optional' => TRUE,
+    ];
+
+    $form['contact_id']['#group'] = 'site_contact_form';
+    // @TODO implements a permission or an option on the site entity ?
+    $form['contact_id']['#access'] = TRUE;
+  }
+
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function micro_contact_form_contact_message_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // @TODO only with contact storage enable ?
+//  /** @var \Drupal\micro_contact\MicroContactManagerInterface $micro_contact_manager */
+//  $micro_contact_manager = \Drupal::service('micro_contact.manager');
+//  $form['site_id'] = [
+//    '#type' => 'hidden',
+//    '#value' => $micro_contact_manager::getCurrentSiteId(),
+//  ];
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function micro_contact_form_contact_form_form_alter(&$form, FormStateInterface $form_state) {
+  /** @var \Drupal\node\NodeTypeInterface $type */
+  $type = $form_state->getFormObject()->getEntity();
+
+  $form['micro_contact'] = [
+    '#type' => 'details',
+    '#group' => isset($form['additional_settings']) ? 'additional_settings' : 'advanced',
+    '#title' => t('Micro sites'),
+    '#access' => \Drupal::currentUser()->hasPermission('administer contact forms'),
+  ];
+
+  $form['micro_contact']['canonical'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Canonical URL form available for micro sites'),
+    '#description' => t('Check this option to allow micro sites to use this contact form from the canonical URL.'),
+    '#default_value' => $type->getThirdPartySetting('micro_contact', 'canonical', 0),
+  ];
+
+  $form['micro_contact']['form'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Embed form available for micro sites'),
+    '#description' => t('Check this option to allow micro sites to use this contact form as an embed form.'),
+    '#default_value' => $type->getThirdPartySetting('micro_contact', 'canonical', 0),
+  ];
+
+  $form['#entity_builders'][] = 'micro_contact_form_contact_form_form_builder';
+}
+
+/**
+ * Entity builder for the node type form with TOC node option.
+ */
+function micro_contact_form_contact_form_form_builder($entity_type, ContactFormInterface $contact_form, &$form, FormStateInterface $form_state) {
+  $contact_form->setThirdPartySetting('micro_contact', 'canonical', $form_state->getValue('canonical'));
+  $contact_form->setThirdPartySetting('micro_contact', 'form', $form_state->getValue('form'));
+}
+
+/**
+ * Implements hook_mail_alter().
+ */
+function micro_contact_mail_alter(&$message) {
+  if ($message['module'] !== 'contact') {
+    return;
+  }
+
+  // Check that the message isn't a copy sent to the sender (page_copy).
+  if (isset($message['params']['contact_message'])) {
+    $contact_message = $message['params']['contact_message'];
+    $active_site = NULL;
+    if (!$contact_message->hasField('site_id')) {
+      /** @var \Drupal\micro_site\SiteNegotiatorInterface $negotiator */
+      $negotiator = \Drupal::service('micro_site.negotiator');
+      $active_site = $negotiator->getActiveSite();
+    }
+    else {
+      $sites = $contact_message->get('site_id')->referencedEntities();
+      if ($sites) {
+        /** @var \Drupal\micro_site\Entity\SiteInterface $active_site */
+        $active_site = reset($sites);
+      }
+    }
+
+    if ($active_site) {
+      $email = $active_site->getEmail();
+      // Alter the from and to variables.
+      $message['from'] = $email;
+      $message['headers']['Return-Path'] = $email;
+      $message['headers']['Sender'] = $email;
+      $message['headers']['From'] = $active_site->getName() . ' <' . $email . '>';
+
+      if ($message['key'] == 'page_mail') {
+        $message['to'] = $email;
+      }
+
+      // Rewrite the body if needed.
+      $sender = $message['params']['sender'];
+      $language = \Drupal::languageManager()->getLanguage($message['langcode']);
+
+      $variables = [
+        '@site-name' => $active_site->getName(),
+        '@subject' => $contact_message->getSubject(),
+        '@form' => !empty($message['params']['contact_form']) ? $message['params']['contact_form']->label() : NULL,
+        '@form-url' => \Drupal::url('<current>', [], ['absolute' => TRUE, 'language' => $language]),
+        '@sender-name' => $sender->getDisplayName(),
+      ];
+      if ($sender->isAuthenticated()) {
+        $variables['@sender-url'] = $sender->url('canonical', ['absolute' => TRUE, 'language' => $language]);
+      }
+      else {
+        $variables['@sender-url'] = $message['params']['sender']->getEmail();
+      }
+
+      $options = ['langcode' => $language->getId()];
+
+      switch ($message['key']) {
+        case 'page_mail':
+        case 'page_copy':
+          $message['body'] = [];
+          $message['subject'] = t('[@form] @subject', $variables, $options);
+          $message['body'][] = t("@sender-name (@sender-url) sent a message using the contact form at @form-url.", $variables, $options);
+          $build = entity_view($contact_message, 'mail');
+          $message['body'][] = \Drupal::service('renderer')->renderPlain($build);
+          break;
+
+        case 'page_autoreply':
+          $message['body'] = [];
+          $message['subject'] = t('[@form] @subject', $variables, $options);
+          $message['body'][] = $message['params']['contact_form']->getReply();
+          break;
+
+        case 'user_mail':
+        case 'user_copy':
+        $message['body'] = [];
+          $variables += [
+            '@recipient-name' => $message['params']['recipient']->getDisplayName(),
+            '@recipient-edit-url' => $message['params']['recipient']->url('edit-form', ['absolute' => TRUE, 'language' => $language]),
+          ];
+          $message['subject'] = t('[@site-name] @subject', $variables, $options);
+          $message['body'][] = t('Hello @recipient-name,', $variables, $options);
+          $message['body'][] = t("@sender-name (@sender-url) has sent you a message via your contact form at @site-name.", $variables, $options);
+          $message['body'][] = t("If you don't want to receive such emails, you can change your settings at @recipient-edit-url.", $variables, $options);
+          $build = entity_view($contact_message, 'mail');
+          $message['body'][] = \Drupal::service('renderer')->renderPlain($build);
+          break;
+      }
+
+    }
+
+//    $message['headers']['Content-Type'] = 'text/html';
+//    $message['params']['convert'] = TRUE;
+  }
+
+}
