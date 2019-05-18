@@ -1,0 +1,1 @@
+var iflychat_auth_token = drupalSettings.drupalchat_auth_token; 
