@@ -1,0 +1,312 @@
+<?php
+
+use Drupal\Core\Form\FormStateInterface;
+
+/**
+ * implements hook_form_alter().
+ */
+function appointment_calendar_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  if ($form_id == 'node_appointment_calendar_form' || $form_id == 'node_appointment_calendar_edit_form') {
+    if (isset($form_state->getValue('field_appointment_date')[0])) {
+      $selected_date = strtotime(date('Y-m-d', $form_state->getValue('field_appointment_date')[0]['value']->getTimestamp()));
+    }
+    else {
+      $selected_date = strtotime(date('Y-m-d', $form['field_appointment_date']['widget'][0]['value']['#default_value']->getTimestamp()));
+    }
+    $current_path = \Drupal::service('path.current')->getPath();
+    $path_args = explode('/', $current_path);
+    // Check for edit page.
+    if ($path_args[1] == 'node' && is_numeric($path_args[2])) {
+      $nid = $path_args[2];
+      $default_value = appointment_calendar_slot_value($nid);
+    }
+    $options = [];
+    // Get slot values.
+    $slot_result = get_slot_values($selected_date);
+    foreach ((array) json_decode($slot_result) as $key => $value) {
+      $options[$key] = $key;
+    }
+    $form['field_appointment_date']['widget'][0]['value']['#ajax'] = [
+      'callback' => 'appointment_calendar_appointment_calendar_timeslot_callback_form',
+      'wrapper' => 'slot-check',
+      'method' => 'replace',
+      'effect' => 'fade',
+    ];
+    $form['data']['field_appointment_slot'] = [
+      '#type' => 'select',
+      '#title' => t('Appointment Slot'),
+      '#weight' => $form['field_appointment_date']['#weight'],
+      '#options' => $options,
+      '#default_value' => isset($default_value) ? $default_value : '',
+    ];
+    $form['appointment_fill'] = [
+      '#type' => 'button',
+      '#value' => t('Check Slot'),
+      '#weight' => $form['field_appointment_date']['#weight'],
+      '#ajax' => [
+        'callback' => 'appointment_calendar_appointment_calendar_timeslot_callback_form',
+        'wrapper' => 'slot-check',
+        'method' => 'replace',
+        'effect' => 'fade',
+      ],
+    ];
+    $values = $form_state->getValues();
+    if (!empty($values)) {
+      $selected_date = strtotime(date('Y-m-d', $values['field_appointment_date'][0]['value']->getTimestamp()));
+      $slot_result = get_slot_values($selected_date);
+      foreach ((array) json_decode($slot_result) as $key => $value) {
+        $options[$key] = $key;
+      }
+      if (!empty($slot_result)) {
+        $form['data']['field_appointment_slot']['#options'] = $options;
+      }
+      else {
+        $form['data']['field_appointment_slot']['#options'] = '';
+      }
+    }
+    $form['data']['#prefix'] = '<div id="slot-check">';
+    $form['data']['#suffix'] = '</div>';
+    $form['data']['calendar'] = [
+      '#theme' => 'appointment_availability',
+      '#selected_date' => date("jS F, Y ", $selected_date),
+      '#headers' => $options,
+      '#values' => check_slot_availability($selected_date),
+    ];
+    // Alter submit and validate functions.
+    foreach (array_keys($form['actions']) as $action) {
+      if ($action != 'preview' && isset($form['actions'][$action]['#type']) && $form['actions'][$action]['#type'] === 'submit') {
+        $form['actions'][$action]['#submit'][] = 'appointment_calendar_submit';
+      }
+    }
+    $form['#validate'][] = 'appointment_calendar_validate';
+  }
+}
+
+/**
+ * Implements validate function for appointment calendar validate.
+ */
+function appointment_calendar_validate(array &$form, FormStateInterface $form_state) {
+  $db_conn = \Drupal::database();
+  // Form state Values.
+  $values = $form_state->getValues();
+  $appointment_date = strtotime(date('Y-m-d', $values['field_appointment_date'][0]['value']->getTimestamp()));
+  $appointment_slot = $values['field_appointment_slot'];
+//  if ($appointment_slot == NULL || $appointment_slot == '') {
+//    $form_state->setErrorByName('field_appointment_slot', t('Time slot not available for Selected slot'));
+//  }
+  $uid = $values['uid'][0]['target_id'];
+  // Get Current Path
+  $current_path = \Drupal::service('path.current')->getPath();
+  $path_args = explode('/', $current_path);
+  if ($path_args[1] == 'node' && $path_args[2] == 'add') {
+    $check_for_booked = appointment_calendar_check_user($appointment_date, $appointment_slot, $uid);
+    if ($check_for_booked >= 1) {
+      $form_state->setErrorByName('field_appointment_date', t('Time slot already booked for Selected Date'));
+      $form_state->setErrorByName('field_appointment_slot', t('Time slot already booked for Selected slot'));
+    }
+  }
+  $count_values = [];
+  $date_query = $db_conn->select('appointment_slots', 'ap');
+  $date_query->fields('ap', ['slot']);
+  $date_query->condition('date', $appointment_date, '=');
+  $date_queryresult = $date_query->execute()->fetchAll(PDO::FETCH_ASSOC);
+  foreach ($date_queryresult as $slot_values) {
+    if ($slot_values['slot']) {
+      @$count_values[$slot_values['slot']] ++;
+    }
+  }
+  if ($count_values) {
+    ksort($count_values);
+    $slot_result = appointment_calendar_slot_capacity($appointment_date);
+    foreach ((array) json_decode($slot_result) as $key => $value) {
+      $options[$key] = $value;
+    }
+    $keys = array_keys($count_values);
+    for ($a = 0; $a < count($keys); $a++) {
+      if (($count_values[$keys[$a]] >= $options[$keys[$a]]) && ($appointment_slot == $keys)) {
+        $form_state->setErrorByName('field_appointment_slot', t('Time slot not available for Selected Date'));
+      }
+    }
+  }
+}
+
+/**
+ * Implements submit function for appointment calendar submit.
+ */
+function appointment_calendar_submit(array &$form, FormStateInterface $form_state) {
+  $db_conn = \Drupal::database();
+  // Form state Values.
+  $values = $form_state->getValues();
+  $uid = $values['uid'][0]['target_id'];
+  $nid = $values['nid'];
+  $appointment_slot = $values['field_appointment_slot'];
+  $appointment_date = strtotime(date('Y-m-d', $values['field_appointment_date'][0]['value']->getTimestamp()));
+  $db_conn->merge('appointment_slots')->key(['date' => $appointment_date, 'nid' => $nid])->fields([
+    'slot' => $appointment_slot,
+    'uid' => $uid,
+  ])->execute();
+}
+
+/**
+ * TimeSlots callback to render derived slots.
+ */
+function appointment_calendar_appointment_calendar_timeslot_callback_form(array &$form, FormStateInterface $form_state) {
+  return $form['data'];
+}
+
+/**
+ * Implements function to get days in between from and to dates.
+ */
+function appointment_calendar_daysbetween($start, $end) {
+  // Get days in between from and to dates.
+  $dates = [];
+  while ($start <= $end) {
+    array_push($dates, strtotime(date('Y-m-d', $start)));
+    $start += 86400;
+  }
+  return $dates;
+}
+
+/**
+ * Implements function to fetch Slot Capacity using selected date.
+ */
+function appointment_calendar_slot_capacity($selected_date) {
+  // Fetch Slot capacity.
+  $db_conn = \Drupal::database();
+  $slot_query = $db_conn->select('appointment_date', 'ad');
+  $slot_query->fields('ad', ['slot_capacity']);
+  $slot_query->condition('date', $selected_date);
+  $slot_capacity = $slot_query->execute()->fetchField();
+  return $slot_capacity;
+}
+
+/**
+ * Implements function to get slot.
+ */
+function appointment_calendar_slot_capacity_value($time_slot) {
+  $db_conn = \Drupal::database();
+  $slot_query = $db_conn->select('appointment_slots', 'ap');
+  $slot_query->fields('ap', ['slot']);
+  $slot_query->condition('slot', $time_slot, '=');
+  $slot_result = $slot_query->execute()->fetchAll();
+  return count($slot_result);
+}
+
+/**
+ * Implements to get slots for selected date.
+ */
+function get_slot_values($selected_date) {
+  $db_conn = \Drupal::database();
+  $slot_query = $db_conn->select('appointment_date', 'ad');
+  $slot_query->fields('ad', ['slot_capacity']);
+  $slot_query->condition('date', strtotime(date('Y-m-d', $selected_date)), '=');
+  $slot_result = $slot_query->execute()->fetchField();
+  return $slot_result;
+}
+
+/**
+ * Implements function to get slot using NID.
+ */
+function appointment_calendar_slot_value($nid) {
+  // Get slot value using nid.
+  $db_conn = \Drupal::database();
+  $slot_query = $db_conn->select('appointment_slots', 'ap');
+  $slot_query->fields('ap', ['slot']);
+  $slot_query->condition('nid', $nid, '=');
+  $slot_result = $slot_query->execute()->fetchField();
+  return $slot_result;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function appointment_calendar_theme($existing, $type, $theme, $path) {
+  $theme = [];
+  $theme['appointment_availability'] = [
+    'variables' => [
+      'selected_date' => NULL,
+      'headers' => NULL,
+      'values' => NULL,
+    ],
+    'template' => 'appointment-availability'
+  ];
+  return $theme;
+}
+
+/**
+ * Implements for slot availability check on selected date.
+ */
+function check_slot_availability($selected_date) {
+  $result = [];
+  $db_conn = \Drupal::database();
+  $date_query = $db_conn->select('appointment_slots', 'ap');
+  $date_query->fields('ap', ['slot']);
+  $date_query->leftJoin('node_field_data', 'node_data', 'node_data.nid = ap.nid');
+  $date_query->condition('date', $selected_date, '=');
+  $date_query->condition('node_data.status', 1);
+  $date_queryresult = $date_query->execute()->fetchAll(PDO::FETCH_ASSOC);
+  $slot_result = appointment_calendar_slot_capacity($selected_date);
+  if ($date_queryresult) {
+    foreach ($date_queryresult as $slot_values) {
+      if ($slot_values['slot']) {
+        @$count_values[$slot_values['slot']] ++;
+      }
+    }
+    if (!empty($slot_result)) {
+      if (!empty($count_values)) {
+        ksort($count_values);
+      }
+      foreach ((array) json_decode($slot_result) as $key => $value) {
+        $options[$key] = $value;
+      }
+      $keys = array_keys($options);
+      for ($a = 0; $a < count($keys); $a++) {
+        if (isset($count_values[$keys[$a]]) && ($count_values[$keys[$a]] >= $options[$keys[$a]])) {
+          $result[$keys[$a]][] = t('Booked');
+          $result[$keys[$a]]['class'] = 'booked';
+          $result[$keys[$a]]['style'] = 'color: red;';
+        }
+        else {
+          $result[$keys[$a]][] = t('Available');
+          $result[$keys[$a]]['class'] = 'available';
+          $result[$keys[$a]]['style'] = 'color: #00ff47;';
+        }
+      }
+    }
+  }
+  else {
+    foreach ((array) json_decode($slot_result) as $key => $value) {
+      $result[$key][] = t('Available');
+      $result[$key]['class'] = 'available';
+      $result[$key]['style'] = 'color: #00ff47;';
+    }
+  }
+  return $result;
+}
+
+/**
+ * Implements function to get slot.
+ */
+function appointment_calendar_check_user($selected_date, $time_slot, $uid) {
+  $db_conn = \Drupal::database();
+  $slot_query = $db_conn->select('appointment_slots', 'ap');
+  $slot_query->fields('ap', ['slot']);
+  $slot_query->leftJoin('node_field_data', 'node_data', 'node_data.nid = ap.nid');
+  $slot_query->condition('ap.slot', $time_slot, '=');
+  $slot_query->condition('ap.date', $selected_date, '=');
+  $slot_query->condition('ap.uid', $uid, '=');
+  $slot_query->condition('node_data.status', 1);
+  $slot_result = $slot_query->execute()->fetchAll();
+  return count($slot_result);
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function appointment_calendar_node_delete(Drupal\node\NodeInterface $node) {
+  if ($node->getType() == 'appointment_calendar') {
+    $query = \Drupal::database()->delete('appointment_slots');
+    $query->condition('nid', $node->id());
+    $query->execute();
+  }
+}
