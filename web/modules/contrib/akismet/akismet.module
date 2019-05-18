@@ -1,0 +1,592 @@
+<?php
+
+use Drupal\comment\CommentInterface;
+use Drupal\Component\Utility\Html;
+use Drupal\Component\Utility\Unicode;
+use Drupal\Core\Url;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\node\Entity\Node;
+use Drupal\akismet\Client\FeedbackManager;
+use Drupal\akismet\Controller\FormController;
+use Drupal\akismet\Storage\ResponseDataStorage;
+use Drupal\akismet\Utility\AkismetUtilities;
+use Drupal\node\Entity\NodeType;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\node\NodeInterface;
+
+/**
+ * Implements hook_help().
+ */
+function akismet_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.akismet':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Allowing users to react, participate and contribute while still keeping the content of your site under control can be a huge challenge. Akismet <a href="@akismet-website">Akismet</a> is a web service that helps you stop spam. When content moderation becomes easier, you have more time and energy to interact with your site visitors and community. For more information, see <a href="@akismet-works">How Akismet Works</a>.', [
+          '@akismet-website' =>  Url::fromUri('https://www.akismet.com'),
+          '@akismet-works' => Url::fromUri('https://www.akismet.com/how'),
+       ]) . '</p>';
+      $output .= '<p>';
+      $output .= t('Data from your site is processed and stored as explained in the <a href="@privacy">privacy policy</a> of Akismet\'s parent company, Automattic. It is your responsibility to provide necessary notices and obtain the appropriate consent regarding Akismet\'s use of submitted data.', [
+        '@privacy' => Url::fromUri('https://www.akismet.com/web-service-privacy-policy'),
+      ]);
+      $output .= '</p>';
+      return $output;
+
+    case 'entity.akismet_form.list':
+      $output = '';
+      $output .= '<p>';
+      $output .= t('All listed forms below are protected by Akismet, unless users are able to <a href="@permissions-url">bypass Akismet\'s protection</a>.', [
+        '@permissions-url' => Url::fromRoute('user.admin_permissions')->toString(),
+      ]);
+      $output .= ' ';
+      $output .= t('You can <a href="@add-form-url">add a form</a> to protect, configure already protected forms, or remove the protection.', [
+        '@add-form-url' => Url::fromRoute('entity.akismet_form.add')->toString(),
+      ]);
+      $output .= '</p>';
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_akismet_form_list().
+ */
+function comment_akismet_form_list() {
+  $forms = [];
+  /* @var $type \Drupal\comment\Entity\CommentType */
+  foreach (\Drupal\comment\Entity\CommentType::loadMultiple() as $type) {
+    $form_id = 'comment_' . $type->id() . '_form';
+    $forms[$form_id] = [
+      'title' => t('@name form', array('@name' => $type->label())),
+      'entity' => 'comment',
+      'bundle' => 'comment',
+      'delete form' => 'comment_comment_delete_form',
+      'delete submit' => 'actions][submit',
+      'report access' => array('administer comments'),
+      'entity delete multiple callback' => 'comment_delete_multiple',
+      'entity report access callback' => 'comment_akismet_entity_report_access',
+    ];
+  }
+  return $forms;
+}
+
+/**
+ * Implements hook_akismet_form_info().
+ */
+function comment_akismet_form_info($form_id) {
+  $form_info = array(
+    'bypass access' => array('administer comments'),
+    'moderation callback' => 'comment_akismet_form_moderation',
+    'context created callback' => 'node_akismet_context_created',
+    'elements' => array(
+      'subject][0][value' => t('Subject'),
+      'comment_body][0][value' => t('Body'),
+    ),
+    'mapping' => array(
+      'comment_author' => 'name',
+      'comment_author_email' => 'mail',
+    ),
+  );
+  // Retrieve internal type from $form_id.
+  $comment_bundle = Unicode::substr($form_id, 0, -5);
+  FormController::addProtectableFields($form_info, 'comment', $comment_bundle);
+  return $form_info;
+}
+
+/**
+ * Implements hook_form_FORMID_alter().
+ */
+function akismet_form_comment_multiple_delete_confirm_alter(array &$form, FormStateInterface $form_state) {
+  FeedbackManager::addFeedbackOptions($form, $form_state);
+  // Report before deletion.
+  array_unshift($form['#submit'], 'akismet_form_comment_multiple_delete_confirm_submit');
+}
+
+/**
+ * Form submit handler for comment_multiple_delete_confirm().
+ */
+function akismet_form_comment_multiple_delete_confirm_submit($form, FormStateInterface $form_state) {
+  $cids = array_keys($form_state->getValue('comments'));
+  $feedback = $form_state->getValue(['akismet', 'feedback']);
+  if (!empty($feedback)) {
+    if (FeedbackManager::sendFeedbackMultiple('comment', $cids, $feedback)) {
+      \Drupal::messenger()->addMessage(t('The posts were successfully reported as inappropriate.'));
+    }
+  }
+  ResponseDataStorage::deleteMultiple('comment', $cids);
+}
+
+
+/**
+ * Implements hook_akismet_form_info().
+ */
+function node_akismet_form_info($form_id) {
+  // Retrieve internal type from $form_id.
+  $form_parts = explode('_', $form_id);
+  // Remove the 'node_' from the beginning of the id.
+  array_shift($form_parts);
+  // Remove the '_form' from the end of the id.
+  array_pop($form_parts);
+  // Whatever is left is the entity type.
+  $entity_type = implode('_', $form_parts);
+
+  /**
+   * @var $type \Drupal\node\Entity\NodeType;
+   */
+  if (!$type = NodeType::load($entity_type)) {
+    return '';
+  }
+  $form_info = array(
+    // @todo This is incompatible with node access.
+    'bypass access' => array('bypass node access'),
+    'bundle' => $type->id(),
+    'moderation callback' => 'node_akismet_form_moderation',
+    'context created callback' => 'node_akismet_context_created',
+    'elements' => [],
+    'mapping' => [
+      'comment_author' => 'name',
+      'context_id' => 'nid',
+    ],
+  );
+  // @see \Drupal\node\NodePermissions
+  $form_info['bypass access'][] = 'edit any ' . $type->id() . ' content';
+  $form_info['bypass access'][] = 'delete any ' . $type->id() . ' content';
+  $form_info['elements']['title][0][value'] = t('Title');
+  $form_info['mapping']['post_title'] = 'title][0][value';
+  FormController::addProtectableFields($form_info, 'node', $type->id());
+  return $form_info;
+}
+
+
+/**
+ * Implements hook_akismet_form_list().
+ */
+function node_akismet_form_list() {
+  $forms = array();
+  /** @var NodeType[] $types */
+  $types = NodeType::loadMultiple();
+  foreach ($types as $type) {
+    $form_id = 'node_' . $type->id() . '_form';
+    $forms[$form_id] = array(
+      'title' => t('@name form', array('@name' => $type->label())),
+      'entity' => 'node',
+      'bundle' => $type->id(),
+      'delete form' => 'node_confirm_form',
+      'report access' => array('bypass node access', 'administer nodes'),
+      'entity report access callback' => 'node_akismet_entity_report_access',
+    );
+  }
+  return $forms;
+}
+
+/**
+ * Entity context created callback for nodes.
+ *
+ * @param $id
+ *   The id of the node.
+ */
+function node_akismet_context_created($id = NULL) {
+  if (empty($id)) {
+    return FALSE;
+  }
+  /* @var $node Drupal\node\Entity\Node */
+  $node = Node::load($id);
+  if (empty($node)) {
+    return FALSE;
+  }
+  return $node->getCreatedTime();
+}
+
+/**
+ * Akismet form moderation callback for nodes.
+ */
+function node_akismet_form_moderation(array &$form, FormStateInterface $form_state) {
+  $form_state->setValue('status', ['value' => NodeInterface::NOT_PUBLISHED]);
+}
+
+/**
+ * Entity report access callback for nodes.
+ *
+ * @param $entity \Drupal\Core\Entity\EntityInterface
+ *   Optional entity object to check access to a specific entity.
+ */
+function node_akismet_entity_report_access($entity = NULL) {
+  // All nodes can be reported as long as the user has access to view.
+  if (!empty($entity)) {
+    return $entity->access('view');
+  }
+  else {
+    // Generally turned on when this function is enabled as a callback.
+    return TRUE;
+  }
+}
+
+/**
+ * Implements hook_form_FORMID_alter().
+ */
+function akismet_form_node_multiple_delete_confirm_alter(array &$form, FormStateInterface $form_state) {
+  FeedbackManager::addFeedbackOptions($form, $form_state);
+  // Report before deletion.
+  array_unshift($form['#submit'], 'akismet_form_node_multiple_delete_confirm_submit');
+}
+
+/**
+ * Form submit handler for node_multiple_delete_confirm().
+ */
+function akismet_form_node_multiple_delete_confirm_submit(array $form, FormStateInterface $form_state) {
+  // @todo do we need to handle translations differently?
+  $nodeInfo = \Drupal::service('tempstore.private')->get('node_multiple_delete_confirm')->get(\Drupal::currentUser()->id());
+  $nids = array_keys($nodeInfo);
+  $feedback = $form_state->getValue(['akismet', 'feedback']);
+  if (!empty($feedback)) {
+    if (FeedbackManager::sendFeedbackMultiple('node', $nids, $feedback)) {
+      \Drupal::messenger()->addMessage(t('The posts were successfully reported as inappropriate.'));
+    }
+  }
+  ResponseDataStorage::deleteMultiple('node', $nids);
+}
+
+/**
+ * Entity report access callback for comments.
+ *
+ * @param $entity
+ *   Optional entity object to check access to a specific entity.
+ */
+function comment_akismet_entity_report_access(CommentInterface $entity = NULL) {
+  // All comments can be reported as long as the user has access to view the
+  // node and its comments.
+  if (!\Drupal::currentUser()->hasPermission('access comments')) {
+    return FALSE;
+  }
+  if (!empty($entity)) {
+    return $entity->getCommentedEntity()->access('view');
+  }
+  return TRUE;
+}
+
+/**
+ * Implements hook_akismet_form_list().
+ */
+function contact_akismet_form_list() {
+  $forms['contact_message_feedback_form'] = array(
+    'title' => t('Site-wide contact form'),
+  );
+  $forms['contact_message_personal_form'] = array(
+    'title' => t('User contact form'),
+  );
+  return $forms;
+}
+
+/**
+ * Implements hook_akismet_form_info().
+ */
+function contact_akismet_form_info($form_id) {
+  switch ($form_id) {
+    case 'contact_message_feedback_form':
+      $form_info = array(
+        'bypass access' => array('administer contact forms'),
+        'elements' => array(
+          'subject' => t('Subject'),
+          'message' => t('Message'),
+        ),
+        'mapping' => array(
+          'comment_author' => 'name',
+          'comment_author_email' => 'mail',
+        ),
+      );
+      return $form_info;
+
+    case 'contact_message_personal_form':
+      $form_info = array(
+        'bypass access' => array('administer users'),
+        'elements' => array(
+          'subject' => t('Subject'),
+          'message' => t('Message'),
+        ),
+        'mapping' => array(
+          'comment_author' => 'name',
+          'comment_author_email' => 'mail',
+        ),
+      );
+      return $form_info;
+  }
+}
+
+/**
+ * Implements hook_akismet_form_info().
+ */
+function user_akismet_form_info($form_id) {
+  switch ($form_id) {
+    case 'user_register_form':
+    case 'user_profile_form':
+      $form_info = array(
+        'bypass access' => array('administer users'),
+        'moderation callback' => 'user_akismet_form_moderation',
+        'mapping' => array(
+          'comment_author' => 'name',
+          'comment_author_email' => 'mail',
+        ),
+      );
+      FormController::addProtectableFields($form_info, 'user', 'user');
+      return $form_info;
+
+    case 'user_pass':
+      $form_info = array(
+        'bypass access' => array('administer users'),
+        'mapping' => array(
+          'post_id' => 'uid',
+          'comment_author' => 'name',
+          // The 'name' form element accepts either a username or mail address.
+          'comment_author_email' => 'name',
+        ),
+      );
+      return $form_info;
+  }
+}
+
+/**
+ * Implements hook_akismet_form_list().
+ */
+function user_akismet_form_list() {
+  $forms['user_register_form'] = array(
+    'title' => t('User registration form'),
+    'type' => 'user',
+    'entity' => 'user',
+    'bundle' => 'user',
+    'delete form' => 'user_cancel_form',
+    'report path' => 'user/%id/cancel',
+    'report access' => array('administer users'),
+  );
+  $forms['user_profile_form'] = $forms['user_register_form'];
+  $forms['user_profile_form']['title'] = t('User profile form');
+
+  $forms['user_pass'] = array(
+    'title' => t('User password request form'),
+  );
+  return $forms;
+}
+
+/**
+ * Akismet form moderation callback for user accounts.
+ */
+function user_akismet_form_moderation(array $form, FormStateInterface $form_state) {
+  $form_state->setValue('status', 0);
+}
+
+/**
+ * Implements hook_akismet_form_info_alter().
+ *
+ * Adds profile fields exposed on the user registration form.
+ */
+function profile_akismet_form_info_alter(&$form_info, $form_id) {
+  if ($form_id !== 'user_register_form') {
+    return;
+  }
+  // @see profile_form_profile()
+  $result = db_query("SELECT name, title FROM {profile_field} WHERE register = 1 AND type IN (:types)", array(
+    ':types' => array('textfield', 'textarea', 'url', 'list'),
+  ));
+  foreach ($result as $field) {
+    $form_info['elements'][$field->name] = Html::escape($field->title);
+  }
+}
+
+/**
+ * Akismet form moderation callback for comments.
+ */
+function comment_akismet_form_moderation(array &$form, FormStateInterface $form_state) {
+  $form_state->setValue('status', CommentInterface::NOT_PUBLISHED);
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Protects all configured forms with Akismet.
+ *
+ * @see akismet_element_info()
+ * @see akismet_process_akismet()
+ * @see akismet_pre_render_akismet()
+ */
+function akismet_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // Skip installation and update forms.
+  if (defined('MAINTENANCE_MODE')) {
+    return;
+  }
+  // Retrieve a list of all protected forms once.
+  $forms = \Drupal\akismet\Controller\FormController::getProtectedForms();
+
+  $url = Url::fromRoute('<current>');
+  $current_path = $url->toString();
+  $build_info = $form_state->getBuildInfo();
+  $base_form_id = isset($build_info['base_form_id']) ? $build_info['base_form_id'] : $form_id;
+  $protected_form_id = '';
+  if (isset($forms['protected'][$form_id])) {
+    $protected_form_id = $form_id;
+  }
+  else if (isset($forms['protected'][$base_form_id])) {
+    $protected_form_id = $base_form_id;
+  }
+  if (!empty($protected_form_id) || strpos($current_path, 'admin/config/content/akismet') === 0) {
+    AkismetUtilities::displayAkismetTestModeWarning();
+  }
+
+  $current_user = \Drupal::currentUser();
+
+  // Site administrators don't have their content checked with Akismet.
+  if (!$current_user->hasPermission('bypass akismet protection')) {
+    // Retrieve configuration for this form.
+    if (!empty($protected_form_id)) {
+      /** @var \Drupal\akismet\Entity\Form $akismet_form */
+      $akismet_form = \Drupal\akismet\Entity\Form::load($protected_form_id)->initialize();
+      // Determine whether to bypass validation for the current user.
+      foreach ($akismet_form['bypass access'] as $permission) {
+        if ($current_user->hasPermission($permission)) {
+          return;
+        }
+      }
+      // Verify global Akismet configuration status.
+      // Only do this if the form is actually protected and if the current user
+      // is not privileged to bypass the Akismet protection. Otherwise, if e.g.
+      // the Testing API is down, then every hook_form_alter() for every single
+      // form on the page would potentially cause a (two) API keys verification
+      // requests (in case caches are disabled).
+      // If API keys have been configured, then the form has to be processed,
+      // regardless of whether API keys could be verified; otherwise, the
+      // fallback mode would not be triggered.
+      $status = AkismetUtilities::getAPIKeyStatus();
+      if (!$status['isConfigured']) {
+        return;
+      }
+
+      // Add Akismet Form object to our Form.
+      $form['akismet'] = array(
+        '#type' => 'akismet',
+        '#akismet_form' => $akismet_form,
+        // #type 'actions' defaults to 100.
+        '#weight' => (isset($form['actions']['#weight']) ? $form['actions']['#weight'] - 1 : 99),
+        '#tree' => TRUE,
+      );
+
+      // Add Akismet form validation handlers.
+      // Form-level validation handlers are required, since we need access to
+      // all validated and submitted form values.
+
+      $form['#validate'][] = array('\Drupal\akismet\Controller\FormController', 'validateAnalysis');
+      $form['#validate'][] = array('\Drupal\akismet\Controller\FormController', 'validatePost');
+      if (!empty($form['actions']['submit']['#submit'])) {
+        $form['actions']['submit']['#submit'][] = array('\Drupal\akismet\Controller\FormController', 'submitForm');
+      }
+      else {
+        $form['#submit'][] = array('\Drupal\akismet\Controller\FormController', 'submitForm');
+      }
+    }
+  }
+  // Integrate with delete confirmation forms to send feedback to Akismet.
+  $delete_form_id = isset($forms['delete'][$base_form_id]) ? $base_form_id : $form_id;
+  if (isset($forms['delete'][$delete_form_id])) {
+    // Check whether the user is allowed to report to Akismet. Limiting report
+    // access is optional for forms integrating via 'delete form' and allowed by
+    // default, since we assume that users being able to delete entities are
+    // sufficiently trusted to also report to Akismet.
+    $access = TRUE;
+    // Retrieve information about the protected form; the form cache maps delete
+    // confirmation forms to protected form_ids, and protected form_ids to their
+    // originating modules.
+    $akismet_form_id = $forms['delete'][$delete_form_id];
+    $module = $forms['protected'][$akismet_form_id];
+    $form_info = FormController::getProtectedFormDetails($akismet_form_id, $module);
+
+    // For entities, there is only one delete confirmation form per entity type.
+    // But not all of its bundles may be protected. We therefore need to figure
+    // out whether the bundle of the entity being deleted is protected.
+    $form_object = $form_state->getFormObject();
+    if ($form_object instanceof \Drupal\Core\Entity\ContentEntityFormInterface) {
+      /* @var $form_object \Drupal\Core\Entity\ContentEntityFormInterface */
+      $entity = $form_object->getEntity();
+      $ids = \Drupal::entityQuery('akismet_form')
+        ->condition('entity', $entity->getEntityTypeId())
+        ->condition('bundle', $entity->bundle())
+        ->execute();
+      if (empty($ids)) {
+        return;
+      }
+    }
+    // Check access, if there is a 'report access' permission list.
+    if (isset($form_info['report access'])) {
+      $access = FALSE;
+      foreach ($form_info['report access'] as $permission) {
+        if ($current_user->hasPermission($permission)) {
+          $access = TRUE;
+          break;
+        }
+      }
+    }
+    if ($access) {
+      FeedbackManager::addFeedbackOptions($form, $form_state);
+      // Report before deleting. This needs to be handled here, since
+      // addFeedbackOptions() is re-used for mass-operation forms.
+      // If there is a button-level submit handler for deletion, then add
+      // the callback to that element which will be the triggering element.
+      // In that case only the element-level submit handlers will run.
+      $submit_button = empty($form_info['delete submit']) ? 'actions][submit' : $form_info['delete submit'];
+      $delete_submit_structure = explode('][', $submit_button);
+      $delete_submit_element = &$form;
+      foreach($delete_submit_structure as $element_name) {
+        if (!isset($delete_submit_element[$element_name])) {
+          break;
+        }
+        $delete_submit_element = &$delete_submit_element[$element_name];
+      }
+      // Just in case the functionality is all in the form, set it back to a
+      // form-level submit handler if the button level submit handlers are
+      // empty.
+      if (empty($delete_submit_element['#submit'])) {
+        $delete_submit_element = &$form;
+      }
+      if (!is_array($delete_submit_element['#submit'])) {
+        $delete_submit_element['#submit'] = [];
+      }
+      array_unshift($delete_submit_element['#submit'], array('Drupal\akismet\Client\FeedbackManager', 'addFeedbackOptionsSubmit'));
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function akismet_entity_update(EntityInterface $entity) {
+  // A user account's status transitions from 0 to 1 upon first login; do not
+  // mark the account as moderated in that case.
+  if ($entity instanceof \Drupal\user\Entity\User && $entity->id() === \Drupal::currentUser()->id()) {
+    return;
+  }
+  // If an existing entity is published and we have session data stored for it,
+  // mark the data as moderated.
+  $update = FALSE;
+  // If the entity update function provides the original entity, only mark the
+  // data as moderated when the entity's status transitioned to published.
+  if (!isset($entity->original)) {
+    $entity->original = \Drupal::entityManager()->getStorage($entity->getEntityTypeId())->loadUnchanged($entity->id());
+  }
+  if (isset($entity->original->status)) {
+    if (empty($entity->original->status->value) && !empty($entity->status->value)) {
+      $update = TRUE;
+    }
+  }
+  // If there is no original entity to compare against, check for the current
+  // status only.
+  elseif (isset($entity->status) && !empty($entity->status->value)) {
+    $update = TRUE;
+  }
+  if ($update) {
+    FeedbackManager::sendFeedback($entity->getEntityTypeId(), $entity->id(), 'ham');
+  }
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function akismet_entity_delete(Drupal\Core\Entity\EntityInterface $entity) {
+  ResponseDataStorage::delete($entity->getEntityTypeId(), $entity->id());
+}
