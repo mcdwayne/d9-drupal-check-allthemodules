@@ -1,0 +1,259 @@
+<?php
+
+/**
+ * @file
+ * Main file of Alipay API module.
+ */
+
+/**
+ * Implements hook_libraries_info().
+ */
+function alipay_api_libraries_info() {
+
+  // A very simple library. No changing APIs (hence, no versions), no variants.
+  // Expected to be extracted into 'sites/all/libraries/simple'.
+  $libraries['alipay'] = array(
+    'name' => 'Alipay SDK',
+    'vendor url' => 'https://open.alipay.com',
+    'download url' => 'https://github.com/lugir/alipay',
+    'version arguments' => array(
+      'file' => 'alipay.sdk.version.php',
+      'pattern' => '@version\s+([0-9a-zA-Z\.-]+)@',
+      'lines' => 4,
+    ),
+    'files' => array(
+      'php' => array(
+        'alipay.sdk.version.php',
+        'alipay_notify.class.php',
+        'alipay_submit.class.php',
+      ),
+    ),
+  );
+
+  return $libraries;
+}
+
+/**
+ * Redirect user to Alipay gateway page, this is the main API function for
+ * other modules to use Alipay.
+ */
+function alipay_api_pay($order_id, $subject, $total_fee, $body = NULL) {
+
+  $options = array(
+    'query' => array(
+      'out_trade_no' => $order_id,
+      'subject'      => $subject,
+      'total_fee'    => $total_fee,
+      'body'         => $body,
+    ),
+  );
+
+  $response = new Symfony\Component\HttpFoundation\RedirectResponse(
+    \Drupal::url('alipay.gateway', array(), $options));
+  $response->send();
+}
+
+/**
+ * Load Alipay SDK.
+ */
+function alipay_api_load_sdk() {
+
+  if (($library = libraries_detect('alipay')) && !empty($library['installed'])) {
+    // The library is installed. Awesome!
+    $library = libraries_load('alipay');
+  }
+  else {
+    // This contains a detailed (localized) error message.
+    $error_message = $library['error message'];
+    drupal_set_message($error_message, 'error');
+  }
+
+  return $library;
+}
+
+/**
+ * Get configurations.
+ */
+function alipay_api_config() {
+
+  $config = \Drupal::config('alipay.settings');
+
+  $alipay_config = array(
+    'partner'           => $config->get('alipay_partner'),
+    'seller_id'         => $config->get('alipay_partner'),
+    'key'               => $config->get('alipay_md5_key'),
+    'notify_url'        => \Drupal::url('alipay.notify', array(), array('absolute' => TRUE)),
+    'return_url'        => \Drupal::url('alipay.return', array(), array('absolute' => TRUE)),
+    'sign_type'         => strtoupper('MD5'),
+    'input_charset'     => strtolower('utf-8'),
+    'transport'         => 'http',
+    'payment_type'      => "1",
+    'service'           => "create_direct_pay_by_user",
+    'anti_phishing_key' => "",
+    'exter_invoke_ip'   => "",
+  );
+
+  return $alipay_config;
+}
+
+/**
+ * Alipay API page.
+ */
+function alipay_api_page() {
+
+  // Load Alipay SDK.
+  $library = alipay_api_load_sdk();
+
+  // Return if there is any error.
+  if (isset($library['error'])) {
+    return isset($library['error message']) ? $library['error message'] : ' ';
+  }
+
+  $alipay_config = alipay_api_config();
+
+  // Parameters check.
+  if (!isset($_GET['out_trade_no'])
+    || !isset($_GET['subject'])
+    || !isset($_GET['total_fee']) || !is_numeric($_GET['total_fee'])
+    || !isset($_GET['body'])) {
+    $message = t('Invalid request');
+    drupal_set_message($message, 'error');
+    return array('#markup' => $message);
+  }
+
+  $out_trade_no = $_GET['out_trade_no'];
+  $subject      = $_GET['subject'];
+  $total_fee    = $_GET['total_fee'];
+  $body         = $_GET['body'];
+
+  $parameter = array(
+    "service"           => $alipay_config['service'],
+    "partner"           => $alipay_config['partner'],
+    "seller_id"         => $alipay_config['seller_id'],
+    "payment_type"      => $alipay_config['payment_type'],
+    "notify_url"        => $alipay_config['notify_url'],
+    "return_url"        => $alipay_config['return_url'],
+    "anti_phishing_key" => $alipay_config['anti_phishing_key'],
+    "exter_invoke_ip"   => $alipay_config['exter_invoke_ip'],
+    "out_trade_no"      => $out_trade_no,
+    "subject"           => $subject,
+    "total_fee"         => $total_fee,
+    "body"              => $body,
+    "_input_charset"    => trim(strtolower($alipay_config['input_charset'])),
+  );
+
+  $alipay_submit = new AlipaySubmit($alipay_config);
+  $html_text = $alipay_submit->buildRequestForm($parameter, 'get', t('Confirm'));
+  echo $html_text;
+
+  return array('#markup' => $html_text);
+}
+
+/**
+ * Alipay result callback function.
+ */
+function _alipay_api_result_callback($method) {
+  $output = '';
+
+  // Load Alipay SDK.
+  $library = alipay_api_load_sdk();
+
+  // Return if there is any error.
+  if (isset($library['error'])) {
+    return isset($library['error message']) ? $library['error message'] : ' ';
+  }
+
+  $alipay_config = alipay_api_config();
+
+  // Returned data verify.
+  $alipay_notify = new AlipayNotify($alipay_config);
+
+  if ($method == 'post') {
+    $verify_result = $alipay_notify->verifyNotify();
+  }
+  elseif ($method == 'get') {
+    $verify_result = $alipay_notify->verifyReturn();
+  }
+
+  // Verify result OK.
+  if ($verify_result) {
+
+    if ($method == 'post') {
+      $trade_status = check_plain($_POST['trade_status']);
+      $order_id     = check_plain($_POST['out_trade_no']);
+      $trade_no     = check_plain($_POST['trade_no']);
+      $total_fee    = check_plain($_POST['total_fee']);
+      // No buyer email if is mobile pay.
+      $buyer_email  = isset($_POST['buyer_email']) ? $_POST['buyer_email'] : NULL;
+    }
+    elseif ($method == 'get') {
+      $trade_status = $_GET['trade_status'];
+      $order_id     = $_GET['out_trade_no'];
+      $trade_no     = $_GET['trade_no'];
+      $total_fee    = $_GET['total_fee'];
+      $buyer_email  = isset($_GET['buyer_email']) ? $_GET['buyer_email'] : NULL;
+    }
+
+    if ($trade_status == 'TRADE_FINISHED' || $trade_status == 'TRADE_SUCCESS') {
+      // Save record when order not exists.
+      $order = alipay_api_order_load($order_id);
+
+      if (!$order) {
+
+        $time = time();
+        db_insert('alipay')
+          ->fields(array(
+            'order_id' => $order_id,
+            'trade_no' => $trade_no,
+            'buyer_email' => $buyer_email,
+            'total_fee' => $total_fee,
+            'status' => 1,
+            'created' => $time,
+            'updated' => $time,
+          ))
+          ->execute();
+      }
+
+      // Output.
+      $output = t('Complete');
+
+      if ($method == 'post') {
+        print 'success';
+        exit();
+      }
+    }
+    else {
+      $message = 'Warning：trade_status=' . $_GET['trade_status'];
+      watchdog('Alipay', $message, array(), WATCHDOG_WARNING);
+
+      $output = $message;
+
+      if ($method == 'post') {
+        print 'fail';
+        exit();
+      }
+    }
+  }
+  // Verify result not OK.
+  else {
+    // For debug, see verifyReturn in alipay_notify.php.
+    $output = $method == 'get' ? 'verify failed' : 'fail';
+
+    if ($method == 'post') {
+      print 'fail';
+      exit();
+    }
+  }
+
+  return array('#markup' => $output);
+}
+
+/**
+ * Alipay API load order.
+ */
+function alipay_api_order_load($order_id) {
+  $query = "SELECT * FROM {alipay} WHERE order_id = :order_id";
+  $result = db_query($query, array(':order_id' => $order_id));
+  $order = $result->fetchObject();
+  return $order;
+}
