@@ -1,0 +1,1 @@
+Affected by promotion
