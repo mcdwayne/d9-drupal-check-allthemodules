@@ -1,0 +1,107 @@
+language: php
+sudo: false
+
+php:
+- '7.1'
+- '7'
+
+env:
+  global:
+  - DRUPAL_BUILD_DIR=$TRAVIS_BUILD_DIR/../drupal
+  - SIMPLETEST_DB=mysql://root:@127.0.0.1/webpack
+  - TRAVIS=true
+  matrix:
+  - DRUPAL_CORE=8.6.x
+  - DRUPAL_CORE=8.7.x
+
+matrix:
+  # Don't wait for the allowed failures to build.
+  fast_finish: true
+
+mysql:
+  database: webpack
+  username: root
+  encoding: utf8
+
+# Cache composer downloads.
+cache:
+  yarn: true
+  directories:
+  - $HOME/.composer
+
+before_install:
+# Disable xdebug.
+- phpenv config-rm xdebug.ini
+
+# Determine the php settings file location.
+- if [[ $TRAVIS_PHP_VERSION = hhvm* ]];
+  then export PHPINI=/etc/hhvm/php.ini;
+  else export PHPINI=$HOME/.phpenv/versions/$(phpenv version-name)/etc/conf.d/travis.ini;
+  fi
+
+# PHP Deprecated: Automatically populating $HTTP_RAW_POST_DATA is deprecated
+# and will be removed in a future version. To avoid this warning set
+# 'always_populate_raw_post_data' to '-1' in php.ini and use the php://input
+# stream instead.
+- if [[ "$TRAVIS_PHP_VERSION" == "5.6" ]];
+  then echo always_populate_raw_post_data = -1 >> $PHPINI;
+  fi;
+
+# Disable the default memory limit.
+- echo memory_limit = -1 >> $PHPINI
+
+# Update composer.
+- composer self-update
+
+# Add the github API key to composer.
+- composer config --global github-oauth.github.com "$GITHUB_TOKEN"
+
+install:
+# Create the database.
+- mysql -e 'create database webpack'
+
+# Download Drupal 8 core from the Github mirror because it is faster.
+- git clone --branch $DRUPAL_CORE --depth 1 https://github.com/drupal/drupal.git $DRUPAL_BUILD_DIR
+
+# Add the github repositories for webpack and npm.
+- composer --working-dir=$DRUPAL_BUILD_DIR config repositories.webpack vcs https://github.com/drupal-webpack/webpack
+
+# Depending on the type of the build (branch vs PR) the TRAVIS_BRANCH hold different values (???)
+# @see https://graysonkoonce.com/getting-the-current-branch-name-during-a-pull-request-in-travis-ci/
+- export COMPOSER_ID=$(if [ ! "$TRAVIS_PULL_REQUEST" == "false" ]; then echo $TRAVIS_PULL_REQUEST_BRANCH; elif [ ! -z "$TRAVIS_TAG" ]; then echo "8.x-1.x#$TRAVIS_COMMIT"; else echo "$TRAVIS_BRANCH#$TRAVIS_COMMIT"; fi)
+
+# Require the webpack module and symfony process. The latter is a dependency of npm and
+# composer doesn't do recursive resolution for packages fetched from custom repositories.
+# @see https://getcomposer.org/doc/faqs/why-can%27t-composer-load-repositories-recursively.md
+- composer --working-dir=$DRUPAL_BUILD_DIR require drupal/webpack:dev-$COMPOSER_ID drush/drush:^9
+
+# Upgrade phpunit to a newer version.
+- composer --working-dir=$DRUPAL_BUILD_DIR run-script drupal-phpunit-upgrade || true
+
+# For some reason, only in travis, the dependencies are downloaded but the module itself is not.
+- rm -rf $DRUPAL_BUILD_DIR/modules/contrib/webpack
+- cp -r $TRAVIS_BUILD_DIR $DRUPAL_BUILD_DIR/modules/contrib/webpack
+
+# Show all these for debugging purposes.
+- echo $TRAVIS_BRANCH
+- echo $BRANCH
+- echo dev-$BRANCH
+- ls $DRUPAL_BUILD_DIR/..
+- ls $DRUPAL_BUILD_DIR
+- ls $DRUPAL_BUILD_DIR/modules
+- ls $DRUPAL_BUILD_DIR/modules/contrib
+- ls $DRUPAL_BUILD_DIR/modules/contrib/webpack
+- ls $DRUPAL_BUILD_DIR/modules/contrib/npm
+- cat $DRUPAL_BUILD_DIR/composer.json
+
+# Copy the customized phpunit configuration file to the core directory so
+# the relative paths are correct.
+- cp $DRUPAL_BUILD_DIR/modules/contrib/webpack/phpunit.xml.dist $DRUPAL_BUILD_DIR/core/phpunit.xml
+
+script:
+- $DRUPAL_BUILD_DIR/vendor/bin/drush si -y minimal --sites-subdir default --db-url=$SIMPLETEST_DB
+- $DRUPAL_BUILD_DIR/vendor/bin/drush serve 2>&1 &
+- until netstat -an 2>/dev/null | grep '8888.*LISTEN'; sleep 1; curl -I http://127.0.0.1:8888 ; do true; done
+- $DRUPAL_BUILD_DIR/vendor/bin/drush sql-drop -y
+- $DRUPAL_BUILD_DIR/vendor/bin/phpunit --configuration $DRUPAL_BUILD_DIR/core/phpunit.xml $DRUPAL_BUILD_DIR/modules/contrib/webpack
+- kill $(jobs -p) || true
