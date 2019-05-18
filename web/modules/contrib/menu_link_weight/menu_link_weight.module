@@ -1,0 +1,214 @@
+<?php
+
+/**
+ * @file
+ * Replaces the menu link weight dropdown with a tabledrag widget.
+ */
+
+use Drupal\Component\Utility\Html;
+use Drupal\Component\Utility\Unicode;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Link;
+use Drupal\Core\Menu\MenuTreeParameters;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Url;
+use Drupal\system\Entity\Menu;
+
+/**
+ * Include functionality related to reordering of options by other modules.
+ */
+require_once __DIR__ . '/menu_link_weight.reorder.inc';
+require_once __DIR__ . '/menu_link_weight.node.inc';
+require_once __DIR__ . '/menu_link_weight.menu_ui.inc';
+
+/**
+ * Minimum weight of a menu link. In Drupal core this is currently -50.
+ */
+define('MENU_LINK_WEIGHT_MIN_DELTA', -50);
+
+/**
+ * Maximum weight of a menu link. In Drupal core this is currently 50.
+ */
+define('MENU_LINK_WEIGHT_MAX_DELTA', 50);
+
+/**
+ * Implements hook_form_FORM_ID_alter() for menu_overview_form().
+ *
+ * Adds an anchor tag so we can link to a menu item directly from the node form.
+ *
+ * @see menu_link_weight_node_element_process
+ */
+function menu_link_weight_form_menu_form_alter(&$form, FormStateInterface $form_state) {
+  if (!isset($form['links']['links'])) {
+    return;
+  }
+
+  foreach (Element::children($form['links']['links']) as $key) {
+    /** @see \Drupal\menu_ui\MenuForm::buildOverviewTreeForm() */
+    list(/** 'menu_plugin_id' */, $plugin_id) = explode(':', $key, 2);
+    $html_id = 'menu-link-weight-link-id-' . Html::getId($plugin_id);
+    $form['links']['links'][$key]['#attributes']['id'] = $html_id;
+  }
+}
+
+/**
+ * Gets the name for the "No-Javascript" button we want to use.
+ *
+ * @return string
+ *   Translated text to show on the button.
+ */
+function menu_link_weight_get_button_text() {
+  return t('Change parent (update list of weights)');
+}
+
+/**
+ * Gets the menu link parent value from the form.
+ *
+ * Helper function for menu link weight process callback.
+ *
+ * @param array $parent_element
+ *   Menu link parent form element.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   The current state of the form.
+ *
+ * @return string
+ *   Menu link
+ */
+function _menu_link_weight_get_parent_value_from_element(array $parent_element, FormStateInterface $form_state) {
+  if ($form_state->hasValue(['field_menulink', 0, 'menu_parent'])) {
+    $value = $form_state->getValue(['field_menulink', 0, 'menu_parent']);
+  }
+  else {
+    $input = $form_state->getUserInput();
+    if (!empty($input['field_menulink'][0]['menu_parent'])) {
+      // $parent_element['#value'] is not set, so get the parent from the raw input.
+      $value = $input['field_menulink'][0]['menu_parent'];
+    }
+    else {
+      $value = $parent_element['#default_value'];
+    }
+  }
+  return $value;
+}
+
+/**
+ * Gets a list of of options for a specific menu/parent.
+ *
+ * @param string $menu_name
+ *   The name of the menu.
+ * @param string $parent_id
+ *   The parent link plugin ID.
+ * @param int $current_mlid
+ *   The menu link for the current item.
+ * @param string $new_item_title
+ *   The title for the new menu link to be created.
+ *
+ * @see _menu_parents_recurse
+ *
+ * @return array
+ *   List of options with index "link_current" or the menu link ID.
+ *   Values include:
+ *     - title: Sanitized title for the menu link.
+ *     - weight: Calculated new weight.
+ *     - db_weight: Current weight in the database, while form is being built.
+ */
+function _menu_link_weight_get_options($menu_name, $parent_id, $current_mlid, $new_item_title = NULL) {
+  // Get the raw tree from the database.
+  $tree = _menu_link_weight_get_tree($menu_name, $parent_id);
+  // Weights will have to be re-ordered from -50 to 50 for fine-grained
+  // control over the weight of the new element.
+  $weight = MENU_LINK_WEIGHT_MIN_DELTA;
+  $options = array();
+
+  $link_current_title_build = [
+    '#type' => 'inline_template',
+    '#template' => '<strong><span class="menu-link-weight-link-current">{{ current_title }}</span></strong> ({% trans %}provided menu link{% endtrans %})',
+    '#context' => [
+      'current_title' => Unicode::truncate($new_item_title, 30, TRUE, FALSE),
+    ],
+  ];
+
+  // Find out whether to add another (fake) item for the new link.
+  $add_link = TRUE;
+  foreach ($tree as $element) {
+    if ($element->link->getPluginId() === $current_mlid) {
+      $add_link = FALSE;
+    }
+  }
+
+  // Add link on top, if needed.
+  if ($add_link) {
+    $options['link_current'] = array(
+      'title' => $link_current_title_build,
+      'weight' => $weight,
+      'db_weight' => NULL,
+    );
+    $weight++;
+  }
+
+  // Loop through the tree again.
+  foreach ($tree as $element) {
+    // Change the title & ID for the current menu link.
+    $plugin_id = $element->link->getPluginId();
+    if ($plugin_id === $current_mlid) {
+      $id = 'link_current';
+      $title_build = $link_current_title_build;
+    }
+    else {
+      $id = $plugin_id;
+      $title = Unicode::truncate($element->link->getTitle(), 30, TRUE, FALSE);
+      $title_build = Link::fromTextAndUrl($title, $element->link->getUrlObject())->toRenderable();
+      $element->link->isEnabled();
+      if (!$element->link->isEnabled()) {
+        $title_build['#suffix'] = ' (' . t('disabled') . ')';
+      }
+    }
+
+    $options[$id] = array(
+      'title' => $title_build,
+      'weight' => $weight,
+      'db_weight' => $element->link->getWeight(),
+    );
+    $weight++;
+  }
+  return $options;
+}
+
+/**
+ * Helper function to get all siblings of an item based on the parent.
+ *
+ * @param string $menu_name
+ *   The name of the menu.
+ * @param string $parent_id
+ *   The parent link plugin ID.
+ *
+ * @return \Drupal\Core\Menu\MenuLinkTreeElement[]
+ *   A menu link tree.
+ */
+function _menu_link_weight_get_tree($menu_name, $parent_id) {
+  /** @var \Drupal\Core\Menu\MenuLinkTreeInterface $menu_link_tree */
+  $menu_link_tree = \Drupal::service('menu.link_tree');
+  if ($parent_id !== '') {
+    /** @var \Drupal\Core\Menu\MenuLinkInterface $link */
+    $parent_tree = $menu_link_tree->load($menu_name, (new MenuTreeParameters())
+      ->addCondition('id', $parent_id));
+    $parent_element = reset($parent_tree);
+    $limit = $parent_element->depth + 1;
+  }
+  else {
+    $limit = 1;
+  }
+
+  $tree = $menu_link_tree->load($menu_name, (new MenuTreeParameters())
+    ->setActiveTrail([$parent_id])
+    ->setMinDepth($limit)
+    ->setMaxDepth($limit)
+    ->addCondition('parent', $parent_id));
+  /** @see \Drupal\Core\Menu\MenuParentFormSelector::getParentSelectOptions() */
+  $manipulators = array(
+    array('callable' => 'menu.default_tree_manipulators:checkNodeAccess'),
+    array('callable' => 'menu.default_tree_manipulators:checkAccess'),
+    array('callable' => 'menu.default_tree_manipulators:generateIndexAndSort'),
+  );
+  return $menu_link_tree->transform($tree, $manipulators);
+}
