@@ -1,0 +1,169 @@
+<?php
+
+/*
+ * @file
+ *   Enable users to select which newsletter lists they want to subscribe on the
+ *   registration page.
+ */
+
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Component\Utility\SafeMarkup;
+use Drupal\Core\Render\Element;
+
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ *
+ * Hooks into the registration form and adds the option to select one of the
+ * available Campaign Monitor lists on registration.
+ */
+function campaignmonitor_registration_form_user_register_form_alter(&$form, FormStateInterface &$form_state) {
+  // Get connected to the API and retrieve the lists.
+  $lists = campaignmonitor_get_lists();
+  $config = Drupal::config('campaignmonitor_registration.settings');
+  // Build options for the form selector.
+  $options = [];
+  $option_descriptions = [];
+  foreach ($lists as $list_id => $list) {
+    // Check if the list is selected to be shown.
+    $list_options = campaignmonitor_get_list_settings($list_id);
+    if (campaignmonitor_is_list_enabled($list_id) && $list_options && isset($list_options['display']['registration']) && $list_options['display']['registration']) {
+      $options[$list_id] = $list['name'];
+      $defaults = campaignmonitor_get_list_settings($list_id);
+      if (isset($defaults['display']['description'])) {
+        $option_descriptions[$list_id] = $defaults['display']['description'];
+      }
+    }
+  }
+  if (!empty($options)) {
+
+    $form['campaignmonitor'] = [
+      '#type' => 'fieldset',
+      '#title' => t('News lists'),
+    ];
+
+    $defaults = campaignmonitor_get_lists();
+    $form['campaignmonitor']['lists'] = [
+      '#type' => 'checkboxes',
+      '#description' => !empty($defaults['instructions']) ? t($defaults['instructions']) : t('Select the news lists that you want to subscribe to.'),
+      '#options' => $options,
+      '#option_descriptions' => $option_descriptions,
+      '#after_build' => array
+      ('_campaignmonitor_registration_option_descriptions'),
+
+    ];
+  }
+
+  foreach (array_keys($form['actions']) as $action) {
+    if ($action != 'preview' && isset($form['actions'][$action]['#type']) && $form['actions'][$action]['#type'] === 'submit') {
+      $form['actions'][$action]['#submit'][] = 'campaignmonitor_registration_form_user_register_submit';
+    }
+  }
+}
+
+/**
+ * After build callback to apply descriptions to checkbox items
+ *
+ * @param $element
+ * @param $form_state
+ * @return mixed
+ */
+function _campaignmonitor_registration_option_descriptions($element, &$form_state) {
+  foreach (Element::children($element) as $key) {
+    $element[$key]['#description'] = t('@description', [
+      '@description' => $element['#option_descriptions'][$key],
+    ]);
+  }
+  return $element;
+}
+/**
+ * Submission form handler. Information about the selected list will be
+ * submitted to Campaign Monitor.
+ */
+function campaignmonitor_registration_form_user_register_submit(&$form, FormStateInterface &$form_state) {
+
+  $values = $form_state->getValues();
+
+  if (isset($values['lists'])) {
+    // Get connected to the API and get lists.
+    $lists_info = campaignmonitor_get_lists();
+    $name = SafeMarkup::checkPlain($values['name']);
+    // Find the selected lists, if any.
+    foreach ($values['lists'] as $list_id => $selected) {
+      if ($selected) {
+        $settings = campaignmonitor_get_list_settings($list_id);
+        if (isset($settings['display']['name_field']) && is_string($settings['display']['name_field']) &&
+          $settings['display']['name_field'] != '') {
+            if (isset($values[$settings['display']['name_field']][0]['value']) &&
+              $values[$settings['display']['name_field']][0]['value'] != '') {
+              $name = $values[$settings['display']['name_field']][0]['value'];
+            }
+        }
+        $subscribe_now = TRUE;
+        // Provide opportunity for modules to override the subscription process
+        $result = Drupal::moduleHandler()->invokeAll('campaignmonitor_registration_submit', [$list_id,$values['mail']]);
+
+        // Modules can prevent immediate subscription
+        if (isset($result['subscribe']) && $result['subscribe'] === 0) {
+          $subscribe_now = FALSE;
+        }
+
+        if ($subscribe_now) {
+          // Try to subscribe to the list.
+          if (!campaignmonitor_subscribe($list_id, SafeMarkup::checkPlain($values['mail']), SafeMarkup::checkPlain($name))) {
+            $form_state->setErrorByName('', t('You were not subscribed to the list. Please try again later.'));
+          }
+          drupal_set_message(t('You are now subscribed to the "@list" list.', ['@list' => html_entity_decode
+          ($lists_info[$list_id]['name'])]), 'status');
+
+        }
+      }
+    }
+
+
+  }
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ *
+ * @param $form
+ * @param FormStateInterface $form_state
+ */
+function campaignmonitor_registration_form_campaignmonitor_list_settings_form_alter(&$form, FormStateInterface &$form_state) {
+  // Find form key to index the form array and load defaults.
+  $list_id = $form['listId']['#value'];
+  $defaults = campaignmonitor_get_list_settings($list_id);
+  $form_key = 'campaignmonitor_list_' . $list_id;
+
+  // Add option to enable this form on the user page.
+  $form[$form_key]['display']['registration'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Display list on registration page'),
+    '#description' => t('Enable this list on the registration page and allow subscription.'),
+    '#default_value' => isset($defaults['display']['registration']) ? $defaults['display']['registration'] : 0,
+  ];
+
+  foreach (array_keys($form['actions']) as $action) {
+    if ($action != 'preview' && isset($form['actions'][$action]['#type']) && $form['actions'][$action]['#type'] === 'submit') {
+      $form['actions'][$action]['#submit'][] = 'campaignmonitor_registration_form_campaignmonitor_list_settings_submit';
+    }
+  }
+
+}
+
+/**
+ * Submit handler for list settings form
+ * @param $form
+ * @param FormStateInterface $form_state
+ */
+function campaignmonitor_registration_form_campaignmonitor_list_settings_submit(&$form, FormStateInterface &$form_state) {
+  $list_id = $form['listId']['#value'];
+  $values = $form_state->getValues();
+  $values = $values['campaignmonitor_list_' . $list_id];
+  // These are saved remotely
+  unset ($values['options']);
+  campaignmonitor_set_list_settings($list_id, $values);
+
+}

@@ -1,0 +1,564 @@
+<?php
+
+/**
+ * @file
+ * Module that plugs in Campaign Monitor functionality to your Drupal web site.
+ * For Campaign Monitor information see: http://www.campaignmonitor.com/.
+ */
+
+use Drupal\Core\Cache\Cache;
+use Drupal\user\Entity\User;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\campaignmonitor\CampaignMonitor;
+use Drupal\Component\Utility\SafeMarkup;
+use Drupal\Core\Entity\EntityInterface;
+
+define('CAMPAIGNMONITOR_ARCHIVE_DELTA', 'HASHc32bde51684d37a36679301a1e9');
+define('CAMPAIGNMONITOR_QUEUE_CRON', 'campaignmonitor');
+define('CAMPAIGNMONITOR_STATUS_SENT', 'sent');
+define('CAMPAIGNMONITOR_STATUS_SAVE', 'save');
+define('CAMPAIGNMONITOR_STATUS_PAUSED', 'paused');
+define('CAMPAIGNMONITOR_STATUS_SCHEDULE', 'schedule');
+define('CAMPAIGNMONITOR_STATUS_SENDING', 'sending');
+
+/**
+ * Implements hook_help().
+ */
+function campaignmonitor_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the facets module.
+    case 'campaignmonitor.admin':
+      return '<p>' . t('Use your API key and other keys to have users register for a mailing list setup through
+      Campaign Monitor.') . '</p>';
+
+      break;
+
+    case 'help.page.campaignmonitor':
+
+      $output = '<p>' . t('In order for a newsletter list to be available for selection on the site it needs to be
+    enabled from <a href="@admin">Lists</a>', ['@admin' => '/admin/config/services/campaignmonitor/lists']
+        ) .
+        '</p>';
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function campaignmonitor_theme($existing, $type, $theme, $path) {
+  return [
+    'campaignmonitor_subscribe_form' => [
+      'render element' => 'form',
+    ],
+    'campaignmonitor_list_stats' => [
+      'template' => 'campaignmonitor-list-stats',
+      'variables' => [
+        'list' => [],
+        'stats' => [],
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete.
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ */
+function campaignmonitor_user_delete(EntityInterface $entity) {
+  // Unsubscribe users when deleted.
+  $mail = $entity->get('mail')->getValue()[0]['value'];
+  $lists = campaignmonitor_get_lists();
+  foreach ($lists as $list_id => $values) {
+    campaignmonitor_unsubscribe($list_id, $mail);
+  }
+}
+
+/**
+ * Checks if the list given by id is enabled locally. If the list id enabled 1
+ * is returned else 0.
+ *
+ * @param string $list_id
+ *   The Campaign Monitor list ID.
+ *
+ * @return int
+ *   1 if list is enabled, 0 otherwise.
+ */
+function campaignmonitor_is_list_enabled($list_id) {
+  $list_options = campaignmonitor_get_list_settings($list_id);
+  return isset($list_options['status']['enabled']) ? $list_options['status']['enabled'] : 0;
+}
+
+/**
+ * Returns a single list.
+ *
+ * @param string $list_id
+ *   The unique ID of the list provided by CampaignMonitor.
+ *
+ * @return array
+ *   Array of list data.
+ */
+function campaignmonitor_get_list($list_id) {
+  $lists = campaignmonitor_get_lists([$list_id]);
+  return reset($lists);
+}
+
+/**
+ * Returns all CampaignMonitor lists for a given key. Lists are stored in the
+ * cache.
+ *
+ * @param array $list_ids
+ *   An array of list IDs to filter the results by.
+ * @param bool $reset
+ *   Force a cache reset.
+ *
+ * @return array
+ *   An array of list data arrays.
+ */
+function campaignmonitor_get_lists($list_ids = [], $reset = FALSE) {
+
+  $cm = CampaignMonitor::getConnector();
+
+  $lists = $cm->getLists();
+
+  // Filter by given IDs.
+  if (!empty($list_ids)) {
+    $filtered_lists = [];
+
+    foreach ($list_ids as $id) {
+      if (array_key_exists($id, $lists)) {
+        $filtered_lists[$id] = $lists[$id];
+      }
+    }
+
+    return $filtered_lists;
+  }
+  else {
+    return $lists;
+  }
+}
+
+/**
+ * Helper function to return lists as an option array for form fields.
+ *
+ * @return array
+ */
+function campaignmonitor_get_list_options() {
+  $lists = campaignmonitor_get_lists();
+  $options = [];
+  foreach ($lists as $list_id => $list) {
+    $options[$list_id] = $list['name'];
+  }
+  return $options;
+}
+
+/**
+ * Helper function to determine config var name for list options.
+ *
+ * @param $list_id
+ *
+ * @return string
+ */
+function campaignmonitor_list_key($list_id) {
+  return 'campaignmonitor_list_' . $list_id;
+}
+
+/**
+ * Helper function to return local config for a list.
+ *
+ * @param $list_id
+ *
+ * @return array|mixed|null
+ */
+function campaignmonitor_get_list_settings($list_id) {
+  $config = \Drupal::config('campaignmonitor.settings.list');
+  $list_key = campaignmonitor_list_key($list_id);
+  return $config->get($list_key);
+}
+
+/**
+ * Helper function to set local config for a list.
+ *
+ * @param $list_id
+ * @param $list_options
+ */
+function campaignmonitor_set_list_settings($list_id, $list_options) {
+  $config = \Drupal::getContainer()
+    ->get('config.factory')
+    ->getEditable('campaignmonitor.settings.list');
+  $list_key = campaignmonitor_list_key($list_id);
+  $config->set($list_key, $list_options)->save();
+}
+
+/**
+ * Helper function to get the remote options for a list.
+ *
+ * @param $list_id
+ *
+ * @return mixed
+ */
+function campaignmonitor_get_extended_list_settings($list_id) {
+  $cm = CampaignMonitor::getConnector();
+  // Load extended information about the list.
+  return $cm->getExtendedList($list_id);
+
+}
+
+/**
+ * Helper function to set the remote options for a list.
+ *
+ * @param $list_id
+ * @param $options
+ *
+ * @return bool
+ */
+function campaignmonitor_set_extended_list_settings($list_id, $options) {
+  $cm = CampaignMonitor::getConnector();
+
+  // Update the information.
+  if (!$cm->updateList($list_id, $options)) {
+    $error = $cm->getLatestError();
+
+    drupal_set_message(t('The list options were not updated correctly at Campaign Monitor.'), 'error');
+    return $error['message'];
+  }
+
+  return 'success';
+}
+
+/**
+ *
+ */
+function campaignmonitor_create_list($values) {
+  $cm = CampaignMonitor::getConnector();
+
+  $result = $cm->createList($values['listname'],
+    $values['UnsubscribePage'],
+    $values['ConfirmedOptIn'],
+    $values['ConfirmationSuccessPage']);
+
+  if (!$result) {
+    $error = $cm->getLatestError();
+    return $error['message'];
+    form_set_error('listname', $error['message']);
+
+  }
+  return 'success';
+}
+
+/**
+ *
+ */
+function campaignmonitor_delete_list($list_id) {
+  $cm = CampaignMonitor::getConnector();
+
+  // Delete the list at Campaign Monitor.
+  if ($cm->deleteList($list_id)) {
+    drupal_set_message(t('The list has been deleted.'), 'status');
+  }
+  else {
+    drupal_set_message(t('The list could not be deleted.'), 'error');
+  }
+
+}
+
+/**
+ * Returns details of a single list.
+ *
+ * @param string $list_id
+ *   The unique ID of the list provided by CampaignMonitor.
+ *
+ * @return array
+ *   Array of list data.
+ */
+function campaignmonitor_get_list_details($list_id) {
+  $cm = CampaignMonitor::getConnector();
+
+  return $cm->getListDetails($list_id);
+}
+
+/**
+ *
+ */
+function campaignmonitor_get_list_stats($list_id) {
+  $cm = CampaignMonitor::getConnector();
+
+  return $cm->getListStats($list_id);
+}
+
+/**
+ * Check if the given email is subscribed to the given list.
+ *
+ * @param string $list_id
+ *   Unique string identifier for the list on your CampaignMonitor account.
+ * @param string $email
+ *   Email address to check for on the identified CampaignMonitor List.
+ *
+ * @return bool
+ *   TRUE if subscribed, FALSE otherwise.
+ */
+function campaignmonitor_is_subscribed($list_id, $email) {
+  $cm = CampaignMonitor::getConnector();
+  if ($cm->isSubscribed($list_id, $email)) {
+    return TRUE;
+  }
+  return FALSE;
+
+}
+
+/**
+ * Subscribe a user to a CampaignMonitor list in real time or by adding to the
+ * queue.
+ *
+ * @see CampaignMonitor_Lists::subscribe()
+ */
+function campaignmonitor_subscribe($list_id,
+                                   $email,
+                                   $name,
+                                   $merge_vars = NULL,
+                                   $interests = [],
+                                   $double_optin = FALSE,
+                                   $format = 'html') {
+
+  // Load the user object.
+  $current_user = \Drupal::currentUser();
+  $account = User::load($current_user->id());
+  $settings = campaignmonitor_get_list_settings($list_id);
+
+  if (isset($settings['display']['name_field']) && is_string($settings['display']['name_field']) &&
+    $settings['display']['name_field'] != '') {
+    $value = $account->get($settings['display']['name_field'])->getValue();
+    if (isset($value[0]['value']) && $value[0]['value'] != '') {
+      $name = $account->get($settings['display']['name_field'])
+        ->getValue()[0]['value'];
+    }
+  }
+
+  $config = \Drupal::config('campaignmonitor.settings');
+
+  if ($config->get('cron')) {
+    $args = [
+      'list_id' => $list_id,
+      'email' => $email,
+      'merge_vars' => $merge_vars,
+      'interests' => $interests,
+      'double_optin' => $double_optin,
+      'format' => $format,
+    ];
+
+    return campaignmonitor_addto_queue('campaignmonitor_subscribe_process', $args);
+  }
+
+  return campaignmonitor_subscribe_process($list_id, $email, $name, $merge_vars, $interests, $double_optin, $format);
+}
+
+/**
+ *
+ */
+function campaignmonitor_subscribe_process($list_id,
+                                           $email,
+                                           $name,
+                                           $CustomFields = NULL,
+                                           $interests = [],
+                                           $double_optin = FALSE,
+                                           $format = 'html') {
+  $config = \Drupal::config('campaignmonitor.settings');
+  $result = FALSE;
+
+  try {
+    $cm = CampaignMonitor::getConnector();
+
+    $custom_fields = [];
+    if (isset($CustomFields)) {
+      foreach ($CustomFields as $key => $field) {
+        if (is_array($field)) {
+          // Filter out non-selected values.
+          $field = array_filter($field);
+          // Transform two level array into one level.
+          foreach ($field as $value) {
+            $custom_fields[] = [
+              'Key' => SafeMarkup::checkPlain($key),
+              'Value' => SafeMarkup::checkPlain($value),
+            ];
+          }
+        }
+        else {
+          // Add non-array custom fields.
+          $custom_fields[] = [
+            'Key' => SafeMarkup::checkPlain($key),
+            'Value' => SafeMarkup::checkPlain($field),
+          ];
+        }
+      }
+    }
+
+    // Update subscriber information or add new subscriber to the list.
+    if ($cm->subscribe($list_id, $email, $name, $custom_fields)) {
+
+      campaignmonitor_cache_clear_subscriber($list_id, $email);
+      Drupal::moduleHandler()->invokeAll('campaignmonitor_subscribe', [
+        $list_id,
+        $email,
+      ]);
+      return TRUE;
+    }
+    else {
+      return FALSE;
+    }
+
+    // // Check if the user should be sent to a subscribe page.
+    //    $lists = $cm->getLists();
+    //    if (isset($lists[$list_id]['details']['ConfirmationSuccessPage']) && !empty($lists[$list_id]['details']['ConfirmationSuccessPage'])) {
+    //      drupal_goto($lists[$list_id]['details']['ConfirmationSuccessPage']);
+    //    }
+    //    else {
+    //      drupal_set_message(t('You are now subscribed to the "@list" list.', array('@list' => $lists[$list_id]['name'])), 'status');
+    //    }.
+  } catch (Exception $e) {
+    \Drupal::logger('campaignmonitor')
+      ->error('An error occurred subscribing {email} to list {list}. "{message}"', [
+        'email' => $email,
+        'list' => $list_id,
+        'message' => $e->getMessage(),
+      ]);
+  }
+
+  return $result;
+}
+
+/**
+ * Adds a CampaignMonitor subscription task to the queue.
+ *
+ * @param string $function
+ *   The name of the function the queue runner should call.
+ * @param array $args
+ *   The list of args to pass to the function.
+ *
+ * @return mixed
+ *   Unique ID if item is successfully added to the queue, FALSE otherwise.
+ */
+function campaignmonitor_addto_queue($function, $args) {
+  $queue = \Drupal::queue(CAMPAIGNMONITOR_QUEUE_CRON);
+  $queue->createQueue();
+
+  return $queue->createItem([
+    'function' => $function,
+    'args' => $args,
+  ]);
+}
+
+/**
+ * Unsubscribes a member from a CampaignMonitor list.
+ *
+ * @see CampaignMonitor_Lists::unsubscribe()
+ */
+function campaignmonitor_unsubscribe($list_id, $email, $delete = FALSE, $goodbye = FALSE, $notify = FALSE) {
+  $config = \Drupal::config('campaignmonitor.settings');
+
+  $result = FALSE;
+
+  if (campaignmonitor_is_subscribed($list_id, $email)) {
+    if ($config->get('cron')) {
+      $result = campaignmonitor_addto_queue(
+        'campaignmonitor_unsubscribe_process',
+        [
+          'list_id' => $list_id,
+          'email' => $email,
+          'delete' => $delete,
+          'goodbye' => $goodbye,
+          'notify' => $notify,
+        ]
+      );
+    }
+    else {
+      $result = campaignmonitor_unsubscribe_process($list_id, $email, $delete, $goodbye, $notify);
+    }
+  }
+
+  return $result;
+}
+
+/**
+ * Unsubscribes a member from a CampaignMonitor list.
+ *
+ * @see CampaignMonitor_Lists::unsubscribe()
+ */
+function campaignmonitor_unsubscribe_process($list_id, $email, $delete, $goodbye, $notify) {
+  $lists = campaignmonitor_get_lists();
+  try {
+    /* @var \CampaignMonitor\CampaignMonitorLists $mc_lists */
+    $cm = CampaignMonitor::getConnector();
+    if ($cm->unsubscribe($list_id, $email)) {
+
+      drupal_set_message(t('You are now unsubscribed from the "@list" list.', [
+        '@list' => html_entity_decode($lists[$list_id]['name']),
+      ]), 'status');
+      \Drupal::moduleHandler()
+        ->invokeAll('campaignmonitor_unsubscribe', [$list_id, $email]);
+      // Clear user cache:
+      campaignmonitor_cache_clear_subscriber($list_id, $email);
+      return TRUE;
+    }
+    return FALSE;
+
+  } catch (Exception $e) {
+    \Drupal::logger('campaignmonitor')
+      ->error('An error occurred unsubscribing {email} from list {list}. "{message}"', [
+        'email' => $email,
+        'list' => $list_id,
+        'message' => $e->getMessage(),
+      ]);
+  }
+
+  return FALSE;
+}
+
+/**
+ * Gets subscriber info from CM.
+ */
+function campaignmonitor_get_subscriber($list_id, $email) {
+  $cm = CampaignMonitor::getConnector();
+  return $cm->getSubscriber($list_id, $email);
+}
+
+/**
+ * Clears a campaignmonitor user subscriber from cache.
+ *
+ * @param string $list_id
+ * @param string $email
+ */
+function campaignmonitor_cache_clear_subscriber($list_id, $email) {
+  $cm = CampaignMonitor::getConnector();
+  $cm->removeSubscriberFromCache($list_id, $email);
+}
+
+/**
+ * @param $email
+ *
+ * @return mixed
+ */
+function campaignmonitor_get_uid_from_email($email) {
+  return \Drupal::database()->select('users_field_data', 'ufd')
+    ->condition('ufd.mail', $email)
+    ->fields('ufd', ['uid'])
+    ->execute()
+    ->fetchField();
+
+}
+
+/**
+ * Helper function to clear cache.
+ *
+ * @param $caches
+ */
+function campaignmonitor_clear_cache($caches) {
+  $module_handler = \Drupal::moduleHandler();
+  // Flush entity and render persistent caches.
+  $module_handler->invokeAll('cache_flush');
+  foreach (Cache::getBins() as $service_id => $cache_backend) {
+    if (in_array($cache_backend->_serviceId, $caches)) {
+      $cache_backend->deleteAll();
+    }
+  }
+}
