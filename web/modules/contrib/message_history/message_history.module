@@ -1,0 +1,172 @@
+<?php
+
+/**
+ * @file
+ * Records which users have read which message.
+ */
+
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Session\AccountInterface;
+
+/**
+ * Retrieves the timestamp for the current user's last view of a message.
+ *
+ * @param int $mid
+ *   A message ID.
+ *
+ * @return int
+ *   If a message has been previously viewed by the user, the timestamp in
+ *   seconds of when the last view occurred; otherwise, zero.
+ */
+function message_history_read($mid) {
+  $history = message_history_read_multiple([$mid]);
+  return $history[$mid];
+}
+
+/**
+ * Retrieves the last viewed timestamp for each of the passed message IDs.
+ *
+ * @param array $mids
+ *   An array of message IDs.
+ *
+ * @return array
+ *   Array of timestamps keyed by message ID. If a message has been previously
+ *   viewed by the user, the timestamp in seconds of when the last view
+ *   occurred; otherwise, zero.
+ */
+function message_history_read_multiple(array $mids = []) {
+  $history = &drupal_static(__FUNCTION__, []);
+
+  $return = [];
+
+  $items_to_read = [];
+  foreach ($mids as $mid) {
+    if (isset($history[$mid])) {
+      $return[$mid] = $history[$mid];
+    }
+    else {
+      // Initialize value if current user has not viewed the message.
+      $items_to_read[$mid] = 0;
+    }
+  }
+
+  if (empty($items_to_read)) {
+    return $return;
+  }
+
+  $result = db_query('SELECT mid, timestamp FROM {message_history} WHERE uid = :uid AND mid IN ( :mids[] )', [
+    ':uid' => \Drupal::currentUser()->id(),
+    ':mids[]' => array_keys($items_to_read),
+  ]);
+  foreach ($result as $row) {
+    $items_to_read[$row->mid] = (int) $row->timestamp;
+  }
+  $history += $items_to_read;
+
+  return $return + $items_to_read;
+}
+
+/**
+ * Updates 'last viewed' timestamp of the specified entity for the current user.
+ *
+ * @param int $mid
+ *   The message ID that has been read.
+ * @param \Drupal\Core\Session\AccountInterface $account
+ *   (optional) The user account to update the message history for. Defaults to
+ *   the current user.
+ */
+function message_history_write($mid, AccountInterface $account = NULL) {
+  if (!isset($account)) {
+    $account = \Drupal::currentUser();
+  }
+
+  if ($account->isAuthenticated()) {
+    db_merge('message_history')
+      ->keys([
+        'uid' => $account->id(),
+        'mid' => $mid,
+      ])
+      ->fields(['timestamp' => \REQUEST_TIME])
+      ->execute();
+    // Update static cache.
+    $history = &drupal_static('message_history_read_multiple', []);
+    $history[$mid] = \REQUEST_TIME;
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function message_history_cron() {
+  db_delete('message_history')
+    ->condition('timestamp', \HISTORY_READ_LIMIT, '<')
+    ->execute();
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_view_alter() for message entities.
+ */
+function message_history_message_view_alter(array &$build, EntityInterface $message, EntityViewDisplayInterface $display) {
+  // Update the message_history table, stating that this user viewed this
+  // message.
+  // @todo: make displays configurable.
+  if (!in_array($display->getOriginalMode(), ['default', 'full'])) {
+    return;
+  }
+  $build['#cache']['contexts'][] = 'user.roles:authenticated';
+  if (!\Drupal::currentUser()->isAuthenticated()) {
+    return;
+  }
+  // When the window's "load" event is triggered, mark the messafe as read.
+  // This still allows for Drupal behaviors (which are triggered on the
+  // "DOMContentReady" event) to add "new" and "updated" indicators.
+  $build['#attached']['library'][] = 'message_history/mark-as-read';
+  $build['#attached']['drupalSettings']['message_history']['itemsToMarkAsRead'][$message->id()] = TRUE;
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete() for message entities.
+ */
+function message_history_message_delete(EntityInterface $message) {
+  db_delete('message_history')
+    ->condition('mid', $message->id())
+    ->execute();
+}
+
+/**
+ * Implements hook_user_cancel().
+ */
+function message_history_user_cancel($edit, $account, $method) {
+  switch ($method) {
+    case 'user_cancel_reassign':
+      db_delete('message_history')
+        ->condition('uid', $account->id())
+        ->execute();
+      break;
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete() for user entities.
+ */
+function message_history_user_delete($account) {
+  db_delete('message_history')
+    ->condition('uid', $account->id())
+    ->execute();
+}
+
+/**
+ * Creates #lazy_builder callback for the last read timestamp for a message.
+ *
+ * @param int $message_id
+ *   The message ID for which to attach the last read timestamp.
+ *
+ * @return array
+ *   A renderable array containing the last read timestamp.
+ */
+function message_history_attach_timestamp($message_id) {
+  $element = [];
+  $element['#attached']['drupalSettings']['message_history']['lastReadTimestamps'][$message_id] = (int) message_history_read($message_id);
+  return $element;
+}
