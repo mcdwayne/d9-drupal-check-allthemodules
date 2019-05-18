@@ -1,0 +1,3 @@
+### Dependencies
+    * optipng
+    * jpegtran
