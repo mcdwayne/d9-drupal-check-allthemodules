@@ -1,0 +1,336 @@
+<?php
+
+/**
+ * @file
+ * Install, update and uninstall functions for the dbee module.
+ */
+
+use Drupal\Core\Site\Settings;
+use Drupal\key\Entity\Key;
+use Drupal\encrypt\Entity\EncryptionProfile;
+
+/**
+ * Implements hook_install().
+ *
+ * Enable encryption of users email address when the module is installed or
+ * enabled. Encrypt all existing users email addresses.
+ */
+function dbee_install() {
+  // Call dbee module on an ultimate stage to improve compatibility with custom
+  // modules : dbee decrypt functions will be call early thanks to the
+  // dbee_module_implements_alter() function. Email address will be availables
+  // for custom modules. It allows to fix custom modules to.
+  module_set_weight('dbee', 10);
+
+  // Add a configuration datas for the dbee module.
+  // Check if a key already exists.
+  if (_dbee_create_encryption_key(DBEE_DEFAULT_KEY_NAME, DBEE_DEFAULT_KEY_BYTES, DBEE_DEFAULT_KEY_FILENAME) && _dbee_create_encryt_profile(DBEE_ENCRYPT_NAME, DBEE_DEFAULT_KEY_NAME, DBEE_DEFAULT_ENCRYPTION_METHOD)) {
+    // Dbee Key and encryption profile exists or have just been created.
+    // Edit mail and init storage lenght.
+    // Parameters.
+    $user_table = 'users_field_data';
+    $mail_index_name = 'user_field__mail';
+    // Drop mail index.
+    /** @var \Drupal\Core\Database\Connection $connection */
+    $connection = \Drupal::service('database');
+    if ($connection->schema()->indexExists($user_table, $mail_index_name)) {
+      $connection->schema()->dropIndex($user_table, $mail_index_name);
+    }
+    $spec = [
+      'type' => 'text',
+      'length' => 600,
+    ];
+    if ($connection->databaseType() === 'pgsql') {
+      unset($spec['length']);
+    }
+    // Increase mail and init storage length.
+    foreach (['mail', 'init'] as $field) {
+      $connection->schema()->changeField($user_table, $field, $field, $spec, []);
+    }
+    // Don't recreate the index.
+    // if succeed, Encrypt all existing email addresses.
+    module_load_include('inc', 'dbee', 'dbee.users');
+    dbee_update_crypt_all('encrypt');
+  }
+  else {
+    // Stop install.
+    \Drupal::messenger()->addError(t('Dbee install fails. Check the <a href="admin/reports/dblog">log page</a> in order to fix it.'));
+  }
+}
+
+/**
+ * Implements hook_uninstall().
+ *
+ * Decrypt all existing email adresses of the user table.
+ */
+function dbee_uninstall() {
+  // Decrypt all existing email addresses.
+  module_load_include('module', 'dbee');
+  module_load_include('inc', 'dbee', 'dbee.users');
+  dbee_update_crypt_all('decrypt', 'uninstall');
+  // Reset mail and init storage lenght, recreate the mail index : will be
+  // managed into the dbee_update_crypt_all() function.
+}
+
+/*
+ * Implements hook_requirements()
+ */
+function dbee_requirements($phase) {
+  $requirements = [];
+  if ($phase == 'update') {
+    module_load_include('inc', 'dbee', 'dbee.update');
+    if (dbee_update_previous_to_8200()) {
+      $requirements['dbee']['title'] = t('Database Email Encryption module update');
+      $requirements['dbee']['description'] = t('Prevent from loosing Users email addresses.');
+      $requirements['dbee']['severity'] = REQUIREMENT_ERROR;
+    }
+  }
+  elseif ($phase == 'runtime') {
+    // Displayed on the status page.
+    // Check if all users are encrypted.
+    $all_mails = dbee_stored_users();
+    $count = array(
+      'crypted' => 0,
+      'not_email' => 0,
+      'not_crypted' => 0,
+      'no_email' => 0,
+      'all' => 0,
+    );
+    foreach ($all_mails as $uid => $stored) {
+      if (empty($stored['mail'])) {
+        $status = 'no_email';
+      }
+      else {
+        $decrypted_fields = dbee_unstore($stored);
+        if ($stored['mail'] == $decrypted_fields['mail']) {
+          $status = (\Drupal::service('email.validator')->isValid($stored['mail'])) ? 'not_crypted' : 'not_email';
+        }
+        else {
+          $status = 'crypted';
+        }
+      }
+      $count['all']++;
+      $count[$status]++;
+    }
+
+    $requirements['dbee']['title'] = t('Database Email Encryption module');
+    if ($count['crypted'] == $count['all']) {
+      $requirements['dbee']['description'] = t('All users emails are correctly encrypted (concerning the @count users in this site).', array('@count' => $count['all']));
+      $requirements['dbee']['severity'] = REQUIREMENT_OK;
+    }
+    elseif (!empty($count['not_crypted'])) {
+      $requirements['dbee']['description'] = t('@count1 users email than should be encrypted are not encrypted ! And @count2 users emails are correctly encrypted (@total users in this site).', array(
+        '@count1' => $count['not_crypted'],
+        '@count2' => $count['crypted'],
+        '@total' => $count['all'],
+      ));
+      $requirements['dbee']['severity'] = REQUIREMENT_ERROR;
+    }
+    else {
+      $requirements['dbee']['description'] = t('All users emails than should be encrypted are correctly encrypted (concerning @count users on @total users in this site).', array('@count' => $count['crypted'], '@total' => $count['all']));
+      $requirements['dbee']['severity'] = REQUIREMENT_OK;
+    }
+  }
+  return $requirements;
+}
+
+/**
+ * Implements hook_update_N().
+ *
+ * Prevent from upgrading from lower that v8.x-2.x
+ */
+
+function dbee_update_8200() {
+  module_load_include('inc', 'dbee', 'dbee.update');
+  if (dbee_update_previous_to_8200()) {
+    return t('<strong>You can not update form version prior to v8.x-2.x on the Database email Encryption module !</strong>
+You should rollback to your previous Dbee version, uninstall the module then install this version. 
+Your datas has not been changed yet. Always make a backup before processing, or you may loose your users email addresses !');
+  }
+}
+
+/**
+ * Provide an encryption key.
+ *
+ * Manage disctinct servers configurations.
+ *
+ * @param int $bytes
+ *   An integer, the number of bytes for the key. Default to 16 (=128bits).
+ *
+ * @return string
+ *   A string, the encryption key, or FALSE if error.
+ */
+function _dbee_encryption_key_value($bytes = 16) {
+  $key_value = '';
+  if (function_exists('random_bytes')) {
+    // For PHP7 and some install of PHP5.2 to 6.
+    $key_value = random_bytes($bytes);
+  }
+  if (empty($key_value) && function_exists('openssl_random_pseudo_bytes')) {
+    // For PHP5 with openssl module.
+    $key_value = openssl_random_pseudo_bytes($bytes);
+  }
+  if (empty($key_value)) {
+    // If openssl module is not enabled on the server.
+    // @TODO
+  }
+  if (!empty($key_value)) {
+    return $key_value;
+  }
+  return FALSE;
+}
+
+/**
+ * Set a dbee Key entity.
+ *
+ * Key entity is provided by the Key contrib module. Look for an existing
+ * entity, and if not exists create it. On creation, try to use a file provider,
+ * creating the file, and if it fails, use the configuration provider (in
+ * database). Steps and errors are logged.
+ *
+ * @param string $key_id
+ *   A string, the entity machine name.
+ * @param int $bytes
+ *   An integer, the number of bytes for the key. Default to 16 (=128bits).
+ * @param string $filename
+ *   A string, filename to store the key. Default is 'key.key'.
+ *
+ * @return bool
+ *   A boolean, TRUE if the Key entity already exists or has been successfully
+ *   created or FALSE if an error occurs.
+ */
+function _dbee_create_encryption_key($key_id, $bytes = 16, $filename = 'key.key') {
+  $key = Drupal::service('key.repository')->getKey($key_id);
+  if (!$key) {
+    // The Dbee key does not exists, we create it.
+    $default_key_datas = [
+      'id' => $key_id,
+      'label' => 'DataBase Email Encryption key',
+      'description' => 'Key for the dbee module.',
+      'key_type' => 'encryption',
+      'key_type_settings' => [
+    // 128 for 16 bytes.
+        'key_size' => ($bytes * 8),
+      ],
+      'key_provider_settings' => [
+        'base64_encoded' => NULL,
+      ],
+    ];
+    // Manage storage, preferentially in a file.
+    $file_succeed = FALSE;
+    $private_path = Settings::get('file_private_path');
+    // This is a local file system path, set into the settings.php file.
+    if (!empty($private_path) && is_dir($private_path)) {
+      // Save in a path.
+      $dbee_path = $private_path . '/' . $filename;
+      if (!file_exists($dbee_path)) {
+        $file = fopen($dbee_path, 'w');
+        if ($file) {
+          // Set dbee key value.
+          $dbee_key_value = _dbee_encryption_key_value($bytes);
+          if ($dbee_key_value && fwrite($file, $dbee_key_value)) {
+            $file_succeed = TRUE;
+          }
+          elseif (empty($dbee_key_value)) {
+            \Drupal::logger('dbee')->critical('An encryption key could not be generated.');
+          }
+          else {
+            \Drupal::logger('dbee')->critical('Writing encryption key to file fails.');
+          }
+          fclose($file);
+        }
+      }
+      else {
+        $file_succeed = TRUE;
+        \Drupal::logger('dbee')->info("The %file file already exists, use it.", ['%file' => $filename]);
+        // The file already exists, Use it. If it not valid, the encryption
+        // profile will detect it.
+      }
+    }
+    else {
+      \Drupal::logger('dbee')->notice('Dbee key is going to be stored into database because private location is not available.');
+    }
+    if ($file_succeed) {
+      $default_key_datas['key_provider'] = 'file';
+      $default_key_datas['key_provider_settings']['file_location'] = 'private://' . $filename;
+    }
+    elseif ($dbee_key_value = _dbee_encryption_key_value($bytes)) {
+      // Store in db.
+      $default_key_datas['key_provider'] = 'config';
+      $default_key_datas['key_input'] = 'text_field';
+      $default_key_datas['key_input_settings']['base64_encoded'] = NULL;
+      $default_key_datas['keyValue'] = $dbee_key_value;
+    }
+    else {
+      \Drupal::logger('dbee')->critical('An encryption key could not be generated.');
+      return FALSE;
+    }
+
+    $key = Key::create($default_key_datas);
+    // Save the key.
+    if ($key->save() && \Drupal::service('key.repository')->getKey($key_id)) {
+      // Load the key to confirm that it was saved.
+      \Drupal::logger('dbee')->info('Dbee key set.');
+      return TRUE;
+    }
+    else {
+      // Dbee key entity was not saved.
+      \Drupal::logger('dbee')->critical('Dbee key was not saved on install.');
+    }
+  }
+  else {
+    // Dbee key already exists.
+    \Drupal::logger('dbee')->info('Dbee key already exists.');
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Set a dbee Encryption Profile entity.
+ *
+ * Encryption Profile entity is provided by the Encrypt contrib module. Look for
+ * an existing entity, and if not exists create it. Steps and errors are logged.
+ *
+ * @param string $encrypt_profile_id
+ *   A string, the Encrypt Profile entity machine name.
+ * @param string $key_id
+ *   A string, the Key entity machine name.
+ * @param string $encryption_method
+ *   A string, the encryption method. Default is 'real_aes', corresponding to
+ *   the real_aes contrib module.
+ *
+ * @return bool
+ *   A boolean, TRUE if the Encryption Profile entity already exists or has been
+ *   successfully created or FALSE if an error occurs.
+ */
+function _dbee_create_encryt_profile($encrypt_profile_id, $key_id, $encryption_method = 'real_aes') {
+  $encrypt_profile = EncryptionProfile::load($encrypt_profile_id);
+  if (!$encrypt_profile) {
+    // The Dbee encryption profile does not exists, we create it.
+    $default_encrypt_datas = [
+      'id' => $encrypt_profile_id,
+      'label' => "Dbee {$encryption_method}",
+      'encryption_method' => $encryption_method,
+      'encryption_key' => $key_id,
+      'status' => 1,
+    ];
+    // Create encryption Profile,.
+    if ($encryption_profile = EncryptionProfile::create($default_encrypt_datas)) {
+      if ($encryption_profile->save()) {
+        if (EncryptionProfile::load($encrypt_profile_id)) {
+          \Drupal::logger('dbee')->info('Dbee encryption profile set.');
+          return TRUE;
+        }
+      }
+    }
+  }
+  else {
+    // A dbee encryption profile already exists.
+    \Drupal::logger('dbee')->info('Dbee encryption profile already exists.');
+    return TRUE;
+  }
+  // Dbee key entity was not saved.
+  \Drupal::logger('dbee')->critical('Dbee encryption profile was not saved on install.');
+  return FALSE;
+}
