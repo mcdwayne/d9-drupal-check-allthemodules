@@ -1,0 +1,244 @@
+<?php
+/**
+ * @file
+ * PM Organization install file.
+ */
+
+/**
+ * Implements hook_install().
+ */
+function pmorganization_install() {
+  variable_set('node_options_pmorganization', array('status'));
+
+  variable_set('pm_permission_field_org_member_reference', 'pmorganization_members');
+  variable_set('pm_permission_node_pmorganization_enabled', TRUE);
+
+  // Create and attaches fields to pmorganization content type.
+  module_load_include('inc', 'pmorganization', 'includes/pmorganization.migrate');
+
+  // Parameter $sandbox is passed as a placeholder.
+  $sandbox = array();
+  pmorganization_migrate_create_fields($sandbox);
+}
+
+/**
+ * Implements hook_schema().
+ */
+function pmorganization_schema() {
+  $schema['pmorganization_index'] = array(
+    'description' => 'Maintains denormalized information about pm organization relationships.',
+    'fields' => array(
+      'nid' => array(
+        'description' => 'The {node}.nid this record tracks.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'pmorganization_nid' => array(
+        'description' => 'The pmorganization nid.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'created' => array(
+        'description' => 'The Unix timestamp when the node was created.',
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+    ),
+    'indexes' => array(
+      'nid' => array('nid'),
+      'pmorganization_nid' => array('pmorganization_nid'),
+    ),
+    'foreign keys' => array(
+      'tracked_node' => array(
+        'table' => 'node',
+        'columns' => array('nid' => 'nid'),
+      ),
+      'pmorganization_nid' => array(
+        'table' => 'node',
+        'columns' => array('pmorganization_nid' => 'nid'),
+      ),
+    ),
+  );
+  return $schema;
+}
+
+/**
+ * Implements hook_disable().
+ */
+function pmorganization_disable() {
+  module_load_include('inc', 'pm', 'includes/pm.install');
+  $module = 'pmorganization';
+
+  // Set standardised message.
+  pm_disable_message($module, 'organizations');
+}
+
+/**
+ * Implements hook_uninstall().
+ */
+function pmorganization_uninstall() {
+  module_load_include('inc', 'pm', 'includes/pm.install');
+  $module = 'pmorganization';
+
+  // Delete items created by his module.
+  pm_uninstall_variables($module);
+  pm_uninstall_fields($module);
+
+  // Set standardised message.
+  pm_uninstall_message($module, 'organizations');
+}
+
+/**
+ * Implements hook_update_last_removed().
+ */
+function pmorganization_update_last_removed() {
+  return 7103;
+}
+
+/**
+ * Migrate PM Organization nodes to field_api fields.
+ */
+function pmorganization_update_7104(&$sandbox) {
+  if (!module_exists('pmpermission')) {
+    module_enable(array('pmpermission'));
+  }
+  module_load_include('inc', 'pmorganization', 'includes/pmorganization.migrate');
+
+  if (pmorganization_migrate_update_could_be_performed()) {
+    return pmorganization_migrate($sandbox);
+  }
+}
+
+/**
+ * Create pmorganization_index table.
+ */
+function pmorganization_update_7300() {
+  $schema = module_invoke('pmorganization', 'schema');
+  db_create_table('pmorganization_index', $schema['pmorganization_index']);
+}
+
+
+/**
+ * Build pmorganization_index for all nodes.
+ */
+function pmorganization_update_7301(&$sandbox) {
+  // Retrieve all records.
+  $result = db_select('node', 'n')
+    ->fields('n', array('nid'))
+    ->orderBy('n.nid', 'ASC')
+    ->execute();
+
+  // Use the sandbox to store the information needed to track progression.
+  if (!isset($sandbox['progress'])) {
+    $sandbox['progress'] = 0;
+    $sandbox['max'] = $result->rowCount();
+    $sandbox['messages'] = array();
+    $sandbox['current_node'] = -1;
+  }
+
+  // Process nodes by groups of 50.
+  $limit = 50;
+
+  // Retrieve the next group of nids.
+  $query = db_select('node', 'n')->extend('PagerDefault');
+
+  $result = $query->fields('n', array('nid'))
+      ->orderBy('n.nid', 'ASC')
+      ->condition('n.nid', $sandbox['current_node'], '>')
+      ->limit($limit)->execute();
+
+  foreach ($result as $row) {
+    $node = node_load($row->nid);
+    // Rebuild the pmorganization_index.
+    pmorganization_delete_node_index($node);
+    pmorganization_build_node_index($node);
+    // Update our progress information.
+    $sandbox['progress']++;
+    $sandbox['current_node'] = $row->nid;
+  }
+
+  $sandbox['#finished'] = ($sandbox['progress'] >= $sandbox['max'])
+    ? TRUE
+    : ($sandbox['progress'] / $sandbox['max']);
+
+  if ($sandbox['#finished']) {
+    return t('PM Organization index rebuild has been completed.');
+  }
+}
+
+
+/**
+ * Use pm_entity_reference_user_filter for pmorganization_members.
+ */
+function pmorganization_update_7302() {
+  $entity_type = 'node';
+  $field_name = 'pmorganization_members';
+  $bundle_name = 'pmorganization';
+
+  // Get defaults from the configurations.
+  // Update Field Base.
+  module_load_include('inc', 'pmorganization', 'includes/pmorganization.field_base');
+  $field_bases = pmorganization_default_field_bases();
+  $field_base = $field_bases[$field_name];
+  $base_info = array(
+    'field_name' => $field_name,
+    'settings' => $field_base['settings'],
+  );
+  field_update_field($base_info);
+
+  // Update Field Instance.
+  module_load_include('inc', 'pmorganization', 'includes/pmorganization.field_instance');
+  $field_instances = pmorganization_default_field_instances();
+  $field_instance = $field_instances['node-pmorganization-pmorganization_members'];
+
+  $instance_info = field_info_instance($entity_type, $field_name, $bundle_name);
+  $instance_info['settings']['behaviors']['prepopulate'] = $field_instance['settings']['behaviors']['prepopulate'];
+  $instance_info['default_value_function'] = $field_instance['default_value_function'];
+  field_update_instance($instance_info);
+}
+
+/**
+ * Implements hook_requirements().
+ */
+function pmorganization_requirements($phase) {
+  $requirements = array();
+  if ($phase == 'update') {
+    $enabled = module_enable(array('link', 'email', 'addressfield'));
+    if (!$enabled) {
+      $t = get_t();
+      $requirements['pmorganization_migrate'] = array(
+        'title' => $t('PM Organization Migrate Issues'),
+        'value' => $t('One or more of the required modules cannot be enabled.
+          If you download the modules from Drupal.org those would be enabled automatically when update script is run.
+          So Please make sure following modules are present: !link, !email & !addressfield',
+          array(
+            '!link' => l($t('link'), 'https://drupal.org/project/link'),
+            '!email' => l($t('email'), 'https://drupal.org/project/email'),
+            '!addressfield' => l($t('addressfield'), 'https://drupal.org/project/addressfield'),
+          )
+        ),
+        'severity' => REQUIREMENT_ERROR,
+      );
+    }
+  }
+  return $requirements;
+}
+
+
+/**
+ * Implements hook_update_dependencies().
+ */
+function pmorganization_update_dependencies() {
+  // pmperson_update_7104() migrates pmperson data to drupal user.
+  // pmorganization migration depends on its completion.
+  $dependencies['pmorganization'][7104] = array(
+    'pmperson' => 7104,
+  );
+
+  return $dependencies;
+}

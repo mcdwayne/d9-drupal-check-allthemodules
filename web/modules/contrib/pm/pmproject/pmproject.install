@@ -1,0 +1,247 @@
+<?php
+/**
+ * @file
+ * Installation functions for the Project Management project module.
+ */
+
+/**
+ * Implements hook_install().
+ */
+function pmproject_install() {
+  variable_set('node_options_pmproject', array('status'));
+
+  // PM Permissions default configurations.
+  variable_set('pm_permission_field_assigned_reference', 'pm_assigned');
+  variable_set('pm_permission_field_pm_reference', 'pm_manager');
+  variable_set('pm_permission_field_parent_reference_for_pmproject', 'pmproject_parent');
+  variable_set('pm_permission_node_pmproject_enabled', TRUE);
+
+  // Create and attaches fields to pmproject content type.
+  module_load_include('inc', 'pmproject', 'includes/pmproject.migrate');
+
+  // Parameter $sandbox is passed as a placeholder.
+  $sandbox = array();
+  pmproject_migrate_create_fields($sandbox);
+}
+
+/**
+ * Implements hook_disable().
+ */
+function pmproject_disable() {
+  module_load_include('inc', 'pm', 'includes/pm.install');
+  $module = 'pmproject';
+
+  // Set standardised message.
+  pm_disable_message($module, 'projects');
+}
+
+/**
+ * Implements hook_uninstall().
+ */
+function pmproject_uninstall() {
+  module_load_include('inc', 'pm', 'includes/pm.install');
+  $module = 'pmproject';
+
+  // Delete items created by his module.
+  pm_uninstall_variables($module);
+  pm_uninstall_fields($module);
+
+  // Set standardised message.
+  pm_uninstall_message($module, 'projects');
+}
+
+/**
+ * Implements hook_schema().
+ */
+function pmproject_schema() {
+  $schema['pmproject_index'] = array(
+    'description' => 'Maintains denormalized information about pm project relationships.',
+    'fields' => array(
+      'nid' => array(
+        'description' => 'The {node}.nid this record tracks.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'pmproject_nid' => array(
+        'description' => 'The pmproject nid.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'created' => array(
+        'description' => 'The Unix timestamp when the node was created.',
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+    ),
+    'indexes' => array(
+      'nid' => array('nid'),
+      'pmproject_nid' => array('pmproject_nid'),
+    ),
+    'foreign keys' => array(
+      'tracked_node' => array(
+        'table' => 'node',
+        'columns' => array('nid' => 'nid'),
+      ),
+      'pmproject_nid' => array(
+        'table' => 'node',
+        'columns' => array('pmproject_nid' => 'nid'),
+      ),
+    ),
+  );
+  return $schema;
+}
+
+/**
+ * Implements hook_update_last_removed().
+ */
+function pmproject_update_last_removed() {
+  return 6202;
+}
+
+/**
+ * Migrate PM Project nodes to field_api fields.
+ */
+function pmproject_update_7105(&$sandbox) {
+  if (!module_exists('pmpermission')) {
+    module_enable(array('pmpermission'));
+  }
+  module_load_include('inc', 'pmproject', 'includes/pmproject.migrate');
+
+  if (pmproject_migrate_update_could_be_performed()) {
+    return pmproject_migrate($sandbox);
+  }
+}
+
+/**
+ * Create pmproject_index table.
+ */
+function pmproject_update_7300() {
+  $schema = module_invoke('pmproject', 'schema');
+  db_create_table('pmproject_index', $schema['pmproject_index']);
+}
+
+/**
+ * Build pmproject_index for all nodes.
+ */
+function pmproject_update_7301(&$sandbox) {
+  // Retrieve all records.
+  $result = db_select('node', 'n')
+    ->fields('n', array('nid'))
+    ->orderBy('n.nid', 'ASC')
+    ->execute();
+
+  // Use the sandbox to store the information needed to track progression.
+  if (!isset($sandbox['progress'])) {
+    $sandbox['progress'] = 0;
+    $sandbox['max'] = $result->rowCount();
+    $sandbox['messages'] = array();
+    $sandbox['current_node'] = -1;
+  }
+
+  // Process nodes by groups of 50.
+  $limit = 50;
+
+  // Retrieve the next group of nids.
+  $query = db_select('node', 'n')->extend('PagerDefault');
+
+  $result = $query->fields('n', array('nid'))
+      ->orderBy('n.nid', 'ASC')
+      ->condition('n.nid', $sandbox['current_node'], '>')
+      ->limit($limit)->execute();
+
+  foreach ($result as $row) {
+    $node = node_load($row->nid);
+    // Rebuild the pmproject_index.
+    pmproject_delete_node_index($node);
+    pmproject_build_node_index($node);
+    // Update our progress information.
+    $sandbox['progress']++;
+    $sandbox['current_node'] = $row->nid;
+  }
+
+  $sandbox['#finished'] = ($sandbox['progress'] >= $sandbox['max'])
+    ? TRUE
+    : ($sandbox['progress'] / $sandbox['max']);
+
+  if ($sandbox['#finished']) {
+    return t('PM Project index rebuild has been completed.');
+  }
+}
+
+/**
+ * Add entityreference_prepopulate behaviour to pmproject_parent.
+ */
+function pmproject_update_7302() {
+  $entity_type = 'node';
+  $bundle_name = 'pmproject';
+
+  // Get defaults from the configurations.
+  module_load_include('inc', 'pmproject', 'includes/pmproject.field_base');
+  module_load_include('inc', 'pmproject', 'includes/pmproject.field_instance');
+  $field_bases = pmproject_default_field_bases();
+  $field_instances = pmproject_default_field_instances();
+
+  // Update pmproject_parent.
+  $field_name = 'pmproject_parent';
+
+  $field_instance = $field_instances['node-pmproject-pmproject_parent'];
+
+  $instance_info = field_info_instance($entity_type, $field_name, $bundle_name);
+  $instance_info['settings']['behaviors']['prepopulate'] = $field_instance['settings']['behaviors']['prepopulate'];
+  $instance_info['default_value_function'] = $field_instance['default_value_function'];
+  field_update_instance($instance_info);
+
+  // Update pm_manager.
+  $field_name = 'pm_manager';
+
+  $field_base = $field_bases[$field_name];
+  $base_info = array(
+    'field_name' => $field_name,
+    'settings' => $field_base['settings'],
+  );
+  field_update_field($base_info);
+
+  // Update Field Instance.
+  $field_instance = $field_instances['node-pmproject-pm_manager'];
+
+  $instance_info = field_info_instance($entity_type, $field_name, $bundle_name);
+  $instance_info['settings']['behaviors']['prepopulate'] = $field_instance['settings']['behaviors']['prepopulate'];
+  $instance_info['default_value_function'] = $field_instance['default_value_function'];
+  field_update_instance($instance_info);
+
+  // Update pm_assigned.
+  $field_name = 'pm_assigned';
+
+  $field_base = $field_bases[$field_name];
+  $base_info = array(
+    'field_name' => $field_name,
+    'settings' => $field_base['settings'],
+  );
+  field_update_field($base_info);
+
+  // Update Field Instance.
+  $field_instance = $field_instances['node-pmproject-pm_assigned'];
+
+  $instance_info = field_info_instance($entity_type, $field_name, $bundle_name);
+  $instance_info['settings']['behaviors']['prepopulate'] = $field_instance['settings']['behaviors']['prepopulate'];
+  $instance_info['default_value_function'] = $field_instance['default_value_function'];
+  field_update_instance($instance_info);
+}
+
+/**
+ * Implements hook_update_dependencies().
+ */
+function pmproject_update_dependencies() {
+  // pmperson_update_7104() migrates pmperson data to drupal user.
+  // pmproject migration depends on its completion.
+  $dependencies['pmproject'][7105] = array(
+    'pmperson' => 7104,
+  );
+
+  return $dependencies;
+}
