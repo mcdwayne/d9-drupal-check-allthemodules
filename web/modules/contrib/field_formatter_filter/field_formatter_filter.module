@@ -1,0 +1,161 @@
+<?php
+
+/**
+ * @file
+ * Allows different text format filters to be applied to text fields.
+ *
+ * Provides additional formatter settings for text fields.
+ *
+ * D8 code port modelled on field_formatter_class.
+ */
+
+use Drupal\Core\Entity\Entity\EntityViewDisplay;
+use Drupal\Component\Utility\Xss;
+use Drupal\Core\Field\FormatterInterface;
+use Drupal\filter\Entity\FilterFormat;
+use Drupal\Core\Field\FieldDefinitionInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Render\Element;
+
+/**
+ * Adds a 'filter' selection to all text formatters.
+ *
+ * @see hook_field_formatter_third_party_settings_form()
+ *
+ * Implements hook_field_formatter_third_party_settings_form().
+ *
+ * @inheritdoc
+ */
+function field_formatter_filter_field_formatter_third_party_settings_form(FormatterInterface $plugin, FieldDefinitionInterface $field_definition, $view_mode, $form, FormStateInterface $form_state) {
+  // Only offer this option to text formatters.
+  if (!_field_formatter_filter_target_field_type($field_definition->getType())) {
+    return NULL;
+  }
+
+  $filter_id = $plugin->getThirdPartySetting('field_formatter_filter', 'format');
+  $filter_format_options = [
+    FALSE => '<none>',
+  ];
+  /* @var \Drupal\filter\FilterFormatInterface $format */
+  $filter_formats = filter_formats();
+  foreach ($filter_formats as $format) {
+    $filter_format_options[$format->id()] = $format->label();
+  }
+
+  $element['format'] = [
+    '#type' => 'select',
+    '#title' => t('Additional Text Filter/Format'),
+    '#options'       => $filter_format_options,
+    '#default_value' => $filter_id,
+    '#description'   => t('The selected format will be used <em>instead</em> of whatever the originally selected format is.'),
+  ];
+  return $element;
+}
+
+/**
+ * Displays the formatter setting on the manage field display overview.
+ *
+ * Implements hook_field_formatter_settings_summary_alter().
+ *
+ * @param string[] $summary
+ *   An array of summary messages.
+ * @param object[] $context
+ *   An associative array with the following elements:
+ *   - formatter: The formatter object.
+ *   - field_definition: The field definition.
+ *   - view_mode: The view mode being configured.
+ */
+function field_formatter_filter_field_formatter_settings_summary_alter(array &$summary, array $context) {
+  /* @var \Drupal\Core\Field\FormatterInterface $formatter */
+  $formatter = $context['formatter'];
+  $format_id = $formatter->getThirdPartySetting('field_formatter_filter', 'format');
+  if (!empty($format_id)) {
+    $format = FilterFormat::load($format_id);
+    $summary[] = t('Text Format: @format', ['@format' => Xss::filter($format->label(), [])]);
+  }
+}
+
+/**
+ * Applies an additional filter on the text field being rendered.
+ *
+ * Implements hook_preprocess_HOOK().
+ *
+ * @param array $variables
+ *   Theme variables.
+ */
+function field_formatter_filter_preprocess_field(array &$variables) {
+  // This runs on all fields all the time - surely that's overkill?
+  // Can I inject instructions further upstream?
+  // It feels this hook is a bit late.
+  // Also, it's a hook. Whither plugins?
+  $element = $variables['element'];
+  // Only process recognised text formatters.
+  if (!_field_formatter_filter_target_field_type($element['#field_type'])) {
+    return;
+  }
+  // Get a few convenient handles.
+  /* @var $entity \Drupal\Core\Entity\FieldableEntityInterface */
+  $entity     = $variables['element']['#object'];
+  $field_name = $variables['element']['#field_name'];
+  $view_mode  = $variables['element']['#view_mode'];
+
+  // Drill down to field formatter settings.
+  $render_display = EntityViewDisplay::collectRenderDisplay($entity, $view_mode);
+  $field_display = $render_display->getComponent($field_name);
+  if (empty($field_display['third_party_settings']['field_formatter_filter']['format'])) {
+    return;
+  }
+
+  $format_id = $field_display['third_party_settings']['field_formatter_filter']['format'];
+
+  // Avoid problems if the named format was invalid, such being deleted.
+  if (!FilterFormat::load($format_id)) {
+    // This is rare and wrong enough to warn loudly about.
+    // Be as informative as we can.
+    $message = "The %field_name field displayed on the %view_mode view of %bundle %entity_type was set to use text format '%format_id' - which is invalid or unavailable. Default rendering will be used until this is fixed.";
+    $strings = [
+      '%field_name' => $field_name,
+      '%view_mode' => $view_mode,
+      '%bundle' => $entity->bundle(),
+      '%entity_type' => $entity->getEntityTypeId(),
+      '%format_id' => $format_id,
+    ];
+    \Drupal::logger('field_formatter_filter')->warning($message, $strings);
+    return;
+  }
+
+  $children_keys = Element::children($element);
+  foreach ($children_keys as $key) {
+    /*
+     * REPLACE the expected format rule.
+     * When the render process eventually hits
+     * @see Drupal\filter\Element\ProcessedText::preRenderText
+     * It will use my given format.
+     */
+    $variables['items'][$key]['content']['#format'] = $format_id;
+
+    /*
+     * Or,
+     * ADD my process to the $variables['items']['content'][#pre_render']
+     * array.
+     * $variables[$key]['#pre_render'][] = [];
+     */
+  }
+
+}
+
+/**
+ * Returns true if the field type is filterable.
+ *
+ * Internal utility.
+ *
+ * @param string $type
+ *   Field type.
+ *
+ * @return bool
+ *   Is this a filterable field type.
+ */
+function _field_formatter_filter_target_field_type($type) {
+  // Only alter longtext sorta fields.
+  return in_array($type, ['text', 'text_long', 'text_with_summary']);
+}
