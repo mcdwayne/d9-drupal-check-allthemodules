@@ -1,0 +1,395 @@
+<?php
+
+/**
+ * @file
+ * Previewable Email Template module.
+ */
+
+use Drupal\node\Entity\Node;
+use Drupal\pet\Entity\Pet;
+use Drupal\user\Entity\User;
+
+/**
+ * Loads a PET by ID.
+ */
+function pet_load($pid) {
+  return Pet::load($pid);
+}
+
+/**
+ * Loads multiple PETs by ID or based on a set of conditions.
+ *
+ * @param array $pids
+ *   An array of PET IDs.
+ * @param bool $reset
+ *   Whether to reset the internal PET loading cache.
+ *
+ * @return array
+ *   An array of PET objects indexed by pid.
+ *
+ * @see entity_load_multiple()
+ */
+function pet_load_multiple($pids = [], $reset = FALSE) {
+  return Pet::loadMultiple('pet', $pids, $reset);
+}
+
+/**
+ * Entity uri callback.
+ */
+function pet_uri(Pet $pet) {
+  return [
+    'path' => 'pet/' . $pet->id(),
+  ];
+}
+
+/**
+ * Title callback for form template page.
+ */
+function pet_page_title(Pet $pet) {
+  return $pet->getTitle();
+}
+
+/**
+ * Helper function to parse emails into an array.
+ */
+function pet_parse_mails($mail_text) {
+  return preg_split('/[\n\r, ]/', $mail_text, -1, PREG_SPLIT_NO_EMPTY);
+}
+
+/**
+ * Helper function to look up a uid from mail.
+ */
+function pet_lookup_uid($mail) {
+  $user = user_load_by_mail($mail);
+  if ($user) {
+    return $user->id();
+  }
+  return FALSE;
+}
+
+/**
+ * Send tokenized email to a list of recipients.
+ *
+ * Given a list of recipients, and an optional node id, perform token
+ * substitution and send an email to each. The node substitutions, if any,
+ * are the same in each email sent.  The user tokens, if any are custom based
+ * on the account (if any) associated with each email.
+ *
+ * @param int $pet_id
+ *   The unique id of the PET template.
+ * @param array $recipients
+ *   An array of at least one recipient in one of two formats:
+ *      1. a simple email address, in which case the uid is looked up
+ *      2. an array('mail' => <email address>, 'uid' => <uid>) in which case
+ *         the uid is already available (more efficient).
+ * @param array $options
+ *   An array of options as follows:
+ *      nid - An optional node id for token substitutions.
+ *      subject - An optional subject which if provided will override the
+ *        subject in the PET.
+ *      body - An optional body which if provided which will override the body
+ *        in the PET.
+ *      body_plain - An optional plain text body which if provided which will
+ *        override the plain text body in the PET.
+ *      from - An optional from email which if provided which will override the
+ *        from in the PET (which in turn overrides the site default).
+ *      reply_to - Optional
+ *      cc - Optional cc emails which if provided which will override the cc's
+ *        in the PET.
+ *      bcc - Optional bcc emails which if provided which will override the
+ *        bcc's in the PET.
+ */
+function pet_send_mail($pet_id, $recipients, $options) {
+  $pet = pet_load($pet_id);
+  if (!$pet) {
+    \Drupal::logger('pet')
+      ->error('Unable to load PET %pet_id.', ['%pet_id' => $pet_id]);
+    return;
+  }
+  if (is_array($recipients) == FALSE) {
+    $recipients = [$recipients];
+  }
+  else {
+    if (is_array($recipients) == TRUE && count($recipients) < 1) {
+      \Drupal::logger('pet')
+        ->notice('At least one recipient must be provided for PET %pet_label.', ['%pet_label' => $pet->label()]);
+      return;
+    }
+  }
+
+  // Override subject and body if necessary.
+  if (isset($options['subject'])) {
+    $pet->setSubject($options['subject']);
+  }
+  if (isset($options['body'])) {
+    $pet->setMailbody($options['body']);
+  }
+  if (isset($options['body_plain'])) {
+    $pet->setMailbodyPlain($options['body_plain']);
+  }
+
+  // Resolve from address.
+  if (pet_isset_or($options['from'])) {
+    $from = $options['from'];
+  }
+  elseif ($pet->getFromOverride()) {
+    $from = $pet->getFromOverride();
+  }
+  else {
+    $from = \Drupal::config('system.site')->get('mail');
+  }
+
+  // Store data in params in case a module wants to act on them somehow.
+  $params = [
+    'pet_from' => $from,
+    'pet_recipients' => $recipients,
+    'pet_nid' => pet_isset_or($options['nid']),
+    'pet_cc' => pet_parse_mails(pet_isset_or($options['cc'])),
+    'pet_bcc' => pet_parse_mails(pet_isset_or($options['bcc'])),
+    'pet_reply_to' => pet_isset_or($options['reply_to']),
+    'pet_options' => $options,
+  ];
+  // Array to hold status of messages send.
+  $message_status = [];
+  foreach ($recipients as $recipient) {
+    if (is_array($recipient)) {
+      $params['pet_to'] = $recipient['mail'];
+      $params['pet_uid'] = $recipient['uid'];
+    }
+    else {
+      // Strip leading uid for backward compatibility.
+      $mail = preg_replace('/^[0-9]*\|/', '', $recipient);
+      $params['pet_to'] = $mail;
+      $params['pet_uid'] = pet_lookup_uid($mail);
+    }
+    $message_status[$params['pet_to']] = pet_send_one_mail($pet, $params);
+  }
+  // Return message status.
+  return $message_status;
+}
+
+/**
+ * Send one email, with token substitution.
+ *
+ * This may be called directly from other modules.
+ *
+ * @param object $pet
+ *   The loaded PET object to use for the email.
+ * @param array $params
+ *   Array of parameters used when constructing the email.
+ *      pet_from (required) - a valid sender email address
+ *      pet_to (required) - a valid recipient email address
+ *      pet_recipients (optional) - if called from pet_send_mail() will contain
+ *        the full recipient list
+ *      pet_uid (optional) - if provided, a valid user id for 'user' type token
+ *        substitution
+ *      pet_nid (optional) - if provided, a valid node id for 'node' type token
+ *        substitution
+ *      pet_reply_to (optional)
+ *   The $params array may also contain data passed in by other modules. One
+ *    use of this is for token substitution.
+ *
+ * @see hook_pet_substitutions_alter()
+ */
+function pet_send_one_mail(Pet $pet, $params) {
+  $pet_logging = \Drupal::config('pet.settings')->get('pet_logging');
+
+  if (!pet_is_valid($pet)) {
+    if ($pet_logging < 2) {
+      \Drupal::logger('pet')
+        ->error('Invalid PET object in pet_send_one_mail().');
+    }
+    else {
+      drupal_set_message(t('Invalid PET object in pet_send_one_mail().'), 'error');
+    }
+    return;
+  }
+
+  $pet_title = $pet->label();
+  if (empty($params['pet_from'])) {
+    if ($pet_logging < 2) {
+      \Drupal::logger('pet')
+        ->error('Missing sender email address in pet_send_one_mail() for PET \'%pet_title\'.', ['%pet_title' => $pet_title]);
+    }
+    else {
+      drupal_set_message(t('Missing sender email address in pet_send_one_mail() for PET \'%pet_title\'.', ['%pet_title' => $pet_title]), 'error');
+    }
+    return;
+  }
+
+  if (empty($params['pet_to'])) {
+    if ($pet_logging < 2) {
+      \Drupal::logger('pet')
+        ->error('Missing recipient email address in pet_send_one_mail() for PET \'%pet_title\'.', ['%pet_title' => $pet_title]);
+    }
+    else {
+      drupal_set_message(t('Missing recipient email address in pet_send_one_mail() for PET \'%pet_title\'.', ['%pet_title' => $pet_title]), 'error');
+    }
+    return;
+  }
+  if (isset($params['pet_reply_to'])) {
+    $message['headers']['Reply-To'] = $params['pet_reply_to'];
+  }
+
+  $params['pet'] = $pet;
+  $substitutions = pet_substitutions($pet, $params);
+  $token = \Drupal::token();
+  $params['subject'] = $token->replace($pet->getSubject(), $substitutions, ['clear' => TRUE]);
+  $params['body'] = $token->replace($pet->getMailbody(), $substitutions, ['clear' => TRUE]);
+
+  // Provided for Mime Mail module; alternate text-only form for multipart MIME.
+  $mail_body_plain = trim($pet->getMailbodyPlain());
+  if (!empty($mail_body_plain)) {
+    $params['plaintext'] = $token->replace($pet->getMailbodyPlain(), $substitutions, ['clear' => TRUE]);
+  }
+
+  // Provided for Mime Mail module; send ONLY plain text.
+  $params['plain'] = $pet->getSendPlain();
+
+  $language_interface = \Drupal::languageManager()->getCurrentLanguage();
+  $langcode = $language_interface->getId();
+  $message = \Drupal::service('plugin.manager.mail')
+    ->mail('pet', $pet->id(), $params['pet_to'], $langcode, $params, $params['pet_from']);
+  if ($message['send'] && $pet_logging == 0) {
+    \Drupal::logger('pet')
+      ->notice('Successfully sent email to %recipient', ['%recipient' => $params['pet_to']]);
+  }
+  // Return message, useful for show custom message, based email send status.
+  return $message;
+}
+
+/**
+ * Load the token objects for a PET template in preparation for token
+ * substitution.
+ */
+function pet_substitutions($pet, $params) {
+  $uid = pet_isset_or($params['pet_uid']);
+  $nid = pet_isset_or($params['pet_nid']);
+
+  // Standard substitutions.
+  $substitutions['global'] = NULL;
+  if (!empty($uid)) {
+    $user = User::load($uid);
+    $substitutions['user'] = $user;
+  }
+  if (!empty($nid)) {
+    $node = Node::load($nid);
+    $substitutions['node'] = $node;
+  }
+
+  // Give modules the opportunity to add their own token types/objects.
+  \Drupal::moduleHandler()->alter('pet_substitutions', $substitutions, $params);
+  return $substitutions;
+}
+
+/**
+ * Implements hook_mail().
+ *
+ * To customize, e.g. to change the content type to text/html etc,
+ * you can use hook_mail_alter() in one of your modules.
+ */
+function pet_mail($key, &$message, $params) {
+  $message['subject'] = $params['subject'];
+  $message['body'][] = $params['body'];
+
+  if (isset($params['pet_cc']) && is_array($params['pet_cc']) && count($params['pet_cc']) > 0) {
+    $message['headers']['Cc'] = implode(',', $params['pet_cc']);
+  }
+  if (isset($params['pet_bcc']) && is_array($params['pet_bcc']) && count($params['pet_bcc']) > 0) {
+    $message['headers']['Bcc'] = implode(',', $params['pet_bcc']);
+  }
+}
+
+/**
+ * Check the validity of a loaded PET.
+ *
+ * Don't want this to be too expensive, but don't want to send bogus emails
+ * either.
+ */
+function pet_is_valid($pet) {
+  return is_object($pet) && is_numeric($pet->id());
+}
+
+/**
+ * Check presence of mimemail.
+ */
+function pet_has_mimemail() {
+  return \Drupal::moduleHandler()->moduleExists('mimemail');
+}
+
+/**
+ * Check if a variable is set and return it if so, otherwise the alternative.
+ */
+function pet_isset_or(&$val, $alternate = NULL) {
+  return isset($val) ? $val : $alternate;
+}
+
+/**
+ * Helper function to provide token help to template construction form and
+ * template use form.
+ */
+function pet_token_help() {
+  if (\Drupal::moduleHandler()->moduleExists('token')) {
+    $tokens = [
+      '#title' => t('Replacement patterns'),
+      '#type' => 'details',
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+      '#description' => t('Make sure that the tokens you choose are available to your template when previewed. The list below includes the standard Nodes and Users groups, as well as global tokens. See also hook_pet_substitutions_alter().'),
+    ];
+    $tokens['token_tree'] = [
+      '#theme' => 'token_tree_link',
+      '#token_types' => ['node', 'user'],
+    ];
+  }
+  else {
+    $tokens = [
+      '#markup' => '<p>' . t('Enable the <a href="@drupal-token">Token module</a> to view the available token browser.', ['@drupal-token' => 'http://drupal.org/project/token']) . '</p>',
+    ];
+  }
+  return $tokens;
+}
+
+/**
+ * Return TRUE if a $val is a natural number (integer 1, 2, 3, ...).
+ *
+ * Base can be changed to zero if desired.
+ */
+function pet_is_natural($val, $base = 1) {
+  if (!isset($val)) {
+    return FALSE;
+  }
+  $return = ((string) $val === (string) (int) $val);
+  if ($return && intval($val) < $base) {
+    $return = FALSE;
+  }
+  return $return;
+}
+
+/**
+ * Return formatted list of PET recipients for preview display.
+ */
+function pet_recipients_formatted($recipients) {
+  $build = [];
+  if (is_array($recipients)) {
+    foreach ($recipients as $recipient) {
+      $output = '';
+      $output .= $recipient['mail'] . ' ';
+      $output .= $recipient['uid'] ? t('(user @uid)', ['@uid' => $recipient['uid']]) : t('(no user id)');
+      $output .= "\n";
+      $build['#markup'] = $output;
+    }
+    return $build;
+  }
+}
+
+/**
+ * Implements hook_hook_info().
+ */
+function pet_hook_info() {
+  $hooks = ['pet_substitutions_alter'];
+  $info = [
+    'group' => 'pet',
+  ];
+  return array_fill_keys($hooks, $info);
+}
