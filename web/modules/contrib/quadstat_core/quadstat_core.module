@@ -1,0 +1,300 @@
+<?php
+
+use \Drupal\Core\Url;
+use \Drupal\Core\Path\PathMatcher;
+use \Drupal\node\Entity;
+use \Drupal\Core\StreamWrapper\PrivateStream;
+use \Drupal\file\FileInterface;
+use \Drupal\Core\File\FileSystem;
+use \Drupal\Core\Entity\FieldableEntityInterface;
+use \Drupal\Core\Field\FieldItemInterface;
+use \Drupal\Core\Field\FieldItemListInterface;
+use \Drupal\Core\TypedData\TypedDataInterface;
+use \Drupal\Core\Entity\EntityInterface;
+use Symfony\Component\HttpFoundation\RedirectResponse;
+use Drupal\Core\Entity\EntityTypeInterface;
+
+module_load_include('inc', 'quadstat_core', 'dataset/dataset');
+module_load_include('inc', 'quadstat_core', 'dataset/random.dataset');
+module_load_include('inc', 'quadstat_core', 'dataset/file.dataset');
+module_load_include('inc', 'quadstat_core', 'dataset/paste.dataset');
+module_load_include('inc', 'quadstat_core', 'dataset/empty.dataset');
+module_load_include('inc', 'quadstat_core', 'application/application');
+module_load_include('inc', 'quadstat_core', 'editor/editor');
+
+function quadstat_core_menu_local_tasks_alter(&$data, $route_name) {
+
+  // Add a tab linking to the frontpage to all pages
+  $is_front = \Drupal::service('path.matcher')->isFrontPage();
+  $data['tabs'][0]['node.front'] = array(
+    '#theme' => 'menu_local_task',
+    '#link' => array(
+      'title' => t('Home'),
+      'url' => Url::fromRoute('<front>'),
+      'localized_options' => array(
+        'attributes' => array(
+          'title' => t('Link to Quadstat frontpage'),
+        ),
+      ),
+    ),
+    '#weight' => -50,
+    '#active' => $is_front,
+  );
+  // Make tab inactive on its page; only show to authenticated users
+  $current_path = \Drupal::service('path.current')->getPath();
+  $user = \Drupal::currentUser();
+  if($user->id()) {
+    $data['tabs'][0]['custom.add_dataset'] = array(
+      '#theme' => 'menu_local_task',
+      '#link' => array(
+        'title' => t('Create Dataset'),
+        'url' => Url::fromUserInput('/node/add/dataset'),
+        'localized_options' => array(
+          'attributes' => array(
+            'title' => t('Import or create a new dataset on Quadstat.com.'),
+          ),
+        ),
+      ),
+      '#weight' => -40,
+      '#active' => $current_path == '/node/add/dataset' ? TRUE : FALSE,
+    );
+    $data['tabs'][0]['custom.logout'] = array(
+      '#theme' => 'menu_local_task',
+      '#link' => array(
+        'title' => t('Logout'),
+        'url' => Url::fromUserInput('/user/logout'),
+        'localized_options' => array(
+          'attributes' => array(
+            'title' => t('Logout of Quadstat'),
+          ),
+        ),
+      ),
+      '#weight' => 50,
+      '#active' => FALSE,
+    );
+  } else if ($current_path != '/user/password' && $current_path != '/user/register' && $current_path != '/user/login' && $current_path != '/user') {
+    // Menu for anonymous user
+    $data['tabs'][0]['custom.login'] = array(
+      '#theme' => 'menu_local_task',
+      '#link' => array(
+        'title' => t('Login'),
+        'url' => Url::fromUserInput('/user/login'),
+        'localized_options' => array(
+          'attributes' => array(
+            'title' => t('Login to Quadstat'),
+          ),
+        ),
+      ),
+      '#weight' => -50,
+      '#active' => FALSE,
+    );
+  }
+  // Hide the 'View' tab on front page
+  if($is_front) {
+    unset($data['tabs'][0]['entity.node.canonical']);
+  }
+}
+
+/**
+ * Implements hook_user_login() to redirect upon login
+ */
+function quadstat_core_user_login($account) {
+  $url = "/";
+  $response = new Symfony\Component\HttpFoundation\RedirectResponse($url);
+  $response->send();
+  return;
+}
+
+/**
+ * Run R code
+ */
+function _quadstat_core_execute_r($commands, $identifier, $is_application = FALSE) {
+  if($is_application) {
+    $prefix = 'application';
+  } else {
+    $prefix = 'dataset';
+  }
+  // Setup up R file with commands to execute
+  $cwd = getcwd();
+  $tmp_path = \Drupal::service('file_system')->realpath('temporary://');
+  chdir($tmp_path);
+// Catch errors and also write messages to the warning and error file for this request
+$rcode = <<<RCODE
+options("width"=200)
+warningFile <- file("$prefix-$identifier.warn", "w")
+errorFile <- file("$prefix-$identifier.err", "w")
+tryCatch({ eval(parse(text = '$commands')) },
+    error = function(cond) { writeLines(toString(cond), con = errorFile) },
+    warning = function(cond) { writeLines(toString(cond), con = warningFile) }
+) 
+RCODE;
+  $rfile = "$tmp_path/$prefix-$identifier.R";
+  file_put_contents($rfile, $rcode);
+  $r_path = \Drupal::state()->get("quadstat_core_r_path");
+  exec("cd $tmp_path; $r_path CMD BATCH --vanilla --slave $rfile", $output);
+  chdir($cwd);
+}
+
+/**
+ * Implements hook_page_attachments() to attach CSS and JS to specific pages
+ */
+function quadstat_core_page_attachments(&$attachments) {
+  $node = \Drupal::routeMatch()->getParameter('node');
+  $user = \Drupal::currentUser();
+
+  if (is_object($node) && $node->getType() == 'dataset') {
+    // Load SlickGrid JavaScript library with data when using the editor
+    $file = $node->get('field_dataset_file')->referencedEntities();
+    $is_cont_table = $node->get('field_dataset_cont_table')->value == 0 || $node->get('field_dataset_cont_table')->value == 1 ? $node->get('field_dataset_cont_table')->value : 0;
+    if ($file != NULL) {
+      $uri = $file[0]->get('uri')->get(0)->value;
+      $filepath = \Drupal::service('file_system')->realpath($uri);
+
+      $row = 0;
+      $longest_row = 0;
+      $data = [];
+      // Begin loading data into Javascript from attached CSV file
+      if (($handle = fopen($filepath, "r")) !== FALSE) {
+        while (($line = fgetcsv($handle, 0, ",", '"')) !== FALSE) {
+          $columns = count($line);
+          for ($col = 0; $col < $columns; $col++) {
+            $data[$row][$col] = $line[$col];
+          }
+          if($col > $longest_row) {
+            $longest_row = $col;
+          }
+          $row++;
+        }
+      }
+    }
+    fclose($handle);
+    $attachments['#attached']['library'][] = 'quadstat_core/slickgrid';
+    $attachments['#attached']['drupalSettings']['quadstat_core']['data'] = $data;
+    $attachments['#attached']['drupalSettings']['quadstat_core']['longest_row'] = $longest_row;
+    $attachments['#attached']['drupalSettings']['quadstat_core']['is_cont_table'] = $is_cont_table;
+    $attachments['#attached']['library'][] = 'quadstat_core/dataset';
+    $attachments['#attached']['library'][] = 'quadstat_core/quadstat_core';
+    $attachments['#attached']['library'][] = 'quadstat_core/codemirror.html';
+  }
+
+  // Dataset is being added; add the JavaScript for this page
+  $current_path = \Drupal::service('path.current')->getPath();
+  if($current_path == '/node/add/dataset') {
+    // Adding a dataset doesn't require many libraries
+    $attachments['#attached']['library'][] = 'quadstat_core/dataset';
+    $attachments['#attached']['library'][] = 'quadstat_core/quadstat_core';
+    $attachments['#attached']['library'][] = 'quadstat_core/codemirror.html';
+  }
+
+  // Load datasets preview into JavaScript array
+  if (is_object($node) && $node->getType() == 'application' && $current_path != '/node/add/application' && strpos($current_path, 'edit') === FALSE) {
+    // Get all datasets owned by admin and current user
+    $res = db_select('file_managed', 'f')->fields('f')->condition('f.status', 1)->condition('filemime', 'text/csv')->condition('f.uid', array($user->id(), 1),'IN')->orderby('fid', 'DSC')->execute();
+    $data = [];
+    $map = [];
+    $n = 0;
+    while($record = $res->fetchAssoc()) {
+      $row = 0;
+      $longest_row = 0;
+      $fid = $record['fid'];
+      $file = file_load($fid);
+      $uri = $file->get('uri')->get(0)->value;
+      // get filesystem path to file
+      $filepath = \Drupal::service('file_system')->realpath($uri);
+
+      // Find out whether or not each table is a contingency table
+      $rec = db_select('node__field_dataset_file', 'n')->fields('n')->condition('field_dataset_file_target_id', $fid)->execute()->fetchAssoc();
+      $node = node_load($rec['entity_id']);
+      $is_cont_table[$n] = !is_null($node->get('field_dataset_cont_table')->value) ? $node->get('field_dataset_cont_table')->value : 0;
+      
+      $data[$n]['fid'] = $fid;
+      // Begin loading data into Javascript from attached CSV file
+      if (($handle = fopen($filepath, "r")) !== FALSE) {
+        while ($row < 6 && ($line = fgetcsv($handle, 0, ",", '"')) !== FALSE) {
+          $columns = count($line);
+          for ($col = 0; $col < $columns; $col++) {
+            $data[$n]['val'][$row][$col] = $line[$col];
+          }
+          if($col > $longest_row) {
+            $longest_row = $col;
+          }
+          $row++;
+        }
+        $row = 0;
+      }
+      fclose($handle);
+      $data[$n]['longest_row'] = $longest_row;
+      $map[$fid] = $n;
+      $n++;
+    }
+    $attachments['#attached']['library'][] = 'quadstat_core/slickgrid';
+    $attachments['#attached']['drupalSettings']['quadstat_core']['data'] = $data;
+    $attachments['#attached']['drupalSettings']['quadstat_core']['is_cont_table'] = $is_cont_table; 
+    $attachments['#attached']['drupalSettings']['quadstat_core']['map'] = $map;
+    $attachments['#attached']['library'][] = 'quadstat_core/application';
+    $attachments['#attached']['library'][] = 'quadstat_core/quadstat_core';
+    $attachments['#attached']['library'][] = 'quadstat_core/codemirror.html';
+  }
+
+  if(is_object($node) && $node->getType() == 'application' && $current_path != '/node/add/application' && strpos($current_path, 'edit') !== FALSE) {
+    $attachments['#attached']['library'][] = 'quadstat_core/codemirror.r';
+    $attachments['#attached']['library'][] = 'quadstat_core/codemirror.html';
+  }
+
+  if($current_path == '/node/add/application') {
+    // Adding a dataset doesn't require many libraries
+    $attachments['#attached']['library'][] = 'quadstat_core/codemirror.html';
+  }
+
+}
+
+/**
+ * Implements hook_entity_presave().
+ */
+function quadstat_core_entity_presave(Drupal\Core\Entity\EntityInterface $entity) {
+  // Only react to dataset presaves
+  if ($entity->bundle() != 'dataset' || drupal_installation_attempted()) {
+    return;
+  }
+  if($entity->isNew()) {
+    _quadstat_core_create_dataset($entity);
+  }
+  _quadstat_core_update_dataset($entity);
+}
+
+/**
+ * Implements hook_entity_insert() to start process of dataset creation.
+ */
+function quadstat_core_entity_insert(Drupal\Core\Entity\EntityInterface $entity) {
+  // Only react to dataset creation
+  if ($entity->bundle() != 'dataset' || drupal_installation_attempted()) {
+    return;
+  }
+  $user = \Drupal::currentUser();
+  _quadstat_core_validate_new_dataset($entity, $user);
+}
+
+/**
+ * Implements hook_install().
+ */
+function quadstat_core_install() {
+  $r_path = `which R`;
+  \Drupal::state()->set('quadstat_core_r_path', str_replace("\n", '', $r_path));
+}
+
+/**
+ * Implements hook_install().
+ */
+function quadstat_core_uninstall() {
+  \Drupal::state()->delete('quadstat_core_r_path');
+}
+
+function _quadstat_core_get_identifier() {
+  return rand(10000, 99999);
+}
+
+function quadstat_core_entity_base_field_info_alter(&$fields, \Drupal\Core\Entity\EntityTypeInterface $entity_type) {
+  if (!empty($fields['title'])) {
+    $fields['title']->addConstraint('DuplicateTitleConstraint'); 
+  }
+}
