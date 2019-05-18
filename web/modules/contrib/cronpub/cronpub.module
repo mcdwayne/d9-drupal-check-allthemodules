@@ -1,0 +1,214 @@
+<?php
+
+/**
+ * @file
+ * Contains cronpub.module..
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\FieldableEntityInterface;
+use Drupal\Core\Field\FieldItemList;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\cronpub\Entity\CronpubEntity;
+
+require_once __DIR__ . '/includes/cronpub_helper.inc';
+
+/**
+ * Implements hook_help().
+ *
+ * @param $route_name
+ * @param \Drupal\Core\Routing\RouteMatchInterface $route_match
+ * @return string
+ */
+function cronpub_help($route_name, RouteMatchInterface $route_match) {
+  unset($route_match);
+  switch ($route_name) {
+    // Main module help for the cronpub module.
+    case 'help.page.cronpub':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Provides time controlled publishing and unpublishing of all fieldable entities.') . '</p>';
+      return $output;
+
+    default:
+      return '';
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function cronpub_theme() {
+  return [
+    'cronpub_formatted_output' => [
+      'variables' => [
+        'title' => NULL,
+        'datelist' => NULL,
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_library_info_build().
+ */
+function cronpub_library_info_alter(&$libraries, $extension) {
+  if ($extension == 'cronpub' && isset($libraries['cronpub_rrulejs_widget'])) {
+    if (cronpub_rrulejs_library_exists()) {
+      $files = \Drupal::config('cronpub.settings')->get('required_library_files');
+      $base = base_path();
+      foreach ($files as $file) {
+        $libraries['cronpub_rrulejs_widget']['js'][$base . $file] = [
+          'weight' => -1,
+        ];
+      }
+    }
+  }
+  return $libraries;
+}
+
+/**
+ * Check existence and return fields of the cronpub_field_type.
+ *
+ * @param EntityInterface $entity
+ *   The content entity in what to search for cronpub fields.
+ * @return array
+ *   Array of all cronpub fields
+ */
+function _cronpub_get_cronpubfields(EntityInterface $entity) {
+  $cronpub_fields = [];
+  if ($entity instanceof FieldableEntityInterface) {
+    $fields = $entity->getFields();
+    foreach ($fields as $field) {
+      if ($field->getFieldDefinition()->getType() == 'cronpub_field_type') {
+        $cronpub_fields[] = $field;
+      }
+    }
+  }
+  return $cronpub_fields;
+}
+
+/**
+ * {@inheritdoc}
+ */
+function cronpub_validate($element, FormStateInterface $form_state) {
+  unset($element);
+  $form_state->getValues();
+}
+
+/**
+ * Implements hook_entity_insert().
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ */
+function cronpub_entity_insert(EntityInterface $entity) {
+  // Check if user has permission to touch cronpub entities in general.
+  if (\Drupal::currentUser()->hasPermission('edit cronpub task entities')) {
+    $cronpub_fields = _cronpub_get_cronpubfields($entity);
+    foreach ($cronpub_fields as $field) {
+
+      $plugin_name = $field->getSetting('plugin');
+
+      /* @var $plugin_manager \Drupal\cronpub\Plugin\Cronpub\CronpubActionManager */
+      $plugin_manager = \Drupal::service('plugin.manager.cronpub');
+      $plugin_definition = $plugin_manager->getDefinition($plugin_name);
+      $permission = $plugin_definition['permission'] ?: '';
+
+      // Check if user has permission defined in the cronpub plugin (i.e. to publish nodes).
+      if (empty($permission) || \Drupal::currentUser()->hasPermission($permission)) {
+        /* @var $field \Drupal\Core\Field\FieldItemList */
+        $cronpub = CronpubEntity::getCronpubEntity(
+          $entity->getEntityTypeId(),
+          $entity->id(),
+          $field->getSetting('plugin'),
+          $field->getName()
+        );
+        $cronpub->editChronology($field);
+      } else {
+        /* @var $perm_handler \Drupal\user\PermissionHandler */
+        $perm_handler = \Drupal::service('user.permissions');
+        $all_permissions = $perm_handler->getPermissions();
+        $permission_title = isset($all_permissions[$permission])
+          ? $all_permissions[$permission]['title']
+          : $permission;
+
+        $meassage = new \Drupal\Core\StringTranslation\TranslatableMarkup(
+          "Changes at field %label will be saved but have no effect, because you don't have permission \"%title\".",
+          ['%label' => $field->getFieldDefinition()->label(), '%title' => $permission_title]
+        );
+        drupal_set_message($meassage, 'warning');
+      }
+    }
+  }
+}
+
+
+/**
+ * Implements hook_entity_presave().
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ */
+function cronpub_entity_presave(EntityInterface $entity) {
+  // Check if user has permission to touch cronpub entities in general.
+  if (!\Drupal::currentUser()->hasPermission('edit cronpub task entities')) {
+    $cronpub_fields = _cronpub_get_cronpubfields($entity);
+    foreach ($cronpub_fields as $field) {
+      /* @var $field \Drupal\Core\Field\FieldItemList */
+      $field_name = $field->getName();
+      $orig_field_val = (isset($entity->original) && $entity->original->{$field_name} instanceof FieldItemList)
+        ? $entity->original->{$field_name}->getValue()
+        : [];
+      $entity->set($field_name, $orig_field_val);
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_update().
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ */
+function cronpub_entity_update(EntityInterface $entity) {
+  cronpub_entity_insert($entity);
+}
+
+
+/**
+ * Implements hook_entity_delete().
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ */
+function cronpub_entity_delete(EntityInterface $entity) {
+  CronpubEntity::deleteCronpubEntities($entity->getEntityTypeId(), $entity->id());
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Execute the automated publishing.
+ */
+function cronpub_cron() {
+  $cronpub = \Drupal::service('cronpub.exec');
+  $cronpub->execAllPublishing();
+}
+
+/**
+ * Avoid to set multiple field items for Cronpub date field.
+ *
+ * @param array $form
+ *   Form array.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   Interface used for this form.
+ */
+//function cronpub_form_field_storage_config_edit_form_alter(&$form, FormStateInterface $form_state) {
+//  if ($form_state->getFormObject()->getEntity()->getType() == 'cronpub_field_type') {
+//    // Disable the cardinality option on the field storage settings form for
+//    // metatag fields.
+//    $form['cardinality_container']['#prefix'] = t("Cronpub fields must be singular.");
+//    $form['cardinality_container']['#disabled'] = TRUE;
+//    $form['cardinality_container']['cardinality']['#disabled'] = TRUE;
+//    $form['cardinality_container']['cardinality_number']['#disabled'] = TRUE;
+//    unset($form['cardinality_container']['cardinality_number']['#states']);
+//  }
+//}
