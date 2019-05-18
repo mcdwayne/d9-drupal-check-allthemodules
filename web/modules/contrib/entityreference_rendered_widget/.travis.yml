@@ -1,0 +1,101 @@
+language: php
+
+sudo: false
+
+php:
+  - 5.6
+  - 7.0
+  - 7.1
+
+env:
+  global:
+    - MODULE_NAME="entityreference_rendered_widget"
+    - DRUPAL_REPO="git://drupalcode.org/project/drupal.git"
+    - PHPCS_VERSION="2.7.*"
+    - CODER_VERSION="8.2.9"
+
+  matrix:
+    - DRUPAL_VERSION="8.3.x"
+    - DRUPAL_VERSION="8.4.x"
+    - DRUPAL_VERSION="8.5.x"
+
+cache:
+  bundler: true
+  apt: true
+  directories:
+  - "$HOME/.composer/cache"
+  - "$HOME/.drush/cache"
+
+mysql:
+  database: drupal
+  username: root
+  encoding: utf8
+
+before_install:
+  # Decide if this build is used to push upstream changes to Drupal.org
+  - if [ "$TRAVIS_PHP_VERSION" == "7.1" ] && [ "$DRUPAL_VERSION" == "8.4.x" ] && [ "$TRAVIS_PULL_REQUEST" == "false" ]; then export UPSTREAM="1"; else export UPSTREAM="0"; fi;
+
+  # Disable xdebug when we do not generate coverage files
+  - if [ "$INSPECT" == "0" ]; then phpenv config-rm xdebug.ini; fi;
+
+  # Composer
+  - sed -i '1i export PATH="$HOME/.composer/vendor/bin:$PATH"' $HOME/.bashrc
+  - source $HOME/.bashrc
+  - composer self-update
+
+  # Load global dependencies
+  - composer global require drush/drush:~8.1
+  - composer global require squizlabs/php_codesniffer:$PHPCS_VERSION
+  - composer global require drupal/coder:$CODER_VERSION
+  - ln -s ~/.composer/vendor/drupal/coder/coder_sniffer/Drupal ~/.composer/vendor/squizlabs/php_codesniffer/CodeSniffer/Standards/
+
+  # Ensure the PHP environment is ready
+  - phpenv rehash
+
+install:
+  # Isolate our module into a separate directory
+  - mkdir module
+  - shopt -s extglob dotglob
+  - mv !(module) module
+  - shopt -u dotglob
+  - git clone --branch $DRUPAL_VERSION $DRUPAL_REPO drupal --depth 1
+  # Make sure Drupal can access our module by using a symlink
+  - ln -s $PWD/module drupal/modules/$MODULE_NAME
+  - cd drupal
+  - composer install
+
+before_script:
+  # This fixes a fail when install Drupal.
+  - echo 'sendmail_path = /bin/true' >> ~/.phpenv/versions/$(phpenv version-name)/etc/conf.d/travis.ini
+
+  # Mysql might time out for long tests, increase the wait timeout.
+  - mysql -e 'SET @@GLOBAL.wait_timeout=1200'
+
+  # Install Drupal and enable the required modules (including this one).
+  - mysql -e 'create database drupal;'
+  - cd $TRAVIS_BUILD_DIR/drupal && drush --yes site-install standard --db-url="mysql://root@127.0.0.1/drupal"
+  - cd $TRAVIS_BUILD_DIR/drupal && drush --yes en $MODULE_NAME
+
+  # Export simpletest environment variables
+  - export SIMPLETEST_BASE_URL=http://localhost:8080
+  - export SIMPLETEST_DB=mysql://root:@127.0.0.1/drupal
+
+script:
+  # CodeSniffer
+  - phpcs --report=full --standard=Drupal --warning-severity=0 $TRAVIS_BUILD_DIR/drupal/modules/$MODULE_NAME
+
+after_success:
+  - if [ "$UPSTREAM" == "1" ]; then cd $TRAVIS_BUILD_DIR/module; fi;
+  - if [ "$UPSTREAM" == "1" ]; then eval "$(ssh-agent -s)"; fi;
+  - if [ "$UPSTREAM" == "1" ]; then echo $DRUPAL_ORG_KEY | base64 --decode > drupalorg_key.pem; fi;
+  - if [ "$UPSTREAM" == "1" ]; then chmod 600 drupalorg_key.pem; fi;
+  - if [ "$UPSTREAM" == "1" ]; then ssh-add drupalorg_key.pem; fi;
+  - if [ "$UPSTREAM" == "1" ]; then git fetch --unshallow; fi;
+  - if [ "$UPSTREAM" == "1" ]; then git config --global user.name "guilopes"; fi;
+  - if [ "$UPSTREAM" == "1" ]; then git config --global user.email guiajlopes@gmail.com; fi;
+  - if [ "$UPSTREAM" == "1" ]; then git config --global push.default matching; fi;
+  - if [ "$UPSTREAM" == "1" ]; then git config --global push.followTags true; fi;
+  - if [ "$UPSTREAM" == "1" ]; then echo -e "Host git.drupal.org\n\tStrictHostKeyChecking no\n" >> ~/.ssh/config; fi;
+  - if [ "$UPSTREAM" == "1" ]; then git remote add drupalorg git@git.drupal.org:project/$MODULE_NAME.git; fi;
+  - if [ "$UPSTREAM" == "1" ]; then git push drupalorg $TRAVIS_BRANCH; fi;
+  - if [ "$UPSTREAM" == "1" ]; then eval "$(ssh-agent -k)"; fi;
