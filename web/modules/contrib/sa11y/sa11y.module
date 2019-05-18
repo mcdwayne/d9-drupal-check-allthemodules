@@ -1,0 +1,126 @@
+<?php
+
+/**
+ * @file
+ * Contains sa11y.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_help().
+ */
+function sa11y_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the Sa11y module.
+    case 'help.page.sa11y':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Connects to the Sa11y API for accessibility testing') . '</p>';
+      return $output;
+
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function sa11y_theme($existing, $type, $theme, $path) {
+  return [
+    'sa11y_tip' => [
+      'variables' => [
+        'violation' => NULL,
+        'reportId' => NULL,
+        'icon' => drupal_get_path('module', 'sa11y') . '/icons/exclaim.svg#exclaim',
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_cron().
+ */
+function sa11y_cron() {
+  $update_config = \Drupal::config('sa11y.settings');
+  $frequency = $update_config->get('frequency');
+
+  // Time check.
+  $request_time = \Drupal::time()->getRequestTime();
+  $interval = 60 * 60 * 24 * $frequency;
+  $last_check = \Drupal::state()->get('sa11y.last_check') ?: 0;
+
+  if (($request_time - $last_check) > $interval) {
+    \Drupal::state()->set('sa11y.last_check', $request_time);
+    sa11y_new_report();
+  }
+  else {
+    sa11y_process();
+  }
+}
+
+/**
+ * Creates and runs a report immediately.
+ */
+function sa11y_new_report() {
+  if (!\Drupal::service('sa11y.service')->createReport()) {
+    \Drupal::logger('sa11y')
+      ->warning('Scheduled Sa11y report not created due to existing pending job.');
+  }
+  sa11y_process();
+}
+
+/**
+ * Processes any pending reports.
+ */
+function sa11y_process() {
+  \Drupal::service('sa11y.service')->processPending();
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function sa11y_page_attachments(array &$attachments) {
+  $user = \Drupal::currentUser();
+  if ($user->hasPermission('node sa11y') && \Drupal::request()->attributes->get('_route') == 'entity.node.canonical') {
+    $attachments['#attached']['library'][] = 'sa11y/node';
+
+    /** @var \Drupal\sa11y\Sa11y $sa11y */
+    $sa11y = \Drupal::service('sa11y.service');
+
+    /** @var \Drupal\node\NodeInterface $node */
+    $node = \Drupal::routeMatch()->getParameter('node');
+
+    // Add to site settings.
+    if ($report = $sa11y->getLatestByNode($node)) {
+      $attachments['#attached']['drupalSettings']['sa11y'] = [
+        'nid' => $node->id(),
+        'reportId' => $report->id,
+        'status' => $report->status,
+        'show' => ($report->status == 0 || $report->status == 1),
+      ];
+    }
+  }
+}
+
+/**
+ * Implements hook_mail().
+ *
+ * Constructs the email notification message when reports have completed.
+ *
+ * @see \Drupal\Core\Mail\MailManagerInterface::mail()
+ */
+function sa11y_mail($key, &$message, $params) {
+  $langcode = $message['langcode'];
+  $message['subject'] .= t('New accessibility report for @site_name', [
+    '@site_name' => \Drupal::config('system.site')
+      ->get('name'),
+  ], ['langcode' => $langcode]);
+
+  $report_url = URL::fromRoute('sa11y.report', ['report_id' => $params['report_id']], ['absolute' => TRUE]);
+  $message['body'][] = t('See the available report page for more information @report', ['@report' => $report_url], ['langcode' => $langcode]);
+  $message['body'][] = "\n";
+
+  $settings_url = Url::fromRoute('sa11y.admin_settings', [], ['absolute' => TRUE]);
+  $message['body'][] = t('Your site is currently configured to send these emails when any reports are available. To change these settings, @url.', ['@url' => $settings_url], ['langcode' => $langcode]);
+}
