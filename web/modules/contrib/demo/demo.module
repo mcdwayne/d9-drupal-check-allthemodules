@@ -1,0 +1,984 @@
+<?php
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Url;
+use Drupal\Component\Utility\SafeMarkup;
+use Drupal\Core\Database\Database;
+
+define('DEMO_DUMP_VERSION', '1.1');
+define('VERSION', '8');
+
+/**
+ * Get the file directory information.
+ */
+function demo_get_fileconfig($filename = 'Set default value') {
+  $fileconfig = [];
+
+  // Build dump path.
+  if (!file_stream_wrapper_valid_scheme('private')) {
+    // @todo Temporarily throwing a form error here.
+    // Don't break demo_profile.
+    if (!defined('MAINTENANCE_MODE')) {
+      drupal_set_message(t('The <a href="../../config/media/file-system">private filesystem</a> must be configured in order to create or load snapshots.'
+       ), 'warning');
+    }
+    return FALSE;
+  }
+  $fileconfig['path'] = 'private://' . \Drupal::config('demo.settings')->get('demo_dump_path', 'demo');
+  $fileconfig['dumppath'] = $fileconfig['path'];
+  // Append site name if it is not included in file_directory_path() and if not
+  // storing files in sites/all/files.
+  $fileconfig['site'] = str_replace('sites', '', \Drupal::service('site.path'));
+
+  // Check if directory exists.
+  if (!file_prepare_directory($fileconfig['dumppath'], FILE_CREATE_DIRECTORY)) {
+    return FALSE;
+  }
+
+  // Protect dump files.
+  file_save_htaccess($fileconfig['path'], TRUE);
+
+  // Build SQL filename.
+  $fileconfig['sql'] = $filename . '.sql';
+  $fileconfig['sqlfile'] = $fileconfig['dumppath'] . '/' . $fileconfig['sql'];
+
+  // Build info filename.
+  $fileconfig['info'] = $filename . '.info';
+  $fileconfig['infofile'] = $fileconfig['dumppath'] . '/' . $fileconfig['info'];
+
+  return $fileconfig;
+}
+
+/**
+ * Get all the dumps from the private directory.
+ */
+function demo_get_dumps() {
+  $fileconfig = demo_get_fileconfig();
+
+  // Fetch list of available info files.
+  $files = file_scan_directory($fileconfig['dumppath'], '/\.info$/');
+
+  foreach ($files as $file => $object) {
+    $files[$file]->filemtime = filemtime($file);
+    $files[$file]->filesize = filesize(substr($file, 0, -4) . 'sql');
+  }
+
+  // Sort snapshots by date (ascending file modification time).
+  uasort($files, create_function('$a, $b', 'return ($a->filemtime < $b->filemtime);'));
+
+  $element = [
+    '#type' => 'radios',
+    '#title' => t('Snapshot'),
+    '#required' => TRUE,
+    '#parents' => ['filename'],
+    '#options' => [],
+    '#attributes' => [
+      'class' => ['demo-snapshots-widget'],
+    ],
+    '#attached' => [
+      'library' => [
+        'demo/demo-library',
+      ],
+    ],
+  ];
+
+  foreach ($files as $filename => $file) {
+    $info = demo_get_info($filename);
+
+    // Prepare snapshot title.
+    $title = t('@snapshot <small>(@date, @aize)</small>', [
+      '@snapshot' => $info['filename'],
+      '@date' => format_date($file->filemtime, 'small'),
+      '@aize' => format_size($file->filesize),
+    ]);
+
+    // Prepare snapshot description.
+    $description = '';
+    if (!empty($info['description'])) {
+      $description .= '<p>' . $info['description'] . '</p>';
+    }
+    // Add download links.
+    $download_sql_url = Url::fromRoute('demo.download', $route_parameters = ['filename' => $file->name, 'type' => 'sql']);
+    $download_info_url = Url::fromRoute('demo.download', $route_parameters = ['filename' => $file->name, 'type' => 'info']);
+    $description .= '<p>' . t('Download: ' . \Drupal::l(t('.info file'), $download_info_url) . ', ' . \Drupal::l(t('.sql file'), $download_sql_url)) . '</p>';
+    // Add module list.
+    if (count($info['modules']) > 1) {
+      // Remove required core modules and Demo from module list.
+      $modules = array_diff($info['modules'], ['filter', 'node', 'system', 'user', 'demo']);
+      // Sort module list alphabetically.
+      sort($modules);
+      $description .= t('Modules: @modules', ['@modules' => implode(', ', $modules)]);
+    }
+    // Add the radio option element.
+    $element['#options'][$info['filename']] = $title;
+    $element[$info['filename']] = [
+      '#description' => $description,
+      '#file' => $file,
+      '#info' => $info,
+    ];
+
+  }
+  return $element;
+}
+
+/**
+ * Dump active database.
+ *
+ * @param $filename
+ *   The filename including path to write the dump to.
+ * @param $options
+ *   An associative array of snapshot options, as described in demo_dump().
+ */
+function demo_dump_db($filename, $options = []) {
+  // Make sure we have permission to save our backup file.
+  $directory = dirname($filename);
+  if (!file_prepare_directory($directory, FILE_CREATE_DIRECTORY)) {
+    return FALSE;
+  }
+
+  if ($fp = fopen($filename, 'wb')) {
+    $header = [];
+    $header[] = '-- Demo module database dump';
+    $header[] = '-- Version ' . DEMO_DUMP_VERSION;
+    $header[] = '-- http://drupal.org/project/demo';
+    $header[] = '--';
+    $header[] = '-- Database: ' . _demo_get_database();
+    $header[] = '-- Date: ' . format_date(REQUEST_TIME, 'small');
+    $header[] = '-- Server version: ' . db_query('SELECT version()')->fetchField();
+    $header[] = '-- PHP version: ' . PHP_VERSION;
+    $header[] = '-- Drupal version: ' . VERSION;
+
+    // Avoid auto value for zero values (required for user id 0).
+    $header[] = '';
+    $header[] = 'SET SQL_MODE="NO_AUTO_VALUE_ON_ZERO";';
+    // Temporarily disable foreign key checks for the time of import.
+    $header[] = 'SET FOREIGN_KEY_CHECKS = 0;';
+    $header[] = '';
+
+    // Set collations for the import. PMA and mysqldump use conditional comments
+    // to exclude MySQL <4.1, but D6 requires >=4.1.
+    $header[] = 'SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT;';
+    $header[] = 'SET @OLD_CHARACTER_SET_RESULTS=@@CHARACTER_SET_RESULTS;';
+    $header[] = 'SET @OLD_COLLATION_CONNECTION=@@COLLATION_CONNECTION;';
+    $header[] = 'SET NAMES utf8;';
+    $header[] = '';
+
+    fwrite($fp, implode("\n", $header));
+
+    foreach ($options['tables'] as $table => $dump_options) {
+      if (!_demo_table_is_view($table)) {
+        if ($dump_options['schema']) {
+          _demo_dump_table_schema($fp, $table);
+        }
+        if ($dump_options['data']) {
+          _demo_dump_table_data($fp, $table);
+        }
+      }
+    }
+
+    $footer = [];
+    $footer[] = '';
+    // Re-enable foreign key checks.
+    $footer[] = 'SET FOREIGN_KEY_CHECKS = 1;';
+
+    // Revert collations for potential subsequent database queries not belonging
+    // to this module.
+    // @todo Double-check this behavior according to the results of
+    //   http://drupal.org/node/772678
+    $footer[] = 'SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT;';
+    $footer[] = 'SET CHARACTER_SET_RESULTS=@OLD_CHARACTER_SET_RESULTS;';
+    $footer[] = 'SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION;';
+    $footer[] = '';
+
+    $footer[] = '';
+    fwrite($fp, implode("\n", $footer));
+
+    fclose($fp);
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Returns the name of the active database.
+ */
+function _demo_get_database() {
+  $database = array_keys(db_query('SHOW TABLES')->fetchAssoc());
+  $database = preg_replace('/^Tables_in_/i', '', $database[0]);
+  return $database;
+}
+
+/**
+ * Enumerate database tables.
+ */
+function _demo_enum_tables() {
+  return db_query('SHOW TABLES')->fetchCol();
+}
+
+/**
+ * Dump table schema.
+ *
+ * @param $fp
+ *   The file handle of the output file.
+ * @param $table
+ *   A table name to export the schema for.
+ */
+function _demo_dump_table_schema($fp, $table) {
+  $output = "\n";
+  $output .= "--\n";
+  $output .= "-- Table structure for table '$table'\n";
+  $output .= "--\n\n";
+  $connection = \Drupal::database();
+  $data = $connection->query('SHOW CREATE TABLE ' . $table)->fetchAssoc();
+  $status = $connection->query('SHOW TABLE STATUS LIKE :table', [':table' => $table])->fetchAssoc();
+
+  // Column keys in $status start with a lower-case letter in PDO and with a
+  // upper-case letter otherwise. We convert all to lower-case.
+  foreach ($status as $key => $value) {
+    $key_lower = strtolower($key);
+    if ($key[0] != $key_lower[0]) {
+      $status[$key_lower] = $value;
+      unset($status[$key]);
+    }
+  }
+
+  // Add IF NOT EXISTS to CREATE TABLE, replace double quotes with MySQL quotes.
+  $pattern_regex = ['/^CREATE TABLE/', '/"/'];
+  $replacement_regex = ['CREATE TABLE IF NOT EXISTS', '`'];
+  $text = $data['Create Table'];
+
+  $output .= preg_replace($pattern_regex, $replacement_regex, $text);
+
+  // @todo Rethink the following code. Perhaps try to strip + parse the existing
+  //   table definition (after leading ")" on last line) and merge anything
+  //   missing into it, and re-append it again. There are too many differences
+  //   between MySQL 5.0 and 5.1+, and PHP mysql(i) and pdo_mysql extensions.
+  // PDO is missing the table engine.
+  if (!strpos($output, ' ENGINE=')) {
+    $output .= ' ENGINE=' . $status['engine'];
+  }
+
+  // Always add charset and collation info to table definitions.
+  // SHOW CREATE TABLE does not contain collation information, if the collation
+  // is equal to the default collation of the connection. Since dumps can be
+  // moved across servers, we need to ensure correct collations.
+  // Note that [DEFAULT] CHARSET or [DEFAULT] CHARACTER SET is always contained
+  // on MySQL 5.1, even if it is equal to the default.
+  // This addition assumes that a collation specified for a table is taken over
+  // for the table's columns. The MySQL manual does not state whether this is
+  // the case, but manual tests confirmed that it works that way.
+  // Like Drupal core, we need to enforce UTF8 as character set and
+  // utf8_general_ci as default database collation, if not overridden via
+  // settings.php.
+  // if (!strpos($output, 'COLLATE=')) {
+  //   // Only if the collation contains a underscore, the first string up to the
+  //   // first underscore is the character set.
+  //   // @see PMA_exportDBCreate()
+  //   if (strpos($status['collation'], '_')) {
+  //     $collate = 'COLLATE=' . $status['Collation'];
+  //   }
+  //   // If there is a character set defined already, just append the collation.
+  //   if (strpos($output, 'CHARSET') || strpos($output, 'CHARACTER SET')) {
+  //     // @todo This may also hit column definitions instead of the table
+  //     //   definition only. Should technically also be case-insensitive.
+  //     $output = preg_replace('@((?:DEFAULT )?(?:CHARSET|CHARACTER SET) \w+)@', '$1 ' . $collate, $output);
+  //   }
+  //   else {
+  //     $output .= ' DEFAULT CHARSET=utf8 ' . $collate;
+  //   }
+  // }.
+  // Add the table comment, if any.
+  if (!preg_match('@^\) .*COMMENT.+$@', $output) && !empty($status['comment'])) {
+    // On PHP 5.2.6/Win32 with PDO MySQL 5.0 with InnoDB, the table comment has
+    // a trailing "; InnoDB free: 84992 kB".
+    $status['comment'] = preg_replace(['@; InnoDB free: .+$@', "/\'/"], ['', '`'], $status['comment']);
+    $output .= " COMMENT='" . $status['comment'] . "'";
+  }
+
+  // @todo Depends on whether we dump data and table existence on import.
+  if (!empty($status['auto_increment'])) {
+    $output .= ' AUTO_INCREMENT=' . $status['auto_increment'];
+  }
+  $output .= ";\n";
+  fwrite($fp, $output);
+}
+
+/**
+ * Dump table data.
+ *
+ * This code has largely been stolen from the phpMyAdmin project.
+ *
+ * @param $fp
+ *   The file handle of the output file.
+ * @param $table
+ *   A table name to export the data for.
+ */
+function _demo_dump_table_data($fp, $table) {
+  $output = "\n";
+  $output .= "--\n";
+  $output .= "-- Dumping data for table '$table'\n";
+  $output .= "--\n\n";
+
+  // Dump table data.
+  $result = db_query("SELECT * FROM `$table`", [], ['fetch' => PDO::FETCH_ASSOC]);
+
+  // Get table fields.
+  if ($fields = _demo_get_fields($result)) {
+    // Disable indices to speed up import.
+    $output .= "/*!40000 ALTER TABLE $table DISABLE KEYS */;\n";
+
+    // Escape backslashes, PHP code, special chars.
+    $search = ['\\', "'", "\x00", "\x0a", "\x0d", "\x1a"];
+    $replace = ['\\\\', "''", '\0', '\n', '\r', '\Z'];
+
+    $insert_cmd = "INSERT INTO `$table` VALUES\n";
+    $insert_buffer = '';
+    $current_row = 0;
+    $query_size = 0;
+
+    foreach ($result as $row) {
+      $current_row++;
+      $values = [];
+      $field = 0;
+      foreach ($row as $value) {
+        // NULL.
+        if (!isset($value) || is_null($value)) {
+          $values[] = 'NULL';
+        }
+        // A number
+        // timestamp is numeric on some MySQL 4.1, BLOBs are sometimes numeric.
+        elseif ($fields[$field]->numeric && !$fields[$field]->timestamp && !$fields[$field]->blob) {
+          $values[] = $value;
+        }
+        // A true BLOB
+        // - mysqldump only generates hex data when the --hex-blob
+        //   option is used, for fields having the binary attribute
+        //   no hex is generated
+        // - a TEXT field returns type blob but a real blob
+        //   returns also the 'binary' flag.
+        elseif ($fields[$field]->binary && $fields[$field]->blob) {
+          // Empty blobs need to be different, but '0' is also empty :-(.
+          if (empty($value) && $value != '0') {
+            $values[] = "''";
+          }
+          else {
+            $values[] = '0x' . bin2hex($value);
+          }
+        }
+        // Something else -> treat as a string.
+        else {
+          $values[] = "'" . str_replace($search, $replace, $value) . "'";
+        }
+        $field++;
+      }
+
+      if ($current_row == 1) {
+        $insert_buffer = $insert_cmd . '(' . implode(', ', $values) . ')';
+      }
+      else {
+        $insert_buffer = '(' . implode(', ', $values) . ')';
+
+        // Check if buffer size exceeds 50KB.
+        if ($query_size + strlen($insert_buffer) > 50000) {
+          // Flush to disc and start new buffer.
+          fwrite($fp, $output . ";\n");
+          $output = '';
+          $current_row = 1;
+          $query_size = 0;
+          $insert_buffer = $insert_cmd . $insert_buffer;
+        }
+      }
+      $query_size += strlen($insert_buffer);
+
+      $output .= ($current_row == 1 ? '' : ",\n") . $insert_buffer;
+    }
+
+    if ($current_row > 0) {
+      $output .= ";\n";
+    }
+
+    // Enable indices again.
+    $output .= "/*!40000 ALTER TABLE $table ENABLE KEYS */;\n";
+  }
+
+  fwrite($fp, $output);
+}
+
+/**
+ * Return table fields and their properties.
+ */
+function _demo_get_fields($result) {
+  $fields = [];
+
+  switch (db_driver()) {
+    case 'mysql':
+      $i = 0;
+      while ($meta = $result->getColumnMeta($i)) {
+        settype($meta, 'object');
+        // pdo_mysql does not add a native type for INT fields.
+        if (isset($meta->native_type)) {
+          // Enhance the field definition for mysql-extension compatibilty.
+          $meta->numeric = (strtolower($meta->native_type) == 'short');
+          $meta->blob = (strtolower($meta->native_type) == 'blob');
+          // Add custom properties.
+          $meta->timestamp = (strtolower($meta->native_type) == 'long');
+        }
+        else {
+          $meta->numeric = $meta->blob = $meta->timestamp = FALSE;
+        }
+        $meta->binary = (array_search('not_null', $meta->flags));
+        $fields[] = $meta;
+        $i++;
+      }
+      break;
+  }
+
+  return $fields;
+}
+
+/**
+ * Determine whether the given table is a VIEW.
+ */
+function _demo_table_is_view($table) {
+  static $tables = [];
+  if (!isset($tables[$table])) {
+    $status = db_query('SHOW TABLE STATUS LIKE :table', [':table' => $table])->fetchAssoc();
+    $tables[$table] = (strtoupper(substr($status['Comment'], 0, 4)) == 'VIEW');
+  }
+  return $tables[$table];
+}
+
+/**
+ * Returns a list of tables in the active database.
+ *
+ * Only returns tables whose prefix matches the configured one (or ones, if
+ * there are multiple).
+ */
+function demo_enum_tables() {
+  $tables = [];
+
+  $connection = Database::getConnection();
+  $db_options = $connection->getConnectionOptions();
+
+  // Create a regex that matches the table prefix(es).
+  // We are only interested in non-empty table prefixes.
+  $prefixes = [];
+  if (!empty($db_options['prefix'])) {
+    if (is_array($db_options['prefix'])) {
+      $prefixes = array_filter($db_options['prefix']);
+    }
+    elseif ($db_options['prefix'] != '') {
+      $prefixes['default'] = $db_options['prefix'];
+    }
+    $rx = '/^' . implode('|', $prefixes) . '/';
+  }
+
+  // Query the database engine for the table list.
+  $result = _demo_enum_tables();
+  foreach ($result as $table) {
+    if (!empty($prefixes)) {
+      // Check if table name matches a configured prefix.
+      if (preg_match($rx, $table, $matches)) {
+        $table_prefix = $matches[0];
+        $plain_table = substr($table, strlen($table_prefix));
+        if ((isset($prefixes[$plain_table]) && $prefixes[$plain_table] == $table_prefix) || $prefixes['default'] == $table_prefix) {
+          $tables[$table] = ['schema' => TRUE, 'data' => TRUE];
+        }
+      }
+    }
+    else {
+      $tables[$table] = ['schema' => TRUE, 'data' => TRUE];
+    }
+  }
+
+  // Apply default exclude list.
+  $excludes = [
+    // Drupal core.
+    '{cache}',
+    '{cache_bootstrap}',
+    '{cache_block}',
+    '{cache_content}',
+    '{cache_field}',
+    '{cache_filter}',
+    '{cache_form}',
+    '{cache_menu}',
+    '{cache_page}',
+    '{cache_path}',
+    '{cache_update}',
+    '{watchdog}',
+    // CTools.
+    '{ctools_object_cache}',
+    // Administration menu.
+    '{cache_admin_menu}',
+    // Panels.
+    '{panels_object_cache}',
+    // Views.
+    '{cache_views}',
+    '{cache_views_data}',
+    '{views_object_cache}',
+    '{cache_config}',
+    '{cache_container}',
+    '{cache_data}',
+    '{cache_default}',
+    '{cache_discovery}',
+    '{cache_render}',
+    '{cachetags}',
+    '{cache_entity}',
+  ];
+  foreach (array_map([$connection, 'prefixTables'], $excludes) as $table) {
+    if (isset($tables[$table])) {
+      $tables[$table]['data'] = FALSE;
+    }
+  }
+
+  return $tables;
+}
+
+/**
+ * Create a new snapshot.
+ *
+ * @param $options
+ *   A structured array of snapshot options:
+ *   - filename: The base output filename, without extension.
+ *   - default: Whether to set this dump as new default snapshot.
+ *   - description: A description for the snapshot. If a snapshot with the same
+ *     name already exists and this is left blank, the new snapshot will reuse
+ *     the existing description.
+ *   - tables: An array of tables to dump, keyed by table name (including table
+ *     prefix, if any). The value is an array of dump options:
+ *     - schema: Whether to dump the table schema.
+ *     - data: Whether to dump the table data.
+ */
+function _demo_dump($options) {
+  // Increase PHP's max_execution_time for large dumps.
+  drupal_set_time_limit(600);
+
+  // Generate the info file.
+  $info = demo_set_info($options);
+  if (!$info) {
+    return FALSE;
+  }
+
+  // Allow other modules to alter the dump options.
+  $fileconfig = demo_get_fileconfig($info['filename']);
+  \Drupal::moduleHandler()->alter('demo_dump', $options, $info, $fileconfig);
+
+  // Set default snapshot
+  if ($options['default']) {
+    \Drupal::service('config.factory')->getEditable('demo.settings')->set('demo_dump_cron', $info['filename'])->save();
+  }
+
+  // Perform database dump.
+  if (!demo_dump_db($fileconfig['sqlfile'], $options)) {
+    return FALSE;
+  }
+
+  // Adjust file permissions.
+  drupal_chmod($fileconfig['infofile']);
+  drupal_chmod($fileconfig['sqlfile']);
+
+  // Allow other modules to act on successful dumps.
+  Drupal::moduleHandler()->invokeAll('demo_dump', [$options, $info, $fileconfig]);
+
+  return $fileconfig;
+}
+
+/**
+ *
+ */
+function demo_set_info($values = NULL) {
+  if (isset($values['filename']) && is_array($values)) {
+    // Check for valid filename.
+    if (!preg_match('/^[-_\.a-zA-Z0-9]+$/', $values['filename'])) {
+      drupal_set_message(t('Invalid filename. It must only contain alphanumeric characters, dots, dashes and underscores. Other characters, including spaces, are not allowed.'), 'error');
+      return FALSE;
+    }
+
+    if (!empty($values['description'])) {
+      // parse_ini_file() doesn't allow certain characters in description.
+      $s = ["\r\n", "\r", "\n", '"'];
+      $r = [' ', ' ', ' ', "'"];
+      $values['description'] = str_replace($s, $r, $values['description']);
+    }
+    else {
+      // If new description is empty, try to use previous description.
+      $old_file = demo_get_fileconfig($values['filename']);
+      $old_description = demo_get_info($old_file['infofile'], 'description');
+      if (!empty($old_description)) {
+        $values['description'] = $old_description;
+      }
+    }
+
+    // Set values.
+    $infos = [];
+    $infos['filename'] = $values['filename'];
+    $infos['description'] = '"' . $values['description'] . '"';
+    $infos['modules'] = implode(' ', getModuleNames());
+    $infos['version'] = DEMO_DUMP_VERSION;
+
+    // Write information to .info file.
+    $fileconfig = demo_get_fileconfig($values['filename']);
+    $infofile = fopen($fileconfig['infofile'], 'w');
+    foreach ($infos as $key => $info) {
+      fwrite($infofile, $key . ' = ' . $info . "\n");
+    }
+    fclose($infofile);
+
+    return $infos;
+  }
+}
+
+/**
+ * To get module directories.
+ */
+function getModuleNames() {
+  $dirs = [];
+  foreach (\Drupal::moduleHandler()->getModuleList() as $module => $filename) {
+    $dirs[$module] = $filename->getExtensionFilename();
+  }
+  return $dirs;
+}
+
+/**
+ *
+ */
+function demo_get_info($filename, $field = NULL) {
+  $info = [];
+
+  if (file_exists($filename)) {
+    $info = parse_ini_file($filename);
+    if (isset($info['modules'])) {
+      $info['modules'] = explode(" ", $info['modules']);
+    }
+    else {
+      $info['modules'] = NULL;
+    }
+
+    if (!isset($info['version'])) {
+      $info['version'] = '1.0';
+    }
+  }
+
+  if (isset($field)) {
+    return isset($info[$field]) ? $info[$field] : NULL;
+  }
+  else {
+    return $info;
+  }
+}
+
+/**
+ * Delete button submit handler for demo_manage_form().
+ */
+function demo_manage_delete_submit($form, &$form_state) {
+  $filename = $form_state->getValue(['filename']);
+  $url = Url::fromRoute('demo.delete_confirm', $route_parameters = ['filename' => $filename]);
+  $form_state->setRedirectUrl($url);
+  return;
+}
+
+/**
+ * Delete button submit handler for demo_manage_form().
+ */
+function demo_config_delete_submit($form, &$form_state) {
+  $filename = $form_state->getValue(['filename']);
+  $filename = substr($filename, 15);
+  $url = Url::fromRoute('demo.delete_config_confirm_sub', $route_parameters = ['filename' => $filename]);
+
+  $form_state->setRedirectUrl($url);
+  return;
+}
+
+/**
+ * Reset site using snapshot.
+ *
+ * @param $filename
+ *   Base snapshot filename, without extension.
+ * @param $verbose
+ *   Whether to output status messages.
+ */
+function _demo_reset($filename, $verbose = TRUE) {
+  // Increase PHP's max_execution_time for large dumps.
+  drupal_set_time_limit(600);
+
+  $fileconfig = demo_get_fileconfig($filename);
+  if (!file_exists($fileconfig['sqlfile']) || !($fp = fopen($fileconfig['sqlfile'], 'r'))) {
+    if ($verbose) {
+      drupal_set_message(t('Unable to read file %filename.', [
+        '%filename' => $fileconfig['sqlfile'],
+      ]), 'error');
+    }
+
+    \Drupal::logger('demo')->error('Unable to read file %filename.', ['%filename' => $fileconfig['sqlfile']]);
+    return FALSE;
+  }
+
+  // Load any database information in front of reset.
+  $info = demo_get_info($fileconfig['infofile']);
+  Drupal::moduleHandler()->invokeAll('demo_reset_before', [$filename, $info, $fileconfig]);
+
+  // Retain special variables, so the (demonstration) site keeps operating after
+  // the reset. Specify NULL instead of default values, so unconfigured
+  // variables are not retained, resp., deleted after the reset.
+  $variables = [
+    // Without the snapshot path, subsequent resets will not work.
+    'demo_dump_path' => \Drupal::config('demo.settings')->get('demo_dump_path', NULL),
+  ];
+
+  // Temporarily disable foreign key checks for the time of import and before
+  // dropping existing tables. Foreign key checks should already be re-enabled
+  // as one of the last operations in the SQL dump file.
+  // @see demo_dump_db()
+  db_query("SET FOREIGN_KEY_CHECKS = 0;");
+
+  // Drop tables.
+  $is_version_1_0_dump = version_compare($info['version'], '1.1', '<');
+  $watchdog = Database::getConnection()->prefixTables('{watchdog}');
+  foreach (demo_enum_tables() as $table => $dump_options) {
+    // Skip watchdog, except for legacy dumps that included the watchdog table.
+    if ($table != $watchdog || $is_version_1_0_dump) {
+      db_query("DROP TABLE $table");
+    }
+  }
+
+  // Load data from snapshot.
+  $success = TRUE;
+  $query = '';
+  while (!feof($fp)) {
+    $line = fgets($fp, 16384);
+    if ($line && $line != "\n" && strncmp($line, '--', 2) && strncmp($line, '#', 1)) {
+      $query .= $line;
+      if (substr($line, -2) == ";\n") {
+        $options = [
+          'target' => 'default',
+          'return' => Database::RETURN_NULL,
+          // 'throw_exception' => FALSE,.
+        ];
+        $stmt = Database::getConnection($options['target'])->prepare($query);
+        if (!$stmt->execute([], $options)) {
+          if ($verbose) {
+            // Don't use t() here, as the locale_* tables might not (yet) exist.
+            drupal_set_message(strtr('Query failed: %query', ['%query' => $query]), 'error');
+          }
+          $success = FALSE;
+        }
+        $query = '';
+      }
+    }
+  }
+  fclose($fp);
+  // Retain variables.
+  // @todo check default value of private dump path.
+  foreach ($variables as $key => $value) {
+    if (isset($value)) {
+      \Drupal::service('config.factory')->getEditable('demo.settings')->set($key, $value)->save();
+    }
+    else {
+      \Drupal::config('demo.settings')->delete($key);
+    }
+  }
+
+  if ($success) {
+    if ($verbose) {
+      drupal_set_message(t('Restored site from %filename.', ['%filename' => $fileconfig['sqlfile']]));
+    }
+    \Drupal::logger('demo')->notice('Restored site from %filename.', ['%filename' => $fileconfig['sqlfile']]);
+
+    // Allow other modules to act on successful resets.
+    Drupal::moduleHandler()->invokeAll('demo_reset', [$filename, $info, $fileconfig]);
+
+    // Save request time of last reset, but not during re-installation via
+    // demo_profile.
+    if (!defined('MAINTENANCE_MODE') || MAINTENANCE_MODE !== 'install') {
+      \Drupal::service('config.factory')->getEditable('demo.settings')->set('demo_reset_last', REQUEST_TIME)->save();
+      $demo_dump_cron = \Drupal::config('demo.settings')->get('demo_dump_cron', 'Set default value');
+      \Drupal::service('config.factory')->getEditable('demo.settings')->set('demo_dump_cron', $demo_dump_cron)->save();
+    }
+  }
+  else {
+    if ($verbose) {
+      drupal_set_message(t('Failed to restore site from %filename.', ['%filename' => $fileconfig['sqlfile']]), 'error');
+    }
+    \Drupal::logger('demo')->error('Unable to read file %filename.', ['%filename' => $fileconfig['sqlfile']]);
+
+    // Save request time of last reset, but not during re-installation via
+    // demo_profile.
+    if (!defined('MAINTENANCE_MODE') || MAINTENANCE_MODE !== 'install') {
+
+      $request_time = \Drupal::request()->server->getRequestTime();
+      \Drupal::service('config.factory')->getEditable('demo.settings')->set('demo_reset_last', REQUEST_TIME)->save();
+      $demo_dump_cron = \Drupal::config('demo.settings')->get('demo_dump_cron', 'Set default value');
+      \Drupal::service('config.factory')->getEditable('demo.settings')->set('demo_dump_cron', $demo_dump_cron)->save();
+    }
+
+    return $success;
+  }
+}
+
+/**
+ * Implementation of hook_cron().
+ */
+function demo_cron() {
+  if ($interval = \Drupal::config('demo.settings')->get('demo_reset_interval', 0)) {
+    // See if it's time for a reset.
+    $request_time = \Drupal::time()->getRequestTime();
+    if ((REQUEST_TIME - $interval) >= \Drupal::config('demo.settings')->get('demo_reset_last', 0)) {
+      _demo_reset(\Drupal::config('demo.settings')->get('demo_dump_cron', 'Set default value'), FALSE);
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORMID_alter().
+ */
+function demo_form_alter(&$form, &$form_state, $form_id) {
+  if ($form_id == 'demo_manage_form') {
+
+    $form['status']['demo_reset_default'] = [
+      '#type' => 'item',
+      '#title' => t('Default snapshot'),
+      '#markup' => SafeMarkup::checkPlain(\Drupal::config('demo.settings')->get('demo_dump_cron', t('- None -'))),
+    ];
+
+    $demo_dump_cron = \Drupal::config('demo.settings')->get('demo_dump_cron', 'Set default value');
+    foreach ($form['dump'] as $name => $option) {
+      if ($name == $demo_dump_cron) {
+        $form['dump'][$name]['#value'] = $name;
+        break;
+      }
+    }
+    $form['actions']['cron'] = [
+      '#type' => 'submit',
+      '#value' => t('Use for cron runs'),
+      '#submit' => ['demo_reset_demo_manage_form_submit'],
+    ];
+  }
+
+  elseif ($form_id == 'demo_dump_form') {
+    $form['dump']['default'] = [
+      '#title' => t('Use as default snapshot for cron runs'),
+      '#type' => 'checkbox',
+    ];
+  }
+}
+
+/**
+ * Form submit handler for demo_manage_form().
+ */
+function demo_reset_demo_manage_form_submit($form, &$form_state) {
+  demo_reset_set_default($form_state->getValue(['filename']));
+}
+
+/**
+ * Sets a specific snapshot as default for cron runs or the site reset block.
+ *
+ * @param $filename
+ *   The filename of the snapshot.
+ */
+function demo_reset_set_default($filename) {
+  \Drupal::service('config.factory')->getEditable('demo.settings')->set('demo_dump_cron', $filename)->save();
+
+  drupal_set_message(t('Snapshot %title will be used for cron runs.', ['%title' => $filename]));
+}
+
+/**
+ * Build options for cron interval.
+ *
+ * @param $intervals
+ *   The filename of the snapshot.
+ */
+function build_options(array $intervals, $granularity = 2, $langcode = NULL) {
+  $callback = function ($value) use ($granularity, $langcode) {
+    return \Drupal::service('date.formatter')->formatInterval($value, $granularity, $langcode);
+  };
+
+  return array_combine($intervals, array_map($callback, $intervals));
+}
+
+/**
+ * Implements hook_file_download().
+ */
+function demo_file_download($uri) {
+  $scheme = file_uri_scheme($uri);
+  $target = file_uri_target($uri);
+  if ($scheme == 'private') {
+    if (\Drupal::currentUser()->hasPermission('export configuration')) {
+      $request = \Drupal::request();
+      $date = DateTime::createFromFormat('U', $request->server->get('REQUEST_TIME'));
+      $date_string = $date->format('Y-m-d-H-i');
+      $hostname = str_replace('.', '-', $request->getHttpHost());
+      $filename = 'config' . '-' . $hostname . '-' . $date_string . '.tar.gz';
+      $disposition = 'attachment; filename="' . $filename . '"';
+
+      return [
+        'Content-disposition' => $disposition,
+      ];
+    }
+    return -1;
+  }
+}
+
+/**
+ *
+ */
+function demo_get_config_dumps() {
+  $fileconfig = demo_get_fileconfig();
+
+  // Fetch list of available info files.
+  $files = file_scan_directory($fileconfig['dumppath'], '/\.tar.gz$/');
+  foreach ($files as $file => $object) {
+    $files[$file]->filemtime = filemtime($file);
+    $files[$file]->filesize = filesize(substr($file, 0, -7) . '.tar.gz');
+  }
+  // Sort snapshots by date (ascending file modification time).
+  uasort($files, create_function('$a, $b', 'return ($a->filemtime < $b->filemtime);'));
+
+  $element = [
+    '#type' => 'radios',
+    '#title' => t('Snapshot'),
+    '#required' => TRUE,
+    '#parents' => ['filename'],
+    '#options' => [],
+    '#attributes' => [
+      'class' => ['demo-snapshots-widget'],
+    ],
+    '#attached' => [
+      'library' => [
+        'demo/demo-library',
+      ],
+    ],
+  ];
+
+  foreach ($files as $filename => $file) {
+
+    // Prepare snapshot title.
+    $title = t('@snapshot <small>(@date, @aize)</small>', [
+      '@snapshot' => substr($filename, 15),
+      '@date' => format_date($file->filemtime, 'small'),
+      '@aize' => format_size($file->filesize),
+    ]);
+    // Add the radio option element.
+    $element['#options'][$filename] = $title;
+    $element[$filename] = [
+      '#file' => $file,
+    ];
+  }
+  return $element;
+}
+
+/**
+ * Implements hook_help().
+ */
+function demo_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.demo':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('demonstration site module help to create snapshots of your drupal site. This will save the current version of your site and you can restore to this version later. ') . '</p>';
+      $output .= '<h3>' . t('Two Options of taking snapshots :-') . '</h3>';
+      $output .= '<p>' . t('<b>(1) Database Snapshots</b> Takes the snapshot of the whole database.All files will get stored in the private directory. On resetting, All the configuration settings and nodes will get restore.') . '</p>';
+      $output .= '<p>' . t('<b>(2) Configuration Snapshots</b> Takes the snapshot only of the configuration settings of your drupal site. All files will get stored in the private directory.On resetting the drupal site, this will only configuration setting will be restored. Nodes will remain as it is.') . '</p>';
+      return $output;
+  }
+}
