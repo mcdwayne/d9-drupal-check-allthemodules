@@ -1,0 +1,328 @@
+<?php
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Config\ImmutableConfig;
+use Drupal\node\Entity\NodeType;
+use Drupal\Component\Utility\SafeMarkup;
+use Drupal\views\Plugin\views\field;
+
+/**
+ * Implements hook_help
+ */
+function field_concat_display_help($route_name, RouteMatchInterface $route_match) {
+  switch($route_name) {
+    case 'help.page.field_concat_display':
+      return check_markup(file_get_contents(dirname(__FILE__) . "/README.txt"));
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function field_concat_display_theme() {
+  return array(
+    'field_concat_display_pseudo_field' => array(
+      'render element' => 'elements',
+    ),
+  );
+}
+
+/**
+ * Implements hook_entity_view
+ */
+function field_concat_display_entity_view(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display, $view_mode) {
+
+  $entity_type = $entity->bundle();
+  $type = $entity->getEntityTypeId();
+
+  if (isset($entity_type)) {
+    $settings = \Drupal::state()->get("field_concat_display_settings_{$entity_type}") ?: array();
+
+    if (!empty($settings)) {
+      field_concat_display_entity_view_entity($build, $entity, $type, $settings);
+    }
+  }
+
+}
+
+
+/**
+ * Theme callback function.
+ */
+function template_preprocess_field_concat_display_pseudo_field(&$variables) {
+
+  $classes = array('clearfix', 'field');
+
+  if (isset($variables['elements']['#field_name'])) {
+    $classes[] = 'field-name-' . strtr($variables['elements']['#field_name'], '_', '-');
+  }
+
+  if (isset($variables['elements']['#label_display'])) {
+    $classes[] = 'field-label-' . $variables['elements']['#label_display'];
+  }
+
+  $variables['attributes']['class'] = $classes;
+
+  // $output = '<div class="' . implode(' ', $classes) . '">';
+
+  $output .= '</div>';
+
+  $variables['content'] = $variables['elements']['#markup'];
+  $variables['title'] = $variables['elements']['#field_name'];
+  $variables['field_name'] = $variables['elements']['#field_name'];
+  $variables['label'] = str_replace('_', ' ', $variables['elements']['#label']->__toString());
+  $variables['label_display'] = $variables['elements']['#label_display'];
+
+}
+
+
+
+
+function field_concat_display_entity_view_entity(&$build, &$entity, $render_type, $settings) {
+
+  if(!empty($settings)) {
+
+    // Create a pseudo field for each set of concatenated fields.
+    foreach ($settings as $pseudo => $data) {
+      $build[$pseudo] = array(
+        '#type' => 'item',
+        '#field_name' => $pseudo,
+        '#label' => SafeMarkup::checkPlain($pseudo),
+        '#label_display' => 'inline',
+        '#theme_wrappers' => array('field_concat_display_pseudo_field'),
+      );
+
+      $markup = '';
+
+      foreach ($data as $field_name => $field_data) {
+        // Skip the remove and update elements.
+        if ($field_name == 'remove' || $field_name == 'update') {
+          continue;
+        }
+        // We need to display each field properly, so it must be handled
+        // appropriately before being concatenated.
+        $field_display = _field_concat_display_process_selected_field($render_type, $entity, $field_name, $field_data['prefix'], $field_data['suffix']);
+        $weight = SafeMarkup::checkPlain($field_data['weight']);
+        $weight = $weight->__toString();
+
+        $strip_markup = strip_tags($field_display);
+        if(!empty($strip_markup)) {
+          $markup[$weight] = check_markup($field_display, 'full_html');
+        }
+      }
+
+      // Sort by weight so the sorting would make sense to a human.
+      uksort($markup, 'strnatcasecmp');
+
+      $build[$pseudo]['#markup'] = implode($markup);
+    }
+
+  }
+
+}
+
+
+/**
+ * Helper function.
+ *
+ * This is where we strip all unnecessary data/tags from the field that is being
+ * concatenated.
+ *
+ * @param string $entity_type
+ *   A string represeting the type of entity... node, user, comment, etc.
+ * @param object $entity
+ *   An object representing the entity who's fields we want to concat.
+ * @param string $field
+ *   A string representing the name of the field(s) we want to operate one.
+ *
+ * @return string $display
+ *   A string representing the field
+ */
+function _field_concat_display_process_selected_field($entity_type, $entity, $field, $prefix, $suffix) {
+
+  $tags_mode = $entity->{$field}->view(array('label' => 'hidden'));
+  $tags_mode['#prefix'] = '<span>'.$prefix;
+  $tags_mode['#suffix'] = $suffix.'</span>';
+  $display = render($tags_mode);
+  return $display;
+}
+
+/**
+ * Implementation of custom validate.
+ */
+function field_concat_display_new_field_validate($form, &$form_state) {
+
+  $form_state_values = $form_state->getValues();
+
+  // Make sure the field name is not empty.
+  if (empty($form_state_values['field_concat_display_field_name'])) {
+    $form_state->setErrorByName('field_concat_display_field_name', t('New fields must have a name!'));
+  }
+
+  // Make sure the field name contains only alphanumerics and underscores.
+  if (!preg_match('/^[a-z\s]*$/i', $form_state_values['field_concat_display_field_name'])) {
+    $form_state->setErrorByName('field_concat_display_field_name', t('Field name must contain only alphanumeric characters and underscores.'));
+  }
+
+  // Make sure at least 2 fields are selected to be concatenated.
+  $counter = 0;
+  foreach ($form_state_values['field_concat_display_select_fields'] as $val) {
+    if ($val !== 0) {
+      $counter++;
+    }
+  }
+  if ($counter < 2) {
+    $form_state->setErrorByName('field_concat_display_select_fields', t('Please select at least 2 fields to concatenate!'));
+  }
+}
+
+/**
+ * Submit function for removing existing fields via the admin form.
+ */
+function field_concat_display_remove_field($form, &$form_state) {
+  $this_node_type = $form['#node_type'];
+  $settings = \Drupal::state()->get("field_concat_display_settings_{$this_node_type}") ?: array();
+
+  $triggering_element = $form_state->getTriggeringElement();
+  $field = $triggering_element['#array_parents'][0];
+
+  unset($settings[$field]);
+
+  \Drupal::state()->set("field_concat_display_settings_{$this_node_type}", $settings);
+
+  $removed_field_name = str_replace("_", " ", $field);
+  drupal_set_message(t("Field $removed_field_name has been removed!"));
+}
+
+/**
+ * Validater for updating existing fields.
+ *
+ * @see field_concat_display_update_field()
+ */
+function field_concat_display_update_field_validate($form, &$form_state) {
+
+  $triggering_element = $form_state->getTriggeringElement();
+  $form_state_values = $form_state->getValues();
+  $which_table = 'prefix_suffix_table_' . $triggering_element['#array_parents'][0];
+
+  // Prevent duplicate weights so the data doesn't get overwritten.
+  $weights = array();
+  foreach ($form_state_values[$which_table] as $key => $el) {
+    if ($key != 'remove' && $key != 'update') {
+      $weights[$key] = $el["weight_{$key}"];
+    }
+  }
+  $counted_weights = array_count_values($weights);
+
+  $weight_error = FALSE;
+  foreach ($counted_weights as $key => $cw) {
+    if ($cw > 1) {
+      foreach ($form_state_values[$which_table] as $name => $data) {
+        if ($name != 'remove' && $name != 'update') {
+          if ($data["weight_{$name}"] == $key) {
+            $weight_error = TRUE;
+            $form_state->setErrorByName("$which_table][$name][weight_{$name}", '');
+          }
+        }
+      }
+    }
+  }
+  if ($weight_error) {
+    drupal_set_message(t('Weights must be unique, positive integers.'),
+    'error');
+  }
+
+  foreach ($form_state_values[$which_table] as $key => $el) {
+    if ($key != 'remove' && $key != 'update') {
+      if (!is_numeric($el["weight_{$key}"])) {
+        $form_state->setErrorByName("$which_table][$key][weight_{$key}", t('Weight must be a positive integer.'));
+      }
+
+      if ($el["weight_$key"] < 0) {
+        $form_state->setErrorByName("$which_table][$key][weight_{$key}", t('Weight must be zero or greater.'));
+      }
+    }
+  }
+}
+
+/**
+ * Submit function for updating a field.
+ *
+ * @see field_concat_display_update_field_validate()
+ */
+function field_concat_display_update_field($form, &$form_state) {
+
+  $this_node_type = $form['#node_type'];
+  $settings = \Drupal::state()->get("field_concat_display_settings_{$this_node_type}") ?: array();
+  $triggering_element = $form_state->getTriggeringElement();
+
+  $trigger = $triggering_element['#name'];
+  $trigger = preg_replace('/update_/', '', $trigger);
+  $which_table = 'prefix_suffix_table_' . $triggering_element['#array_parents'][0];
+
+  // $new_values = $form_state['values'];
+  $new_values = $form_state->getValues();
+
+  unset($new_values[$which_table]['remove']);
+  unset($new_values[$which_table]['update']);
+
+  foreach ($new_values[$which_table] as $field_name => $field) {
+    foreach ($field as $el => $val) {
+      $parts = explode('_', $el);
+      $settings[$trigger][$field_name][$parts[0]] = $val;
+    }
+  }
+
+  $updated_field = str_replace('_', ' ', $trigger);
+
+  \Drupal::state()->set("field_concat_display_settings_{$this_node_type}", $settings);
+
+  drupal_set_message(t("Field $updated_field has been updated!"));
+}
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function field_concat_display_entity_extra_field_info() {
+
+  $concat_list = \Drupal::state()->get("field_concat_display_var_names") ?: array();
+
+  if (!empty($concat_list)) {
+    foreach ($concat_list as $node_type) {
+
+      $settings = \Drupal::state()->get("field_concat_display_settings_{$node_type}") ?: array();
+
+      if (!is_null($settings)) {
+
+        foreach ($settings as $pseudo => $data) {
+          $concatenated_fields = '';
+          foreach ($data as $sub_field => $el) {
+            $concatenated_fields .= ' ' . $sub_field;
+          }
+          $concatenated_fields = trim($concatenated_fields);
+          $concatenated_fields = preg_replace('/ /', ' & ', $concatenated_fields);
+
+          $extra['node'][$node_type]['form'][$pseudo] = array(
+            'label' => SafeMarkup::checkPlain($pseudo),
+            'description' => SafeMarkup::checkPlain($concatenated_fields),
+            'weight' => 0,
+            'visible' => TRUE,
+            //'delete' => l(t('delete'), "delete_pseudo_field/{$node_type}/{$pseudo}"),
+          );
+          $extra['node'][$node_type]['display'][$pseudo] = array(
+            'label' => SafeMarkup::checkPlain($pseudo),
+            'description' => SafeMarkup::checkPlain($concatenated_fields),
+            'weight' => 0,
+            'visible' => TRUE,
+          );
+        }
+      }
+    }
+    if (!empty($extra)) {
+      return $extra;
+    }
+  }
+
+}
