@@ -1,0 +1,182 @@
+<?php
+
+/**
+ * @file
+ * Contains media_attribution.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Url;
+use Drupal\Core\Render\Markup;
+use Drupal\Core\Entity\Entity\EntityFormDisplay;
+use Drupal\Core\Entity\Entity\EntityViewDisplay;
+use Drupal\taxonomy\Entity\Term;
+use Drupal\file\Entity\File;
+use Drupal\Component\Serialization\Yaml;
+
+/**
+ * Implements hook_help().
+ */
+function media_attribution_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the media_attribution module.
+    case 'help.page.media_attribution':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Attach an attribution and license info to embedded media') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_modules_installed().
+ *
+ * Add attribution form to media embed forms and view displays.
+ */
+function media_attribution_modules_installed($modules) {
+
+  foreach (['default', 'media_browser'] as $form_variant) {
+    $form_entity = EntityFormDisplay::load("media.image.$form_variant");
+    if (!empty($form_entity)) {
+      $form_entity->setComponent('field_image_attribution',
+        [
+          'region' => 'content',
+          'settings' => [
+            'title' => 'Paragraph',
+            'title_plural' => 'Paragraphs',
+            'edit_mode' => 'open',
+            'closed_mode' => 'summary',
+            'autocollapse' => 'none',
+            'closed_mode_threshold' => 0,
+            'add_mode' => 'dropdown',
+            'form_display_mode' => 'default',
+            'default_paragraph_type' => '',
+            'features' => [
+              'duplicate' => 'duplicate',
+              'collapse_edit_all' => 'collapse_edit_all',
+            ]
+          ],
+          'type' => 'paragraphs',
+        ])
+        ->save();
+    }
+  }
+  foreach (['default', 'embedded'] as $entity_view_variant) {
+    $view_entity = EntityViewDisplay::load("media.image.$entity_view_variant");
+    if (!empty($view_entity)) {
+      $view_entity->setComponent('field_image_attribution', [
+        'type' => 'entity_reference_revisions_entity_view',
+        'label' => 'hidden',
+        'settings' => ['view_mode' => 'default', 'link' => ''],
+      ])->save();
+    }
+  }
+  // Load default license terms from the module config.
+  media_attribution_load_default_licenses();
+}
+
+/**
+ * Implementation of hook_preprocess_entity_embed_container().
+ *
+ * @param $variables
+ */
+function media_attribution_preprocess_entity_embed_container(&$variables) {
+
+  if ($variables['element']['#entity']->hasField('field_image_attribution')
+      && $attributions = $variables['element']['#entity']->get('field_image_attribution')
+      ->referencedEntities()) {
+    $attribution = $attributions[0];
+    $author = $attribution->get('field_attribution_author')->getValue()[0];
+
+    $source = $attribution->get('field_attribution_source')->getValue()[0];
+    $license = $attribution->get('field_license')->entity;
+    $license_link = !empty($license) ? $license->get('field_license_link')->getValue()[0] : FALSE;
+    $attribution_note = $attribution->get('field_attribution_note')->getValue()[0];
+    $attribution_text = [];
+    if (!empty($source['uri'])) {
+      $attribution_text['source'] = [
+        '#type' => 'link',
+        '#title' => $source['title'],
+        '#prefix' => "<br>&ldquo;<cite>",
+        '#suffix' => "</cite>&rdquo;",
+        '#url' => Url::fromUri($source['uri']),
+      ];
+    }
+  }
+  if (!empty($author)) {
+    $attribution_text['author'] = [
+      '#type' => 'link',
+      '#title' => $author['title'],
+      '#prefix' => ' ' . t('by') . ' ',
+      '#url' => Url::fromUri($author['uri']),
+      '#suffix' => '. ',
+    ];
+  }
+  if (!empty($license_link)) {
+    $attribution_text['license'] = [
+      '#type' => 'link',
+      '#title' => $license_link['title'],
+      '#prefix' => ' ' . t('Licensec under') . ' ',
+      '#url' => Url::fromUri($license_link['uri']),
+      '#suffix' => '.',
+
+    ];
+  }
+  if (!empty($attribution_note)) {
+    $attribution_text['note'] = [
+      '#type' => 'markup',
+      '#markup' => $attribution_note['value'],
+      '#prefix' => ' ',
+    ];
+  }
+  $variables['children'] = [
+    'first' => [
+      '#type' => 'markup',
+      '#markup' => render($variables['children'])
+    ],
+    $attribution_text
+  ];
+}
+
+/**
+ * Read the list of pre-defined Creative Commons media_attribution_licenses and create corresponding taxonomy terms.
+ */
+function media_attribution_load_default_licenses() {
+  $file_path = drupal_get_path('module', 'media_attribution') . '/media_attribution.default.licenses.yml';
+  $file_contents = file_get_contents($file_path);
+  $license_data = Yaml::decode($file_contents);
+
+  foreach ($license_data as $license_item) {
+    media_attribution_create_license_term($license_item['title'],$license_item['short_label'], $license_item['icon_file'], $license_item['url']);
+  }
+}
+
+function media_attribution_create_license_term($term_title, $term_short_label, $icon_filename, $license_url) {
+  $icon_file_uri = drupal_get_path('module', 'media_attribution') . "/images/$icon_filename";
+
+  // Just in case the file has already been created.
+  $icon_files = \Drupal::entityTypeManager()
+    ->getStorage('file')
+    ->loadByProperties(['uri' => $icon_file_uri]);
+  $icon_file = reset($icon_files);
+  // if not create a file
+  if (!$icon_file) {
+    $icon_file = File::create([
+      'uri' => $icon_file_uri,
+    ]);
+    $icon_file->save();
+  }
+
+  $tid = Term::create([
+    'name' =>  $term_title,
+    'vid' => 'media_attribution_licenses',
+    'field_license_link' =>  ['title' => $term_short_label, 'uri' => $license_url],
+    'field_license_icon' => [
+      'target_id' => $icon_file->id(),
+      'alt' => $term_title,
+      'title' => $term_title,
+    ]
+  ])->save();
+}
