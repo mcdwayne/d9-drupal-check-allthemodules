@@ -1,0 +1,1 @@
+Dynamic date display
