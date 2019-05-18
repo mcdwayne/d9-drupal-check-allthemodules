@@ -1,0 +1,189 @@
+<?php
+
+/**
+ * @file
+ *  Path alias handling for multiple micro sites.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\pathauto\PathautoFieldItemList;
+use Drupal\pathauto\PathautoPatternInterface;
+use Drupal\micro_site\Entity\SiteInterface;
+use Drupal\micro_site\Entity\Site;
+
+/**
+ * Implements hook_form_alter().
+ */
+function micro_path_form_alter(&$form, &$form_state, $form_id) {
+  // We really only want to alter entity forms with the path widget on it since
+  // we're editing path aliases.
+  if (isset($form['path']['widget']) && ($object = $form_state->getFormObject())
+    && !empty($object) && is_callable([$object, 'getEntity'])
+    && ($entity = $object->getEntity())) {
+    $micro_path_helper = \Drupal::service('micro_path.helper');
+    if ($micro_path_helper->microPathsIsEnabled($entity)) {
+      $micro_path_helper->alterEntityForm($form, $form_state, $entity);
+    }
+  }
+}
+
+/**
+ * Implements hook_field_widget_form_alter().
+ */
+function micro_path_field_widget_form_alter(&$element, FormStateInterface $form_state, $context) {
+  /** @var \Drupal\Core\Field\FieldItemListInterface $items */
+  $items = $context['items'];
+  if ($items->getName() == 'path' && $items instanceof PathautoFieldItemList) {
+    $entity = $items->getEntity();
+    $micro_path_helper = \Drupal::service('micro_path.helper');
+    if ($micro_path_helper->microPathsIsEnabled($entity)) {
+      $micro_path_helper->alterWidgetElement($element, $form_state, $context, $entity);
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function micro_path_entity_delete(EntityInterface $entity) {
+  \Drupal::service('micro_path.helper')->deleteEntityMicroPaths($entity);
+}
+
+/**
+ * Implements hook_entity_translation_delete().
+ */
+function micro_path_entity_translation_delete(EntityInterface $translation) {
+  \Drupal::service('micro_path.helper')->deleteEntityMicroPaths($translation);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * @see \Drupal\pathauto\Form\PatternEditForm
+ */
+function micro_path_form_pathauto_pattern_form_alter(&$form, FormStateInterface $form_state) {
+  /** @var \Drupal\pathauto\Entity\PathautoPattern $entity */
+  $entity = $form_state->getFormObject()->getEntity();
+
+  if ($entity->get('type') == 'canonical_entities:node') {
+    // Search the Pathauto pattern for the site_type condition.
+    foreach ($entity->getSelectionConditions() as $candidate) {
+      if ($candidate->getPluginId() == 'site_type') {
+        $condition = $candidate;
+        break;
+      }
+    }
+
+    // If we could not find a configured condition, create an empty one.
+    if (empty($condition)) {
+      /** @var \Drupal\Core\Condition\ConditionManager $condition_manager */
+      $condition_manager = \Drupal::service('plugin.manager.condition');
+      $condition = $condition_manager->createInstance('site_type');
+    }
+
+    // Add the condition plugin form to the form, removing the negate checkbox.
+    $condition_form = $condition->buildConfigurationForm($form['pattern_container'], $form_state);
+    unset($condition_form['negate']);
+    $form['pattern_container'] += $condition_form;
+
+    // Add our submit handler after ::submit but before ::save.
+    $offset = array_search('::submit', $form['actions']['submit']['#submit']) + 1;
+    array_splice($form['actions']['submit']['#submit'], $offset, 0 , 'micro_path_pathauto_pattern_submit');
+  }
+
+}
+
+/**
+ * Submit handler for form ID pathauto_pattern_form.
+ *
+ * @see my_module_form_pathauto_pattern_form_alter()
+ */
+function micro_path_pathauto_pattern_submit($form, FormStateInterface $form_state) {
+  /** @var \Drupal\pathauto\Entity\PathautoPattern $entity */
+  $entity = $form_state->getFormObject()->getEntity();
+  $alias_type = $entity->getAliasType();
+  $entity_type = $alias_type->getDerivativeId();
+  if ($site_type = array_filter($form_state->getValue('site_type'))) {
+    $conditions = $entity->getSelectionConditions();
+    foreach ($conditions as $id => $condition) {
+      if ($condition->getPluginId() == 'site_type') {
+        $entity->removeSelectionCondition($id);
+      }
+    }
+    $entity->addSelectionCondition([
+      'id' => 'site_type',
+      'site_type' => $site_type,
+      'negate' => FALSE,
+      'context_mapping' => [
+        $entity_type => $entity_type,
+      ],
+    ]);
+  }
+}
+
+/**
+ * Validate the pattern field, to ensure it doesn't contain any characters that
+ * are invalid in URLs.
+ */
+function micro_path_pattern_validate($element, FormStateInterface $form_state) {
+
+  if (isset($element['#value'])) {
+    $title = empty($element['#title']) ? $element['#parents'][0] : $element['#title'];
+    $invalid_characters = ['#', '?', '&'];
+    $invalid_characters_used = [];
+
+    foreach ($invalid_characters as $invalid_character) {
+      if (strpos($element['#value'], $invalid_character) !== FALSE) {
+        $invalid_characters_used[] = $invalid_character;
+      }
+    }
+
+    if (!empty($invalid_characters_used)) {
+      $form_state->setError($element, t('The %element-title is using the following invalid characters: @invalid-characters.', array('%element-title' => $title, '@invalid-characters' => implode(', ', $invalid_characters_used))));
+    }
+
+    if (preg_match('/(\s$)+/', $element['#value'])) {
+      $form_state->setError($element, t('The %element-title doesn\'t allow the patterns ending with whitespace.', array('%element-title' => $title)));
+    }
+  }
+
+  return $element;
+}
+
+/**
+ * Implements hook_micro_path_pattern_alter().
+ */
+function micro_path_micro_path_pattern_alter(PathautoPatternInterface $pattern, array $context) {
+  $site_id = $context['site_id'];
+  $active_site = Site::load($site_id);
+  if (!$active_site instanceof SiteInterface) {
+    // Try to load the micro site from the negotiator.
+    /** @var \Drupal\micro_site\SiteNegotiatorInterface $site_negotiator */
+    $site_negotiator = \Drupal::service('micro_site.negotiator');
+    $active_site = $site_negotiator->getActiveSite();
+    if (!$active_site instanceof SiteInterface) {
+      return;
+    }
+  }
+
+
+  /** @var \Drupal\micro_path\MicroPathHelper $micro_path_helper */
+  $micro_path_helper = \Drupal::service('micro_path.helper');
+  $patterns = $micro_path_helper->getPatternsData($active_site);
+  if (empty($patterns)) {
+    return;
+  }
+
+  $bundle = $context['bundle'];
+  $langcode = $context['language'];
+  $entity_type = $context['entity_type'];
+  if (isset($patterns[$entity_type][$bundle]['all'])) {
+    $new_pattern = $patterns[$entity_type][$bundle]['all'];
+    $pattern->setPattern($new_pattern);
+  }
+  elseif (isset($patterns[$entity_type][$bundle][$langcode])) {
+    $new_pattern = $patterns[$entity_type][$bundle][$langcode];
+    $pattern->setPattern($new_pattern);
+  }
+}
