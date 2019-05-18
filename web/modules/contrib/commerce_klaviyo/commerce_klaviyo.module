@@ -1,0 +1,158 @@
+<?php
+
+/**
+ * @file
+ * Provides Drupal Commerce Integration with Klaviyo.
+ */
+
+use Drupal\Core\Cache\CacheableMetadata;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Url;
+use Drupal\commerce_klaviyo\CustomerProperties;
+use Drupal\commerce_klaviyo\Util\KlaviyoRequestInterface;
+use Drupal\commerce_klaviyo\OrderProperties;
+use Drupal\commerce_klaviyo\ProductProperties;
+
+/**
+ * Implements hook_page_attachments().
+ */
+function commerce_klaviyo_page_attachments(array &$attachments) {
+  /** @var \Drupal\Core\Config\ConfigFactoryInterface $config_factory */
+  $config_factory = \Drupal::service('config.factory');
+  $user = \Drupal::entityTypeManager()
+    ->getStorage('user')
+    ->load(\Drupal::currentUser()->id());
+  $js_settings['public_key'] = $config_factory
+    ->get('commerce_klaviyo.settings')
+    ->get('public_key');
+
+  if (\Drupal::currentUser()->isAuthenticated()) {
+    $customer_properties = CustomerProperties::createFromUser($user);
+    $customer_properties = $customer_properties->getProperties();
+    /** @var Drupal\commerce_klaviyo\Util\KlaviyoRequestInterface $klaviyo_request */
+    $klaviyo_request = \Drupal::service('commerce_klaviyo.klaviyo_request');
+    $js_settings['identify'] = $klaviyo_request->alterIdentify($customer_properties);
+  }
+
+  $attachments['#attached']['drupalSettings']['commerce_klaviyo'] = $js_settings;
+  $attachments['#attached']['library'][] = 'commerce_klaviyo/drupal.commerce_klaviyo.analytics';
+
+  CacheableMetadata::createFromRenderArray($attachments)
+    ->addCacheableDependency($user)
+    ->applyTo($attachments);
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function commerce_klaviyo_form_commerce_checkout_flow_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $current_user = \Drupal::currentUser();
+  /** @var \Drupal\commerce_checkout\Plugin\Commerce\CheckoutFlow\CheckoutFlowWithPanesInterface $form_object */
+  $form_object = $form_state->getFormObject();
+  $order = $form_object->getOrder();
+  $user = \Drupal::entityTypeManager()
+    ->getStorage('user')
+    ->load($current_user->id());
+
+  if ($current_user->isAuthenticated() || ($email = $order->getEmail())) {
+    /** @var \Drupal\Core\Config\ConfigFactoryInterface $config_factory */
+    $config_factory = \Drupal::service('config.factory');
+    $properties = new OrderProperties($config_factory, $order);
+
+    if (isset($email)) {
+      $customer_properties = CustomerProperties::createFromOrder($order);
+    }
+    else {
+      $customer_properties = CustomerProperties::createFromUser($user);
+    }
+
+    if (isset($form['#step_id'])) {
+      $checkout_url = Url::fromRoute('commerce_checkout.form', [
+        'commerce_order' => $order->id(),
+        'step' => $form['#step_id'],
+      ], ['absolute' => TRUE])->toString();
+      $properties->setProperty('CheckoutURL', $checkout_url);
+    }
+
+    $js_settings['public_key'] = $config_factory
+      ->get('commerce_klaviyo.settings')
+      ->get('public_key');
+
+    $customer_properties = $customer_properties->getProperties();
+    /** @var Drupal\commerce_klaviyo\Util\KlaviyoRequestInterface $klaviyo_request */
+    $klaviyo_request = \Drupal::service('commerce_klaviyo.klaviyo_request');
+    $js_settings['identify'] = $klaviyo_request->alterIdentify($customer_properties);
+    $request_properties = $klaviyo_request->alterTrack(KlaviyoRequestInterface::STARTED_CHECKOUT_EVENT, $properties->getProperties(), $properties);
+    $js_settings['track'][] = [
+      'event' => KlaviyoRequestInterface::STARTED_CHECKOUT_EVENT,
+      'properties' => $request_properties,
+    ];
+
+    $form['#attached']['drupalSettings']['commerce_klaviyo'] = $js_settings;
+    $form['#attached']['library'][] = 'commerce_klaviyo/drupal.commerce_klaviyo.analytics';
+  }
+
+  CacheableMetadata::createFromRenderArray($form)
+    ->addCacheableDependency($user)
+    ->applyTo($form);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_view().
+ */
+function commerce_klaviyo_commerce_product_view(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display, $view_mode) {
+  // "Viewed Product" event available only for authenticated users.
+  if (\Drupal::currentUser()->isAuthenticated()) {
+    /** @var \Drupal\Core\Config\ConfigFactoryInterface $config_factory */
+    $config_factory = \Drupal::service('config.factory');
+    $klaviyo_settings = $config_factory->get('commerce_klaviyo.settings');
+    /** @var \Drupal\commerce_product\Entity\Product $product */
+    $product = $entity;
+    $bundle = $product->bundle();
+    $product_types = $klaviyo_settings->get('product_types');
+
+    if (!empty($product_types) && array_key_exists($bundle, $product_types)) {
+      if (in_array($view_mode, $product_types[$bundle]['view_modes'])) {
+        $user = \Drupal::entityTypeManager()
+          ->getStorage('user')
+          ->load(\Drupal::currentUser()->id());;
+        $product_properties = new ProductProperties($config_factory, $product);
+        $properties = $product_properties->getProperties();
+        $track_viewed_item = [
+          'Title' => $properties['ProductName'],
+          'ItemId' => $properties['ProductID'],
+          'Url' => $properties['ProductURL'],
+        ];
+
+        foreach (['ImageURL', 'Categories'] as $item) {
+          if (!empty($properties[$item])) {
+            $track_viewed_item[$item] = $properties[$item];
+          }
+        }
+        foreach (['Brand', 'Price'] as $item) {
+          if (!empty($properties[$item])) {
+            $track_viewed_item['Metadata'] = !empty($track_viewed_item['Metadata']) ? $track_viewed_item['Metadata'] : [];
+            $track_viewed_item['Metadata'][$item] = $properties[$item];
+          }
+        }
+
+        /** @var Drupal\commerce_klaviyo\Util\KlaviyoRequestInterface $klaviyo_request */
+        $klaviyo_request = \Drupal::service('commerce_klaviyo.klaviyo_request');
+        $request_properties = $klaviyo_request->alterTrack(KlaviyoRequestInterface::VIEWED_PRODUCT_EVENT, $properties, $product_properties);
+        $js_settings['track'][] = [
+          'event' => KlaviyoRequestInterface::VIEWED_PRODUCT_EVENT,
+          'properties' => $request_properties,
+        ];
+        $js_settings['trackViewedItem'][] = $track_viewed_item;
+
+        $build['#attached']['drupalSettings']['commerce_klaviyo'] = $js_settings;
+
+        CacheableMetadata::createFromRenderArray($build)
+          ->addCacheableDependency($user)
+          ->applyTo($build);
+      }
+    }
+  }
+}
