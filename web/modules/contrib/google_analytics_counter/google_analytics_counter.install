@@ -1,0 +1,486 @@
+<?php
+
+/**
+ * @file
+ * Update, and uninstall functions for the Google Analytics Counter module.
+ */
+
+use Drupal\Core\Config\FileStorage;
+use Drupal\Core\Database\Database;
+use Drupal\Core\Url;
+use Drupal\field\Entity\FieldStorageConfig;
+use Drupal\field\Entity\FieldConfig;
+use Drupal\google_analytics_counter\GoogleAnalyticsCounterHelper;
+
+/**
+ * Implements hook_requirements().
+ */
+function google_analytics_counter_requirements($phase) {
+  // Only check requirements during the run-time (aka Status Report).
+  if ($phase != 'runtime') {
+    return [];
+  }
+
+  $requirements = [];
+  // Verify that the user has authenticated with Google Analytics.
+  // If not, display a warning on the status page.
+  $t_args = [
+    ':href' => Url::fromRoute('google_analytics_counter.admin_auth_form', [], ['absolute' => TRUE])
+      ->toString(),
+    '@href' => 'authentication form',
+  ];
+  /* @var \Drupal\google_analytics_counter\GoogleAnalyticsCounterAuthManagerInterface $auth_manager */
+  $auth_manager = Drupal::service('google_analytics_counter.auth_manager');
+
+  if ($auth_manager->isAuthenticated() === TRUE) {
+    $requirements['google_analytics_counter_authentication'] = [
+      'title' => t('Google Analytics Counter'),
+      'description' => t('You can revoke authentication on the <a href=:href>@href</a>.', $t_args),
+      'severity' => REQUIREMENT_OK,
+      'value' => t('Google Analytics have been authenticated.'),
+    ];
+  }
+  else {
+    $requirements['google_analytics_counter_authentication'] = [
+      'title' => t('Google Analytics Counter'),
+      'description' => t('Authenticate with Google on the <a href=:href>@href</a>.', $t_args),
+      'severity' => REQUIREMENT_ERROR,
+      'value' => t('Google Analytics have not been authenticated.'),
+    ];
+  }
+
+  return $requirements;
+}
+
+/**
+ * Implements hook_schema().
+ */
+function google_analytics_counter_schema() {
+  $schema['google_analytics_counter'] = [
+    'description' => 'Stores URIs and pageviews from Google Analytics.',
+    'fields' => [
+      'pagepath_hash' => [
+        'type' => 'varchar',
+        'length' => 32,
+        'description' => 'md5 hash of the relative page path.',
+        'not null' => TRUE,
+      ],
+      'pagepath' => [
+        'type' => 'varchar',
+        'length' => 2048,
+        'description' => 'Relative page path, for example "node/1" or "contact", as stored by GA.',
+        'not null' => TRUE,
+      ],
+      'pageviews' => [
+        'type' => 'int',
+        'size' => 'big',
+        'description' => 'Pageview count.',
+        'unsigned' => TRUE,
+        'default' => 0,
+        'not null' => TRUE,
+      ],
+    ],
+    'primary key' => ['pagepath_hash'],
+    'indexes' => [
+      'pagepath' => [['pagepath', 20]],
+      'pageviews' => ['pageviews'],
+    ],
+  ];
+
+  $schema['google_analytics_counter_storage'] = [
+    'description' => 'Stores node ids for nodes only that have pageview totals.',
+    'fields' => [
+      'nid' => [
+        'description' => 'Node IDs',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ],
+      'pageview_total' => [
+        'description' => 'Total pageview counts',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ],
+    ],
+    'indexes' => [
+      'nid' => ['nid'],
+      'pageview_total' => ['pageview_total'],
+    ],
+  ];
+
+  return $schema;
+}
+
+/**
+ * Implements hook_install().
+ */
+function google_analytics_counter_install() {
+  GoogleAnalyticsCounterHelper::gacSaveTypeConfig();
+}
+
+/**
+ * Implements hook_uninstall().
+ */
+function google_analytics_counter_uninstall() {
+
+  // Revoke the state values.
+  GoogleAnalyticsCounterHelper::gacDeleteState();
+
+  // Remove queued items from the database.
+  GoogleAnalyticsCounterHelper::gacRemoveQueuedItems();
+
+  // Uninstall the Google Analytics Counter field.
+  $bundles = ['node'];
+
+  $fields['field_google_analytics_counter'] = [
+    'entity_type' => 'node',
+  ];
+
+  // Delete the field config.
+  foreach ($bundles as $bundle) {
+    foreach ($fields as $field_name => $config) {
+      $field = FieldConfig::loadByName($config['entity_type'], $bundle, $field_name);
+      if (!empty($field)) {
+        $field->delete();
+      }
+    }
+  }
+
+  // Delete the field storage config.
+  foreach ($fields as $field_name => $config) {
+    $field_storage = FieldStorageConfig::loadByName($config['entity_type'], $field_name);
+    if (!empty($field_storage)) {
+      $field_storage->delete();
+    }
+  }
+}
+
+/**
+ * Issue #2978896: Use Google developers page for Google Quotas.
+ */
+function google_analytics_counter_update_8002() {
+  \Drupal::state()->deleteMultiple([
+    'google_analytics_counter.dayquota_request',
+    'google_analytics_counter.dayquota_timestamp',
+    'google_analytics_counter.chunk_process_time',
+    'google_analytics_counter.chunk_node_process_time',
+  ]);
+}
+
+/**
+ * Issue #2978896: Remove dayquota_timestamp.
+ */
+function google_analytics_counter_update_8003() {
+  \Drupal::state()->delete('google_analytics_counter.dayquota_timestamp');
+}
+
+/**
+ * Issue #3003910: Remove overwrite_statistics configuration.
+ */
+function google_analytics_counter_update_8004() {
+  $config_factory = \Drupal::configFactory();
+  $config_factory->getEditable('google_analytics_counter.settings')
+    ->clear('general_settings.overwrite_statistics')
+    ->save();
+}
+
+/**
+ * Issue #3003875: Remove profile_id_prefill configuration.
+ */
+function google_analytics_counter_update_8005() {
+  $config_factory = \Drupal::configFactory();
+  $config_factory->getEditable('google_analytics_counter.settings')
+    ->clear('general_settings.profile_id_prefill')
+    ->save();
+}
+
+/**
+ * Issue #3009673: Add the Google Analytics Counter field to existing installations.
+ */
+function google_analytics_counter_update_8006() {
+  // Check if field storage exists.
+  $config = FieldStorageConfig::loadByName('node', 'field_google_analytics_counter');
+  if (isset($config)) {
+    return NULL;
+  }
+
+  // Obtain configuration from yaml files.
+  $config_path = 'modules/contrib/google_analytics_counter/config/optional';
+  $source      = new FileStorage($config_path);
+
+  // Obtain the storage manager for field storage bases.
+  // Create the new field configuration from the yaml configuration and save.
+  \Drupal::entityTypeManager()->getStorage('field_storage_config')
+    ->create($source->read('field.storage.node.field_google_analytics_counter'))
+    ->save();
+}
+
+/**
+ * Issue #3009673: Remove stale queued items from the database.
+ */
+function google_analytics_counter_update_8007() {
+  GoogleAnalyticsCounterHelper::gacRemoveQueuedItems();
+}
+
+/**
+ * Issue #3020811: Move Configure types form into its own tab.
+ */
+function google_analytics_counter_update_8008() {
+  GoogleAnalyticsCounterHelper::gacSaveTypeConfig();
+}
+
+/**
+ * Issue #3025051: Google Analytics Counter field should be a number
+ */
+function google_analytics_counter_update_8009() {
+  $config_factory = \Drupal::configFactory();
+
+  // Get the content types.
+  $content_types = \Drupal::service('entity.manager')
+    ->getStorage('node_type')
+    ->loadMultiple();
+
+  $gac_types = [];
+  foreach ($content_types as $machine_name => $content_type) {
+    // Get the {gac_type_}.
+    $gac_type = $config_factory->getEditable('google_analytics_counter.settings')
+      ->get("general_settings.gac_type_$machine_name");
+
+    // Store content types that have the custom field in a lookup table.
+    if ($gac_type == 1) {
+      $gac_types[] = $machine_name;
+    }
+  }
+
+  // Uninstall the Google Analytics Counter field.
+  $bundles = ['node'];
+
+  $fields['field_google_analytics_counter'] = [
+    'entity_type' => 'node',
+  ];
+
+  // Delete the field config.
+  foreach ($bundles as $bundle) {
+    foreach ($fields as $field_name => $config) {
+      $field = FieldConfig::loadByName($config['entity_type'], $bundle, $field_name);
+      if (!empty($field)) {
+        $field->delete();
+      }
+    }
+  }
+
+  // Delete the field storage.
+  $field_storage = FieldStorageConfig::loadByName('node', 'field_google_analytics_counter');
+  if (isset($field_storage)) {
+    $field_storage->delete();
+  }
+
+  // Add the field storage as an integer this time.
+  $config_path = 'modules/contrib/google_analytics_counter/config/optional';
+  $source      = new FileStorage($config_path);
+  \Drupal::entityTypeManager()->getStorage('field_storage_config')
+    ->create($source->read('field.storage.node.field_google_analytics_counter'))
+    ->save();
+
+  // Finally, if the {gac_type_} was checked, create the field config, and check {gac_type_} again.
+  foreach ($content_types as $machine_name => $content_type) {
+    foreach ($gac_types as $key => $gac_type) {
+      if ($gac_type == $content_type->id()) {
+
+        /* @var \Drupal\google_analytics_counter\GoogleAnalyticsCounterCustomFieldGeneratorInterface $custom_field */
+        $custom_field = \Drupal::service('google_analytics_counter.custom_field_generator');
+        $custom_field->gacAddField($content_type);
+
+        $config_factory->getEditable('google_analytics_counter.settings')
+          ->set("general_settings.$machine_name", 1)
+          ->save();
+      }
+    }
+  }
+}
+
+/**
+ * Issue #3028146: Date range doesn't make any sense
+ */
+function google_analytics_counter_update_8010() {
+  $config_factory = \Drupal::configFactory();
+
+  // Get the existing fixed start date and set it to the custom_start_date.
+  $fixed_start_date = $config_factory->getEditable('google_analytics_counter.settings')
+    ->get('general_settings.fixed_start_date');
+  if (!empty($fixed_start_date)) {
+    $config_factory->getEditable('google_analytics_counter.settings')
+      ->set('general_settings.custom_start_date', $fixed_start_date)
+      ->save();
+  }
+
+  // Get the existing fixed end date and set it to the custom_end_date.
+  $fixed_end_date = $config_factory->getEditable('google_analytics_counter.settings')
+    ->get('general_settings.fixed_end_date');
+  if (!empty($fixed_end_date)) {
+    $config_factory->getEditable('google_analytics_counter.settings')
+      ->set('general_settings.custom_end_date', $fixed_end_date)
+      ->save();
+  }
+
+  // Get the existing start date.
+  $start_date = $config_factory->getEditable('google_analytics_counter.settings')
+    ->get('general_settings.start_date');
+
+  switch ($start_date) {
+    case '-1 day':
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.start_date', 'yesterday')
+        ->save();
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.end_date', 'yesterday')
+        ->save();
+      break;
+
+    case '-1 week':
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.start_date', '-1 week last sunday midnight')
+        ->save();
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.end_date', '-1 week next saturday')
+        ->save();
+      break;
+
+    case '-1 month':
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.start_date', '30 days ago')
+        ->save();
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.end_date', '30 days ago')
+        ->save();
+      break;
+
+    case '-3 months':
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.start_date', '3 months ago')
+        ->save();
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.end_date', '3 months ago')
+        ->save();
+      break;
+
+    case '-6 months':
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.start_date', '6 months ago')
+        ->save();
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.end_date', '6 months ago')
+        ->save();
+      break;
+
+    case '-1 year':
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.start_date', 'first day of last year')
+        ->save();
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.end_date', 'last day of last year')
+        ->save();
+      break;
+
+    case '2005-01-01':
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.start_date', 'first day of last year')
+        ->save();
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.end_date', 'last day of last year')
+        ->save();
+      break;
+
+    default:
+      break;
+  }
+
+  // Clear old configuration.
+  $config_factory->getEditable('google_analytics_counter.settings')
+    ->clear('general_settings.advanced_date_checkbox')
+    ->save();
+
+  $config_factory->getEditable('google_analytics_counter.settings')
+    ->clear('general_settings.fixed_start_date')
+    ->save();
+
+  $config_factory->getEditable('google_analytics_counter.settings')
+    ->clear('general_settings.fixed_end_date')
+    ->save();
+}
+
+/**
+ * Issue #3031429: Dashboard not reporting correctly.
+ */
+function google_analytics_counter_update_8011() {
+  $config_factory = \Drupal::configFactory();
+
+  // Get the existing start date.
+  $start_date = $config_factory->getEditable('google_analytics_counter.settings')
+    ->get('general_settings.start_date');
+
+  switch ($start_date) {
+    case '30 days ago':
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.start_date', '30 days ago')
+        ->save();
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.end_date', '30 days ago +30 days -1 day')
+        ->save();
+      break;
+
+    case '3 months ago':
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.start_date', '3 months ago')
+        ->save();
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.end_date', '3 months ago +3 months -1 day')
+        ->save();
+      break;
+
+    case '6 months ago':
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.start_date', '6 months ago')
+        ->save();
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.end_date', '6 months ago +6 months - 1 day')
+        ->save();
+      break;
+
+    default:
+      break;
+  }
+}
+
+/**
+ * Issue #3036157: Date Range.
+ */
+function google_analytics_counter_update_8012() {
+  $config_factory = \Drupal::configFactory();
+
+  // Get the existing start date.
+  $start_date = $config_factory->getEditable('google_analytics_counter.settings')
+    ->get('general_settings.start_date');
+
+  switch ($start_date) {
+    case '2005-01-01':
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.start_date', '14 November 2005')
+        ->save();
+      $config_factory->getEditable('google_analytics_counter.settings')
+        ->set('general_settings.end_date', 'yesterday')
+        ->save();
+      break;
+
+    default:
+      break;
+  }
+}
+
+/**
+ * Issue #3003875: Delete cron_next_execution state.
+ */
+function google_analytics_counter_update_8013() {
+  \Drupal::state()->delete('google_analytics_counter.cron_next_execution');
+}

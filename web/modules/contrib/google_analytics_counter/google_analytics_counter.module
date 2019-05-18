@@ -1,0 +1,159 @@
+<?php
+
+/**
+ * @file
+ * Basic functions for this module.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\node\NodeInterface;
+
+/**
+ * Implements hook_help().
+ */
+function google_analytics_counter_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.google_analytics_counter':
+      $output = file_get_contents(drupal_get_path('module', 'google_analytics_counter') . '/README.md');;
+      return nl2br($output);
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function google_analytics_counter_cron() {
+  $config = \Drupal::config('google_analytics_counter.settings');
+  $database = \Drupal::database();
+  $state = \Drupal::state();
+
+  // $interval must be a value in seconds.
+  $interval = 60 * $config->get('general_settings.cron_interval');
+
+  // Set the total number of published nodes.
+  $query = $database->select('node_field_data', 'nfd');
+  $query->fields('nfd', ['nid']);
+  $query->condition('status', NodeInterface::PUBLISHED);
+  $total_nodes = $query->countQuery()->execute()->fetchField();
+  $state->set('google_analytics_counter.total_nodes', $total_nodes);
+
+  // On some systems, cron could be every minute. Throttle updating with the
+  // cron_interval on the settings form.
+  // To avoid this interval, set cron_interval to 0.
+  if (!\Drupal::time()->getRequestTime() >= \Drupal::state()->get('system.cron_last') + $interval) {
+    return FALSE;
+  }
+
+  // Proceed no further if not authenticated.
+  /* @var \Drupal\google_analytics_counter\GoogleAnalyticsCounterAuthManagerInterface $auth_manager */
+  $auth_manager = \Drupal::service('google_analytics_counter.auth_manager');
+  if (!$auth_manager->isAuthenticated()) {
+    \Drupal::logger('google_analytics_counter')->alert('Google Analytics Counter is not authenticated.');
+    return FALSE;
+  }
+
+  // Returns the google_analytics_counter_worker queue.
+  $queue = \Drupal::queue('google_analytics_counter_worker');
+
+  /* @var \Drupal\google_analytics_counter\GoogleAnalyticsCounterAppManagerInterface $app_manager */
+  $app_manager = \Drupal::service('google_analytics_counter.app_manager');
+
+  try {
+    // Fetch the total results from Google first.
+    $app_manager->reportData();
+    $total_results = $state->get('google_analytics_counter.total_paths');
+
+    // Create queue fetch items from the total results divided into chunks.
+    for ($index = 0; $index < $total_results / $config->get('general_settings.chunk_to_fetch'); $index++) {
+      // Add a queue item to fetch for all chunks.
+      $queue->createItem([
+        'type' => 'fetch',
+        'index' => $index,
+      ]);
+    }
+
+    // Select all the published nodes and create queue count items.
+    $query = $database->select('node_field_data', 'nfd');
+    $query->fields('nfd', ['nid', 'type', 'vid']);
+    $query->condition('status', NodeInterface::PUBLISHED);
+    $query->addTag('google_analytics_counter');
+    $result = $query->execute();
+    while ($record = $result->fetchAssoc()) {
+      $queue->createItem([
+        'type' => 'count',
+        'nid' => $record['nid'],
+        'bundle' => $record['type'],
+        'vid' => $record['vid']
+      ]);
+    }
+  }
+  catch (RuntimeException $e) {
+    \Drupal::logger('google_analytics_counter')
+      ->alert('Cron experienced a problem: ' . $e->getMessage());
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function google_analytics_counter_theme() {
+  return [
+    'google_analytics_counter' => [
+      'variables' => ['pageviews' => NULL],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_queue_info_alter().
+ */
+function google_analytics_counter_queue_info_alter(&$queues) {
+  $config = \Drupal::config('google_analytics_counter.settings');
+  $queues['google_analytics_counter_worker']['cron']['time'] = $config->get('general_settings.queue_time');
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function google_analytics_counter_page_attachments(&$page) {
+  $theme = \Drupal::theme()->getActiveTheme()->getName();
+  if (in_array($theme, ['bartik', 'seven'])) {
+    $page['#attached']['library'][] = 'google_analytics_counter/google_analytics_counter';
+  }
+}
+
+/******************************************************************************/
+// Form alter hooks
+/******************************************************************************/
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter() for node_form().
+ */
+function google_analytics_counter_form_node_form_alter(&$form, FormStateInterface $form_state) {
+  // Make the google analytics counter field readonly.
+  isset($form['field_google_analytics_counter']) ? $form['field_google_analytics_counter']['widget'][0]['value']['#attributes']['readonly'] = 'readonly' : NULL;
+
+  // Display Google Analytics Counter field only to roles with the permission.
+  $fields_requiring_permission = [
+    'field_google_analytics_counter',
+  ];
+  foreach ($fields_requiring_permission as $field_requiring_permission) {
+    $form[$field_requiring_permission]['#access'] = \Drupal::currentUser()->hasPermission('access content');
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function google_analytics_counter_form_alter(&$form, FormStateInterface $form_state) {
+  /* @var \Drupal\google_analytics_counter\GoogleAnalyticsCounterAuthManagerInterface $auth_manager */
+  $auth_manager = \Drupal::service('google_analytics_counter.auth_manager');
+
+  // Make Client ID, Client Secret, and Authorized Redirect URI read only when authenticated.
+  if ($form['#form_id'] == 'google_analytics_counter_admin_auth') {
+    $auth_manager->isAuthenticated() === TRUE ? $form['client_id']['#disabled'] = 'readonly' : NULL;
+    $auth_manager->isAuthenticated() === TRUE ? $form['client_secret']['#disabled'] = 'readonly' : NULL;
+    $auth_manager->isAuthenticated() === TRUE ? $form['redirect_uri']['#disabled'] = 'readonly' : NULL;
+  }
+}
