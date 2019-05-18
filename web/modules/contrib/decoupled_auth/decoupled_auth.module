@@ -1,0 +1,366 @@
+<?php
+
+/**
+ * @file
+ * Allow decoupling of Drupal Authentication from Drupal Users.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\decoupled_auth\AcquisitionServiceInterface;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\profile\Entity\ProfileType;
+use Drupal\profile\Entity\ProfileInterface;
+use Drupal\profile\Entity\ProfileTypeInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\user\UserInterface;
+use Drupal\decoupled_auth\Form\UserPasswordFormAlter;
+use Drupal\decoupled_auth\Form\UserLoginFormAlter;
+
+/**
+ * Implements hook_entity_type_build().
+ */
+function decoupled_auth_entity_type_build(array &$entity_types) {
+  /** @var \Drupal\Core\Entity\EntityTypeInterface $user_type */
+  $user_type = $entity_types['user'];
+  $user_type->setClass('Drupal\decoupled_auth\Entity\DecoupledAuthUser');
+  $user_type->setHandlerClass('storage_schema', 'Drupal\decoupled_auth\DecoupledAuthUserStorageSchema');
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter() for user_form.
+ */
+function decoupled_auth_form_user_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // If this is the register form, we need to hook into the entity builders for
+  // acquisitions.
+  if ($form_id == 'user_register_form' && !Drupal::currentUser()->hasPermission('administer users')) {
+    // Check our configuration to see if we want to run acquisitions.
+    if (Drupal::config('decoupled_auth.settings')->get('acquisitions.registration')) {
+      $form['#entity_builders'][] = 'decoupled_auth_form_user_register_form_entity_build';
+    }
+
+    // Add our cache tag for the config.
+    $form['#cache']['tags'][] = 'config:decoupled_auth.settings';
+
+    // The rest of this doesn't need to run at all.
+    return;
+  }
+
+  // Add our cache context for the permission.
+  $form['#cache']['context'][] = 'user.permissions';
+
+  // If we don't have administer users, we shouldn't be able to manage the
+  // decoupled state of a user.
+  $user = Drupal::currentUser();
+  if (!$user->hasPermission('administer users')) {
+    return;
+  }
+
+  /** @var \Drupal\decoupled_auth\DecoupledAuthUserInterface $account */
+  $account = $form_state->getFormObject()->getEntity();
+
+  // Set a weight on mail so we can insert our checkbox in the right place.
+  $form['account']['mail']['#weight'] = -2;
+
+  // Add our 'has login details' checkbox.
+  $form['account']['not_decoupled'] = [
+    '#type' => 'checkbox',
+    '#title' => t('This user has login details'),
+    '#description' => t('If un-checked, this user will not have a username and password.'),
+    '#default_value' => !$account->isDecoupled(),
+    '#weight' => -1,
+  ];
+
+  // If normally required, switch mail, name and pass to not required and then
+  // use form states and constraints to manage when it is required.
+  foreach (['mail', 'name', 'pass'] as $element) {
+    if (isset($form['account'][$element])) {
+      if (!empty($form['account'][$element]['#required'])) {
+        $form['account'][$element]['#required'] = FALSE;
+        $form['account'][$element]['#states']['required'][':input[name="not_decoupled"]'] = ['checked' => TRUE];
+      }
+
+      // If not mail, hide unless this user has login details.
+      if ($element != 'mail') {
+        $form['account'][$element]['#states']['visible'][':input[name="not_decoupled"]'] = ['checked' => TRUE];
+      }
+    }
+  }
+
+  $form['#entity_builders'][] = 'decoupled_auth_form_user_form_entity_build';
+}
+
+/**
+ * Entity build handler for user_register_form.
+ *
+ * Get into the entity build phase so we can run acquisitions.
+ *
+ * @see decoupled_auth_form_user_form_alter()
+ */
+function decoupled_auth_form_user_register_form_entity_build($entity_type, $entity, &$form, &$form_state) {
+  // Attempt to run acquisitions for the given email address.
+  /** @var \Drupal\decoupled_auth\Entity\DecoupledAuthUser $entity */
+  /** @var \Drupal\decoupled_auth\AcquisitionServiceInterface $acquisition */
+  $acquisition = Drupal::service('decoupled_auth.acquisition');
+
+  // Acquire based on email, but we are only interested in decoupled users.
+  $values = [
+    'mail' => $entity->getEmail(),
+    'decoupled' => TRUE,
+  ];
+
+  // We don't want the default behaviors as we are only interested in decoupled
+  // users and we don't need to create one, as we already have a user object.
+  $context = [
+    'name' => 'user_register_form',
+    'behavior' => Drupal::config('decoupled_auth.settings')->get('acquisitions.behavior_first') ? AcquisitionServiceInterface::BEHAVIOR_FIRST : NULL,
+  ];
+
+  // Run the acquisition process.
+  $acquired_user = $acquisition->acquire($values, $context, $method);
+
+  // If we get a result, we need to copy the values over.
+  if ($acquired_user) {
+    // Make sure it's not enforced as new.
+    $entity->enforceIsNew(FALSE);
+
+    // Copy our values over.
+    $override = ['uid', 'uuid', 'created'];
+    foreach (array_keys($entity->getFields()) as $key) {
+      // If we have a value on the acquired user but not on the new user we'll
+      // copy it over, with the exception of uid, uuid and roles which we'll
+      // override.
+      if (in_array($key, $override) || $entity->{$key}->isEmpty()) {
+        $entity->{$key} = $acquired_user->{$key}->getValue();
+      }
+    }
+
+    // Add in any roles.
+    foreach ($acquired_user->getRoles(TRUE) as $role) {
+      $entity->addRole($role);
+    }
+  }
+}
+
+/**
+ * Entity build handler for user_form.
+ *
+ * @see decoupled_auth_form_user_form_alter()
+ */
+function decoupled_auth_form_user_form_entity_build($entity_type, $entity, &$form, &$form_state) {
+  // If we are not decoupling, process when things are required.
+  /** @var \Drupal\decoupled_auth\DecoupledAuthUserInterface $entity */
+  if (!$form_state->getValue('not_decoupled')) {
+    $entity->decouple();
+  }
+}
+
+/**
+ * Implements hook_element_info_alter().
+ */
+function decoupled_auth_element_info_alter(array &$types) {
+  if (isset($types['password_confirm'])) {
+    $types['password_confirm']['#process'][] = 'decoupled_auth_form_process_password_confirm';
+  }
+}
+
+/**
+ * Form element process handler for client-side password validation.
+ */
+function decoupled_auth_form_process_password_confirm($element) {
+  if (isset($element['#states'])) {
+    foreach (Element::children($element) as $key) {
+      $element[$key]['#states'] = $element['#states'];
+    }
+  }
+  return $element;
+}
+
+/**
+ * Implements hook_preprocess_HOOK() for form_element.
+ */
+function decoupled_auth_preprocess_form_element(&$variables) {
+  if (isset($variables['element']['#type']) && $variables['element']['#type'] == 'password_confirm') {
+    if (isset($variables['element']['#attributes']['data-drupal-states'])) {
+      $variables['attributes']['data-drupal-states'] = $variables['element']['#attributes']['data-drupal-states'];
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert() for view.
+ */
+function decoupled_auth_view_insert(EntityInterface $entity) {
+  if ($entity->id() == 'user_admin_people') {
+    module_load_include('install', 'decoupled_auth', 'decoupled_auth');
+    decoupled_auth_install_update_user_admin_people_view($entity);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert() for user.
+ *
+ * Wrap around email_registration_user_insert() so we only trigger it for users
+ * that are coupled. Otherwise all users become coupled.
+ *
+ * @see \decoupled_auth_module_implements_alter()
+ */
+function decoupled_auth_user_insert(UserInterface $account) {
+  /* @var \Drupal\decoupled_auth\DecoupledAuthUserInterface $account */
+  if ($account->isCoupled() && function_exists('email_registration_user_insert')) {
+    email_registration_user_insert($account);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update() for user.
+ *
+ * Wrap around email_registration_user_insert(), triggering when a user moves
+ * from decoupled to coupled to ensure a username is set.
+ *
+ * @see \decoupled_auth_module_implements_alter()
+ */
+function decoupled_auth_user_update(UserInterface $account) {
+  // @todo Remove when https://www.drupal.org/project/email_registration/issues/2935622 is fixed.
+  $account->original = \Drupal::entityTypeManager()->getStorage('user')->loadUnchanged($account->id());
+
+  /* @var \Drupal\decoupled_auth\DecoupledAuthUserInterface $account */
+  if (!empty($original = $account->original)) {
+    /* @var \Drupal\decoupled_auth\DecoupledAuthUserInterface $original */
+    if ($account->isCoupled() && $original->isDecoupled() && function_exists('email_registration_user_insert')) {
+      email_registration_user_insert($account);
+    }
+  }
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function decoupled_auth_module_implements_alter(&$implementations, $hook) {
+  // Remove profile_user_view() and profile_entity_extra_field_info() as they
+  // are now provided by our base fields.
+  if (in_array($hook, ['user_view', 'entity_extra_field_info'])) {
+    unset($implementations['profile']);
+  }
+
+  // Swap out hook_user_insert if email registration module is enabled. This is
+  // to deal with email_registration's lack of knowledge of decoupled users,
+  // which results in them always becoming coupled.
+  if (in_array($hook, ['user_insert', 'user_update'])) {
+    if (\Drupal::moduleHandler()->moduleExists('email_registration')) {
+      unset($implementations['email_registration']);
+    }
+    else {
+      unset($implementations['decoupled_auth']);
+    }
+  }
+
+  // Make sure our user alters run last.
+  if ($hook == 'form_alter' && isset($implementations['decoupled_auth'])) {
+    $group = $implementations['decoupled_auth'];
+    unset($implementations['decoupled_auth']);
+    $implementations['decoupled_auth'] = $group;
+  }
+}
+
+/**
+ * Implements hook_entity_base_field_info().
+ */
+function decoupled_auth_entity_base_field_info(EntityTypeInterface $entity_type) {
+  // If the profile module exists, add the profile fields to the user.
+  if ($entity_type->id() == 'user' && Drupal::moduleHandler()->moduleExists('profile')) {
+    $fields = [];
+
+    /** @var \Drupal\profile\Entity\ProfileType[] $types */
+    $types = ProfileType::loadMultiple();
+    foreach ($types as $profile_type) {
+      $name = 'profile_' . $profile_type->id();
+      $fields[$name] = BaseFieldDefinition::create('entity_reference')
+        ->setLabel($profile_type->label())
+        ->setReadOnly(TRUE)
+        ->setSetting('target_type', 'profile')
+        ->setSetting('handler_settings', ['target_bundles' => [$profile_type->id()]])
+        ->setDisplayConfigurable('view', TRUE)
+        ->setDisplayOptions('view', [
+          'type' => 'entity_reference_entity_view',
+          'weight' => 10,
+        ])
+        ->setCardinality(BaseFieldDefinition::CARDINALITY_UNLIMITED);
+    }
+
+    return $fields;
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert() for profile.
+ */
+function decoupled_auth_profile_insert(ProfileInterface $entity) {
+  $entity->getOwner()->updateProfileFields([$entity->bundle()]);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update() for profile.
+ */
+function decoupled_auth_profile_update(ProfileInterface $entity) {
+  // In some circumstances deleting the user may lead to updating the profile,
+  // check the owner exists before attempting to update the profile fields.
+  $owner = $entity->getOwner();
+  if ($owner) {
+    $owner->updateProfileFields([$entity->bundle()]);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete() for profile.
+ */
+function decoupled_auth_profile_delete(ProfileInterface $entity) {
+  // As we may be deleting in response to a deleted user, check the owner exists
+  // before attempting to update the profile fields.
+  $owner = $entity->getOwner();
+  if ($owner) {
+    $owner->updateProfileFields([$entity->bundle()]);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert() for profile_type.
+ */
+function decoupled_auth_profile_type_insert(ProfileTypeInterface $entity) {
+  // Create our new field.
+  $field_manager = Drupal::service('entity_field.manager');
+  $field_manager->clearCachedFieldDefinitions();
+  $definitions = $field_manager->getFieldStorageDefinitions('user');
+  Drupal::service('field_storage_definition.listener')->onFieldStorageDefinitionCreate($definitions['profile_' . $entity->id()]);
+  // @todo Remove this once profile issue is cleared [#2875157].
+  Drupal::service('entity_type.manager')->clearCachedDefinitions();
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete() for profile_type.
+ */
+function decoupled_auth_profile_type_delete(ProfileTypeInterface $entity) {
+  // Remove our field.
+  $definitions = Drupal::service('entity.last_installed_schema.repository')->getLastInstalledFieldStorageDefinitions('user');
+  $name = 'profile_' . $entity->id();
+  if (isset($definitions[$name])) {
+    Drupal::service('field_storage_definition.listener')->onFieldStorageDefinitionDelete($definitions[$name]);
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for user_pass.
+ */
+function decoupled_auth_form_user_pass_alter(&$form, FormStateInterface $form_state, $form_id) {
+  \Drupal::classResolver()->getInstanceFromDefinition(UserPasswordFormAlter::class)
+    ->alter($form, $form_state);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for user_pass.
+ */
+function decoupled_auth_form_user_login_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  \Drupal::classResolver()->getInstanceFromDefinition(UserLoginFormAlter::class)
+    ->alter($form, $form_state);
+}

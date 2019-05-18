@@ -1,0 +1,264 @@
+<?php
+
+/**
+ * @file
+ * Install, update and uninstall functions for the decoupled user auth module.
+ */
+
+use Drupal\profile\Entity\ProfileType;
+
+/**
+ * Implements hook_requirements().
+ */
+function decoupled_auth_requirements($phase) {
+  $requirements = [];
+
+  if ($phase == 'runtime') {
+    $requirements['decoupled_auth_registration_acquisitions'] = [
+      'title' => t('User registration acquisition verification'),
+      'severity' => REQUIREMENT_OK,
+      'description' => t('It is not recommended that user registration acquisitions are enabled without account verification such as email. This could allow malicious registrations to access data they should not be authorised to see.'),
+    ];
+
+    // If registration acquisitions are enabled but email verification is not,
+    // we probably want to show a warning.
+    if (Drupal::config('decoupled_auth.settings')->get('acquisitions.registration')) {
+      if (!Drupal::config('user.settings')->get('verify_mail')) {
+        // As other verification processes could be enabled, we allow this
+        // message to be disabled.
+        if (!Drupal::config('decoupled_auth.settings')->get('acquisitions.registration_notice_demote')) {
+          $requirements['decoupled_auth_registration_acquisitions']['severity'] = REQUIREMENT_ERROR;
+        }
+        else {
+          $requirements['decoupled_auth_registration_acquisitions']['severity'] = REQUIREMENT_WARNING;
+        }
+      }
+    }
+  }
+
+  return $requirements;
+}
+
+/**
+ * Implements hook_install().
+ */
+function decoupled_auth_install() {
+  $manager = Drupal::entityDefinitionUpdateManager();
+
+  // Get hold of our user type definition.
+  $user_type = $manager->getEntityType('user');
+
+  // Switch to our own class and inform the entity definition manager.
+  $user_type->setClass('Drupal\decoupled_auth\Entity\DecoupledAuthUser');
+  $user_type->setHandlerClass('storage_schema', 'Drupal\decoupled_auth\DecoupledAuthUserStorageSchema');
+  $manager->updateEntityType($user_type);
+
+  // Make name not required at a database level and swap the constraint.
+  $name = $manager->getFieldStorageDefinition('name', 'user');
+  $constraints = $name->getConstraints();
+  unset($constraints['UserName']);
+  unset($constraints['NotNull']);
+  $name
+    ->setRequired(FALSE)
+    ->setConstraints($constraints);
+
+  // Make adjustments to mail.
+  $mail = $manager->getFieldStorageDefinition('mail', 'user');
+  $constraints = $mail->getConstraints();
+
+  // Swap to our own unique constraint for mail.
+  unset($constraints['UserMailUnique']);
+  $constraints['DecoupledAuthUserMailUnique'] = [];
+
+  // Swap to our own required constraint for mail.
+  unset($constraints['UserMailRequired']);
+  $constraints['DecoupledAuthUserMailRequired'] = [];
+
+  $mail->setConstraints($constraints);
+
+  $manager->updateFieldStorageDefinition($name);
+
+  // Add the decoupled filter to the people view.
+  if (Drupal::moduleHandler()->moduleExists('views')) {
+    if ($people_view = $people_view = Drupal::entityTypeManager()->getStorage('view')->load('user_admin_people')) {
+      decoupled_auth_install_update_user_admin_people_view($people_view);
+    }
+  }
+
+  // Install the fields for existing profile types.
+  if (Drupal::moduleHandler()->moduleExists('profile')) {
+    $field_manager = Drupal::service('entity_field.manager');
+    $field_manager->clearCachedFieldDefinitions();
+    $definitions = $field_manager->getFieldStorageDefinitions('user');
+    $field_storage_listener = Drupal::service('field_storage_definition.listener');
+
+    /** @var \Drupal\profile\Entity\ProfileType[] $types */
+    $types = ProfileType::loadMultiple();
+    foreach ($types as $profile_type) {
+      $name = 'profile_' . $profile_type->id();
+      if (isset($definitions[$name])) {
+        $field_storage_listener->onFieldStorageDefinitionCreate($definitions[$name]);
+      }
+    }
+
+    // @todo: Fill out the fields for existing users. This should probably be
+    // batched.
+  }
+}
+
+/**
+ * Implements hook_uninstall().
+ */
+function decoupled_auth_uninstall() {
+  $manager = Drupal::entityDefinitionUpdateManager();
+
+  // Get hold of our user type definition.
+  $user_type = $manager->getEntityType('user');
+
+  // Switch to our own class and inform the entity definition manager.
+  $user_type->setClass('Drupal\user\Entity\User');
+  $user_type->setHandlerClass('storage_schema', 'Drupal\user\UserStorageSchema');
+  $manager->updateEntityType($user_type);
+
+  // Revert our name changes.
+  $name = $manager->getFieldStorageDefinition('name', 'user');
+  $constraints = $name->getConstraints();
+  $constraints['UserName'] = [];
+  $constraints['NotNull'] = [];
+  $name
+    ->setRequired(FALSE)
+    ->setConstraints($constraints);
+
+  // Revert our mail changes.
+  $mail = $manager->getFieldStorageDefinition('mail', 'user');
+  $constraints = $mail->getConstraints();
+
+  // Swap back the unique constraint.
+  unset($constraints['DecoupledAuthUserMailUnique']);
+  $constraints['UserMailUnique'] = [];
+
+  // Swap back the required constraint.
+  unset($constraints['DecoupledAuthUserMailRequired']);
+  $constraints['UserMailRequired'] = [];
+
+  $mail->setConstraints($constraints);
+
+  $manager->updateFieldStorageDefinition($name);
+
+  // Remove the decoupled filter from the people view.
+  if (Drupal::moduleHandler()->moduleExists('views')) {
+    if ($people_view = $people_view = Drupal::entityTypeManager()->getStorage('view')->load('user_admin_people')) {
+      decoupled_auth_uninstall_update_user_admin_people_view($people_view);
+    }
+  }
+
+  // Remove the fields for profile types.
+  if (Drupal::moduleHandler()->moduleExists('profile')) {
+    $definitions = Drupal::service('entity.last_installed_schema.repository')->getLastInstalledFieldStorageDefinitions('user');
+    $field_storage_listener = Drupal::service('field_storage_definition.listener');
+
+    /** @var \Drupal\profile\Entity\ProfileType[] $types */
+    $types = ProfileType::loadMultiple();
+    foreach ($types as $profile_type) {
+      $name = 'profile_' . $profile_type->id();
+      if (isset($definitions[$name])) {
+        $field_storage_listener->onFieldStorageDefinitionDelete($definitions[$name]);
+      }
+    }
+  }
+}
+
+/**
+ * Add the decoupled filter to the people view.
+ */
+function decoupled_auth_install_update_user_admin_people_view($people_view) {
+  $display = &$people_view->getDisplay('default');
+  $display['display_options']['filters']['decoupled'] = [
+    'id' => 'decoupled',
+    'table' => 'users',
+    'field' => 'decoupled',
+    'relationship' => 'none',
+    'group_type' => 'group',
+    'admin_label' => '',
+    'operator' => '=',
+    'value' => '0',
+    'group' => 1,
+    'exposed' => TRUE,
+    'expose' => [
+      'operator_id' => '',
+      'label' => 'Has web account?',
+      'description' => '',
+      'use_operator' => FALSE,
+      'operator' => 'decoupled_op',
+      'identifier' => 'decoupled',
+      'required' => FALSE,
+      'remember' => FALSE,
+      'multiple' => FALSE,
+      'remember_roles' => [
+        'authenticated' => 'authenticated',
+        'anonymous' => '',
+        'administrator' => '',
+      ],
+    ],
+    'is_grouped' => FALSE,
+    'group_info' => [
+      'label' => '',
+      'description' => '',
+      'identifier' => '',
+      'optional' => TRUE,
+      'widget' => 'select',
+      'multiple' => FALSE,
+      'remember' => FALSE,
+      'default_group' => 'All',
+      'default_group_multiple' => [],
+      'group_items' => [],
+    ],
+    'entity_type' => 'user',
+    'plugin_id' => 'user_decoupled',
+  ];
+
+  $people_view->save();
+}
+
+/**
+ * Remove the decoupled filter from the people view.
+ */
+function decoupled_auth_uninstall_update_user_admin_people_view($people_view) {
+  $display = &$people_view->getDisplay('default');
+  unset($display['display_options']['filters']['decoupled']);
+  $people_view->save();
+}
+
+/**
+ * Install the fields for existing profile types.
+ */
+function decoupled_auth_update_8001() {
+  // Install the fields for existing profile types.
+  if (Drupal::moduleHandler()->moduleExists('profile')) {
+    $field_manager = Drupal::service('entity_field.manager');
+    $field_manager->clearCachedFieldDefinitions();
+    $definitions = $field_manager->getFieldStorageDefinitions('user');
+    $field_storage_listener = Drupal::service('field_storage_definition.listener');
+
+    /** @var \Drupal\profile\Entity\ProfileType[] $types */
+    $types = ProfileType::loadMultiple();
+    foreach ($types as $profile_type) {
+      $name = 'profile_' . $profile_type->id();
+      if (isset($definitions[$name])) {
+        $field_storage_listener->onFieldStorageDefinitionCreate($definitions[$name]);
+      }
+    }
+
+    // @todo: Fill out the fields for existing users. This should probably be
+    // batched.
+  }
+}
+
+/**
+ * Add the protected roles setting.
+ */
+function decoupled_auth_update_8002() {
+  $settings = Drupal::configFactory()->getEditable('decoupled_auth.settings');
+  $settings->set('acquisitions.protected_roles', ['administrator']);
+  $settings->save();
+}
