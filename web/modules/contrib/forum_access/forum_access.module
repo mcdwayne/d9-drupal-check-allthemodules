@@ -1,0 +1,789 @@
+<?php
+
+/**
+ * @file
+ * Contains forum_access.module.
+ */
+
+use Drupal\comment\CommentInterface;
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Database\Query\AlterableInterface;
+use Drupal\Core\Database\Query\SelectInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\node\Entity\Node;
+use Drupal\node\NodeInterface;
+
+/**
+ * Implements hook_help().
+ *
+ * @inheritdoc
+ */
+function forum_access_help($route_name, RouteMatchInterface $route_match) {
+  $output = '';
+
+  switch ($route_name) {
+
+    // Main module help for the forum_access module.
+    case 'help.page.forum_access':
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Allows forums to be set private and to be given moderators.') . '</p>';
+
+  }
+  return $output;
+}
+
+/**
+ * Implements hook_theme().
+ *
+ * @inheritdoc
+ */
+function forum_access_theme($existing, $type, $theme, $path) {
+  $result['forum_access_table'] = [
+    'render element' => 'form',
+  ];
+  return $result;
+}
+
+/**
+ * Implements hook_node_grants().
+ *
+ * This function supplies the forum access grants. forum_access simply uses
+ * roles as ACLs, so rids translate directly to gids.
+ *
+ * @inheritdoc
+ */
+function forum_access_node_grants(AccountInterface $account, $op) {
+  $roles_gids = \Drupal::configFactory()
+    ->getEditable('forum_access.settings')
+    ->get('forum_access_roles_gids');
+  $grants = [];
+  /** @var string $role */
+  foreach ($account->getRoles() as $role) {
+    $grants['forum_access'][] = $roles_gids[$role];
+  }
+  return $grants;
+}
+
+/**
+ * Implements hook_node_access().
+ *
+ * @inheritdoc
+ */
+function forum_access_node_access(NodeInterface $node, $op, AccountInterface $account) {
+  module_load_include('inc', 'forum_access', 'includes/forum_access.common');
+  if ($node->bundle() != 'forum') {
+    return AccessResult::neutral();
+  }
+  // Disallow if user has no access to view.
+  if (!forum_access_entity_access_by_tid('view', $node)) {
+    return AccessResult::forbidden();
+  }
+  $author = $node->get('uid')->first()->get('entity')->getTarget()->getValue();
+  switch ($op) {
+    case 'view':
+      if ($node->isPublished()) {
+        $access = forum_access_entity_access_by_tid($op, $node);
+      }
+      elseif ($author->id() == $account->id() && $account->hasPermission('view own unpublished content')) {
+        $access = forum_access_entity_access_by_tid($op, $node);
+      }
+      break;
+
+    case 'update':
+      if ($op == 'update' && ($account->hasPermission('edit any forum content') || ($author->id() == $account->id() && $account->hasPermission('edit own forum content')))) {
+        $access = forum_access_entity_access_by_tid('view', $node);
+      }
+      break;
+
+    case 'delete':
+      if ($op == 'delete' && ($account->hasPermission('delete any forum content') || ($author->id() == $account->id() && $account->hasPermission('delete own forum content')))) {
+        $access = forum_access_entity_access_by_tid('view', $node);
+      }
+      break;
+  }
+  if (isset($access)) {
+    if ($access) {
+      return AccessResult::allowed();
+    }
+    else {
+      return AccessResult::forbidden();
+    }
+  }
+  return AccessResult::neutral();
+}
+
+/**
+ * Implements hook_node_access_records().
+ *
+ * Returns a list of grant records for the passed in node object.
+ * Checks to see if maybe we're being disabled.
+ *
+ * @inheritdoc
+ */
+function forum_access_node_access_records(NodeInterface $node) {
+  module_load_include('inc', 'forum_access', 'includes/forum_access.common');
+  $grants = &drupal_static(__FUNCTION__, []);
+  $seers = &drupal_static(__FUNCTION__ . '__seers');
+  $tid = forum_access_get_tid($node);
+  $roles_gids = \Drupal::configFactory()
+    ->getEditable('forum_access.settings')
+    ->get('forum_access_roles_gids');
+  if ($tid) {
+    // We want to give our rights only for published nodes.
+    if ($node->isPublished()) {
+      if (!isset($grants[$tid])) {
+        if (!isset($seers)) {
+          $seers = user_roles(FALSE, 'bypass node access');
+        }
+        $result = forum_access_get_grants_by_tid($tid);
+        foreach ($result as $grant) {
+          if (isset($seers[$grant->rid])) {
+            // Don't provide any useless grants!
+            continue;
+          }
+          $grants[$tid][] = [
+            'realm' => 'forum_access',
+            // We change machine_name of role to its numeric equivalent.
+            'gid' => $roles_gids[$grant->rid],
+            'grant_view' => $grant->grant_view,
+            'grant_update' => $grant->grant_update,
+            'grant_delete' => $grant->grant_delete,
+            'priority' => $grant->priority,
+          ];
+        }
+      }
+      if (isset($grants[$tid])) {
+        return $grants[$tid];
+      }
+    }
+  }
+  return [];
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_create_access() for node entities.
+ *
+ * @inheritdoc
+ */
+function forum_access_node_create_access(AccountInterface $account, array $context, $entity_bundle) {
+  if ($entity_bundle != 'forum') {
+    return AccessResult::neutral();
+  }
+  // If we are on forum page we want to restrict access
+  // to create forum according to the forum access rules.
+  module_load_include('inc', 'forum_access', 'includes/forum_access.common');
+  $route = \Drupal::routeMatch();
+  $route_name = $route->getCurrentRouteMatch()->getRouteName();
+  switch ($route_name) {
+    case 'forum.page':
+      $term = $route->getParameter('taxonomy_term');
+      if (forum_access_access('create', $term->id())) {
+        return AccessResult::allowed();
+      }
+      else {
+        return AccessResult::forbidden();
+      }
+      break;
+
+    case 'node.add':
+      $forum_id = \Drupal::request()->get('forum_id');
+      if (forum_access_access('create', $forum_id)) {
+        return AccessResult::allowed();
+      }
+      else {
+        return AccessResult::forbidden();
+      }
+      break;
+  }
+  return AccessResult::neutral();
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert() for node entities.
+ *
+ * @inheritdoc
+ */
+function forum_access_node_insert(EntityInterface $entity) {
+  module_load_include('inc', 'forum_access', 'includes/forum_access.acl');
+  if ($entity->bundle() != 'forum') {
+    return;
+  }
+  if ($tid = forum_access_get_tid($entity)) {
+    $acl_id = forum_access_get_acl($tid, 'moderate');
+    acl_node_add_acl($entity->id(), $acl_id, 1, 1, 1);
+  }
+  $node = Node::load($entity->id());
+  // To preserve database integrity, only write grants if the node
+  // loads successfully.
+  if (!empty($node)) {
+    \Drupal::entityTypeManager()
+      ->getAccessControlHandler('node')
+      ->writeGrants($node);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update() for node entities.
+ *
+ * @inheritdoc
+ */
+function forum_access_node_update(EntityInterface $entity) {
+  if ($entity->bundle() != 'forum') {
+    return;
+  }
+  $old_tid = forum_access_get_tid($entity->original);
+  $current_tid = forum_access_get_tid($entity);
+  if (isset($old_tid)) {
+    if ($current_tid == $old_tid) {
+      return;
+    }
+    acl_node_clear_acls($entity->id(), 'forum_access');
+  }
+  // For changed and for previously unassigned terms we need to fake an insert.
+  forum_access_node_insert($entity);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_view_alter() for node entities.
+ *
+ * @inheritdoc
+ */
+function forum_access_node_view_alter(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display) {
+  module_load_include('inc', 'forum_access', 'includes/forum_access.common');
+  if ($entity->bundle() != 'forum') {
+    return;
+  }
+  // Don't show comment form is user has no access to it.
+  if (!forum_access_entity_access_by_tid('create', $entity)) {
+    $build['comment_forum'][0]['comment_form'] = [];
+  }
+}
+
+/**
+ * Implements hook_node_links_alter().
+ *
+ * @inheritdoc
+ */
+function forum_access_node_links_alter(array &$links, NodeInterface $entity, array &$context) {
+  if ($entity->bundle() != 'forum') {
+    return;
+  }
+  // Don't show Comment link is user has no access to it.
+  if (!forum_access_entity_access_by_tid('create', $entity)) {
+    unset($links['comment__comment_forum']);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_access() for comment entities.
+ *
+ * @inheritdoc
+ */
+function forum_access_comment_access(EntityInterface $entity, $operation, AccountInterface $account) {
+  module_load_include('inc', 'forum_access', 'includes/forum_access.common');
+  // Get parent entity of comment.
+  $parent = $entity->get('entity_id')
+    ->first()
+    ->get('entity')
+    ->getTarget()
+    ->getValue();
+  if (!($parent->getEntityTypeId() == 'node' && $parent->bundle() == 'forum')) {
+    return AccessResult::neutral();
+  }
+  if ($account->hasPermission('administer comments')) {
+    return AccessResult::neutral();
+  }
+  if ($tid = forum_access_get_tid($parent)) {
+    // Disallow if user has no access to view.
+    if (!forum_access_access('view', $tid)) {
+      return AccessResult::forbidden();
+    }
+    $comment_author = $entity->get('uid')
+      ->first()
+      ->get('entity')
+      ->getTarget()
+      ->getValue();
+    // Check if user is author of comment.
+    $is_author = $account->id() == $comment_author->id();
+    if ($operation == 'view' && forum_access_access('view', $tid)) {
+      return AccessResult::allowed();
+    }
+    elseif ($operation == 'update'
+      && (forum_access_access('update', $tid) || $account->hasPermission('edit any forum content') || $is_author && $account->hasPermission('edit own forum content'))) {
+      return AccessResult::allowed();
+    }
+    // Delete operation.
+    elseif ($operation == 'delete'
+      && (forum_access_access('delete', $tid) || $account->hasPermission('delete any forum content') || $is_author && $account->hasPermission('delete own forum content'))) {
+      return AccessResult::allowed();
+    }
+    // Approve operation.
+    elseif ($operation == 'approve' && (forum_access_access('update', $tid) || forum_access_access('delete', $tid))) {
+      return AccessResult::allowed();
+    }
+  }
+  return AccessResult::forbidden();
+}
+
+/**
+ * Implements hook_query_TAG_alter() for tag 'comment_filter'.
+ *
+ * @inheritdoc
+ */
+function forum_access_query_comment_filter_alter(AlterableInterface $query) {
+  module_load_include('inc', 'forum_access', 'includes/forum_access.common');
+  $entity = $query->getMetaData('entity');
+  if (!($entity->getEntityTypeId() == 'node' && $entity->bundle() == 'forum')) {
+    return;
+  }
+  // @todo Replace it with the function.
+  $tid = forum_access_get_tid($entity);
+  $access = [
+    'update' => forum_access_access('update', $tid),
+    'delete' => forum_access_access('delete', $tid),
+  ];
+  // If user has access to update or delete posts or he is moderator
+  // of forum allow him to see unpublished comments.
+  if (!($access['update'] || $access['delete'])) {
+    return;
+  }
+  $conditions =& $query->conditions();
+  foreach ($conditions as $key => $condition) {
+    if (!is_numeric($key)) {
+      continue;
+    }
+    if ($condition['field'] == 'c.status' && $condition['value'] == CommentInterface::PUBLISHED && $condition['operator'] == '=') {
+      unset($conditions[$key]);
+    }
+  }
+}
+
+/**
+ * Implements hook_comment_links_alter().
+ *
+ * @inheritdoc
+ */
+function forum_access_comment_links_alter(array &$links, CommentInterface $entity, array &$context) {
+  // Get parent entity of comment.
+  $parent = $entity->get('entity_id')
+    ->first()
+    ->get('entity')
+    ->getTarget()
+    ->getValue();
+  $account = \Drupal::currentUser();
+  if (!($parent->getEntityTypeId() == 'node' && $parent->bundle() == 'forum')) {
+    return;
+  }
+  if ($account->hasPermission('administer comments')) {
+    return;
+  }
+  if (!forum_access_entity_access_by_tid('create', $parent)) {
+    unset($links['comment']['#links']['comment-reply']);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete() for taxonomy_term entities.
+ *
+ * @inheritdoc
+ */
+function forum_access_taxonomy_term_delete(EntityInterface $entity) {
+  $vid = $entity->get('vid')->first()->getValue()['target_id'];
+  // Delete {forum_access} records when forums are deleted.
+  if ($vid == \Drupal::config('forum.settings')->get('vocabulary')) {
+    \Drupal::database()->delete('forum_access')
+      ->condition('tid', $entity->id())
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_query_TAG_alter() for tag 'taxonomy_term_access'.
+ *
+ * @inheritdoc
+ */
+function forum_access_query_taxonomy_term_access_alter(SelectInterface $query) {
+  // Read meta-data from query, if provided.
+  if (!$account = $query->getMetaData('account')) {
+    $account = \Drupal::currentUser();
+  }
+  if (!$op = $query->getMetaData('op')) {
+    $op = 'view';
+  }
+  // If $account can bypass node access, or there are no node access
+  // modules, we don't need to alter the query.
+  if ($account->hasPermission('bypass node access')) {
+    return;
+  }
+  // Prevent duplicate records.
+  $query->distinct();
+  // Find all instances of the {taxonomy_term_data} table being joined --
+  // could appear more than once in the query, and could be aliased.
+  // Join each one to the forum_access table.
+  $tables = $query->getTables();
+  $rids = $account->getRoles();
+  foreach ($tables as $talias => $tableinfo) {
+    $table = $tableinfo['table'];
+    if ($table == 'taxonomy_term_field_data') {
+      // The node_access table has the access grants for any given node.
+      $access_alias = $query->leftJoin('forum_access', 'fa', '%alias.tid = ' . $talias . '.tid');
+      $acl_alias = $query->leftJoin('acl', 'acl', "%alias.figure = $talias.tid AND %alias.module = 'forum_access' AND %alias.name=:name",
+        [
+          ':name' => 'moderate',
+        ]);
+      $aclu_alias = $query->leftJoin('acl_user', 'aclu', "%alias.acl_id = $acl_alias.acl_id AND %alias.uid = :uid",
+        [
+          ':uid' => $account->id(),
+        ]);
+      $query->condition(db_or()
+        ->isNull("$access_alias.rid")
+        ->condition(db_and()
+          ->condition("$access_alias.rid", $rids, 'IN')
+          ->condition("$access_alias.grant_$op", 1, '>='))
+        ->condition("$aclu_alias.uid", $account->id()));
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert() for user_role entitites.
+ *
+ * @inheritdoc
+ */
+function forum_access_user_role_insert(EntityInterface $entity) {
+  $config = \Drupal::configFactory()->getEditable('forum_access.settings');
+  $roles_gids = array_flip($config->get('forum_access_roles_gids'));
+  $roles_gids[] = $entity->id();
+  $config->set('forum_access_roles_gids', array_flip($roles_gids));
+  $config->save();
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete() for user_role entities.
+ *
+ * @inheritdoc
+ */
+function forum_access_user_role_delete(EntityInterface $entity) {
+  // Delete records from access tables.
+  \Drupal::database()->delete('forum_access')
+    ->condition('rid', $entity->id())
+    ->execute();
+  \Drupal::database()->delete('node_access')
+    ->condition('gid', $entity->id())
+    ->condition('realm', 'forum_access')
+    ->execute();
+  // Delete accordance between roles and numeric value.
+  $config = \Drupal::configFactory()->getEditable('forum_access.settings');
+  $roles_gids = $config->get('forum_access_roles_gids');
+  unset($roles_gids[$entity->id()]);
+  $config->set('forum_access_roles_gids', $roles_gids);
+  $config->save();
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for node_form.
+ *
+ * @inheritdoc
+ */
+function forum_access_form_node_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  if (!isset($form['taxonomy_forums'])) {
+    return;
+  }
+  $node = $form_state->getFormObject()->getEntity();
+  $account = \Drupal::currentUser();
+  // True node administrators are all powerful
+  // and do NOT get their forms rewritten here.
+  if ($account->hasPermission('bypass node access')) {
+    return;
+  }
+  // Get list of available lists.
+  $tids = forum_access_form_node_form_get_available_tids($account, $node);
+  $forum_tid = forum_access_get_tid($node);
+  // Leave only that forum options for which user has access.
+  $form_options = &$form['taxonomy_forums']['widget']['#options'];
+  foreach ($form_options as $tid => $name) {
+    if (!isset($tids[$tid])) {
+      unset($form_options[$tid]);
+    }
+  }
+  // Apply modifications for Moderators (by role or uid).
+  if (!$account->hasPermission('administer nodes') && forum_access_is_moderator($account, $forum_tid)) {
+    foreach (Element::children($form) as $key) {
+      switch ($key) {
+        case 'sticky':
+          $form[$key]['#access'] = TRUE;
+          break;
+
+        case 'revision':
+          $form['revision']['#access'] = TRUE;
+          break;
+
+        case 'comment_forum':
+          $form[$key]['#access'] = TRUE;
+          break;
+
+        case 'shadow':
+          $form[$key]['#description'] .= ' ' . t('Note: Access to this topic and its shadows is controlled by the forum that contains the topic.');
+          break;
+
+        case 'taxonomy_forums':
+          $form[$key]['widget']['#description'] .= t('Note: Moving a topic to a different forum may change its accessibility.');
+          break;
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for taxonomy_term_forums_forum_form.
+ *
+ * @inheritdoc
+ */
+function forum_access_form_taxonomy_term_forums_forum_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  module_load_include('inc', 'forum_access', 'includes/forum_access.admin');
+  module_load_include('inc', 'forum_access', 'includes/forum_access.acl');
+  $tid = $form['tid']['#value'];
+  $settings = forum_access_get_settings($tid);
+  $form['forum_access'] = [
+    '#type' => 'details',
+    '#title' => t('Access control'),
+    '#collapsible' => TRUE,
+    '#tree' => TRUE,
+  ];
+  // Moderators fields.
+  $form['forum_access']['permissions'] = _forum_access_forum_permissions_form();
+  $form['forum_access']['grants'] = _forum_access_forum_grants_form($form_state, $settings);
+  $form['forum_access']['moderators'] = _forum_access_forum_moderators_form($form_state, $tid);
+  $form['actions']['submit']['#submit'][] = '_forum_access_admin_forum_form_submit';
+  if (isset($tid) && !node_access_needs_rebuild()) {
+    // Count number of nodes which are attached to this term.
+    $count = Drupal::database()
+      ->select('node__taxonomy_forums')
+      ->condition('taxonomy_forums_target_id', $tid)
+      ->countQuery()
+      ->distinct()
+      ->execute()
+      ->fetchField();
+    $limit = $threshold = 20;
+    $form['forum_access']['update_limit'] = [
+      '#type' => 'value',
+      '#value' => $limit,
+    ];
+    $form['forum_access']['update_choice'] = [
+      '#type' => 'radios',
+      '#title' => t('Update the permissions'),
+      '#description' => t('<em>If</em> you make any node access changes, then each node in this forum needs to be updated. Hover over the radiobuttons for details.'),
+      '#options' => [
+        'all' => t('for all %count nodes immediately', ['%count' => $count]),
+        'batch' => t('in batches of :limit now', [':limit' => $limit]),
+        'later' => t('rebuild <strong>all</strong> permissions later'),
+      ],
+      '#default_value' => 'batch',
+    ];
+  }
+  if (isset($tid)) {
+    $form['forum_access']['force_update'] = [
+      '#type' => 'checkbox',
+      '#title' => t('Update even if unchanged'),
+    ];
+  }
+}
+
+/**
+ * Submit handler for forum access administrative form.
+ */
+function _forum_access_admin_forum_form_submit($form, FormStateInterface $form_state) {
+  module_load_include('inc', 'forum_access', 'includes/forum_access.admin');
+  // Save roles permissions.
+  _forum_access_form_roles_permissions_save($form_state);
+  // Save moderators list.
+  _forum_access_form_moderators_save($form_state);
+  // Update access records.
+  _forum_access_update_access_records($form_state);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for taxonomy_term_forums_container_form.
+ *
+ * @inheritdoc
+ */
+function forum_access_form_taxonomy_term_forums_container_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  module_load_include('inc', 'forum_access', 'includes/forum_access.admin');
+  module_load_include('inc', 'forum_access', 'includes/forum_access.acl');
+  $tid = $form['tid']['#value'];
+  $settings = forum_access_get_settings($tid);
+  $form['forum_access'] = [
+    '#type' => 'details',
+    '#title' => t('Access control'),
+    '#collapsible' => TRUE,
+    '#tree' => TRUE,
+  ];
+  // Moderators fields.
+  $form['forum_access']['grants'] = _forum_access_container_grants_form($form_state, $settings);
+  $form['forum_access']['moderators'] = _forum_access_forum_moderators_form($form_state, $tid);
+  $form['actions']['submit']['#submit'][] = '_forum_access_admin_container_form_submit';
+}
+
+/**
+ * Submit handler for container access administrative form.
+ */
+function _forum_access_admin_container_form_submit($form, FormStateInterface $form_state) {
+  module_load_include('inc', 'forum_access', 'includes/forum_access.admin');
+  // Save roles permissions.
+  _forum_access_form_roles_permissions_save($form_state);
+  // Save moderators list.
+  _forum_access_form_moderators_save($form_state);
+}
+
+/**
+ * This is also required by ACL module.
+ *
+ * @see acl_node_access_records()
+ */
+function forum_access_enabled($set = NULL) {
+  // Not drupal_static!
+  static $enabled = TRUE;
+  if ($set !== NULL) {
+    $enabled = $set;
+  }
+  return $enabled;
+}
+
+/**
+ * Retrieve the settings for a taxonomy term.
+ *
+ * @param int $tid
+ *   (optional) Taxonomy term id.
+ *
+ * @return array
+ */
+function forum_access_get_settings($tid = NULL) {
+  $settings = [
+    'view' => [],
+    'create' => [],
+    'update' => [],
+    'delete' => [],
+    'priority' => 0,
+  ];
+  $result = \Drupal::database()->select('forum_access', 'a')
+    ->fields('a', [
+      'tid',
+      'rid',
+      'grant_view',
+      'grant_update',
+      'grant_delete',
+      'grant_create',
+      'priority',
+    ])
+    ->condition('tid', $tid)
+    ->execute();
+  foreach ($result as $access) {
+    if ($access->grant_view) {
+      $settings['view'][] = $access->rid;
+    }
+    if ($access->grant_update) {
+      $settings['update'][] = $access->rid;
+    }
+    if ($access->grant_delete) {
+      $settings['delete'][] = $access->rid;
+    }
+    if ($access->grant_create) {
+      $settings['create'][] = $access->rid;
+    }
+    if ($access->rid == AccountInterface::AUTHENTICATED_ROLE) {
+      // This is our reference.
+      $settings['priority'] = $access->priority;
+    }
+  }
+  return $settings;
+}
+
+/**
+ * Set settings for taxonomy term.
+ *
+ * @param int $tid
+ *   Taxonomy term id.
+ * @param array $settings
+ *   Forum Access settings.
+ */
+function forum_access_set_settings($tid, array $settings) {
+  \Drupal::database()->delete('forum_access')
+    ->condition('tid', $tid)
+    ->execute();
+  $insert = \Drupal::database()->insert('forum_access');
+  $insert->fields([
+    'tid',
+    'rid',
+    'grant_view',
+    'grant_update',
+    'grant_delete',
+    'grant_create',
+    'priority',
+  ]);
+  foreach ($settings['view'] as $rid => $checked) {
+    $insert->values([
+      'tid' => $tid,
+      'rid' => $rid,
+      'grant_view' => (int) !empty($checked),
+      'grant_update' => (int) !empty($settings['update'][$rid]),
+      'grant_delete' => (int) !empty($settings['delete'][$rid]),
+      'grant_create' => (int) !empty($settings['create'][$rid]),
+      'priority' => 0,
+    ]);
+  }
+  $insert->execute();
+}
+
+/**
+ * Get list of available tids for specific account.
+ *
+ * @param AccountInterface $account
+ *   The user object for the user whose access is being checked.
+ * @param NodeInterface $node
+ *   The node to check.
+ *
+ * @return array
+ */
+function forum_access_form_node_form_get_available_tids(AccountInterface $account, NodeInterface $node) {
+  // We figure out what tids we want to show in form according
+  // to the forum access settings.
+  $forum_access_settings = forum_access_get_settings_by_roles($account->getRoles(), 'create');
+  $tids = [];
+  foreach ($forum_access_settings as $setting) {
+    $tids[$setting->tid] = $setting->tid;
+  }
+  // Also get all forums they happen to be able to moderate.
+  $acl_access_settings = forum_access_get_settings_by_user('forum_access', $account->id(), 'moderate');
+  foreach ($acl_access_settings as $setting) {
+    $tids[$setting->figure] = $setting->figure;
+  }
+  // Make available current forum for existed node.
+  if (!empty($node)) {
+    $forum_tid = forum_access_get_tid($node);
+    $tids[$forum_tid] = $forum_tid;
+  }
+  return $tids;
+}
+
+/**
+ * Preprocess for output of form with roles and permissions.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - form: A render element representing the form with
+ *     - check_boxes: A render element representing the forum_access table.
+ */
+function template_preprocess_forum_access_table(array &$variables) {
+  $checkboxes = &$variables['form']['checkboxes'];
+  foreach (Element::children($checkboxes) as $child) {
+    foreach (Element::children($checkboxes[$child]) as $child2) {
+      $variables['form']['rows'][$child2][] = $checkboxes[$child][$child2];
+    }
+  }
+}
+
