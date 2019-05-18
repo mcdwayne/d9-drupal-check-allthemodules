@@ -1,0 +1,679 @@
+<?php
+
+/**
+ * @file
+ * Author : Vinek T.
+ * Description : This module gives attempt to login/register in drupal site
+ * with netFORUM SOAP api. You can find multiple functions present as a global
+ * methods & to override and change the behaviour of default user login.
+ * Date : 16th March'2017.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\user\Entity\User;
+
+/**
+ * Implements hook_form_alter().
+ * Manage complete user_login_form() functionality here and change drastically.
+ */
+function netauth_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  switch ($form_id) {
+    case 'user_login_form':
+      array_unshift($form['#validate'], '_netauth_user_login_validate');
+      $form['#submit'][] = '_netauth_user_login_form_submit';
+      break;
+  }
+}
+
+/**
+ * Implements hook_validate().
+ * The validation callback function to authenticate a user from external system.
+ */
+function _netauth_user_login_validate(&$form, FormStateInterface $form_state) {
+  global $user;
+
+  $language = \Drupal::languageManager()->getCurrentLanguage()->getId();
+  $user = User::create();
+  $config = \Drupal::config('netauth.settings');
+
+  $xweb_url = $config->get('netauth_wsdl_url');
+  $xweb_user = $config->get('netauth_user');
+  $xweb_pass = $config->get('netauth_pass');
+
+  $values = $form_state->getValues();
+  $name = $values['name'];
+  $pass = $values['pass'];
+
+  $uid = _uid_from_username($name);
+  $external_id = _netauth_get_external_uid_from_username($name);
+  $user_by_email = user_load_by_mail($name);
+
+  $authToken = _netforum_ssoauth($xweb_user['netauth_user'], $xweb_pass['netauth_pass']);
+  $get_sso = _netforum_sso_token($name, $pass, $authToken);
+  if ($get_sso) {
+    $sso = explode("=", $get_sso);
+    $ssoToken = $sso[1];
+  }
+  else {
+    $ssoToken = "";
+  }
+
+  if (($external_id || !$uid) && ((!$uid && !$user_by_email) ||
+      (isset($user_by_email->get('uid')->value) &&
+      $uid == $user_by_email->get('uid')->value &&
+      $external_id)) && $ssoToken) {
+    $cst_key = _netforum_cst_key($xweb_user['netauth_user'], $xweb_pass['netauth_pass'], $ssoToken);
+    $existing_uid = _netauth_get_uid_from_cst_key($cst_key);
+    $existing_user = NULL;
+
+    if ($existing_uid) {
+      // Get customer info.
+      $arr_cust = _netforum_get_cust_by_key($xweb_url['netauth_wsdl_url'], $xweb_user['netauth_user'], $xweb_pass['netauth_pass'], $cst_key);
+      $memtype = ($arr_cust["MemberFlag"] == 0) ? "nfnonmember" : "nfmember";
+
+      // Load the existing user.
+      $existing_user = user_load($existing_uid);
+      $existing_user->get('name')->value = $name;
+      $existing_user->get('mail')->value = $name;
+      $existing_user->get('pass')->value = $pass;
+
+      // Update/save the existing user.
+      $existing_user->setUsername($name);
+      $existing_user->setPassword($pass);
+      $existing_user->setEmail($name);
+      $existing_user->addRole('rid');
+      $existing_user->save();
+
+      // Update the authmap.
+      _netauth_update_authmap($name, $existing_uid);
+
+      // Update the fs_netforum_auth table.
+      _netauth_set_sso_token_from_uid($existing_uid, $ssoToken);
+
+      // Assign user_id to the varible.
+      $uid = $existing_user->get('uid')->value;
+    }
+    else {
+      // There is no uid with cst key but there may be already be a user with
+      // that email.
+      if ($existing_uid != $uid) {
+        $name = array_keys($form)[0];
+        $siteEmail = (variable_get('site_mail', '') == '') ? '' : "(" . variable_get('site_mail', '') . ")";
+        $form_state->setErrorByName($name, t("Invalid credentials. Please contact your system administrator @mail", array['@mail' => $siteEmail]));
+        return FALSE;
+      }
+
+      // Get customer info.
+      $arr_cust = _netforum_get_cust_by_key($xweb_url['netauth_wsdl_url'], $xweb_user['netauth_user'], $xweb_pass['netauth_pass'], $cst_key);
+      $memtype = ($arr_cust["MemberFlag"] == 0) ? "nfnonmember" : "nfmember";
+
+      // Register the user.
+      $user->setUsername($name);
+      $user->setPassword($pass);
+      $user->setEmail($name);
+      $user->enforceIsNew();
+      $user->set("init", $name);
+      $user->set("langcode", $language);
+      $user->set("preferred_langcode", $language);
+      $user->set("preferred_admin_langcode", $language);
+      $user->addRole('rid');
+      $user->activate();
+      $user->save();
+
+      // Insert into the netforum_auth table.
+      _netauth_set_cst_key_uid($user->id(), $cst_key, $memtype, $ssoToken);
+
+      // Insert into the autmap table.
+      _netauth_set_authmap_uid($user->id(), $name, 'netauth');
+
+      // Save/update user email and load user object.
+      $newUser = user_load($user->id());
+      $newUser->get('name')->value = $name;
+      $newUser->get('pass')->value = $pass;
+
+      // Assign user_id to the varible.
+      $uid = $newUser->get('uid')->value;
+    }
+
+    // Load the user and let login user.
+    $values['uid'] = $uid;
+    $user_load = user_load($uid);
+    user_login_finalize($user_load);
+
+    $form_state->setRedirect('<front>');
+
+    // Set sso token in session.
+    $_SESSION['netforum_sso'] = $ssoToken;
+  }
+}
+
+/**
+ * Custom submit handler callback function for login form.
+ */
+function _netauth_user_login_form_submit($form, FormStateInterface $form_state) {
+  $form_state->setRedirect('<front>');
+}
+
+/**
+ * Implements hook_user_delete().
+ */
+function netauth_user_delete($account) {
+  db_delete('fs_authmap')->condition('uid', $account->id())->execute();
+  db_delete('fs_netforum_auth')->condition('uid', $account->id())->execute();
+}
+
+/**
+ * Implement hook_user_form_alter().
+ */
+function netauth_form_user_form_alter(&$form, FormStateInterface $form_state) {
+  $user = \Drupal::currentUser()->id();
+  if ($user != 1) {
+    if (strpos($form['account']['name'], '@') !== FALSE) {
+      $form['account']['name']['#disabled'] = TRUE;
+      $form['account']['name']['#description'] = t('The username for this account cannot be changed');
+      $form['account']['mail']['#disabled'] = TRUE;
+      $form['account']['mail']['#description'] = t('This e-mail address for this account cannot be changed.');
+      array_unshift($form['#validate'], '_netauth_update_user_password');
+    }
+  }
+}
+
+/**
+ * Function to retrieve the password entered so as to update it on netFORUM.
+ */
+function _netauth_update_user_password(&$form, FormStateInterface $form_state) {
+  global $user;
+  $config = \Drupal::config('netauth.settings');
+  $user = \Drupal::currentUser();
+  $uid = $user->id();
+
+  $xweb_url = $config->get('netauth_wsdl_url');
+  $xweb_user = $config->get('netauth_user');
+  $xweb_pass = $config->get('netauth_pass');
+
+  $values = $form_state->getValues();
+  $oldPass = $values['current_pass'];
+  $newPass = $values['pass'];
+  if (array_key_exists('uid', $form_state) && ($uid <= 1)) {
+    return;
+  }
+  try {
+    $existingUser = user_load($uid);
+    if ($existingUser == FALSE) {
+      throw new RuntimeException("Cannot load user information");
+    }
+
+    $cst_key = _netauth_get_cst_key_from_uid($uid);
+    $obj = new stdClass();
+    $obj->any = to_xml([
+      'IndividualObject' => [
+        'cst_web_new_password' => $newPass,
+      ],
+    ]);
+    _netforum_set_password($xweb_url['netauth_wsdl_url'], $xweb_url['netauth_user'], $xweb_url['netauth_pass'], $cst_key, $obj);
+  }
+  catch (Exception $e) {
+    $form_state->setErrorByName($xweb_url['netauth_wsdl_url'], t('Uh Oh! @message', array['@message' => $e->getMessage()]));
+    return FALSE;
+  }
+}
+
+/**
+ * Function to reset the password from forgot password section.
+ */
+function netauth_form_user_pass_alter(&$form, FormStateInterface &$form_state) {
+  array_unshift($form['#validate'], '_netauth_reset_user_password');
+}
+
+/**
+ * Callback function to reset the password from netFORUM.
+ */
+function _netauth_reset_user_password(&$form, FormStateInterface &$form_state) {
+  global $user;
+
+  $language = \Drupal::languageManager()->getCurrentLanguage()->getId();
+  $user = User::create();
+  $config = \Drupal::config('netauth.settings');
+
+  $xweb_url = $config->get('netauth_wsdl_url');
+  $xweb_user = $config->get('netauth_user');
+  $xweb_pass = $config->get('netauth_pass');
+
+  $email = $form['name']['#value'];
+  $name = array_keys($form)[0];
+  $uid = _netauth_get_external_user($email);
+  $account = user_load($uid);
+
+  // Check if this customer has a netFORUM account already in drupal.
+  if (!$account) {
+    $customer = _netforum_get_cust_by_mail($xweb_url['netauth_wsdl_url'], $xweb_user['netauth_user'], $xweb_pass['netauth_pass'], $email);
+
+    // Sometimes netFOURM sends an array of emails that match, occasionally
+    // for the same user, in that case just pick the first one.
+    if (!isset($customer['cst_key']) && isset($customer[0])) {
+      $customer = (array) $customer[0];
+    }
+
+    if (isset($customer['cst_key'])) {
+      // Check if there is a user with this email, if so let the default
+      // validator handle it.
+      if (user_load_by_mail($email)) { 
+        return TRUE;
+      }
+
+      $cust_info = _netforum_get_cust_by_key($xweb_url['netauth_wsdl_url'], $xweb_user['netauth_user'], $xweb_pass['netauth_pass'], $customer['cst_key']);
+      if (!is_array($cust_info)) {
+        $form_state->setErrorByName($name, t("An error occurred contacting netFORUM, please try again"));
+        return FALSE;
+      }
+
+      if(!isset($cust_info["EmailAddress"])){
+        $form_state->setErrorByName($name, t("No email set on netFORUM"));
+        return FALSE;
+      }
+
+      // Check if it is the primary email.
+      if ($customer['EmailAddress'] != $cust_info["EmailAddress"]) {
+        $form_state->setErrorByName($name, t("Invalid Email. This is not the primary email for this account, or another netFORUM account is also tied to this email"));
+        return FALSE;
+      }
+
+      // Check if there is already a user with this cst key in drupal.
+      // They may have changed their email.
+      $user_id = _netauth_get_uid_from_cst_key($customer['cst_key']);
+      if (!$user_id) {
+        // Register this new user.
+        $user->setUsername($customer['EmailAddress']);
+        $user->setPassword($customer['cst_key']);
+        $user->setEmail($customer['EmailAddress']);
+        $user->enforceIsNew();
+        $user->set("init", $name);
+        $user->set("langcode", $language);
+        $user->addRole('rid');
+        $user->activate();
+        $user->save();
+
+        // Insert into the autmap table.
+        _netauth_set_authmap_uid($user->id(),$customer['EmailAddress'], 'netauth');
+
+        // Insert into the netforum_auth table.
+        _netauth_set_cst_key_uid($user->id(),$customer['cst_key'], "", "");
+      }
+      else {
+        // Load the existing user.
+        $existing_user = user_load($user_id);
+        $existing_user->get('name')->value = $customer['EmailAddress'];
+        $existing_user->get('mail')->value = $customer['EmailAddress'];
+        $existing_user->get('pass')->value = $customer['cst_key'];
+
+        // Update/save the existing user.
+        $existing_user->setUsername($customer['EmailAddress']);
+        $existing_user->setPassword($customer['cst_key']);
+        $existing_user->setEmail($customer['EmailAddress']);
+        $existing_user->addRole('rid');
+        $existing_user->save();
+
+        // Terminate if an error occurred during user_save().
+        if (!$existing_user) {
+          $form_state->setErrorByName($customer['EmailAddress'], t("An error occurred please try again"));
+          return FALSE;
+        }
+
+        // Update the authmap.
+        _netauth_update_authmap($customer['EmailAddress'], $user_id);
+
+        // Update the fs_netforum_auth table.
+        _netauth_set_sso_token_from_uid($user_id, "");
+      }
+    }
+  }
+  else {
+    $cust_cst = _netauth_get_cst_key_from_uid($account->get('uid')->value);
+
+    // There is an associated netFORUM account.
+    if (!empty($cust_cst)) {
+      $cust_info = _netforum_get_cust_by_key($xweb_url['netauth_wsdl_url'], $xweb_user['netauth_user'], $xweb_pass['netauth_pass'], $cust_cst);
+      if (!is_array($cust_info)) {
+        $form_state->setErrorByName($email, t("An error occurred contacting netFORUM, please try again"));
+        return FALSE;
+      }
+
+      if (!isset($cust_info["EmailAddress"])) {
+        $form_state->setErrorByName($email, t("No email set on netFORUM"));
+        return FALSE;
+      }
+
+      $site_acc = user_load_by_mail($cust_info["EmailAddress"]);
+      $site_acc_cst_key = ($site_acc) ? _netauth_get_cst_key_from_uid($site_acc->get('uid')->value) : '';
+      $siteEmail = ($config->get('site_mail') == '') ? '' : "(" . $config->get('site_mail') . ")";
+      if ($site_acc_cst_key != $cust_cst) {
+        $form_state->setErrorByName($email, t("Your email has been changed on netFORUM. Another user with this email already exists. Please contact your site administrator @mail for more information", array['@mail' => $siteEmail]));
+        return FALSE;
+      }
+      if ($account->get('name')->value != $cust_info["EmailAddress"]) {
+        $form_state->setErrorByName($email, t("Your email has been changed in netFORUM. Please check your email. Contact: {$siteEmail} for more information"));
+        return FALSE;
+      }
+    }
+  }
+  return TRUE;
+}
+
+/**
+ * Few helper functions goes here for returning a user id.
+ */
+function _uid_from_username($username) {
+  return db_query('SELECT uid from {users_field_data} WHERE name = :name',
+    [':name' => $username])->fetchField();
+}
+
+/**
+ * Helper functions to return a uid, name and mail.
+ */
+function _user_from_mail($mail) {
+  return db_query('SELECT uid,name,mail from {users_field_data} 
+    WHERE mail = :mail', [':mail' => $mail])->fetchObject();
+}
+
+/**
+ * Helper functions to return a users uid.
+ */
+function _netauth_get_external_uid_from_username($username) {
+  return db_query('SELECT uid FROM {fs_authmap} WHERE authname = :authname
+    AND module = :module', [':authname' => $username, ':module' => 'netauth'])
+  ->fetchField();
+}
+
+/**
+ * Helper functions to return a users uid.
+ */
+function _netauth_get_uid_from_cst_key($cst_key) {
+  return db_query('SELECT uid FROM {fs_netforum_auth} WHERE cst_key = :cst_key',
+    [':cst_key' => $cst_key])->fetchField();
+}
+
+/**
+ * Helper functions to return a cst_key.
+ */
+function _netauth_get_cst_key_from_uid($uid) {
+  return db_query('SELECT cst_key FROM {fs_netforum_auth} WHERE uid = :uid',
+    [':uid' => $uid,])->fetchField();
+}
+
+/**
+ * Helper functions to insert in netauth table.
+ */
+function _netauth_set_cst_key_uid($uid, $cst_key, $memtype, $ssoToken) {
+  return db_insert('fs_netforum_auth')->fields(['uid' => $uid,
+    'cst_key' => $cst_key,
+    'member_type' => $memtype,
+    'sso_token' => $ssoToken])->execute();
+}
+
+/**
+ * Helper functions to update netauth table.
+ */
+function _netauth_set_sso_token_from_uid($uid, $ssoToken) {
+  return db_update('fs_netforum_auth')
+    ->fields(['sso_token' => $ssoToken])
+    ->condition('uid', $uid)
+    ->execute();
+}
+
+/**
+ * Helper functions to insert in authmap.
+ */
+function _netauth_set_authmap_uid($uid, $name, $module) {
+  return db_insert('fs_authmap')
+    ->fields(['uid' => $uid, 'authname' => $name, 'module' => $module])
+    ->execute();
+}
+
+/**
+ * Helper functions to update a authmap table.
+ */
+function _netauth_update_authmap($name, $uid) {
+  return db_update('fs_authmap')
+    ->fields(['authname' => $name])
+    ->condition('uid', $uid)
+    ->execute();
+}
+
+/**
+ * Helper functions to return a users uid.
+ */
+function _netauth_get_external_user($authname) {
+  return db_query('SELECT uid FROM {fs_authmap} 
+    WHERE authname = :authname', [':authname' => $authname])->fetchField();
+}
+
+/**
+ * Convert respective array into XML to use into xml unicode style.
+ *
+ * @param string $params
+ *   Array for variable to be passed on.
+ * @param string $rootNodeName
+ *   Pass the node name here.
+ */
+function to_xml(array $params, $rootNodeName = NULL) {
+  $array_to_be_called = $params;
+  if ($rootNodeName == NULL) {
+    reset($params);
+    $rootNodeName = key($params);
+    $array_to_be_called = $params[$rootNodeName];
+  }
+  $xml_to_send = new SimpleXMLElement ("<" . $rootNodeName . "></" . $rootNodeName . ">");
+
+  create_xml_from_array($array_to_be_called, $xml_to_send);
+  $dom_xml_to_send = dom_import_simplexml($xml_to_send);
+
+  return $dom_xml_to_send->ownerDocument->saveXML($dom_xml_to_send->ownerDocument->documentElement);
+}
+
+/**
+ * Helper functions to create XML from array.
+ */
+function create_xml_from_array(array $params, SimpleXMLElement &$xml_result) {
+  foreach ($params as $key => $value) {
+    if (is_array($value)) {
+      if (!is_numeric($key)) {
+        $subnode = $xml_result->addChild('' . $key);
+        create_xml_from_array($value, $subnode);
+      }
+      else {
+        create_xml_from_array($value, $xml_result);
+      }
+    }
+    else {
+      $xml_result->addChild("" . $key, htmlspecialchars("" . $value));
+    }
+  }
+}
+
+/**
+ * NetFORUM SOAP API configuration function authorize a user via netFORUM.
+ *
+ * @param string $user
+ *   An username for passing to netFORUM API.
+ * @param string $pass
+ *   A password for passing to netFORUM API.
+ *
+ * @return
+ *   Get an auth token once calling from netFORUM auth API.
+ */
+function _netforum_ssoauth($user, $pass) {
+  $response = "";
+  $client = new SoapClient("https://netforum.avectra.com/xWeb/Signon.asmx?WSDL", array['trace' => 1]);
+  $result = $client->__soapCall("Authenticate", array[
+    "params" => array(
+      "userName" => $user,
+      "password" => $pass,
+    ],
+  ], NULL, NULL, $response);
+  return $result->AuthenticateResult;
+}
+
+/**
+ * Attempts to authorize a user via netFORUM.
+ *
+ * @param string $username
+ *   An username for passing to netFORUM API.
+ * @param string $password
+ *   A password for passing to netFORUM API.
+ *
+ * @return
+ *   Get SSO token boolean false once calling from netFORUM single sign on API.
+ */
+function _netforum_sso_token($user,$pass,$authToken) {
+  try {
+    $response = "";
+    $client = new SoapClient("https://netforum.avectra.com/xWeb/Signon.asmx?WSDL", array['trace' => 1]);
+    $result = $client->__soapCall("GetSignOnToken", array[
+      "params" => array[
+        "Email" => $user,
+        "Password" => $pass,
+        "AuthToken" => $authToken,
+        "Minutes" => "45",
+      ],
+    ], NULL, NULL, $response);
+  return $result->GetSignOnTokenResult;
+  }
+  catch (SoapFault $fault) {
+    trigger_error("SOAP Fault: (faultcode: {$fault->faultcode}, faultstring: {$fault->faultstring})", E_USER_ERROR);
+  }
+}
+
+/**
+ * Attempts to get cst_key via netFORUM.
+ *
+ * @param string $username
+ *   An username for passing to netFORUM API.
+ * @param string $password
+ *   A password for passing to netFORUM API.
+ *
+ * @return
+ *   Getting cst_key in boolean format.
+ */
+function _netforum_cst_key($user,$pass,$ssoToken) {
+  $authToken = _netforum_ssoauth($user,$pass);
+  $client = new SoapClient("https://netforum.avectra.com/xWeb/Signon.asmx?WSDL", array['trace' => 1]);
+  $result = $client->__soapCall("GetCstKeyFromSignOnToken", array[
+    "params" => array[
+      "AuthToken" => $authToken,
+      "szEncryptedSingOnToken" => $ssoToken,
+    ],
+  ], NULL, NULL, $response);
+  return $result->GetCstKeyFromSignOnTokenResult;
+}
+
+/**
+ * Make authorize to user via netFORUM console
+ */
+function _netforum_authenticate($wsdlurl,$user,$pass) {
+  $response = "";
+  $client = new SoapClient($wsdlurl, array['trace' => 1]);
+  $result = $client->__soapCall("Authenticate", array[
+    "params" => array(
+      "userName" => $user,
+      "password" => $pass,
+    ],
+  ], NULL, NULL, $response);
+  $getResult = $result->AuthenticateResult;
+  return $response['AuthorizationToken']->Token;
+}
+
+/**
+ * Getting CST key by providing user/cust key
+ */
+function _netforum_get_cust_by_key($wsdlurl, $user, $pass, $cstKey) {
+  $response = array();
+  $client = new SoapClient($wsdlurl, array['trace' => 1]);
+  $result = $client->__soapCall("Authenticate", array[
+    "params" => array[
+      "userName" => $user,
+      "password" => $pass,
+    ],
+  ], NULL, NULL, $response);
+  $getResult = $result->AuthenticateResult;
+  $token = $response['AuthorizationToken']->Token;
+
+  // Making of soapHeader.
+  if ($response != NULL || isset($response['AuthorizationToken']) ||
+    isset($response['AuthorizationToken']->Token)) {
+    $token = $response['AuthorizationToken']->Token;
+  }
+  $header = new SoapHeader($getResult, "AuthorizationToken", array["Token" => $token]);
+  $result2 = $client->__soapCall("GetCustomerByKey", array[
+    "GetCustomerByKey" => array[
+      "szCstKey" => $cstKey,
+    ],
+  ], NULL, $header, $inforesponse);
+  $cust_info = new SimpleXMLElement($result2->GetCustomerByKeyResult->any);
+  $array = json_decode(json_encode((array)$cust_info), TRUE);
+  return $array['Result'];
+}
+
+/**
+ * Getting CST key by providing user/cust mail.
+ *
+ * @return
+ *   User email for API call.
+ */
+function _netforum_get_cust_by_mail($wsdlurl, $user, $pass, $email) {
+  $response = array();
+  $client = new SoapClient($wsdlurl, array['trace' => 1]);
+  $result = $client->__soapCall("Authenticate", array[
+    "params" => array(
+      "userName" => $user,
+      "password" => $pass,
+    ],
+  ], NULL, NULL, $response);
+  $getResult = $result->AuthenticateResult;
+  $token = $response['AuthorizationToken']->Token;
+
+  // Making of soapHeader.
+  if ($response != NULL || isset($response['AuthorizationToken']) ||
+    isset($response['AuthorizationToken']->Token)) {
+    $token = $response['AuthorizationToken']->Token;
+  }
+  $array['Result'] = array();
+  $header = new SoapHeader($getResult, "AuthorizationToken", array["Token" => $token]);
+  $result2 = $client->__soapCall("GetCustomerByEmail", array[
+    "GetCustomerByEmail" => array[
+      "szEmailAddress" => $email,
+    ],
+  ], NULL, $header, $inforesponse);
+  $cust_info = new SimpleXMLElement($result2->GetCustomerByEmailResult->any);
+  $array = json_decode(json_encode((array)$cust_info), TRUE);
+  return (!$array['Result']) ? "" : $array['Result'];
+}
+
+/**
+ * Set password for netFORUM user/cust
+ */
+function _netforum_set_password($wsdlurl, $user, $pass, $key, $node) {
+  $response = array[];
+  $client = new SoapClient($wsdlurl, array['trace' => 1]);
+  $result = $client->__soapCall("Authenticate", array[
+    "params" => array(
+      "userName" => $user,
+      "password" => $pass,
+    ],
+  ], NULL, NULL, $response);
+  $getResult = $result->AuthenticateResult;
+  $token = $response['AuthorizationToken']->Token;
+
+  // Making of soapHeader.
+  if ($response != NULL || isset($response['AuthorizationToken']) ||
+    isset($response['AuthorizationToken']->Token)) {
+    $token = $response['AuthorizationToken']->Token;
+  }
+  $header = new SoapHeader($getResult, "AuthorizationToken", array["Token" => $token]);
+  $result2 = $client->__soapCall("SetIndividualInformation", array[
+  	"SetIndividualInformation" => array[
+  	  "IndividualKey" => $key,
+  	  "oUpdateNode" => $node,
+  	],
+  ], NULL, $header, $inforesponse);
+  return $setupinfo = $result2->GetCustomerByEmailResult->any;
+}
