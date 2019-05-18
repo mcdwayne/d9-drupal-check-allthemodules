@@ -1,0 +1,217 @@
+<?php
+/**
+ * @file
+ * Eat module.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\taxonomy\Entity\Vocabulary;
+use Drupal\taxonomy\Entity\Term;
+use Drupal\views\ViewExecutable;
+use Drupal\node\Entity\Node;
+use Drupal\Core\Entity;
+use Drupal\node\NodeInterface;
+use Drupal\eat\Eat;
+
+/**
+ * Implements hook_form_alter().
+ */
+function eat_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // Check config exists.
+  $config = \Drupal::configFactory()->get('eat.settings');
+  $name = !empty($config->getName()) ? $config->getName() : NULL;
+  if ($name == 'eat.settings') {
+    $eat_items = $config->get('eat_item');
+    // Check if eat items exists
+    if (!$eat_items) {
+      return;
+    }
+    foreach ($eat_items as $item) {
+      $entity_type = $item['#entity_type'];
+      $bundle = $item['#bundle'];
+
+      if ($form_id == "{$entity_type}_{$bundle}_form" || $form_id == "{$entity_type}_{$bundle}_edit_form") {
+        $form['entity_type'] = [
+          '#type' => 'textfield',
+          '#disabled' => TRUE,
+          '#access' => FALSE,
+          '#default_value' => $entity_type,
+        ];
+        $form['bundle'] = [
+          '#type' => 'textfield',
+          '#disabled' => TRUE,
+          '#access' => FALSE,
+          '#default_value' => $bundle,
+        ];
+        $form['actions']['submit']['#submit'][] = 'eat_form_submit';
+      }
+    }
+  }
+}
+
+/**
+ * Alters submission behaviour of entity.
+ */
+function eat_form_submit(array &$form, FormStateInterface $form_state) {
+
+  // @todo: Add check for all entity types.
+  $entity_id = $form_state->getValue('nid');
+  $entity_type = $form_state->getValue('entity_type');
+  $bundle = $form_state->getValue('bundle');
+  $title = $form_state->getValue('title');
+
+  $config = \Drupal::configFactory()->get('eat.settings');
+  // Check if the term name exists already.
+  // If it exists, then return term id.
+  $eat_exist_tid = Eat::checkIfExists($title);
+
+  if (!empty($eat_exist_tid)) {
+    $eat_items = $config->get('eat_item');
+    foreach ($eat_items as $item) {
+      if ($entity_type === $item['#entity_type'] && $bundle === $item['#bundle']) {
+        foreach ($item['#vocab'] as $vocabulary) {
+          \Drupal::database()->insert('eat')->fields(
+            [
+              'etid' => $entity_id,
+              'tid' => $eat_exist_tid,
+              'vid' => $vocabulary,
+            ])->execute();
+        }
+      }
+    }
+  }
+  else {
+    // Based off operations add/edit taxonomy.
+    if ($form_state->getFormObject()->getOperation() == 'default') {
+      $eat_items = $config->get('eat_item');
+
+      foreach ($eat_items as $item) {
+        if ($entity_type === $item['#entity_type'] && $bundle === $item['#bundle']) {
+          foreach ($item['#vocab'] as $vocabulary) {
+            eat_add_term($title, $entity_id, $vocabulary);
+          }
+        }
+      }
+    }
+    elseif ($form_state->getFormObject()->getOperation() == 'edit') {
+      $tid = \Drupal::database()->select('eat', 'e')
+        ->fields('e', ['tid'])
+        ->condition('etid', $entity_id)
+        ->execute()
+        ->fetchField();
+
+      if ($tid == NULL) {
+        return;
+      }
+      // Get entity title.
+      $entity = \Drupal::entityTypeManager()->getStorage('node')->load($entity_id);
+
+      // Update the term title.
+      $term = Term::load($tid);
+      $term->setName($entity->getTitle());
+      $term->save();
+
+      \Drupal::logger('eat')->notice('Term %tid updated to %etid', [
+        '%tid' => $tid,
+        '%etid' => $entity_id,
+      ]);
+    }
+  }
+}
+
+/**
+ * Load entity tid.
+ *
+ * @param $etid
+ *
+ * @return mixed
+ */
+function eat_load($etid) {
+  return \Drupal::database()->select('eat', 'e')
+    ->fields('e', ['tid', 'etid'])
+    ->condition('etid', $etid)
+    ->execute()
+    ->fetchField();
+}
+
+/**
+ * eat_add_term
+ *
+ * @param $title
+ * @param $entity_id
+ * @param $vocabulary - Selected
+ * @throws Exception
+ */
+function eat_add_term(&$title, &$entity_id, &$vocabulary) {
+  // Insert into vocabulary
+  $term = Term::create([
+    'vid' => $vocabulary,
+    'name' => $title,
+  ]);
+  $term->save();
+
+  \Drupal::database()->insert('eat')->fields(
+    [
+      'etid' => $entity_id,
+      'tid' => $term->id(),
+      'vid' => $vocabulary
+    ])->execute();
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function eat_entity_delete(Drupal\Core\Entity\EntityInterface $entity) {
+  $entity_id = $entity->id();
+
+  $tid = \Drupal::database()->select('eat', 'e')
+    ->fields('e', ['tid'])
+    ->condition('etid', $entity_id)
+    ->execute()
+    ->fetchField();
+
+  if ($tid == NULL) {
+    return;
+  }  
+
+  // Remove term from Eat.
+  \Drupal::database()->delete('eat')
+    ->condition('etid', $entity_id)
+    ->execute();
+  // @todo: Add non deprecated delete.
+  entity_delete_multiple('taxonomy_term', [$tid]);
+}
+
+/**
+ * @param $entity_id
+ */
+function eat_get_related_entities($entity_id) {
+
+}
+
+/**
+ * Implements hook_views_pre_build().
+ */
+function eat_views_pre_build(ViewExecutable $view) {
+  $node = \Drupal::routeMatch()->getParameter('node');
+  if ($node instanceof NodeInterface) {
+    $nid = $node->id();
+    $tid = eat_load_all_for_entity($nid);
+  }
+
+}
+
+/**
+ * Helper function to return all tids.
+ *
+ * @param $etid
+ *
+ * @return mixed
+ */
+function eat_load_all_for_entity($etid) {
+  return \Drupal::database()->select('eat', 'e')
+    ->fields('e', ['tid', 'etid'])
+    ->condition('etid', $etid)
+    ->execute()
+    ->fetchAll();
+}
