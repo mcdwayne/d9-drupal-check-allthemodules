@@ -1,0 +1,235 @@
+<?php
+/**
+ * @file
+ * Displays the time it will take to read content on your site.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\node\NodeTypeInterface;
+use Drupal\node\Entity\NodeType;
+use \Drupal\Core\Entity\EntityInterface;
+use \Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+
+/**
+ * Implements hook_form_FORM_ID_alter() for \Drupal\node\NodeTypeForm.
+ *
+ * Adds read_time options to the node type form.
+ *
+ * @see NodeTypeForm::form()
+ * @see read_time_form_node_type_form_submit()
+ */
+function read_time_form_node_type_form_alter(&$form, FormStateInterface $form_state) {
+  /** @var \Drupal\node\NodeTypeInterface $type */
+  $type = $form_state->getFormObject()->getEntity();
+  $entity = 'node';
+
+  $defaults = read_time_defaults();
+
+  $form['read_time'] = [
+    '#type' => 'details',
+    '#title' => t('Read time'),
+    '#group' => 'additional_settings',
+  ];
+
+  $definitions = \Drupal::service('entity_field.manager')
+    ->getFieldDefinitions($entity, $type->id());
+
+  $options = [];
+  foreach ($definitions as $key => $field) {
+    if (in_array($field->getType(), ['text', 'text_long', 'text_with_summary'])) {
+      $options[$key] = $field->getLabel();
+    }
+  }
+
+  $form['read_time']['read_time_fields'] = [
+    '#type' => 'checkboxes',
+    '#title' => t('Fields'),
+    '#description' => t('Calculate the combined read time of these fields.'),
+    '#options' => $options,
+    '#multiple' => TRUE,
+    '#default_value' => $type->getThirdPartySetting('read_time', 'read_time_fields', $defaults['fields']),
+  ];
+
+  $form['read_time']['read_time_wpm'] = [
+    '#type' => 'number',
+    '#title' => t('Words per minute'),
+    '#description' => t('Average reading speed used for the calculation.'),
+    '#min' => 1,
+    '#default_value' => $type->getThirdPartySetting('read_time', 'read_time_wpm', $defaults['wpm']),
+  ];
+
+  $form['read_time']['read_time_format'] = [
+    '#type' => 'select',
+    '#title' => t('Format'),
+    '#description' => t('How the calculation will be formatted.'),
+    '#options' => [
+      'hour_short' => t('Hours & minutes, short (1 hr, 5 mins)'),
+      'hour_long' => t('Hours & minutes, long (1 hour, 5 minutes)'),
+      'min_short' => t('Minutes, short (65 mins)'),
+      'min_long' => t('Minutes, long (65 minutes)'),
+    ],
+    '#default_value' => $type->getThirdPartySetting('read_time', 'read_time_format', $defaults['format']),
+  ];
+
+  $form['read_time']['read_time_display'] = [
+    '#type' => 'textfield',
+    '#title' => t('Read time display'),
+    '#description' => t("How the read time will be displayed. Use <em>:read_time</em> to output the read time formatted as above."),
+    '#default_value' => $type->getThirdPartySetting('read_time', 'read_time_display', $defaults['display']),
+  ];
+
+  $form['#entity_builders'][] = 'read_time_form_node_type_form_builder';
+
+}
+
+/**
+ * Entity builder for the node type form with read time options.
+ *
+ * @see menu_ui_form_node_type_form_alter()
+ */
+function read_time_form_node_type_form_builder($entity_type, NodeTypeInterface $type, &$form, FormStateInterface $form_state) {
+  $type->setThirdPartySetting('read_time', 'read_time_fields', array_values(array_filter($form_state->getValue('read_time_fields'))));
+  $type->setThirdPartySetting('read_time', 'read_time_wpm', $form_state->getValue('read_time_wpm'));
+  $type->setThirdPartySetting('read_time', 'read_time_format', $form_state->getValue('read_time_format'));
+  $type->setThirdPartySetting('read_time', 'read_time_display', $form_state->getValue('read_time_display'));
+}
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function read_time_entity_extra_field_info() {
+  $extra_field = [];
+
+  foreach (NodeType::loadMultiple() as $bundle) {
+    $extra_field['node'][$bundle->id()]['display']['read_time'] = [
+      'label' => t('Read time'),
+      'description' => t('Display the read time for the content.'),
+      'weight' => 100,
+      'visible' => TRUE,
+    ];
+  }
+
+  return $extra_field;
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_view().
+ */
+function read_time_node_view(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display, $view_mode) {
+  if ($display->getComponent('read_time')) {
+
+    $defaults = read_time_defaults();
+
+    $node_type = $entity->type->entity;
+    $format = $node_type->getThirdPartySetting('read_time', 'read_time_format', $defaults['format']);
+    $display = $node_type->getThirdPartySetting('read_time', 'read_time_display', $defaults['display']);
+
+    $time = \Drupal::database()
+      ->select('read_time', 'r')
+      ->fields('r', ['read_time'])
+      ->condition('r.nid', $entity->id())
+      ->execute()
+      ->fetchField();
+
+    if (empty($time)) {
+      $read_time = read_time_calculate($entity);
+      \Drupal::database()->merge('read_time')
+        ->key(['nid' => $entity->id()])
+        ->fields([
+          'read_time' => $time,
+        ])
+        ->execute();
+    }
+
+    // Format read time.
+    if (in_array($format, array('hour_short', 'hour_long'))) {
+      $hours = floor($time / 60);
+      $minutes = ceil(fmod($time, 60));
+    } else {
+      $minutes = ceil($time);
+    }
+    if (in_array($format, array('hour_long', 'min_long'))) {
+      $hour_suffix = 'hour';
+      $min_suffix = 'minute';
+    } else {
+      $hour_suffix = 'hr';
+      $min_suffix = 'min';
+    }
+    $minute_format = \Drupal::translation()->formatPlural($minutes, '1 ' . $min_suffix, '@count ' . $min_suffix . 's');
+    if (!empty($hours)) {
+      $hour_format = \Drupal::translation()->formatPlural($hours, '1 ' . $hour_suffix, '@count ' . $hour_suffix . 's');
+      $read_time = format_string('@h, @m', array('@h' => $hour_format, '@m' => $minute_format));
+    } else {
+      $read_time = $minute_format;
+    }
+
+    $build['read_time'] = [
+      '#type' => 'markup',
+      '#markup' => t($display, [':read_time' => $read_time]),
+    ];
+  }
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function read_time_node_insert($node) {
+  $read_time = read_time_calculate($node);
+  $read_time_manager = \Drupal::service('read_time.manager');
+  $read_time_manager->updateReadTime($node, $read_time);
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function read_time_node_update($node) {
+  $read_time = read_time_calculate($node);
+  $read_time_manager = \Drupal::service('read_time.manager');
+  $read_time_manager->updateReadTime($node, $read_time);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_predelete() for node entities.
+ */
+function read_time_node_predelete(EntityInterface $node) {
+  if (!empty($node->id())) {
+    $read_time_manager = \Drupal::service('read_time.manager');
+    $read_time_manager->deleteReadTime($node->id());
+  }
+}
+
+/**
+ * Calculate read time.
+ */
+function read_time_calculate($entity) {
+
+  $node_type = $entity->type->entity;
+  $defaults = read_time_defaults();
+
+  $fields = $node_type->getThirdPartySetting('read_time', 'read_time_fields', $defaults['fields']);
+  $wpm = $node_type->getThirdPartySetting('read_time', 'read_time_wpm', $defaults['wpm']);
+
+  $field_words = '';
+
+  foreach ($fields as $field) {
+    $field_words .= strip_tags($entity->{$field}->getString());
+  }
+
+  // Calculate read time.
+  $words = str_word_count($field_words);
+  $time = $words / $wpm;
+
+  return $time;
+}
+
+/**
+ * Store default settings.
+ */
+function read_time_defaults() {
+  return [
+    'fields' => ['body'],
+    'wpm' => '225',
+    'format' => 'hour_short',
+    'display' => t('Read time: :read_time'),
+  ];
+}
