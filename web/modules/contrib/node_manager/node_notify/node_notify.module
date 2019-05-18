@@ -1,0 +1,452 @@
+<?php
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Entity\EntityInterface;
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ *
+ * Creates fields when new node types are created.
+ * @param  $entity
+ */
+function node_notify_node_type_insert(EntityInterface $entity) {
+  /** @var \Drupal\Core\Config\Entity\ConfigEntityInterface $entity */
+  if (!$entity->isSyncing()) {
+
+    node_notify_install_fields($entity->id());
+  }
+}
+
+/**
+ * Creates our fields for an entity bundle.
+ *
+ * @param string $bundle
+ *   The bundle being created.
+ */
+function node_notify_install_fields($bundle) {
+  // Field import may fail.
+  try {
+
+    $id = 'node' . '.' . $bundle . '.field_node_expire_date';
+
+    $field_storage = \Drupal::entityTypeManager()->getStorage('field_config');
+    if (!$field = $field_storage->load($id)) {
+      $field = [
+        'field_name' => 'field_node_expire_date',
+        'entity_type' => 'node',
+        'field_type' => 'datetime',
+        'label' => 'Node expire date',
+        'bundle' => $bundle,
+        'description' => 'Select a date on which node will expire.',
+      ];
+      $field_config = $field_storage->create($field);
+      $field_config->save();
+    }
+    // Assign the all affiliates field.
+    $id = 'node' . '.' . $bundle . '.field_node_notify_email';
+    if (!$field = $field_storage->load($id)) {
+      $field = [
+        'field_name' => 'field_node_notify_email',
+        'entity_type' => 'node',
+        'field_type' => 'email',
+        'label' => 'Node notify email',
+        'bundle' => $bundle,
+        'description' => 'Select a email on which email notification will send.',
+      ];
+      $field_config = $field_storage->create($field);
+      $field_config->save();
+    }
+
+    $properties = [
+      'targetEntityType' => 'node',
+      'bundle' => $bundle
+    ];
+    if ($form_displays = \Drupal::entityTypeManager()->getStorage('entity_form_display')->loadByProperties($properties)) {
+      foreach ($form_displays as $form_display) {
+        if ($component = $form_display->getComponent('field_node_expire_date')) {
+          $form_display->setComponent('field_node_expire_date', [
+              'type' => 'datetime_default',
+              'region' => 'content',
+            ] + $component)->save();
+        }
+      }
+      foreach ($form_displays as $form_display) {
+        if ($component = $form_display->getComponent('field_node_notify_email')) {
+          $form_display->setComponent('field_node_notify_email', [
+              'type' => 'email_default',
+              'region' => 'content',
+              'settings' => [
+                'size' => '60',
+                'placeholder' => '',
+              ],
+            ] + $component)->save();
+        }
+      }
+    }
+  }
+  catch (Exception $e) {
+    \Drupal::logger('node_notify')->notice('Field installation failed.');
+  }
+}
+
+/**
+ * Implements hook_entity_presave().
+ * @param Drupal\Core\Entity\EntityInterface $entity
+ */
+function node_notify_node_presave(EntityInterface $entity) {
+
+  // Return from presave if node is new.
+  if($entity->isNew()) {
+    return;
+  }
+
+  $field_date = '';
+  $field_email = '';
+  $config = \Drupal::config('node_notify.settings');
+  $author_check = $config->get('send_email_to_author');
+
+  // get date
+  if ($entity->hasField('field_node_expire_date')) {
+    if(!empty($entity->get('field_node_expire_date'))) {
+      $field_date = $entity->get('field_node_expire_date')->getString();
+    }
+  }
+
+
+  // get email
+  if ($entity->hasField('field_node_notify_email')) {
+    if(!empty($entity->get('field_node_notify_email'))) {
+      $field_email = $entity->get('field_node_notify_email')->getString();
+    }
+  }
+
+  if(!empty($field_date) && !empty($field_email)) {
+    $nid = $entity->id();
+    $bundle = $entity->bundle();
+
+    // Load old content of node.
+    $old_node = \Drupal::entityTypeManager()->getStorage('node')->load($nid);
+    $db_connection = \Drupal::database();
+
+    // Create/Update entry in node_notify table.
+    if ($db_connection->schema()->tableExists('node_notify')) {
+      $query = $db_connection->select('node_notify', 'nn');
+      $query->fields('nn', array('id'));
+      $query->condition('nn.id', $nid);
+      $results = $query->execute()->fetchField();
+      if($results) {
+
+        // Set author email if notify enabled for author.
+        if($author_check) {
+          $author_email = $entity->getOwner()->getEmail();
+          $field_email = $field_email.','.$author_email;
+        }
+        // Update status only when new date is after old date.
+        if($old_node->hasField('field_node_expire_date')) {
+          $old_date = $old_node->get('field_node_expire_date')->getString();
+          if($old_date != $field_date) {
+            $row = ['status' => 0,
+              'email' => $field_email,
+              'date' => $field_date,
+            ];
+            $db_connection->update('node_notify')
+              ->fields($row)
+              ->condition('id', $nid)
+              ->execute();
+            $message = $this->t('Notify date has been updated. New date will be @date', ['@date' => $field_date]);
+            \Drupal::messenger()->addMessage($message, 'status');
+
+            // Update email if author is set.
+          } elseif($author_check) {
+
+            $row = ['email' => $field_email];
+            $db_connection->update('node_notify')
+              ->fields($row)
+              ->condition('id', $nid)
+              ->execute();
+            $message = t('Notify email has been updated.');
+            \Drupal::messenger()->addMessage($message, 'status');
+          }
+        }
+        // Create new entry.
+      } else {
+        $row = ['id' => $nid,
+          'entity_type' => $bundle,
+          'email' => $field_email,
+          'date' => $field_date,
+          'status' => 0];
+        $db_connection->insert('node_notify')
+          ->fields($row)
+          ->execute();
+        $message = t('Node will notify on @date', ['date' => $field_date]);
+        \Drupal::messenger()->addMessage($message, 'status');
+      }
+    }
+
+    // Update table if author is also need to notify.
+  } elseif($author_check && !empty($field_date)) {
+
+    $nid = $entity->id();
+    $bundle = $entity->bundle();
+    $author_email = $entity->getOwner()->getEmail();
+
+    // Load old content of node.
+    $old_node = \Drupal::entityTypeManager()->getStorage('node')->load($nid);
+    $db_connection = \Drupal::database();
+
+    // Create/Update entry in node_notify table.
+    if ($db_connection->schema()->tableExists('node_notify')) {
+      $query = \Drupal::database()->select('node_notify', 'nn');
+      $query->fields('nn', ['id']);
+      $query->condition('nn.id', $nid);
+      $results = $query->execute()->fetchField();
+      if($results) {
+
+        // Update status only when new date is after old date.
+        if($old_node->hasField('field_node_expire_date') && !empty($author_email)) {
+          $old_date = $old_node->get('field_node_expire_date')->getString();
+          if($old_date != $field_date) {
+            $row = ['status' => 0,
+              'email' => $author_email,
+              'date' => $field_date,
+            ];
+            $db_connection->update('node_notify')
+              ->fields($row)
+              ->condition('id', $nid)
+              ->execute();
+            $message = $this->t('Notify date has been updated. New date will be @date', ['@date' => $field_date]);
+            \Drupal::messenger()->addMessage($message, 'status');
+          }
+        }
+        // Create new entry.
+      } elseif(!empty($author_email)) {
+        $row = ['id' => $nid,
+          'entity_type' => $bundle,
+          'email' => $author_email,
+          'date' => $field_date,
+          'status' => 0];
+        $db_connection->insert('node_notify')
+          ->fields($row)
+          ->execute();
+        $message = $this->t('Node will notify on @date', ['date' => $field_date]);
+        \Drupal::messenger()->addMessage($message, 'status');
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_node_insert().
+ * @param Drupal\Core\Entity\EntityInterface $entity
+ */
+function node_notify_node_insert($entity) {
+
+  $current_bundle = $entity->bundle();
+  $field_date = '';
+  $field_email = '';
+  $config = \Drupal::config('node_notify.settings');
+  $author_check = $config->get('send_email_to_author');
+
+  // get date
+  if ($entity->hasField('field_node_expire_date')) {
+    if(!empty($entity->get('field_node_expire_date'))) {
+      $field_date = $entity->get('field_node_expire_date')->getString();
+    }
+  }
+
+  // get email
+  if ($entity->hasField('field_node_notify_email')) {
+    if(!empty($entity->get('field_node_notify_email'))) {
+      $field_email = $entity->get('field_node_notify_email')->getString();
+    }
+  }
+
+  if(!empty($field_date) && !empty($field_email)) {
+    $nid = $entity->id();
+
+    $db_connection = \Drupal::database();
+    if ($db_connection->schema()->tableExists('node_notify')) {
+
+      // Set author email if notify enabled for author.
+      if($author_check) {
+        $author_email = $entity->getOwner()->getEmail();
+        $field_email = $field_email.','.$author_email;
+      }
+      $row = ['id' => $nid,
+        'entity_type' => $current_bundle,
+        'email' => $field_email,
+        'date' => $field_date,
+        'status' => 0];
+      $db_connection->insert('node_notify')->fields($row)->execute();
+    }
+  } elseif($author_check && !empty($field_date)) {
+
+    $nid = $entity->id();
+    $author_email = $entity->getOwner()->getEmail();
+
+    if(!empty($author_email)) {
+      $db_connection = \Drupal::database();
+      if ($db_connection->schema()->tableExists('node_notify')) {
+
+
+        $row = ['id' => $nid,
+          'entity_type' => $current_bundle,
+          'email' => $author_email,
+          'date' => $field_date,
+          'status' => 0];
+        $db_connection->insert('node_notify')->fields($row)->execute();
+      }
+    }
+  }
+}
+
+/**
+ * Checks that the site URI is set, and sets an error message otherwise.
+ *
+ * @return bool
+ *   TRUE if the URI is set, otherwise FALSE.
+ */
+function node_notify_check_site_uri() {
+  $host = \Drupal::request()->getHost();
+  // Check if the host name is configured.
+  if ($host == 'default') {
+    \Drupal::logger('node_notify')->error('Site URI not specified.');
+    return FALSE;
+  }
+  return TRUE;
+}
+
+/**
+ * Implements hook_cron().
+ */
+function node_notify_cron() {
+  if (!node_notify_check_site_uri()) {
+    return;
+  }
+
+  $notify = \Drupal::config('node_notify.settings')->get('enable');
+  if($notify) {
+    // Send notification email.
+    \Drupal::service('node_notify.email')->sendEmail();
+  }
+}
+
+/**
+ * Implements hook_mail().
+ * @param $key
+ * @param $message
+ * @param $params
+ */
+function node_notify_mail($key, &$message, $params) {
+
+  // Check key of mail
+  switch ($key) {
+    case 'notify':
+
+      // Create rest part of mail
+      $message['from'] = \Drupal::config('system.site')->get('mail');
+      $message['subject'] =$params['title'];
+      $message['body'][] = $params['message'];
+      $message['plain'] = TRUE;
+      $message['format'] = 'text/plain';
+      break;
+  }
+}
+
+
+/**
+ * Implements hook_form_alter().
+ * @param array $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *
+ */
+function node_notify_form_node_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+
+  // Get the days before notification should send.
+  // Add validator to restrict user not to save before date.
+  $node_obj = \Drupal::routeMatch()->getParameter('node');
+  $days = \Drupal::config('node_notify.settings')->get('days');
+  if($days != '') {
+    if(is_object($node_obj)) {
+      $bundle = $node_obj->bundle();
+      if ($form_id == 'node_'.$bundle.'_edit_form') {
+        $form['#validate'][] = '_node_notify_dates_edit_form_validate';
+      }
+    } else {
+      $form['#validate'][] = '_node_notify_dates_form_validate';
+    }
+  }
+}
+
+
+/**
+ * Validate callback for node_notify.
+ *
+ * @param array $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+function _node_notify_dates_edit_form_validate(&$form, FormStateInterface $form_state) {
+
+  $node_obj = \Drupal::routeMatch()->getParameter('node');
+  $days = \Drupal::config('node_notify.settings')->get('days');
+  if(is_object($node_obj)) {
+    if ($form_state->hasValue('field_node_expire_date')) {
+      $notify_date = $form_state->getValue('field_node_expire_date')[0]['value']->format("Y-m-d");
+    }
+    if($node_obj->hasField('field_node_expire_date')) {
+      $old_date = $node_obj->get('field_node_expire_date')->getValue();
+    }
+
+    // Show error is new end date is less then +15 dates from current date
+    if(isset($notify_date) && !empty($notify_date) && isset($old_date[0]['value']) && !empty($old_date[0]['value'])) {
+      if($notify_date != $old_date[0]['value']) {
+        $date = date("Y-m-d");
+        $date = strtotime('+'.$days.' days', strtotime($date));
+        $date = date("Y-m-d", $date);
+        if($notify_date < $date) {
+          $form_state->setErrorByName('field_node_expire_date', $this->t('New notify date can not be less then @date ', array('@date' => $date)));
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Validate callback for node_notify.
+ *
+ * @param array $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+function _node_notify_dates_form_validate(&$form, FormStateInterface $form_state) {
+
+  $days = \Drupal::config('node_notify.settings')->get('days');
+  if ($form_state->hasValue('field_node_expire_date')) {
+    $notify_date = $form_state->getValue('field_node_expire_date');
+  }
+
+  // Show error is new end date is less then $days dates from current date
+  if(isset($notify_date[0]['value']) && !empty($notify_date[0]['value'])) {
+
+    $date = date("Y-m-d");
+    $date = strtotime('+'.$days.' days', strtotime($date));
+    $date = date("Y-m-d", $date);
+    if($notify_date[0]['value'] < $date) {
+      $form_state->setErrorByName('field_node_expire_date', $this->t('New notify date can not be less then @date ', array('@date' => $date)));
+    }
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ * @param array $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *
+ */
+function node_notify_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+
+  // Make email field required if author needs to be notify.
+  $author_check = $days = \Drupal::config('node_notify.settings')->get('send_email_to_author');
+  if($form_id == 'user_register_form' && $author_check) {
+    $form['account']['mail']['#required'] = true;
+  }
+}
