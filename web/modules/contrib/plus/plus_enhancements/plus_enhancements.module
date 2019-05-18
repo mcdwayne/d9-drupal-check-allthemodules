@@ -1,0 +1,577 @@
+<?php
+
+/**
+ * @file
+ * Drupal+ Enhancements module.
+ */
+
+// Define specific CSS and JS groups for aggregation purposes.
+define('JS_ENHANCEMENT', JS_THEME + 100);
+define('CSS_ENHANCEMENT', JS_THEME + 100);
+
+/**
+ * Retrieves user enhancement definitions.
+ *
+ * @param string $id
+ *   The machine name identifier of a specific user enhancement to retrieve.
+ * @param bool $rebuild
+ *   Flag indicating whether to force rebuild the definitions.
+ *
+ * @return array|null
+ *   An associative array of user enhancement definitions, keyed by machine
+ *   name. If $id was provided, the user enhancement array definition or NULL
+ *   if the user enhancement does not exist.
+ */
+function plus_enhancements_info($id = NULL, $rebuild = FALSE) {
+  static $drupal_static_fast;
+  if (!isset($drupal_static_fast)) {
+    $drupal_static_fast['info'] = &drupal_static(__FUNCTION__);
+  }
+  $definitions = &$drupal_static_fast['info'];
+
+  // Build the enhancement definitions from modules.
+  if ($rebuild || !isset($definitions)) {
+    $definitions = array();
+    if (!$rebuild && ($cache = cache_get(__FUNCTION__)) && !empty($cache->data)) {
+      $definitions = $cache->data;
+    }
+    else {
+      foreach (module_implements('enhancements_info') as $module) {
+        $module_path = drupal_get_path('module', $module);
+        foreach (module_invoke($module, 'enhancements_info') as $key => $info) {
+          // Ensure the following properties are always set with the correct info.
+          $info['id'] = $key;
+          $info['module'] = $module;
+
+          // Fill in any defaults that weren't provided.
+          $info += array(
+            'conditions' => array(),
+            'css' => array(),
+            'dependencies' => array(),
+            'description' => '',
+            'enabled' => FALSE,
+            'experimental' => FALSE,
+            'group' => 'general',
+            'js' => array(),
+            'path' => "$module_path/enhancements",
+            'settings' => array(),
+            'title' => $key,
+            'ui' => TRUE,
+            'version' => NULL,
+          );
+
+          // If no assets were explicitly specified, attempt to automatically
+          // discover them based on definition identifier, path and asset type.
+          foreach (array('css', 'js') as $type) {
+            if (empty($info[$type])) {
+              $paths = array(
+                $info['path'] . "/$key.min.$type",
+                $info['path'] . "/$key.$type",
+                // Look in specific enhancement directories.
+                $info['path'] . "/$key/$key.min.$type",
+                $info['path'] . "/$key/$key.$type",
+              );
+              if ($type === 'js') {
+                $paths[] = $info['path'] . "/$key.es6.min.$type";
+                $paths[] = $info['path'] . "/$key.es6.$type";
+                $paths[] = $info['path'] . "/$key/$key.es6.min.$type";
+                $paths[] = $info['path'] . "/$key/$key.es6.$type";
+              }
+              foreach ($paths as $path) {
+                if (file_exists($path)) {
+                  $info[$type][$path] = array();
+                  break;
+                }
+              }
+            }
+
+            // Set sane defaults.
+            foreach ($info[$type] as &$file) {
+              if (!isset($file['group'])) {
+                $file['group'] = $type === 'css' ? CSS_ENHANCEMENT : JS_ENHANCEMENT;
+              }
+            }
+          }
+
+          // Add the enhancement to the array.
+          if (!isset($definitions[$key])) {
+            $definitions[$key] = $info;
+          }
+          // Otherwise, merge in values.
+          else {
+            $definitions[$key] = drupal_array_merge_deep($definitions[$key], $info);
+          }
+        }
+      }
+      drupal_alter('enhancements_info', $definitions);
+
+      // Post process definitions.
+      foreach ($definitions as $key => &$info) {
+        // Process dependencies and extrapolate shorthand syntax into proper
+        // Drupal 7 style library dependencies, e.g. array(module, library).
+        $dependencies = array('plus_enhancements/enhancements');
+        foreach ($info['dependencies'] as $dependency) {
+          // Convert to a sanitized D8 like dependency, e.g. module/library.
+          $dependency = (string) (is_array($dependency) ? implode('/', $dependency) : $dependency);
+
+          // Determine module and library identifiers.
+          list($module, $name) = explode('/', $dependency . '/');
+
+          // If no library name was given, assume that it is a user enhancement
+          // dependency and add it as such.
+          if (!empty($module) && empty($name)) {
+            $dependencies[] = "plus_enhancements/$module";
+          }
+          // Handle normal module/library dependencies.
+          else {
+            if (!empty($module) && !empty($name)) {
+              $dependencies[] = "$module/$name";
+            }
+          }
+        }
+
+        // Replace enhancement's dependencies with the sanitized array.
+        $info['dependencies'] = array_map(function ($library) {
+          list($module, $name) = explode('/', $library);
+          return array($module, $name);
+        }, array_unique($dependencies));
+      }
+
+      // Cache the definitions.
+      cache_set(__FUNCTION__, $definitions);
+    }
+  }
+
+  // Return a specific user enhancement definition.
+  if (isset($id)) {
+    return isset($definitions[$id]) ? $definitions[$id] : NULL;
+  }
+
+  return $definitions;
+}
+
+/** @noinspection PhpDocMissingThrowsInspection */
+
+/**
+ * Determines whether or not an enhancement has satisfied any conditions.
+ *
+ * @param array $enhancement
+ *   The enhancement definition array.
+ *
+ * @return bool
+ *   TRUE or FALSE
+ */
+function plus_enhancements_conditions_met(array $enhancement) {
+  foreach ($enhancement['conditions'] as $condition) {
+    // Entity condition.
+    if (isset($condition['entity'])) {
+      list($entity_type, $entity_bundle) = explode(':', $condition['entity'] . ':');
+      $object = menu_get_object($entity_type);
+      if (!$object) {
+        return FALSE;
+      }
+      if (isset($entity_bundle)) {
+        /** @noinspection PhpUnhandledExceptionInspection */
+        list($id, $vid, $bundle) = entity_extract_ids($entity_type, $object);
+        if ($entity_bundle !== $bundle) {
+          return FALSE;
+        }
+      }
+    }
+
+    if (isset($condition['path'])) {
+      $current_path_alias = drupal_strtolower(drupal_get_path_alias($_GET['q']));
+      $paths = implode("\n", (array) $condition['path']);
+      $match = drupal_match_path($current_path_alias, $paths);
+      if (!$match && $current_path_alias != $_GET['q']) {
+        $match = drupal_match_path($_GET['q'], $paths);
+      }
+      if (!$match) {
+        return FALSE;
+      }
+    }
+  }
+  return TRUE;
+}
+
+/**
+ * Implements hook_load().
+ *
+ * @param string $id
+ *   The machine name identifier of a specific user enhancement to retrieve.
+ * @param stdClass $account
+ *   A user object to use. Defaults to the currently logged in user.
+ *
+ * @return array|null
+ *   The user enhancement array definition or NULL if the user enhancement
+ *   does not exist.
+ */
+function plus_enhancements_load($id, $account = NULL) {
+  $user_enhancement = plus_enhancements_load_multiple(array($id), $account);
+  return reset($user_enhancement);
+}
+
+/**
+ * Retrieves the enabled enhancements (for a specific user).
+ *
+ * @param string[] $ids
+ *   An indexed array of machine name identifiers of the specific user
+ *   enhancements to retrieve. To return all, leave empty.
+ * @param stdClass $account
+ *   A user object to use. Defaults to the currently logged in user.
+ * @param array $conditions
+ *   An array of conditions that match the enhancements.
+ *
+ * @return array
+ *   An array of enabled enhancement definitions, keyed by their machine name.
+ *
+ * @see plus_enhancements_info()
+ */
+function plus_enhancements_load_multiple(array $ids = array(), $account = NULL, array $conditions = array()) {
+  global $user;
+
+  // Default to current user.
+  if (!isset($account)) {
+    $account = $user;
+  }
+
+  // Get all user enhancements.
+  $enhancements = plus_enhancements_info();
+
+  // Merge user enhancements that are valid.
+  $user_enhancements = isset($account->data['enhancements']) ? array_filter($account->data['enhancements']) : array();
+  foreach ($user_enhancements as $id => $account_enhancement) {
+    if (isset($enhancements[$id])) {
+      $enhancements[$id] = drupal_array_merge_deep($enhancements[$id], $account_enhancement);
+    }
+  }
+
+  $loaded = array_filter($enhancements, function ($info) use ($ids, $conditions) {
+    // Check if identifiers match.
+    if ($ids && !in_array($info['id'], $ids)) {
+      return FALSE;
+    }
+
+    // Check if conditions match.
+    $valid = TRUE;
+    if ($conditions) {
+      foreach ($conditions as $property => $value) {
+        if (!$valid) {
+          break;
+        }
+
+        // Handle conditions differently.
+        if ($property === 'conditions' && ($value === TRUE || $value === FALSE)) {
+          if ($value === TRUE) {
+            $valid = plus_enhancements_conditions_met($info);
+          }
+          else {
+            if ($value === FALSE) {
+              $valid = !plus_enhancements_conditions_met($info);
+            }
+          }
+        }
+        // Otherwise, soft check if values match.
+        elseif (isset($info[$property]) && $info[$property] != $value) {
+          $valid = FALSE;
+        }
+      }
+    }
+
+    // All conditions have been met, keep the user enhancement.
+    return $valid;
+  });
+
+  return $loaded;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function plus_enhancements_form_user_profile_form_alter(&$form, &$form_state, $form_id) {
+  // Immediately return if not the "enhancements" user profile category.
+  if (!isset($form['#user_category']) || $form['#user_category'] !== 'enhancements') {
+    return;
+  }
+
+  // Retrieve all available enhancements. merging in the user settings and
+  // any submitted values from the form.
+  $account = isset($form_state['user']) ? $form_state['user'] : NULL;
+  $enhancements = drupal_array_merge_deep(plus_enhancements_info(), plus_enhancements_load_multiple(array(), $account), isset($form_state['values']['data']['enhancements']) ? $form_state['values']['data']['enhancements'] : array());
+
+  $form['title'] = array(
+    '#theme' => 'html_tag',
+    '#tag' => 'h3',
+    '#value' => t('User Enhancements'),
+    '#weight' => -10,
+  );
+  $form['description'] = array(
+    '#theme' => 'html_tag',
+    '#tag' => 'p',
+    '#value' => t('Below are a list of user enhancements that can be enabled through out this site.'),
+    '#weight' => -9,
+  );
+
+  // Save any existing messages.
+  $messages = drupal_get_messages();
+
+  // Render the experimental message so the theme properly handles it.
+  drupal_set_message('<strong>Experimental</strong> - This user enhancement may change or possibly be removed at a future date.', 'warning');
+  $experimental_message = theme('status_messages');
+
+  // Restore the saved messages.
+  $_SESSION['messages'] = $messages;
+
+  // Retrieve the user enhancement groups.
+  $groups = user_enhancement_groups();
+
+  // If there is more than one group, put them into vertical tabs.
+  $vertical_tabs = count($groups) > 1;
+  if ($vertical_tabs) {
+    $form['vertical_tabs'] = array('#type' => 'vertical_tabs');
+  }
+
+  // Add each user enhancement to the form.
+  foreach ($enhancements as $id => $enhancement) {
+    // If enhancement has opted out of any UI, skip it.
+    if (!$enhancement['ui']) {
+      continue;
+    }
+
+    // Add the user enhancement group.
+    $group_id = isset($enhancement['group']) && isset($groups[$enhancement['group']]) ? $enhancement['group'] : 'general';
+    if (!isset($form['data']['enhancements'][$group_id])) {
+      $form['data']['enhancements'][$group_id] = array(
+        '#type' => 'fieldset',
+        '#title' => $groups[$group_id]['title'],
+        '#group' => 'vertical_tabs',
+      );
+      if ($vertical_tabs) {
+        $form['data']['enhancements'][$group_id]['#group'] = 'vertical_tabs';
+      }
+      if (isset($groups[$group_id]['description'])) {
+        $form['data']['enhancements'][$group_id]['#description'] = $groups[$group_id]['description'];
+      }
+    }
+
+    // Add the user enhancement.
+    $form['data']['enhancements'][$group_id][$id] = array(
+      '#type' => 'fieldset',
+      '#tree' => TRUE,
+      // We need to specify the #parents to remove the group from also being
+      // saved in the form state values; just using #tree here doesn't work.
+      '#parents' => array('data', 'enhancements', $id),
+    );
+    $form['data']['enhancements'][$group_id][$id]['enabled'] = array(
+      '#type' => 'checkbox',
+      '#title' => $enhancement['title'],
+      '#default_value' => !empty($enhancement['enabled']) ? 1 : 0,
+    );
+    if ($enhancement['experimental']) {
+      if (!isset($enhancement['description'])) {
+        $enhancement['description'] = '';
+      }
+      $enhancement['description'] .= $experimental_message;
+    }
+    if (isset($enhancement['description'])) {
+      $form['data']['enhancements'][$group_id][$id]['enabled']['#description'] = $enhancement['description'];
+    }
+
+    // Provide additional settings for the user enhancement.
+    $form['data']['enhancements'][$group_id][$id]['settings'] = array(
+      '#type' => 'container',
+      '#attributes' => array('class' => array('indented')),
+      '#states' => [
+        'visible' => array(
+          ':input[name="data[enhancements][' . $id . '][enabled]"]' => array('checked' => TRUE),
+        ),
+      ],
+    );
+
+    // Allow module providers to expand the enhancement settings form.
+    $settings = module_invoke_all('enhancements_settings_form', $enhancement);
+
+    // Allow modules to alter the settings element.
+    drupal_alter('enhancements_settings_form', $settings, $enhancement);
+
+    // Merge in settings.
+    if ($settings) {
+      $form['data']['enhancements'][$group_id][$id]['settings'] = array_merge($form['data']['enhancements'][$group_id][$id]['settings'], $settings);
+    }
+    // Otherwise, hide the settings.
+    else {
+      $form['data']['enhancements'][$group_id][$id]['settings']['#access'] = FALSE;
+    }
+  }
+}
+
+/**
+ * Retrieves a specific user enhancement group definition.
+ *
+ * @param string $id
+ *   The machine name identifier of an enhancement.
+ * @param bool $rebuild
+ *   Toggle indicating whether or not the definitions should be rebuilt.
+ *
+ * @return array|NULL
+ *   The enhancement array definition or NULL if the enhancement does not exist.
+ */
+function user_enhancement_group($id, $rebuild = FALSE) {
+  $enhancements = user_enhancement_groups($rebuild);
+  return isset($enhancements[$id]) ? $enhancements[$id] : NULL;
+}
+
+/**
+ * Retrieves all user enhancement group definitions.
+ *
+ * @param bool $rebuild
+ *   Toggle indicating whether or not the definitions should be rebuilt.
+ *
+ * @return array
+ *   An associative array of enhancement definitions, keyed by machine name.
+ */
+function user_enhancement_groups($rebuild = FALSE) {
+  static $drupal_static_fast;
+  if (!isset($drupal_static_fast)) {
+    $drupal_static_fast['groups'] = &drupal_static(__FUNCTION__);
+  }
+  $groups = &$drupal_static_fast['groups'];
+
+  // Build the enhancement definitions from modules.
+  if ($rebuild || !isset($groups)) {
+    $groups = array('general' => array('title' => t('General')));
+    if (!$rebuild && ($cache = cache_get(__FUNCTION__)) && !empty($cache->data)) {
+      $groups = $cache->data;
+    }
+    else {
+      foreach (module_implements('enhancements_group_info') as $module) {
+        foreach (module_invoke($module, 'enhancements_group_info') as $id => $group) {
+          // Ensure the following properties are always set with the correct info.
+          $group['id'] = $id;
+          $group['module'] = $module;
+
+          // Fill in any defaults that weren't provided.
+          $group += array(
+            'description' => '',
+            'title' => $id,
+          );
+
+          // Add the group to the array.
+          if (!isset($groups[$id])) {
+            $groups[$id] = $group;
+          }
+          // Otherwise, merge in values.
+          else {
+            $groups[$id] = drupal_array_merge_deep($groups[$id], $group);
+          }
+        }
+      }
+      drupal_alter('enhancements_group_info', $groups);
+      cache_set(__FUNCTION__, $groups);
+    }
+  }
+
+  return $groups;
+}
+
+/**
+ * Implements hook_hook_info().
+ */
+function plus_enhancements_hook_info() {
+  $info = array('group' => 'enhancements');
+  $hooks['enhancements_info'] = $info;
+  $hooks['enhancements_info_alter'] = $info;
+  $hooks['enhancements_group_info'] = $info;
+  $hooks['enhancements_group_info_alter'] = $info;
+  $hooks['enhancements_js_settings_alter'] = $info;
+  $hooks['enhancements_settings_form'] = $info;
+  $hooks['enhancements_settings_form_alter'] = $info;
+  return $hooks;
+}
+
+/**
+ * Implements hook_library().
+ */
+function plus_enhancements_library() {
+  $module_path = drupal_get_path('module', 'plus_enhancements');
+  $version = '1.0.0';
+
+  $libraries['enhancement'] = array(
+    'title' => 'Drupal+ Enhancement',
+    'version' => $version,
+    'js' => array(
+      "$module_path/js/Drupal.Enhancement.es6.js" => array(
+        'es6' => TRUE,
+        'group' => JS_ENHANCEMENT,
+      ),
+    ),
+    'dependencies' => array(
+      array('system', 'drupal'),
+    ),
+  );
+
+  $libraries['enhancements'] = array(
+    'title' => 'Drupal+ Enhancements',
+    'version' => $version,
+    'js' => array(
+      "$module_path/js/Drupal.Enhancements.es6.js" => array(
+        'es6' => TRUE,
+        'group' => JS_ENHANCEMENT,
+      ),
+    ),
+    'dependencies' => array(
+      array('plus_enhancements', 'enhancement'),
+    ),
+  );
+
+  // Add each enhancement as a separate library.
+  $enhancements = plus_enhancements_info();
+  foreach ($enhancements as $id => $enhancement) {
+    $libraries[$id] = $enhancement;
+  }
+
+  return $libraries;
+}
+
+/**
+ * Implements hook_page_build().
+ */
+function plus_enhancements_page_build(&$page) {
+  $enhancements = plus_enhancements_load_multiple(array(), NULL, array(
+    'conditions' => TRUE,
+    'enabled' => TRUE,
+    'ui' => TRUE,
+  ));
+
+  // Immediately return if there aren't any user enhancements on the page.
+  if (!$enhancements) {
+    return;
+  }
+
+  // Attach the user enhancements to the page.
+  $settings = array();
+  foreach ($enhancements as $id => $enhancement) {
+    drupal_add_library('plus_enhancements', $id);
+    $settings['Enhancements'][$id] = $enhancement['settings'];
+  }
+
+  // Add the necessary Drupal settings.
+  if ($settings) {
+    // Allow modules to alter the settings array.
+    drupal_alter('enhancements_js_settings', $settings['Enhancements']);
+    drupal_add_js($settings, 'setting');
+  }
+}
+
+/**
+ * Implements hook_user_categories().
+ */
+function plus_enhancements_user_categories() {
+  return array(
+    'enhancements' => array(
+      'name' => 'enhancements',
+      'title' => t('Enhancements'),
+      'weight' => 30,
+    ),
+  );
+}
