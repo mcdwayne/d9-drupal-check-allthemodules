@@ -1,0 +1,188 @@
+<?php
+
+use \Drupal\Core\Form\FormStateInterface;
+
+const NODE_SUBS_HISTORY_TABLE = 'node_subs_history';
+
+const NODE_SUBS_QUEUE_TABLE = 'node_subs_queue';
+
+const NODE_SUBS_ACCOUNT_TABLE = 'node_subs_account';
+
+/**
+ * implements hook_permission()
+ */
+function node_subs_permission() {
+  return array(
+    'node_subs admin' => array(
+      'title' => t('Administer node_subs module'),
+      'description' => t('Perform change settings and view subscribers'),
+    ),
+    'node_subs use' => array(
+      'title' => t('Use node_subs module'),
+      'description' => t('Use and view subscribe module'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function node_subs_form_node_type_form_alter(array &$form, FormStateInterface $form_state) {
+  $form['actions']['submit']['#submit'][] = 'node_subs_form_node_type_form_submit';
+  if (isset($form['type'])) {
+    $form['node_subs'] = array(
+      '#title' => t('Subscribe'),
+      '#type' => 'details',
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+      '#group' => 'additional_settings',
+      '#weight' => 10,
+      '#attached' => [
+        'library' => [
+          'node_subs/node_type',
+        ],
+      ],
+    );
+    $bundle = $form_state->getBuildInfo()['callback_object']->getEntity()->get('type');
+    $node_subs_config = \Drupal::config("node_subs.nodesettings.$bundle");
+    $form['node_subs']['node_subs_node'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Include to newsletter functionality'),
+      '#description' => t('Automated include nodes of this type to newsletter'),
+      '#weight' => 0,
+      '#default_value' => \Drupal::config("node_subs.nodesettings.$bundle")->get('enabled'),
+      '#attributes' => array(
+        'data-enabled-description' => t('Included'),
+        'data-disabled-description' => t('Excluded'),
+      ),
+    );
+    $fields_definitions = array_filter(
+      \Drupal::service('entity_field.manager')->getFieldDefinitions('node', $bundle), function ($field_definition) {
+        return $field_definition instanceof \Drupal\Core\Field\FieldConfigInterface;
+      }
+    );
+    $fields = [];
+    foreach ($fields_definitions as $field) {
+      $fields_definition = $field->getFieldStorageDefinition();
+      if (!$fields_definition->isBaseField() && $fields_definition->get('module') == 'text') {
+        $fields[$field->get('field_name')] = $field->getLabel();
+      }
+    }
+
+    $form['node_subs']['node_subs_field'] = array(
+      '#type' => 'select',
+      '#title' => t('Field for send'),
+      '#description' => t('Field name for send'),
+      '#weight' => 10,
+      '#options' => $fields,
+      '#default_value' => $node_subs_config->get('field'),
+      '#states' => array(
+        'visible' => array(
+          ':input[name="node_subs_node"]' => array('checked' => TRUE)
+        )
+      )
+    );
+
+    $view_modes = [];
+    foreach(\Drupal::configFactory()->listAll("core.entity_view_display.node.{$bundle}") as $display_config) {
+      $mode = \Drupal::config($display_config)->get('mode');
+      $view_modes[$mode] = $mode;
+    }
+
+    $form['node_subs']['node_subs_view_mode'] = array(
+      '#type' => 'select',
+      '#options' => $view_modes,
+      '#title' => t('View mode for render'),
+      '#description' => t('Select view mode for render field'),
+      '#weight' => 20,
+      '#default_value' => $node_subs_config->get('view_mode'),
+      '#states' => array(
+        'visible' => array(
+          ':input[name="node_subs_node"]' => array('checked' => TRUE)
+        )
+      )
+    );
+  }
+}
+
+function node_subs_form_node_type_form_submit($form, FormStateInterface $form_state) {
+  $values = $form_state->getValues();
+  $params = [
+    'field' => 'node_subs_field',
+    'view_mode' => 'node_subs_view_mode',
+    'enabled' => 'node_subs_node',
+  ];
+  $config = \Drupal::configFactory()->getEditable("node_subs.nodesettings.{$values['type']}");
+  foreach ($params as $key => $value) {
+    $config->set($key, $values[$value]);
+  }
+  $config->save();
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ */
+function node_subs_node_insert(Drupal\Core\Entity\EntityInterface $node) {
+  \Drupal::service('node_subs.nodes')->addToProcess($node);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update().
+ */
+function node_subs_node_update($node) {
+  \Drupal::service('node_subs.nodes')->addToProcess($node);
+}
+
+/**
+ * implements hook_node_subs_process_queue()
+ */
+function node_subs_node_subs_queue_process($accounts, $params) {
+  $from_mail = \Drupal::config('node_subs.settings')->get('node_subs_from', NULL);
+
+  $params['site_name'] = \Drupal::config('system.site')->get('name');
+
+  $node = \Drupal\node\Entity\Node::load($params['nid']);
+  $params['node_type'] = $node->bundle();
+  $params['site_url'] = \Drupal\Core\Url::fromRoute('<front>', ['absolute' => TRUE]);
+
+  foreach ($accounts as $account) {
+    $email = $account->email;
+    $token = \Drupal::service('node_subs.account')->getToken($email);
+    $params['unsub_link'] = \Drupal\Core\Url::fromRoute('node_subs.unsubscribe', ['user_token' => $token], array(
+      'absolute' => TRUE,
+      'query' => array(
+        'email' => $email
+      )
+    ));
+    $params['email'] = $email;
+    \Drupal::service('plugin.manager.mail')->mail('node_subs', 'users', $email, \Drupal::languageManager()->getDefaultLanguage()->getId(), $params, $from_mail);
+  }
+}
+
+/**
+ * Implementation Hook_mail()
+ */
+function node_subs_mail($key, &$message, $params) {
+  switch ($key) {
+    case 'users':
+      $allowed_tags = \Drupal::config('node_subs.settings')->get('node_subs_allowed_tags');
+      $message['body'][] = strip_tags($params['body'], $allowed_tags);
+
+      if (Drupal::config('node_subs.settings')->get('node_subs_add_unsubscribe')) {
+        $message['body'][] = \Drupal\Core\Link::fromTextAndUrl(t('Unsubscribe'), $params['unsub_link'])->toString();
+      }
+
+      $message['subject'] = $params['subject'];
+      break;
+  }
+}
+
+function node_subs_cron() {
+  if (\Drupal::config('node_subs.settings')->get('node_subs_is_crone')) {
+    \Drupal::service('node_subs.nodes')->queueProcess();
+  }
+}
+
+function node_subs_edit_form_title($subscriber) {
+  return t('Edit subscriber !name', array('!name' => $subscriber->name));
+}
