@@ -1,0 +1,282 @@
+<?php
+
+/**
+ * @file
+ * Main Setka Editor module file.
+ */
+
+use Drupal\Core\Cache\Cache;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Link;
+use Drupal\Core\Url;
+use Drupal\file\Entity\File;
+use Drupal\setka_editor\Form\SettingsForm;
+use Drupal\setka_editor\SetkaEditorHelper;
+
+/**
+ * Implements hook_cron().
+ */
+function setka_editor_cron() {
+  $config = \Drupal::config('setka_editor.settings');
+  $setkaUseCdn = $config->get('setka_use_cdn');
+  $setkaEditorLicense = $config->get('setka_license_key');
+
+  if ($setkaEditorLicense && !$setkaUseCdn) {
+    $editorApi = \Drupal::service('setka_editor.api');
+
+    try {
+      if (!SetkaEditorHelper::checkSetkaFolderPermissions(\Drupal::service('file_system'))) {
+        throw new \Exception('Setka files directory is not writable!');
+      }
+
+      if ($currentBuild = $editorApi->getCurrentBuild($setkaEditorLicense)) {
+        $values = SetkaEditorHelper::parseStyleManagerData($currentBuild);
+
+        $editorJsCdn = !empty($values['setka_editor_js_cdn']);
+        $editorCssCdn = !empty($values['setka_editor_css_cdn']);
+        $companyCssCdn = !empty($values['setka_company_css_cdn']);
+        $companyJsonCdn = !empty($values['setka_company_json_cdn']);
+        $publicJsCdn = !empty($values['setka_public_js_cdn']);
+        if (!($editorJsCdn && $editorCssCdn && $companyCssCdn && $companyJsonCdn && $publicJsCdn)) {
+          throw new \Exception('Setka Editor config update by cron error: required response data does not exist!');
+        }
+
+        $queue = \Drupal::queue('update_setke_editor');
+        if (!$queue->numberOfItems()) {
+          $queue->createQueue();
+        }
+        $queue->createItem(['newSettings' => $values]);
+
+        $lock = \Drupal::lock();
+        if ($lock->acquire('setka_editor_files_update')) {
+          $configFactory = \Drupal::configFactory();
+          $state = \Drupal::state();
+
+          while ($newSettingsItem = $queue->claimItem()) {
+            $newSettingsData = $newSettingsItem->data['newSettings'];
+            SetkaEditorHelper::buildSetkaFilesUpdateTask($config, $state, $newSettingsData);
+            $configFactory->getEditable('setka_editor.settings')
+              ->set('setka_editor_version', $newSettingsData['setka_editor_version'])
+              ->set('setka_editor_public_token', $newSettingsData['setka_editor_public_token'])
+              ->set('setka_company_meta_data', $newSettingsData['setka_company_meta_data'])
+              ->set('setka_editor_js_cdn', $newSettingsData['setka_editor_js_cdn'])
+              ->set('setka_editor_css_cdn', $newSettingsData['setka_editor_css_cdn'])
+              ->set('setka_company_css_cdn', $newSettingsData['setka_company_css_cdn'])
+              ->set('setka_company_json_cdn', $newSettingsData['setka_company_json_cdn'])
+              ->set('setka_public_js_cdn', $newSettingsData['setka_public_js_cdn'])
+              ->save();
+            \Drupal::service('library.discovery')->clearCachedDefinitions();
+            $configFactory->reset('setka_editor.settings');
+            SetkaEditorHelper::runSetkaFilesUpdateTask($state);
+            $queue->deleteItem($newSettingsItem);
+          }
+
+          foreach (Cache::getBins() as $cache_backend) {
+            $cache_backend->deleteAll();
+          }
+          \Drupal::service('library.discovery')->clearCachedDefinitions();
+          $configFactory->reset('setka_editor.settings');
+          \Drupal::service('cache.discovery')->deleteAll();
+          \Drupal::service('asset.css.collection_optimizer')->deleteAll();
+          \Drupal::service('asset.js.collection_optimizer')->deleteAll();
+          _drupal_flush_css_js();
+
+          $lock->release('setka_editor_files_update');
+        }
+      }
+    }
+    catch (\Exception $e) {
+      watchdog_exception('setka_editor', $e);
+    }
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function setka_editor_theme($existing, $type, $theme, $path) {
+  return [
+    'setka_editor_formatter' => [
+      'variables' => [
+        'editor_content' => '',
+        'typekit_id' => '',
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_library_info_build().
+ */
+function setka_editor_library_info_build() {
+  $libraries = [];
+  $config = \Drupal::config('setka_editor.settings');
+  $logger = \Drupal::logger('setka_editor');
+  $state = \Drupal::state();
+  $messenger = \Drupal::messenger();
+
+  $setka_editor_license = $config->get('setka_license_key');
+  if (!empty($setka_editor_license)) {
+    $setka_editor_js = SettingsForm::getConfigValue($config, $state, 'setka_editor_js', TRUE);
+    $setka_editor_css = SettingsForm::getConfigValue($config, $state, 'setka_editor_css', TRUE);
+    if (!empty($setka_editor_js) && !empty($setka_editor_css)) {
+      $libraries['setka-editor'] = [
+        'js' => $setka_editor_js,
+        'css' => [
+          'base' => $setka_editor_css,
+        ],
+      ];
+    }
+    else {
+      $logger->warning("Can't add 'setka-editor' library. Please check your Setka editor license key.");
+      $messenger->addWarning("Can't add 'setka-editor' library. Please check your Setka editor license key.");
+    }
+
+    $setka_styles_css = SettingsForm::getConfigValue($config, $state, 'setka_company_css', TRUE);
+    if (!empty($setka_styles_css)) {
+      $libraries['setka-styles'] = [
+        'css' => [
+          'base' => $setka_styles_css,
+        ],
+      ];
+    }
+    else {
+      $logger->warning("Can't add 'setka-styles' library. Please check your Setka editor license key.");
+      $messenger->addWarning("Can't add 'setka-styles' library. Please check your Setka editor license key.");
+    }
+
+    $setka_public_js = SettingsForm::getConfigValue($config, $state, 'setka_public_js', TRUE, TRUE);
+    if (!empty($setka_public_js)) {
+      $libraries['setka-public-js'] = [
+        'js' => $setka_public_js,
+      ];
+    }
+    else {
+      $logger->warning("Can't add 'setka-public-js' library. Please check your Setka editor license key.");
+      $messenger->addWarning("Can't add 'setka-public-js' library. Please check your Setka editor license key.");
+    }
+  }
+
+  return $libraries;
+}
+
+/**
+ * Implements hook_library_info_alter().
+ */
+function setka_editor_library_info_alter(&$libraries, $extension) {
+  if ($extension == 'setka_editor') {
+    $state = \Drupal::getContainer()->get('state');
+    $setkaEditorFilesUpdate = !\Drupal::lock()->lockMayBeAvailable('setka_editor_files_update');
+    $config = \Drupal::config('setka_editor.settings');
+
+    if ($setkaEditorFilesUpdate) {
+      if (!empty($libraries['setka-editor']['js'])) {
+        $url = key($libraries['setka-editor']['js']);
+        $options = $libraries['setka-editor']['js'][$url];
+        if ($cdnUrl = $config->get('setka_editor_js_cdn')) {
+          $libraries['setka-editor']['js'] = [
+            $cdnUrl => $options,
+          ];
+        }
+      }
+      if (!empty($libraries['setka-editor']['css']['base'])) {
+        $url = key($libraries['setka-editor']['css']['base']);
+        $options = $libraries['setka-editor']['css']['base'][$url];
+        if ($cdnUrl = $config->get('setka_editor_css_cdn')) {
+          $libraries['setka-editor']['css']['base'] = [
+            $cdnUrl => $options,
+          ];
+        }
+      }
+      if (!empty($libraries['setka-styles']['css']['base'])) {
+        $url = key($libraries['setka-styles']['css']['base']);
+        $options = $libraries['setka-styles']['css']['base'][$url];
+        if ($cdnUrl = $config->get('setka_company_css_cdn')) {
+          $libraries['setka-styles']['css']['base'] = [
+            $cdnUrl => $options,
+          ];
+        }
+      }
+      if (!empty($libraries['setka-public-js']['js'])) {
+        $url = key($libraries['setka-public-js']['js']);
+        $options = $libraries['setka-public-js']['js'][$url];
+        if ($cdnUrl = $config->get('setka_public_js_cdn')) {
+          $libraries['setka-public-js']['js'] = [
+            $cdnUrl => $options,
+          ];
+        }
+      }
+    }
+    else {
+      if (!empty($libraries['setka-editor'])) {
+        $setka_editor_js = SettingsForm::getConfigValue($config, $state, 'setka_editor_js', TRUE);
+        $setka_editor_css = SettingsForm::getConfigValue($config, $state, 'setka_editor_css', TRUE);
+        if (!empty($setka_editor_js) && !empty($setka_editor_css)) {
+          $libraries['setka-editor'] = [
+            'js' => $setka_editor_js,
+            'css' => [
+              'base' => $setka_editor_css,
+            ],
+          ];
+        }
+      }
+      if (!empty($libraries['setka-styles'])) {
+        $setka_styles_css = SettingsForm::getConfigValue($config, $state, 'setka_company_css', TRUE);
+        if (!empty($setka_styles_css)) {
+          $libraries['setka-styles'] = [
+            'css' => [
+              'base' => $setka_styles_css,
+            ],
+          ];
+        }
+      }
+      if (!empty($libraries['setka-public-js'])) {
+        $setka_public_js = SettingsForm::getConfigValue($config, $state, 'setka_public_js', TRUE, TRUE);
+        if (!empty($setka_public_js)) {
+          $libraries['setka-public-js'] = [
+            'js' => $setka_public_js,
+          ];
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_insert().
+ */
+function setka_editor_entity_insert(EntityInterface $entity) {
+  $entityType = $entity->getEntityType()->id();
+  $entityId = $entity->id();
+  // $setkaEditorUuid needs to put session entity uuid from setka editor field
+  // to know which images to attach to entity.
+  // See \Drupal\setka_Editor\Validate\SetkaEditorValidate::validate method.
+  $setkaEditorUuid = &drupal_static('setkaEditorUuid');
+  /** @var \Drupal\Core\TempStore\PrivateTempStore $store */
+  $store = \Drupal::service('user.private_tempstore')->get('setka_editor');
+  $setkaEditorImages = $store->get('setka_editor_images') ?? [];
+  if ($setkaEditorUuid && !empty($setkaEditorImages[$setkaEditorUuid])) {
+    /** @var \Drupal\file\FileUsage\DatabaseFileUsageBackend $file_usage */
+    $file_usage = \Drupal::service('file.usage');
+    $entityImages = File::loadMultiple($setkaEditorImages[$setkaEditorUuid]);
+    foreach ($entityImages as $imageFile) {
+      $file_usage->add($imageFile, 'setka_editor', $entityType, $entityId);
+    }
+    unset($setkaEditorImages[$setkaEditorUuid]);
+    $store->set('setka_editor_images', $setkaEditorImages);
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function setka_editor_form_field_config_edit_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  if ($form['default_value']['widget'][0]['#setka_editor_widget']) {
+    $form['default_value']['widget'][0]['#type'] = 'hidden';
+    $form['default_value']['widget'][0]['#default_value'] = '';
+    $link = Link::fromTextAndUrl('Setka Editor Style Manager', Url::fromUri(SetkaEditorHelper::SETKA_EDITOR_DOMAIN))->toString();
+    $form['default_value']['widget'][0]['#suffix'] = '<b>' . t('The default settings of Setka Editor must be managed on the @link pages.',
+        ['@link' => $link]) . '</b>';
+  }
+}
