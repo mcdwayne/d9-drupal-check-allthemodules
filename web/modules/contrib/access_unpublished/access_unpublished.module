@@ -1,0 +1,88 @@
+<?php
+
+/**
+ * @file
+ * Contains access_unpublished implementations.
+ */
+
+use Drupal\access_unpublished\Form\AccessUnpublishedForm;
+use Drupal\Core\Entity\EntityPublishedInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Session\AccountInterface;
+
+module_load_include('inc', 'access_unpublished', 'access_unpublished.tokens');
+
+/**
+ * Implements hook_entity_access().
+ */
+function access_unpublished_entity_access(EntityInterface $entity, $operation, AccountInterface $account) {
+
+  $tokenKey = \Drupal::config('access_unpublished.settings')->get('hash_key');
+  $permission = 'access_unpublished ' . $entity->getEntityTypeId() . ($entity->getEntityType()->hasKey('bundle') ? ' ' . $entity->bundle() : '');
+  if (
+    $operation == 'view' &&
+    \Drupal::request()->query->has($tokenKey) &&
+    $entity instanceof EntityPublishedInterface &&
+    $account->hasPermission($permission) &&
+    !$entity->isPublished()
+  ) {
+
+    $storage = \Drupal::entityTypeManager()->getStorage('access_token');
+    $tokens = $storage->getQuery()
+      ->condition('entity_type', $entity->getEntityType()->id())
+      ->condition('entity_id', $entity->id())
+      ->condition('value', \Drupal::request()->get($tokenKey))
+      ->execute();
+
+    if ($tokens) {
+      /** @var \Drupal\access_unpublished\AccessTokenInterface $token */
+      $token = $storage->load(current($tokens));
+
+      return AccessResult::allowedIf(!$token->isExpired())
+        ->cachePerPermissions()
+        ->addCacheableDependency($token)
+        ->setCacheMaxAge($token->get('expire')->value - \Drupal::time()->getRequestTime());
+
+    }
+  }
+  return AccessResult::neutral();
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function access_unpublished_entity_delete(EntityInterface $entity) {
+  /** @var \Drupal\access_unpublished\AccessTokenManager $tokenManager */
+  $tokenManager = \Drupal::service('access_unpublished.access_token_manager');
+  foreach ($tokenManager->getAccessTokensByEntity($entity) as $token) {
+    $token->delete();
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function access_unpublished_cron() {
+  $config = \Drupal::config('access_unpublished.settings');
+  if ($config->get('cleanup_expired_tokens')) {
+    $strtotime = strtotime($config->get('cleanup_expired_tokens_period'));
+    /** @var \Drupal\access_unpublished\AccessTokenManager $tokenManager */
+    $tokenManager = \Drupal::service('access_unpublished.access_token_manager');
+    foreach ($tokenManager->getAccessTokens('expired') as $token) {
+      if ($strtotime > $token->get('expire')->value) {
+        $token->delete();
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function access_unpublished_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  \Drupal::service('class_resolver')
+    ->getInstanceFromDefinition(AccessUnpublishedForm::class)
+    ->formAlter($form, $form_state, $form_id);
+}
