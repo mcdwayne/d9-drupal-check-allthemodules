@@ -1,0 +1,343 @@
+<?php
+
+/**
+ * Performs an HTTP request.
+ *
+ * This is a flexible and powerful HTTP client implementation. Correctly
+ * handles GET, POST, PUT or any other HTTP requests. Handles redirects.
+ *
+ * @param $url
+ *   A string containing a fully qualified URI.
+ * @param array $options
+ *   (optional) An array that can have one or more of the following elements:
+ *   - headers: An array containing request headers to send as name/value pairs.
+ *   - method: A string containing the request method. Defaults to 'GET'.
+ *   - data: A string containing the request body, formatted as
+ *     'param=value&param=value&...'. Defaults to NULL.
+ *   - max_redirects: An integer representing how many times a redirect
+ *     may be followed. Defaults to 3.
+ *   - timeout: A float representing the maximum number of seconds the function
+ *     call may take. The default is 30 seconds. If a timeout occurs, the error
+ *     code is set to the HTTP_REQUEST_TIMEOUT constant.
+ *   - context: A context resource created with stream_context_create().
+ *   - verify_ssl: A boolean, to decide whether (TRUE) or not (FALSE) verify the SSL certificate and host.
+ *   - verbose: A boolean, to switch on (TRUE) and off (FALSE) the cURL verbose mode.
+ *   - cookiefile: A string containing a local path to the cookie file.
+ *   - http_proxy: An array that will override the system-wide HTTP proxy settings. Array's elements:
+ *   - https_proxy: An array that will override the system-wide HTTPS proxy settings.
+ * @return object
+ *   An object that can have one or more of the following components:
+ *   - request: A string containing the request body that was sent.
+ *   - code: An integer containing the response status code, or the error code
+ *     if an error occurred.
+ *   - protocol: The response protocol (e.g. HTTP/1.1 or HTTP/1.0).
+ *   - status_message: The status message from the response, if a response was
+ *     received.
+ *   - redirect_code: If redirected, an integer containing the initial response
+ *     status code.
+ *   - redirect_url: If redirected, a string containing the URL of the redirect
+ *     target.
+ *   - error: If an error occurred, the error message. Otherwise not set.
+ *   - errno: If an error occurred, a cURL error number greater than 0. Otherwise set to 0.
+ *   - headers: An array containing the response headers as name/value pairs.
+ *     HTTP header names are case-insensitive (RFC 2616, section 4.2), so for
+ *     easy access the array keys are returned in lower case.
+ *   - data: A string containing the response body that was received.
+ */
+function curl_http_request($url, array $options = array()) {
+  $result = new stdClass();
+
+  // Parse the URL and make sure we can handle the schema.
+  $uri = @parse_url($url);
+
+  if ($uri == FALSE) {
+    $result->error = 'unable to parse URL';
+    $result->code = -1001;
+    return $result;
+  }
+
+  if (!isset($uri['scheme'])) {
+    $result->error = 'missing schema';
+    $result->code = -1002;
+    return $result;
+  }
+
+  timer_start(__FUNCTION__);
+
+  // Merge the default options.
+  $options += array(
+    'headers' => array(),
+    'method' => 'GET',
+    'data' => NULL,
+    'max_redirects' => 3,
+    'timeout' => 30.0,
+    'context' => NULL,
+    'verify_ssl' => FALSE,
+    'verbose' => FALSE,
+    'cookiefile' => NULL,
+    'http_proxy' => variable_get('http_proxy'),
+    'https_proxy' => variable_get('https_proxy'),
+  );
+
+  // Select the right proxy for the right protocol.
+  $proxy = ('https' == $uri['scheme']) ? $options['https_proxy'] : $options['http_proxy'];
+
+  // Nullify the proxy if the host to send the request to is part of the proxy's exceptions.
+  if ((!empty($proxy['exceptions'])) && (array_key_exists($uri['host'], $proxy['exceptions']))) {
+    $proxy = NULL;
+  }
+
+  $curl_opt = array(
+    CURLOPT_HEADER => TRUE,
+    CURLINFO_HEADER_OUT => TRUE,
+    CURLOPT_TIMEOUT => $options['timeout'],
+    CURLOPT_FOLLOWLOCATION => TRUE,
+    CURLOPT_RETURNTRANSFER => TRUE,
+    CURLOPT_SSL_VERIFYPEER => $options['verify_ssl'],
+    CURLOPT_SSL_VERIFYHOST => $options['verify_ssl'],
+    CURLOPT_MAXREDIRS => $options['max_redirects'],
+  );
+
+  if ($options['cookiefile']) {
+    $curl_opt += array(
+      CURLOPT_COOKIEJAR => $options['cookiefile'],
+      CURLOPT_COOKIEFILE => $options['cookiefile'],
+    );
+  }
+
+  if (!empty($proxy)) {
+    $proxy_options = array(
+      CURLOPT_PROXY => $proxy['server'],
+      CURLOPT_PROXYPORT => $proxy['port'],
+    );
+    // For the time being let's just support HTTP proxies with basic authentication.
+    if (isset($proxy['username']) && isset($proxy['password'])) {
+      $proxy_options += array(
+        CURLOPT_PROXYUSERPWD => implode(':', array($proxy['username'], $proxy['password'])),
+        CURLOPT_PROXYTYPE => CURLPROXY_HTTP,
+        CURLOPT_PROXYAUTH => CURLAUTH_BASIC,
+      );
+    }
+    $curl_opt += $proxy_options;
+  }
+
+  $default_ports = array(
+    'http' => 80,
+    'feed' => 80,
+    'https' => 443,
+  );
+
+  if (array_key_exists($uri['scheme'], $default_ports)) {
+    if (!isset($uri['port'])) {
+      $uri['port'] = $default_ports[$uri['scheme']];
+    }
+    // RFC 2616: "non-standard ports MUST, default ports MAY be included".
+    // We don't add the standard port to prevent from breaking rewrite rules
+    // checking the host that do not take into account the port number.
+    $options['headers']['Host'] = $uri['host'] . ($uri['port'] != 80 ? ':' . $uri['port'] : '');
+  }
+  else {
+    $result->error = 'invalid schema ' . $uri['scheme'];
+    $result->code = -1003;
+    return $result;
+  }
+
+  // Merge the default headers.
+  $options['headers'] += array(
+    'User-Agent' => 'Drupal (+http://drupal.org/)',
+  );
+
+  // Only add Content-Length if we actually have any content or if it is a POST
+  // or PUT request. Some non-standard servers get confused by Content-Length in
+  // at least HEAD/GET requests, and Squid always requires Content-Length in
+  // POST/PUT requests.
+  $content_length = strlen($options['data']);
+  if ($content_length > 0 || $options['method'] == 'POST' || $options['method'] == 'PUT') {
+    $options['headers']['Content-Length'] = $content_length;
+  }
+
+  // If the server URL has a user then attempt to use basic authentication.
+  if (isset($uri['user'])) {
+    $options['headers']['Authorization'] = 'Basic ' . base64_encode($uri['user'] . (isset($uri['pass']) ?
+      ':' . $uri['pass'] : ''));
+  }
+
+  // If the database prefix is being used by SimpleTest to run the tests in a copied
+  // database then set the user-agent header to the database prefix so that any
+  // calls to other Drupal pages will run the SimpleTest prefixed database. The
+  // user-agent is used to ensure that multiple testing sessions running at the
+  // same time won't interfere with each other as they would if the database
+  // prefix were stored statically in a file or database variable.
+  $test_info = &$GLOBALS['drupal_test_info'];
+  if (!empty($test_info['test_run_id'])) {
+    $options['headers']['User-Agent'] = drupal_generate_test_ua($test_info['test_run_id']);
+  }
+
+  // Set all the headers.
+  $curl_opt[CURLOPT_HTTPHEADER] = array();
+  foreach ($options['headers'] as $name => $value) {
+    $curl_opt[CURLOPT_HTTPHEADER][] = $name . ": " . trim($value);
+  }
+
+  // Set the request method.
+  switch ($options['method']) {
+    case 'GET':
+      $curl_opt[CURLOPT_HTTPGET] = TRUE;
+      break;
+    case 'POST':
+      $curl_opt[CURLOPT_POST] = TRUE;
+      if (!empty($options['data'])) {
+        $curl_opt[CURLOPT_POSTFIELDS] = drupal_http_build_query($options['data']);
+      }
+      break;
+    case 'PUT':
+      $curl_opt[CURLOPT_PUT] = TRUE;
+      break;
+    default:
+      $result->error = 'invalid method ' . $options['method'];
+      $result->code = -1004;
+      return $result;
+  }
+
+  // Make the request.
+  $ch = curl_init($url);
+  curl_setopt_array($ch, $curl_opt);
+
+  // Full response stored. To be parsed later on and split in protocol, code, status message, and response headers.
+  $result->data = trim(curl_exec($ch));
+  $result->error = curl_error($ch);
+  $result->errno = curl_errno($ch);
+
+  // If there's been an error, do not continue.
+  if ($result->error) {
+    // Request timed out.
+    if (CURLE_OPERATION_TIMEOUTED == $result->errno) {
+      $result->code = HTTP_REQUEST_TIMEOUT;
+      $result->error = 'request timed out';
+      return $result;
+    }
+    $result->code = $result->errno;
+    return $result;
+  }
+
+  // The last effective URL should correspond to the Redirect URL.
+  $result->redirect_url = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
+
+  // Save the request sent into the result object.
+  $result->request = curl_getinfo($ch, CURLINFO_HEADER_OUT);
+
+  // Parse response headers from the response body.
+  // Be tolerant of malformed HTTP responses that separate header and body with
+  // \n\n or \r\r instead of \r\n\r\n.
+  list($response, $result->data) = preg_split("/\r\n\r\n|\n\n|\r\r/", $result->data, 2);
+
+  // Sometimes when making an HTTP request via proxy using cURL, you end up with a multiple set of headers:
+  // from the web server being the actual target, from the proxy itself, etc.
+  // The following 'if' statement is to check for such a situation and make sure we get a proper split between
+  // actual response body and actual response headers both coming from the web server.
+  while ('HTTP/' == substr($result->data, 0, 5)) {
+    list($response, $result->data) = preg_split("/\r\n\r\n|\n\n|\r\r/", $result->data, 2);
+  }
+
+  $response = preg_split("/\r\n|\n|\r/", $response);
+
+  // Parse the response status line.
+  list($protocol, $code, $status_message) = explode(' ', trim(array_shift($response)), 3);
+  $result->protocol = $protocol;
+  $result->status_message = $status_message;
+
+  $result->headers = array();
+
+  // Parse the response headers.
+  while ($line = trim(array_shift($response))) {
+    list($name, $value) = explode(':', $line, 2);
+    $name = strtolower($name);
+    if (isset($result->headers[$name]) && $name == 'set-cookie') {
+      // RFC 2109: the Set-Cookie response header comprises the token Set-
+      // Cookie:, followed by a comma-separated list of one or more cookies.
+      $result->headers[$name] .= ',' . trim($value);
+    }
+    else {
+      $result->headers[$name] = trim($value);
+    }
+  }
+
+  $responses = array(
+    100 => 'Continue',
+    101 => 'Switching Protocols',
+    200 => 'OK',
+    201 => 'Created',
+    202 => 'Accepted',
+    203 => 'Non-Authoritative Information',
+    204 => 'No Content',
+    205 => 'Reset Content',
+    206 => 'Partial Content',
+    300 => 'Multiple Choices',
+    301 => 'Moved Permanently',
+    302 => 'Found',
+    303 => 'See Other',
+    304 => 'Not Modified',
+    305 => 'Use Proxy',
+    307 => 'Temporary Redirect',
+    400 => 'Bad Request',
+    401 => 'Unauthorized',
+    402 => 'Payment Required',
+    403 => 'Forbidden',
+    404 => 'Not Found',
+    405 => 'Method Not Allowed',
+    406 => 'Not Acceptable',
+    407 => 'Proxy Authentication Required',
+    408 => 'Request Time-out',
+    409 => 'Conflict',
+    410 => 'Gone',
+    411 => 'Length Required',
+    412 => 'Precondition Failed',
+    413 => 'Request Entity Too Large',
+    414 => 'Request-URI Too Large',
+    415 => 'Unsupported Media Type',
+    416 => 'Requested range not satisfiable',
+    417 => 'Expectation Failed',
+    500 => 'Internal Server Error',
+    501 => 'Not Implemented',
+    502 => 'Bad Gateway',
+    503 => 'Service Unavailable',
+    504 => 'Gateway Time-out',
+    505 => 'HTTP Version not supported',
+  );
+  // RFC 2616 states that all unknown HTTP codes must be treated the same as the
+  // base code in their class.
+  if (!isset($responses[$code])) {
+    $code = floor($code / 100) * 100;
+  }
+  $result->code = $code;
+
+  switch ($code) {
+    case 200: // OK
+    case 304: // Not modified
+      break;
+    case 301: // Moved permanently
+    case 302: // Moved temporarily
+    case 307: // Moved temporarily
+      $location = $result->headers['location'];
+      $options['timeout'] -= timer_read(__FUNCTION__) / 1000;
+      if ($options['timeout'] <= 0) {
+        $result->code = HTTP_REQUEST_TIMEOUT;
+        $result->error = 'request timed out';
+      }
+      elseif ($options['max_redirects']) {
+        // Redirect to the new location.
+        $options['max_redirects']--;
+        $result = curl_http_request($location, $options);
+        $result->redirect_code = $code;
+      }
+      if (!isset($result->redirect_url)) {
+        $result->redirect_url = $location;
+      }
+      break;
+    default:
+      $result->error = $status_message;
+  }
+
+  curl_close($ch);
+  return $result;
+}
