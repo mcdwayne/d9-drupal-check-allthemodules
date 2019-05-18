@@ -1,0 +1,363 @@
+<?php
+
+/**
+ * @file
+ * Contains pbf.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\node\NodeInterface;
+use Drupal\field\FieldConfigInterface;
+use Drupal\user\RoleInterface;
+use Drupal\user\Entity\User;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\FieldableEntityInterface;
+
+define('PBF_BY_ROLE_ID', 'role_id');
+define('PBF_BY_USER_ID', 'user_id');
+
+/**
+ * Implements hook_help().
+ */
+function pbf_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the pbf module.
+    case 'help.page.pbf':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Manage access entity by Entity reference field') . '</p>';
+      $output .= '<pre>' . file_get_contents(__DIR__ . '/README.txt') . '</pre>';
+      return $output;
+
+    default:
+  }
+}
+
+
+/**
+ * Implements hook_node_grants().
+ */
+function pbf_node_grants(AccountInterface $account, $op) {
+  // First grant a grant to the author for own content.
+  $grants['pbf_author'] = [$account->id()];
+
+  // Grant to the user referenced by a Pbf field.
+  $grants['pbf_' . PBF_BY_USER_ID] = [$account->id()];
+
+  // Grant to the user according roles.
+  $roles = $account->getRoles();
+  $role_ids = \Drupal::config('pbf.settings')->get('pbf_roles_gids');
+  foreach ($roles as $role) {
+    $grants['pbf_' . PBF_BY_ROLE_ID][] = $role_ids[$role];
+
+  }
+
+  // Grant to the user according to his Pbf field referencing node or term.
+  $user = User::load($account->id());
+  $field_definitions = $user->getFieldDefinitions();
+
+  foreach ($field_definitions as $field_name => $field_definition) {
+    if ($field_definition instanceof FieldConfigInterface && $field_definition->getType() == 'pbf') {
+
+      $values = $user->{$field_name}->getValue();
+      if (empty($values)) {
+        continue;
+      }
+
+      $target_entity_type_id = $field_definition->getSetting('target_type');
+      switch ($target_entity_type_id) {
+        case 'node':
+        case 'taxonomy_term':
+          foreach ($values as $value) {
+            // On user edit account page, if the cardinality of Pbf field is
+            // unlimited, we can have an empty array for $value which
+            // correspond to the empty input field on the form edit.
+            if ($value) {
+              $grants['pbf_' . $field_name][] = $value['target_id'];
+            }
+          }
+          break;
+
+        case 'user':
+          foreach ($values as $value) {
+            // On user edit account page, if the cardinality of Pbf field is
+            // unlimited, we can have an empty array for $value which
+            // correspond to the empty input field on the form edit.
+            if ($value) {
+              $grants['pbf_' . $field_name][] = $value['target_id'];
+            }
+          }
+          break;
+      }
+    }
+  }
+
+  return $grants;
+}
+
+/**
+ * Implements hook_node_access_records().
+ *
+ * All node access modules must implement this hook. If the module is
+ * interested in the privacy of the node passed in, return a list
+ * of node access values for each grant ID we offer.
+ */
+function pbf_node_access_records(NodeInterface $node) {
+  if (!$node->isPublished()) {
+    return NULL;
+  }
+
+  // Check if a Pbf field is attached to the node.
+  $field_definitions = $node->getFieldDefinitions();
+  $grants = [];
+  /** @var \Drupal\Core\Field\FieldDefinitionInterface $field_definition */
+  foreach ($field_definitions as $field_name => $field_definition) {
+    if ($field_definition instanceof FieldConfigInterface && $field_definition->getType() == 'pbf') {
+
+      $values = $node->{$field_name}->getValue();
+      if (empty($values)) {
+        continue;
+      }
+
+      $target_entity_type_id = $field_definition->getSetting('target_type');
+      $priority = $field_definition->getSetting('priority');
+      $user_method = $field_definition->getSetting('user_method');
+
+      switch ($target_entity_type_id) {
+        case 'node':
+        case 'taxonomy_term':
+          foreach ($values as $value) {
+            // If node's permissions are set as public, we let standard
+            // permissions applied, and so we do not populate a grants array.
+            if ($value['grant_public']) {
+              continue;
+            }
+            $grants[] = pbf_create_grant($value, $field_name, $priority);
+          }
+          break;
+
+        case 'user':
+          foreach ($values as $value) {
+            // If node's permissions are set as public, we use standard
+            // permissions, and so do not populate a grants array.
+            if ($value['grant_public']) {
+              continue;
+            }
+            // If the field which reference user grant access directly to this
+            // user for this node.
+            if ($user_method == 'user') {
+              $grants[] = pbf_create_grant($value, PBF_BY_USER_ID, $priority);
+            }
+            // If the field which reference user grant access to users which
+            // reference this user. We grant access to these users who have
+            // same Pbf field set on this user.
+            if ($user_method == 'ref_user') {
+              $grants[] = pbf_create_grant($value, $field_name, $priority);
+              // We grant access to the user referenced too.
+              $grants[] = pbf_create_grant($value, PBF_BY_USER_ID, $priority);
+            }
+          }
+          break;
+
+        case 'user_role':
+          foreach ($values as $value) {
+            // If node's permissions are set as public, we use standard
+            // permissions, and so do not populate a grants array.
+            if ($value['grant_public']) {
+              continue;
+            }
+
+            $role_ids = \Drupal::config('pbf.settings')->get('pbf_roles_gids');
+            if (isset($role_ids[$value['target_id']]) && is_int($role_ids[$value['target_id']])) {
+              // Replace the Role target_id (string) by our role id (integer).
+              $value['target_id'] = $role_ids[$value['target_id']];
+              $grants[] = pbf_create_grant($value, PBF_BY_ROLE_ID, $priority);
+            }
+          }
+          break;
+      }
+    }
+  }
+
+  // If there is some custom permissions then we need to
+  // grant access to node's author according to standard permissions defined.
+  // Otherwise, standard permissions applied to node
+  // and so we return an empty array. We set this realm only if anonymous user
+  // is not the node's owner.
+  if ($grants && $node->getOwnerId()) {
+    $grants[] = array(
+      'realm' => 'pbf_author',
+      'gid' => $node->getOwnerId(),
+      'grant_view' => 1,
+      'grant_update' => ($node->getOwner()->hasPermission('edit own ' . $node->bundle() . ' content')) ? 1 : 0,
+      'grant_delete' => ($node->getOwner()->hasPermission('delete own ' . $node->bundle() . ' content')) ? 1 : 0,
+      'priority' => 0,
+    );
+  }
+
+  return $grants;
+}
+
+/**
+ * Helper function to generate a grant array.
+ *
+ * @param array $value
+ *   The field values.
+ * @param string $field_name
+ *   The field name used for the realm.
+ * @param int $priority
+ *   The permissions's priority.
+ *
+ * @return array $grant
+ *   The grant array.
+ */
+function pbf_create_grant($value, $field_name, $priority = 0) {
+  // @todo support langcode
+  $grant = array(
+    'realm' => 'pbf_' . $field_name,
+    'gid' => $value['target_id'],
+    'grant_view' => $value['grant_view'],
+    'grant_update' => $value['grant_update'],
+    'grant_delete' => $value['grant_delete'],
+    'priority' => $priority,
+  );
+  return $grant;
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function pbf_entity_delete(EntityInterface $entity) {
+  $config = \Drupal::configFactory()->getEditable('pbf.settings');
+  if ($entity instanceof RoleInterface) {
+    $roles_gids = $config->get('pbf_roles_gids');
+    unset($roles_gids[$entity->id()]);
+    $config->set('pbf_roles_gids', $roles_gids);
+    $config->save();
+  }
+  if ($entity instanceof FieldableEntityInterface) {
+    \Drupal::service('pbf.synchronize')->synchronize('delete', $entity);
+  }
+}
+
+/**
+ * Implements hook_entity_insert().
+ */
+function pbf_entity_insert(EntityInterface $entity) {
+  $config = \Drupal::configFactory()->getEditable('pbf.settings');
+  if ($entity instanceof RoleInterface) {
+    $roles_gids = array_flip($config->get('pbf_roles_gids'));
+    $roles_gids[] = $entity->id();
+    $config->set('pbf_roles_gids', array_flip($roles_gids));
+    $config->save();
+  }
+  if ($entity instanceof FieldableEntityInterface) {
+    \Drupal::service('pbf.synchronize')->synchronize('insert', $entity);
+  }
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function pbf_entity_update(EntityInterface $entity) {
+  if ($entity instanceof FieldableEntityInterface) {
+    \Drupal::service('pbf.synchronize')->synchronize('update', $entity);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ */
+function pbf_field_config_insert(FieldConfigInterface $entity) {
+  if ($entity->getType() == 'pbf' && $entity->getSetting('synchronized_with')) {
+
+    $entityTypeManager = \Drupal::entityTypeManager()->getStorage('field_config');
+    /** @var \Drupal\field\FieldConfigInterface $field_to_synchronize */
+    $field_to_synchronize = $entityTypeManager->load($entity->getSetting('synchronized_with'));
+    if ($field_to_synchronize) {
+      $field_to_synchronize->set('synchronized_by', $entity->id())
+        ->set('synchronized_from_target', $entity->getSetting('synchronized_from_target'))
+        ->save();
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update().
+ */
+function pbf_field_config_update(FieldConfigInterface $entity) {
+  if ($entity->getType() == 'pbf') {
+    $original = $entity->original;
+    $entityTypeManager = \Drupal::entityTypeManager()->getStorage('field_config');
+
+    // If no change on the field synchronized, and if there is a field selected,
+    // we must care about the synchronized_from_target option.
+    if ($entity->getSetting('synchronized_with') == $original->getSetting('synchronized_with') && $entity->getSetting('synchronized_with')) {
+      if ($entity->getSetting('synchronized_from_target') !== $original->getSetting('synchronized_from_target')) {
+        $field_to_synchronize = $entityTypeManager->load($entity->getSetting('synchronized_with'));
+        if ($field_to_synchronize) {
+          $field_to_synchronize->setSetting('synchronized_from_target', $entity->getSetting('synchronized_from_target'))->save();
+        }
+      }
+      else {
+        return;
+      }
+    }
+
+    // If a new field is selected and there is no synchronization before.
+    if ($entity->getSetting('synchronized_with') && empty($original->getSetting('synchronized_with'))) {
+      /** @var \Drupal\field\FieldConfigInterface $field_to_synchronize */
+      $field_to_synchronize = $entityTypeManager->load($entity->getSetting('synchronized_with'));
+      if ($field_to_synchronize) {
+        $field_to_synchronize->setSetting('synchronized_by', $entity->id())
+          ->setSetting('synchronized_from_target', $entity->getSetting('synchronized_from_target'))
+          ->save();
+      }
+    }
+
+    // If the field selected is removed and no synchronization is enabled.
+    if (empty($entity->getSetting('synchronized_with')) && $original->getSetting('synchronized_with')) {
+      /** @var \Drupal\field\FieldConfigInterface $field_to_synchronize */
+      $field_to_synchronize = $entityTypeManager->load($original->getSetting('synchronized_with'));
+      if ($field_to_synchronize) {
+        $field_to_synchronize->setSetting('synchronized_by', '')
+          ->setSetting('synchronized_from_target', 0)
+          ->save();
+      }
+    }
+
+    // If a new field is selected and there is another field selected before.
+    if ($entity->getSetting('synchronized_with') && $original->getSetting('synchronized_with') &&
+        $entity->getSetting('synchronized_with') !== $original->getSetting('synchronized_with')) {
+      /** @var \Drupal\field\FieldConfigInterface $new_field_to_synchronize */
+      $new_field_to_synchronize = $entityTypeManager->load($entity->getSetting('synchronized_with'));
+      if ($new_field_to_synchronize) {
+        $new_field_to_synchronize->setSetting('synchronized_by', $entity->id())
+          ->setSetting('synchronized_from_target', $entity->getSetting('synchronized_from_target'))
+          ->save();
+      }
+      $old_field_to_synchronize = $entityTypeManager->load($original->getSetting('synchronized_with'));
+      if ($old_field_to_synchronize) {
+        $old_field_to_synchronize->setSetting('synchronized_by', '')
+          ->setSetting('synchronized_from_target', 0)
+          ->save();
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ */
+function pbf_field_config_delete(FieldConfigInterface $entity) {
+  if ($entity->getType() == 'pbf' && $entity->getSetting('synchronized_with')) {
+    $entityTypeManager = \Drupal::entityTypeManager()->getStorage('field_config');
+    /** @var \Drupal\field\FieldConfigInterface $field_to_synchronize */
+    $field_to_synchronize = $entityTypeManager->load($entity->getSetting('synchronized_with'));
+    if ($field_to_synchronize) {
+      $field_to_synchronize->set('synchronized_by', '')->save();
+      $field_to_synchronize->set('synchronized_from_target', 0)->save();
+    }
+  }
+}
