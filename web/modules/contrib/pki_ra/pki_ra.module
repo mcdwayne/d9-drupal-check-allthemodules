@@ -1,0 +1,174 @@
+<?php
+
+/**
+ * @file
+ * Contains pki_ra.module.
+ */
+
+use Drupal\Component\Utility\Xss;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\StringTranslation\TranslatableMarkup;
+use Drupal\node\Entity\Node;
+use Drupal\pki_ra\Processors\PKIRARegistrationProcessor;
+
+/**
+ * Implements hook_help().
+ */
+function pki_ra_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the pki_ra module.
+    case 'help.page.pki_ra':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Allows your site to act as registration authority (RA) as part of a public key infrastructure (PKI)') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function pki_ra_theme() {
+  return [
+    'pki_ra' => [
+      'template' => 'pki_ra',
+      'render element' => 'children',
+    ],
+    'user_progress_indicator' => [
+      'variables' => [
+        'content' => NULL,
+      ],
+      'template' => 'user-progress-indicator',
+    ],
+  ];
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_presave() for Node.
+ *
+ * Perform actions before nodes are saved.
+ */
+function pki_ra_node_presave(Node $node) {
+  if (($node->getType() == PKIRARegistrationProcessor::NODE_TYPE) && (empty($node->id()))) {
+    $processor = new PKIRARegistrationProcessor($node);
+    $processor->setSecurityToken();
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert() for Node.
+ *
+ * Perform actions after nodes are inserted into the database.
+ */
+function pki_ra_node_insert(Node $node) {
+  if ($node->getType() == PKIRARegistrationProcessor::NODE_TYPE) {
+    $processor = new PKIRARegistrationProcessor($node);
+    $processor->sendEmailVerification();
+  }
+}
+
+/**
+ * Implements hook_mail().
+ *
+ * Define e-mail message templates.
+ */
+function pki_ra_mail($key, &$message, $params) {
+  switch ($key) {
+    case 'verification':
+      $translation_options = ['langcode' => $message['langcode']];
+      $subject_options = ['@site' => \Drupal::config('system.site')->get('name')];
+      $body = \Drupal::config('pki_ra.settings')->get('messages.verification_email_body')['value'];
+      $expiry = \Drupal::config('pki_ra.settings')->get('registration_confirmation_window');
+
+      $message['subject'] = t('Verification link for @site registration', $subject_options, $translation_options);
+      $message['body'][] =  Xss::filterAdmin($body) . '
+
+' . $params['url'] . '
+
+' . t('The above link will expire in @days days.', ['@days' => $expiry]);
+      break;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Alter Registration edit forms.
+ */
+function pki_ra_form_node_pki_ra_registration_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+
+  // Enter help text for the title field (an e-mail address). It's not possible to do
+  // this in the configuration for the content type so do it here.
+  $title_help_text = t('Please enter a valid e-mail address with which to register.');
+  $form['title']['widget'][0]['value']['#description'] = $title_help_text;
+
+  $form['title']['widget'][0]['value']['#element_validate'][] = [
+    'Drupal\pki_ra\Processors\PKIRARegistrationProcessor',
+    'validateEmailAddress',
+  ];
+
+  if (\Drupal::currentUser()->isAnonymous()) {
+    // Redirect elsewhere after submission.
+    $form['actions']['submit']['#submit'][] = 'pki_ra_registration_save_redirect';
+  }
+}
+
+/**
+ * Redirects registrants to the front page after creating a Registration.
+ *
+ * By default, saving a Registration node will take the user to its view page.
+ * However, it's not meant for viewing by the registraant. So we're altering the
+ * form to redirect to the site home page.
+ *
+ * @param array $form
+ *   The form definition.
+ * @param FormStateInterface $form_state
+ *   The current state of the form.
+ */
+function pki_ra_registration_save_redirect($form, FormStateInterface $form_state) {
+  $form_state->setRedirect('<front>');
+}
+
+/**
+ * Replace instances of "password" with "passphrase" in the password confirm widget.
+ *
+ * @see PKIRACertificateGenerationForm::buildForm()
+ */
+function pki_ra_alter_element_password_confirm($form_element) {
+  $form_element['pass1']['#title'] = new TranslatableMarkup('Passphrase');
+  $form_element['pass2']['#title'] = new TranslatableMarkup('Confirm passphrase');
+  $form_element['#attached']['drupalSettings']['password']['strengthTitle'] = new TranslatableMarkup('Passphrase strength:');
+  $form_element['#attached']['drupalSettings']['password']['confirmTitle'] = new TranslatableMarkup('Passphrase match:');
+  $form_element['#attached']['drupalSettings']['password']['hasWeaknesses'] = new TranslatableMarkup('Recommendations to make your passphrase stronger:');
+  return $form_element;
+}
+
+/**
+ * Implements hook_cron().
+ */
+function pki_ra_cron() {
+  // Purge expired unconfirmed registrations.
+  $timeout = PKIRARegistrationProcessor::getRegistrationTimeoutInSeconds();
+  $expired_registrations = \Drupal::entityQuery('node')
+    ->condition('type', PKIRARegistrationProcessor::NODE_TYPE)
+    ->condition('created', REQUEST_TIME - $timeout, '<')
+    ->condition('field_registration_confirmed', FALSE)
+    ->execute();
+  entity_delete_multiple('node', $expired_registrations);
+  \Drupal::logger('pki_ra')->notice('Deleted %number expired unconfirmed registrations.', [
+    '%number' => count($expired_registrations),
+  ]);
+}
+
+
+/**
+ * Implements hook_page_attachments().
+ */
+function pki_ra_page_attachments(array &$attachments) {
+  $attachments['#attached']['library'][] = 'pki_ra/pkira.style';
+  $attachments['#attached']['library'][] = 'pki_ra/pkira.admin';
+  $attachments['#attached']['library'][] = 'pki_ra/pkira.enrollmentjs';
+}
