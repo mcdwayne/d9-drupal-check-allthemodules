@@ -1,0 +1,137 @@
+<?php
+
+/**
+ * @file
+ * Contains az_blob_fs.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\image\Entity\ImageStyle;
+use Symfony\Component\HttpFoundation\Response;
+use Drupal\Component\Utility\Crypt;
+use Symfony\Component\HttpKernel\Exception\ServiceUnavailableHttpException;
+
+/**
+ * Implements hook_help().
+ */
+function az_blob_fs_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the az_blob_fs module.
+    case 'help.page.az_blob_fs':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('This module create a stream wrapper scheme in order to store files on the Azure Storage cloud service') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+
+/**
+ * @inheritdoc
+ */
+function az_blob_fs_preprocess_image_style(&$variables) {
+  $image_style = ImageStyle::load($variables['style_name']);
+  $image_uri = $variables['uri'];
+  $derivative_uri = $image_style->buildUri($image_uri);
+
+  // First, generate derivative image
+  // Don't try to generate file if source is missing.
+  if (!file_exists($image_uri)) {
+    // If the image style converted the extension, it has been added to the
+    // original file, resulting in filenames like image.png.jpeg. So to find
+    // the actual source image, we remove the extension and check if that
+    // image exists.
+    $path_info = pathinfo($image_uri);
+    $pos = strpos($path_info['filename'], '.');
+    if ($pos !== false) {
+      $converted_image_uri = $path_info['dirname'] . DIRECTORY_SEPARATOR . $path_info['filename'];
+      if (!file_exists($converted_image_uri)) {
+        \Drupal::logger('az_blob_fs')->notice(t('Source image at %source_image_path not found while trying to generate derivative image at %derivative_path.'),
+          ['%source_image_path' => $image_uri, '%derivative_path' => $derivative_uri]
+        );
+        return new Response(t('Error generating image, missing source file.'), 404);
+      }
+      else {
+        // The converted file does exist, use it as the source.
+        $image_uri = $converted_image_uri;
+      }
+    }
+    else {
+      //TODO: source image is missing, break the process
+      return false;
+    }
+  }
+
+  // Don't start generating the image if the derivative already exists or if
+  // generation is in progress in another thread.
+  if (!file_exists($derivative_uri)) {
+    $lock_name = 'azblob_image_style_deliver:' . $image_style->id() . ':' . Crypt::hashBase64($image_uri);
+    $lock = \Drupal::lock();
+    $lock_acquired = $lock->acquire($lock_name);
+    if (!$lock_acquired) {
+      // Pause the process 3 seconds.
+      $lock->wait($lock_name, 3);
+      \Drupal::logger('az_blob_fs')->notice(t('Image generation in progress, paused for 3 seconds.'));
+    }
+  }
+
+  // Try to generate the image, unless another thread just did it while we
+  // were acquiring the lock.
+  $success = file_exists($derivative_uri);
+
+  if (!$success) {
+    $success = $image_style->createDerivative($image_uri, $derivative_uri);
+  }
+
+  if (!empty($lock_acquired)) {
+    $lock->release($lock_name);
+  }
+
+  // Derivative image generated correctly
+  // Build render array
+
+  // Determine the dimensions of the styled image.
+  $dimensions = [
+    'width' => $variables['width'],
+    'height' => $variables['height'],
+  ];
+
+  $image_style->transformDimensions($dimensions, $variables['uri']);
+
+  $variables['image'] = [
+    '#theme' => 'image',
+    '#width' => $dimensions['width'],
+    '#height' => $dimensions['height'],
+    '#attributes' => $variables['attributes'],
+    '#style_name' => $variables['style_name'],
+  ];
+
+  // If the current image toolkit supports this file type, prepare the URI for
+  // the derivative image. If not, just use the original image resized to the
+  // dimensions specified by the style.
+  if ($image_style->supportsUri($variables['uri'])) {
+    $variables['image']['#uri'] = $image_style->buildUrl($variables['uri']);
+  }
+  else {
+    $variables['image']['#uri'] = $variables['uri'];
+    // Don't render the image by default, but allow other preprocess functions
+    // to override that if they need to.
+    $variables['image']['#access'] = FALSE;
+
+    // Inform the site builders why their image didn't work.
+    \Drupal::logger('az_blob_fs')->warning('Could not apply @style image style to @uri because the style does not support it.', [
+      '@style' => $image_style->label(),
+      '@uri' => $variables['uri'],
+    ]);
+  }
+
+  if (isset($variables['alt']) || array_key_exists('alt', $variables)) {
+    $variables['image']['#alt'] = $variables['alt'];
+  }
+  if (isset($variables['title']) || array_key_exists('title', $variables)) {
+    $variables['image']['#title'] = $variables['title'];
+  }
+
+}
