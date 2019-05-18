@@ -1,0 +1,229 @@
+<?php
+
+/**
+ * @file
+ * Allow uploading of files directly to AmazonS3 via the browser using CORS.
+ */
+
+use Aws\S3\PostObject;
+use Drupal\Component\Utility\NestedArray;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Site\Settings;
+use Drupal\field\FieldConfigInterface;
+
+/**
+ * Implements hook_help().
+ */
+function s3fs_cors_help($path, $arg) {
+  if ($path == 'admin/config/media/s3fs/cors') {
+    $msg = t("Configure your S3 Bucket's CORS configuration from this page.
+      Please be aware that submitting this form will <b>overwrite</b> your bucket's current CORS config.<br>
+      So if you intend to configure your bucket's CORS policy manually, <b>never submit this form</b>."
+    );
+    return "<p>$msg</p>";
+  }
+}
+
+/**
+ * Value callback for s3fs_cors_upload element type.
+ */
+function s3fs_cors_upload_value(&$element, $input = FALSE, $form_state = NULL) {
+  $user = \Drupal::currentUser();
+  $fid = 0;
+  $return = [];
+  $parents = $element['#parents'];
+  $parents_id = implode('_', $parents);
+
+  if (!empty($input['fid'])) {
+    // The input will have a non-zero fid only when saving the full node form.
+    // We don't want to do anything when that happens, because everything has
+    // already been done in the AJAX workflow.
+    return $input;
+  }
+
+  $remove_button_clicked = (isset($form_state['input']['_triggering_element_name'])
+    && $form_state['input']['_triggering_element_name'] == "{$parents_id}_remove_button");
+
+  // TODO: I'm relatively sure this is useless, because of how we deal with the files.
+  // But just in case, I'm going to leave it around for now.
+  // Find the current value of this field from the form state, if it's there.
+  $form_state_fid = $form_state['values'];
+  foreach ($parents as $parent) {
+    $form_state_fid = isset($form_state_fid[$parent]) ? $form_state_fid[$parent] : 0;
+  }
+  if ($element['#extended'] && isset($form_state_fid['fid'])) {
+    $fid = $form_state_fid['fid'];
+  }
+  elseif (is_numeric($form_state_fid)) {
+    $fid = $form_state_fid;
+  }
+
+  // If there's valid input, save the new upload.
+  if ($input !== FALSE && $fid == 0 && !empty($input['filename']) && !$remove_button_clicked) {
+    $return = $input;
+
+    $base_dir = '';
+    if (isset($element['#upload_location']) && file_uri_target($element['#upload_location']) != '') {
+      $base_dir = file_uri_target($element['#upload_location']) . '/';
+    }
+
+    // @FIXME
+    // @FIXME
+    // This looks like another module's variable. You'll need to rewrite this
+    // call to ensure that it uses the correct configuration object.
+    // if (module_exists('transliteration') && variable_get('transliteration_file_uploads', 1)) {
+    // $input['filename'] = transliteration_clean_filename($input['filename']);
+    // }
+    // Construct a Drupal file object.
+    $file = new stdClass();
+    $file->uid = $user->uid;
+    $file->filename = $input['filename'];
+    $file->filesize = $input['filesize'];
+    $file->filemime = $input['filemime'];
+    $file->uri = file_destination("s3://$base_dir{$input['filename']}", FILE_EXISTS_RENAME);
+    $file->status = 0;
+    $file->timestamp = REQUEST_TIME;
+
+    // Save the uploaded file to the file_managed table.
+    $file = _s3fs_cors_file_save($file);
+    $return['fid'] = $file->fid;
+
+    // Store the file's metadata into s3fs's metadata cache.
+    $wrapper = new S3fsStreamWrapper();
+    $wrapper->writeUriToCache($file->uri);
+  }
+
+  if ($input === FALSE || $remove_button_clicked) {
+    // If there is no input, or the remove button was just clicked, set the
+    // default value.
+    if ($element['#extended']) {
+      $default_fid = isset($element['#default_value']['fid']) ? $element['#default_value']['fid'] : 0;
+      $return = isset($element['#default_value']) ? $element['#default_value'] : ['fid' => 0];
+    }
+    else {
+      $default_fid = isset($element['#default_value']) ? $element['#default_value'] : 0;
+      $return = ['fid' => 0];
+    }
+
+    // Confirm that the file exists when used as a default value.
+    if ($default_fid && $file = file_load($default_fid)) {
+      $return['fid'] = $file->fid;
+    }
+    else {
+      $return['fid'] = $fid;
+    }
+  }
+
+  return $return;
+}
+
+/**
+ * The #value_callback for the s3fs_cors field element.
+ *
+ * This is pretty much a copy of file_field_widget_value(), but modified to use
+ * the s3fs_cors_upload_value() function instead of the file.module one.
+ */
+function s3fs_cors_field_widget_value($element, $input = FALSE, $form_state = NULL) {
+  if ($input) {
+    // Checkboxes lose their value when empty.
+    // If the display field is present make sure its unchecked value is saved.
+    $field = field_widget_field($element, $form_state);
+    if (empty($input['display'])) {
+      $input['display'] = $field['settings']['display_field'] ? 0 : 1;
+    }
+  }
+
+  // Handle uploads and the like.
+  $return = s3fs_cors_upload_value($element, $input, $form_state);
+
+  // Ensure that all the required properties are returned, even if empty.
+  $return += [
+    'fid' => 0,
+    'display' => 1,
+    'description' => '',
+  ];
+
+  return $return;
+}
+
+/**
+ * Custom version of drupal's file_save() function.
+ *
+ * This function exists because we need to call file_save() before saving the
+ * file's s3 metadata to the cache. Which means that the filesize() function
+ * will fail. So we skip it in this version, since we already know the size.
+ *
+ * @param object $file
+ *   A file object returned by file_load().
+ *
+ * @return object
+ *   The updated file object.
+ *
+ * @see hook_file_insert()
+ * @see hook_file_update()
+ */
+function _s3fs_cors_file_save(stdClass $file) {
+  \Drupal::moduleHandler()->invokeAll('file_presave', [$file]);
+  \Drupal::moduleHandler()->invokeAll('entity_presave', [$file, 'file']);
+
+  \Drupal::database()->insert('file_managed')->fields($file)->execute();
+  // Inform modules about the newly added file.
+  \Drupal::moduleHandler()->invokeAll('file_insert', [$file]);
+  \Drupal::moduleHandler()->invokeAll('entity_insert', [$file, 'file']);
+
+  // Clear the static loading cache.
+  entity_get_controller('file')->resetCache([$file->fid]);
+
+  return $file;
+}
+
+/**
+ * Implements hook_field_info_alter().
+ *
+ * Use a custom class to override the file field class by extending it to allow
+ * larger file sizes when the upload is to AWS S3. Images are not being treated
+ * similarly at this time.
+ */
+function s3fs_cors_field_info_alter(array &$info) {
+
+  // Override the default file field class with a custom version.
+  $info['file']['class'] = '\Drupal\s3fs_cors\Plugin\Field\FieldType\S3fsCorsFileItem';
+
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Remove the S3 Cors widget option from file or image fields that are not
+ * using S3 storage.
+ */
+function s3fs_cors_form_entity_form_display_edit_form_alter(&$form, FormStateInterface $form_state) {
+
+  $entity_type = $form['#entity_type'];
+  $bundle = $form['#bundle'];
+  $entityManager = Drupal::service('entity.manager');
+  $field_definitions = $entityManager->getFieldDefinitions($entity_type, $bundle);
+  $s3_public = Settings::get('s3fs.use_s3_for_public');
+  $s3_private = Settings::get('s3fs.use_s3_for_private');
+  foreach ($form['#fields'] as $field) {
+    $field_definition = $field_definitions[$field];
+    if ($field_definition instanceof FieldConfigInterface) {
+      /** @var \Drupal\field\Entity\FieldConfig $field_definition */
+      $field_type = $field_definition->get('field_type');
+      if ($field_type == 'file' || $field_type == 'image') {
+        /** @var \Drupal\field\Entity\FieldStorageConfig $field_storage */
+        $field_storage = $field_definition->getFieldStorageDefinition();
+        $uri_scheme = $field_storage->getSetting('uri_scheme');
+        if ($uri_scheme == 's3' ||
+          ($uri_scheme == 'public' && $s3_public) ||
+          ($uri_scheme == 'private' && $s3_private)) {
+          continue;
+        }
+        $widget = 's3fs_cors_' . $field_type . '_widget';
+        unset($form['fields'][$field]['plugin']['type']['#options'][$widget]);
+      }
+    }
+  }
+
+}
