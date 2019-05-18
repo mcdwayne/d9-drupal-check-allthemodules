@@ -1,0 +1,248 @@
+<?php
+
+/**
+ * @file
+ * Queries the hostip.info api to get the country / state info. based on the
+ * user's ip or specific ip passed to it.
+ *
+ * @author: Amit Goyal <http://drupal.org/user/56441>
+ */
+
+use Drupal\Component\Utility\String;
+
+/**
+ * Implements hook_help().
+ */
+function hostip_help($path, $arg) {
+  switch ($path) {
+    case 'admin/settings/hostip':
+      return t("Queries the hostip.info api to get the country / state info. based on the user's ip or specific ip passed to it");
+  }
+}
+
+/**
+ * Menu callback; presents the hostip settings page.
+ */
+/*function hostip_admin_settings() {
+  $form['hostip_user_profile'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Display location information on user profile page'),
+    '#default_value' => \Drupal::config('hostip.settings')->get('hostip_user_profile'),
+  );
+  return system_settings_form($form);
+}*/
+
+/**
+ * Implements hook_page_build().
+ */
+function hostip_page_build(&$page) {
+  $hostip_user_profile = \Drupal::config('hostip.settings')->get('hostip_user_profile');
+
+  if ($hostip_user_profile && empty($_SESSION['hostip_data'])) {
+    $_SESSION['hostip_data'] = hostip_get_iptocountry_info();
+  }
+}
+
+/**
+ * Implements hook_user_view().
+ */
+function hostip_user_view(array &$build, \Drupal\user\UserInterface $account, \Drupal\Core\Entity\Display\EntityViewDisplayInterface $display, $view_mode) {
+  $user = \Drupal::currentUser();
+  // User is viewing his own profile.
+  if ($user->id() == $account->id() && $view_mode == 'full' && !empty($_SESSION['hostip_data'])) {
+    $hostip_lookup_result_set = $_SESSION['hostip_data'];
+    $country_info = $hostip_lookup_result_set['country'] ? $hostip_lookup_result_set['country'] . ' (' . $hostip_lookup_result_set['countrycode'] . '), ' . $hostip_lookup_result_set['city'] : '';
+    if ($display->getComponent('member_for')) {
+      $build['hostip'] = [
+        '#type' => 'item',
+        '#weight' => 10,
+        '#title' => t('Country details'),
+        '#markup' => $country_info,
+        '#attributes' => ['class' => 'hostip'],
+      ];
+    }
+  }
+}
+
+/**
+ * Gets country details for the given ip by calling hostip api.
+ *
+ * Takes ($ip)
+ *
+ * @param valid ip addess to get country details for specific ip address otherwise
+ * it returns country details for the user
+ */
+function hostip_get_iptocountry_info($ip = '') {
+  $ip = $ip ? $ip : \Drupal::request()->getClientIp();
+  //$ip = '170.149.100.10';
+  if (!hostip_is_valid_ip($ip)) {
+    return [];
+  }
+  // HTML Format
+  /*$url = "http://api.hostip.info/get_html.php?ip=$ip&position=true";
+  $ip_details = drupal_http_request($url);
+  $output = nl2br($ip_details->data);
+  return $output;*/
+
+  // XML Format.
+  $url = "http://api.hostip.info/?ip=$ip&position=true";
+
+  // TODO: https://www.drupal.org/node/1862446, we may Guzzle HTTP client library.
+  $ip_details = hostip_curl($url);
+  if (empty($ip_details)) {
+    return [];
+  }
+  /*if (empty($ip_details->data)) {
+    return array();
+  }*/
+  $ip_details_array = hostip_xml2array($ip_details);
+  if (empty($ip_details_array['HostipLookupResultSet'])) {
+    return [];
+  }
+
+  $data['country'] = String::checkPlain($ip_details_array['HostipLookupResultSet']['gml:featureMember']['Hostip']['countryName']['value']);
+  $data['countrycode'] = String::checkPlain($ip_details_array['HostipLookupResultSet']['gml:featureMember']['Hostip']['countryAbbrev']['value']);
+  $data['city'] = String::checkPlain($ip_details_array['HostipLookupResultSet']['gml:featureMember']['Hostip']['gml:name']['value']);
+  if (!empty($ip_details_array['HostipLookupResultSet']['gml:featureMember']['Hostip']['ipLocation'])) {
+    $map_info = explode(',', $ip_details_array['HostipLookupResultSet']['gml:featureMember']['Hostip']['ipLocation']['gml:pointProperty']['gml:Point']['gml:coordinates']['value']);
+    $data['longitude'] = String::checkPlain($map_info[0]);
+    $data['latitude'] = String::checkPlain($map_info[1]);
+  }
+
+  return $data;
+}
+
+/**
+ * Utility function to send request to remote site.
+ */
+function hostip_curl($url) {
+  $ch = curl_init();
+  curl_setopt($ch, CURLOPT_URL, $url);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+  $return = curl_exec($ch);
+  curl_close($ch);
+  return $return;
+}
+
+/**
+ * Checks for valid ip.
+ */
+function hostip_is_valid_ip($ip) {
+  if (!preg_match("/^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$/", $ip)) {
+    $return = FALSE;
+  }
+  else {
+    $return = TRUE;
+  }
+
+  $tmp = explode(".", $ip);
+  if ($return == TRUE) {
+    foreach ($tmp as $sub) {
+      $sub = $sub * 1;
+      if ($sub < 0 || $sub > 256) {
+        $return = FALSE;
+      }
+    }
+  }
+  return $return;
+}
+
+/**
+ * Converts the given XML text to an array in the XML structure.
+ *
+ * Takes ($contents, $get_attributes)
+ *
+ * @param string $contents: the XML text
+ * @param integer $get_attributes: if you need attributes of the nodes set to 1 else 0 (default 1)
+ */
+function hostip_xml2array($contents, $get_attributes = 1) {
+  if (!$contents) {
+    return [];
+  }
+
+  if (!function_exists('xml_parser_create')) {
+    return [];
+  }
+  // Gets XML parser of PHP - PHP must have this module for the parser to work.
+  $parser = xml_parser_create();
+  xml_parser_set_option( $parser, XML_OPTION_CASE_FOLDING, 0 );
+  xml_parser_set_option( $parser, XML_OPTION_SKIP_WHITE, 1 );
+  xml_parse_into_struct( $parser, $contents, $xml_values );
+  xml_parser_free( $parser );
+  
+  if (!$xml_values) return;
+  
+  //Initializations
+  $xml_array = [];
+  $parents = [];
+  $opened_tags = [];
+  $arr = [];
+  
+  $current = &$xml_array;
+  
+  //Go through the tags.
+  foreach ($xml_values as $data) {
+    unset($attributes, $value);//Remove existing values, or there will be trouble
+    extract($data);//We could use the array by itself, but this cooler.
+    
+    $result = '';
+    if ($get_attributes) {//The second argument of the function decides this.
+      $result = [];
+      if (isset($value)) $result['value'] = $value;
+      
+      //Set the attributes too.
+      if (isset($attributes)) {
+        foreach ($attributes as $attr => $val) {
+        if ($get_attributes == 1) $result['attr'][$attr] = $val; //Set all the attributes in a array called 'attr'
+        /** :TODO: should we change the key name to '_attr'? Someone may use the tagname 'attr'. Same goes for 'value' too */
+        }
+      }
+    } 
+    elseif (isset($value)) {
+      $result = $value;
+    }
+    
+    //See tag status and do the needed.
+    if ($type == "open") {//The starting of the tag '<tag>'
+      $parent[$level-1] = &$current;
+    
+      if (!is_array($current) or (!in_array($tag, array_keys($current)))) { //Insert New tag
+        $current[$tag] = $result;
+        $current = &$current[$tag];
+      
+      }
+      else { //There was another element with the same tag name
+        if (isset($current[$tag][0])) {
+          array_push($current[$tag], $result);
+        }
+        else {
+          $current[$tag] = [$current[$tag], $result];
+        }
+        $last = count($current[$tag]) - 1;
+        $current = &$current[$tag][$last];
+      }
+    
+    }
+    elseif ($type == "complete") { //Tags that ends in 1 line '<tag />'
+    //See if the key is already taken.
+      if (!isset($current[$tag])) { //New Key
+        $current[$tag] = $result;
+      
+      }
+      else { //If taken, put all things inside a list(array)
+        if ((is_array($current[$tag]) && $get_attributes == 0) || (isset($current[$tag][0]) && is_array($current[$tag][0]) && $get_attributes == 1)) {
+          array_push($current[$tag], $result); // ...push the new element into that array.
+        }
+        else { //If it is not an array...
+          $current[$tag] = [$current[$tag], $result]; //...Make it an array using using the existing value and the new value
+        }
+      }
+    
+    }
+    elseif ($type == 'close') { //End of tag '</tag>'
+      $current = &$parent[$level-1];
+    }
+  }
+  
+  return ($xml_array);
+}
