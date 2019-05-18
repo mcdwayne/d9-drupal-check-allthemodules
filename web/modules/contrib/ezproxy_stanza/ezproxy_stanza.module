@@ -1,0 +1,267 @@
+<?php
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\node\Entity\Node;
+use Drupal\ezproxy_stanza\Git\PublicRepo;
+use Drupal\ezproxy_stanza\Git\PrivateRepo;
+use Drupal\Core\Url;
+use Drupal\Core\Link;
+use Drupal\user\Entity\Role;
+
+const EZPROXY_STANZA_REPO_PUBLIC = 'private://ezproxy_stanza/public';
+const EZPROXY_STANZA_REPO_PRIV = 'private://ezproxy_stanza/priv';
+const EZPROXY_STANZA_CONFIG_TERMINATOR = '### DO NOT WRITE BELOW THIS LINE. IT WILL BE OVERWRITTEN.';
+
+/**
+ * Implements hook_cron().
+ *
+ * @todo use Queue API
+ */
+function ezproxy_stanza_cron() {
+
+  // open up the OCLC git repo
+  // and fetch any commits
+  $git = new PublicRepo();
+  $git->pullRemote();
+
+  // look for commits that have happened since either the last cron run
+  // OR since the last time a node was updated from cron (whichever date is the furthest back)
+  $last_updated = \Drupal::database()->query('SELECT MAX(r.changed) FROM {node_field_revision} r')->fetchField();
+  $last_cron_run = \Drupal::state()->get('system.cron_last');
+  $last_checked = date('Y-m-d', min($last_updated, $last_cron_run) - 86400);
+
+  // get the log entries with the filenames updated
+  $logs = $git->log('--since=' . $last_checked, '--name-only', '--pretty=oneline');
+
+  $files = [];
+  foreach (explode("\n", $logs) as $line) {
+    $parts = explode('/', $line);
+    if (count($parts) === 3 && $parts[0] === 'stanzas' && $parts[2] === 'stanza.txt') {
+      $url = 'https://help.oclc.org/Library_Management/EZproxy/Database_stanzas/' . $parts[1];
+      $files[$url] = $line;
+    }
+  }
+
+  // if there has been an update to a stanza from OCLC
+  if (count($files)) {
+    $updates = [];
+    $d_args = [
+      ':bundle' => 'resource',
+      ':uris[]' => array_keys($files)
+    ];
+    $nids = \Drupal::database()->query('SELECT entity_id FROM {node__field_ezproxy_url}
+      WHERE bundle = :bundle AND field_ezproxy_url_uri IN (:uris[])', $d_args
+    )->fetchCol();
+    foreach ($nids as $vid => $nid) {
+      $node = Node::load($nid);
+      $url = $node->field_ezproxy_url->uri;
+      $stanza_file = EZPROXY_STANZA_REPO_PUBLIC . DIRECTORY_SEPARATOR . $files[$url];
+      $readme_file = str_replace(DIRECTORY_SEPARATOR . 'stanza.txt', DIRECTORY_SEPARATOR . 'README.md', $stanza_file);
+      $stanza = file_get_contents($stanza_file);
+      $title = ezproxy_stanza_get_title($stanza);
+      $node->set('title', $title);
+
+      // see when this file was last updated from git
+      $stanza_changed = filemtime($stanza_file);
+      // make sure the stanza indeed needs updated
+      // AND the node hasn't been updated already by an admin
+      if ($stanza !== $node->field_ezproxy_stanza->value && $node->changed->value < $stanza_changed) {
+        if ($node->getRevisionUserId() != 0 || file_exists($readme_file)) {
+          $node->set('field_ezproxy_review', TRUE);
+        }
+        $node->set('field_ezproxy_stanza', $stanza);
+
+        $node->setNewRevision(TRUE);
+        $node->revision_log = t('Updating from OCLC');
+        $node->setRevisionCreationTime(\Drupal::time()->getRequestTime());
+        $node->setRevisionUserId(0);
+
+        $node->save();
+
+        // only add to the list of updated if the node is in config.txt
+        // this way we will know whether we should send an email notification or not
+        if ($node->isPublished()) {
+          $updates[] = $node->label();
+        }
+      }
+
+      unset($files[$url]);
+    }
+
+    // add the new resources
+    $path = $git->getDirectory();
+    foreach ($files as $url => $stanza_file) {
+      $stanza_file = EZPROXY_STANZA_REPO_PUBLIC . DIRECTORY_SEPARATOR . $stanza_file;
+      $oclc_stanza_dir = dirname($stanza_file);
+
+      $parts = explode(DIRECTORY_SEPARATOR, $oclc_stanza_dir);
+      $stanza_dir = array_pop($parts);
+
+      $stanza = file_get_contents($stanza_file);
+      $lines = explode("\n", $stanza);
+      $title = ezproxy_stanza_get_title($stanza);
+      if (!$title) {
+        $title = $oclc_stanza_dir;
+      }
+
+      $node = Node::create([
+        'title' => $title,
+        'type' => 'resource',
+        'status' => NODE_NOT_PUBLISHED,
+      ]);
+      $node->set('field_ezproxy_url', 'https://help.oclc.org/Library_Management/EZproxy/Database_stanzas/'.$stanza_dir);
+
+      $node->set('field_ezproxy_stanza', $stanza);
+      $node->set('field_ezproxy_review', file_exists($oclc_stanza_dir . DIRECTORY_SEPARATOR . 'README.md'));
+      $node->save();
+    }
+
+    // if we updated a stanza that is in config.txt
+    if (count($updates)) {
+      // write the changes to config.txt so admins can see the pending diff
+      $repo = new PrivateRepo();
+      $repo->setConfig();
+
+      $module = 'ezproxy_stanza';
+      $key = 'oclc_update';
+
+      // get the email address for everyone with the EZProxy Admin role
+      $emails = \Drupal::database()->query("SELECT u.uid, u.mail
+        FROM {users_field_data} u
+        INNER JOIN {user__roles} r ON r.bundle = 'user' AND r.entity_id = u.uid
+        WHERE r.roles_target_id = :target_id AND u.status = 1", [':target_id' => 'ezproxy_admin'])->fetchAllKeyed();
+      // if we found someone to email, send the email
+      if (count($emails)) {
+        $options = [
+          'absolute' => TRUE,
+        ];
+        $params = [
+          'message' => 'New OCLC update at '
+            . Url::fromRoute('ezproxy_stanza.manage', [], $options)->toString(),
+          'updated' => $updates,
+        ];
+        $langcode =  \Drupal::languageManager()->getCurrentLanguage()->getId();
+        $to = implode(',', $emails);
+        $result = \Drupal::service('plugin.manager.mail')->mail($module, $key, $to, $langcode, $params);
+      }
+      else {
+        // @todo watchdog();
+      }
+    }
+  }
+}
+
+/**
+* Implements hook_mail().
+*/
+function ezproxy_stanza_mail($key, &$message, $params) {
+  $options = ['langcode' => $message['langcode']];
+  switch ($key) {
+    case 'oclc_update':
+      $message['from'] = \Drupal::config('system.site')->get('mail');
+      $message['subject'] = t('[EZProxy] OCLC Update', [], $options);
+      $message['body'][] = $params['message'];
+      $message['body'][] = '';
+      $message['body'][] = t('Nodes updated:', [], $options);
+      $message['body'] = array_merge($message['body'], $params['updated']);
+    break;
+  }
+}
+
+/**
+ * Implements hook_file_download().
+ */
+function ezproxy_stanza_file_download($uri) {
+  $scheme = file_uri_scheme($uri);
+  $target = file_uri_target($uri);
+
+  if ($scheme === 'private' && substr($target, 0, 14)  === 'ezproxy_stanza') {
+    if (\Drupal::currentUser()->hasPermission('administer ezproxy server')) {
+      return [
+        'Content-Type' => 'text/plain',
+        'Cache-Control' => 'no-store',
+      ];
+    }
+    else {
+      return -1;
+    }
+  }
+
+  return NULL;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function ezproxy_stanza_form_node_resource_edit_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // add a cancel button to resource node edit form to take people back to config.txt admin UI
+  $form['actions']['cancel'] = [
+    '#type' => 'submit',
+    '#value' => 'Cancel',
+    '#submit' => ['_ezproxy_stanza_node_update'],
+  ];
+
+  // make the stanza textarea as long as the stanza
+  $stanza_widget = &$form['field_ezproxy_stanza']['widget'][0]['value'];
+  $lines = substr_count($stanza_widget['#default_value'], "\n");
+  $stanza_widget['#rows'] = $lines ? $lines + 1 : $stanza_widget['#rows'];
+
+  // if there is a stanza URL this resource used
+  // show a link to the stanza to easily compare the remote vs local versions
+  if (!empty($form['field_ezproxy_url']['widget'][0]['uri']['#default_value'])
+    && empty($form_state->get('ezproxy_stanza_link_displayed'))) {
+    $oclc_url = $form['field_ezproxy_url']['widget'][0]['uri']['#default_value'];
+    if (filter_var($oclc_url, FILTER_VALIDATE_URL)) {
+      $options = [
+        'attributes' => [
+          'target' => '_blank',
+          'onclick' => "window.open('$oclc_url', 'SecurityHistory', 'top=200,left=400,width=800,height=500,scrollbars,toolbar=no,location=no,menubar=no,resizable=yes')"
+        ]
+      ];
+      $link = Link::fromTextandUrl(t("View OCLC's stanza"), Url::fromUri($oclc_url, $options))->toString();
+    }
+  }
+
+  $form['actions']['publish']['#submit'][] = '_ezproxy_stanza_node_update';
+  $form['actions']['unpublish']['#submit'][] = '_ezproxy_stanza_node_update';
+}
+
+function _ezproxy_stanza_node_update($form, FormStateInterface $form_state) {
+  // clear out the "View OCLC's stanza" message
+  drupal_get_messages('status');
+
+  $node = $form_state->getFormObject()->getEntity();
+
+  // if the stanza has changed while editing the node, update the config.txt
+  if ($node->get('field_ezproxy_stanza')->value !=
+    $form['field_ezproxy_stanza']['widget'][0]['value']['#default_value']) {
+    // incase any changes were made to node, update the repo right away
+    $repo = new PrivateRepo();
+    $repo->setConfig();
+  }
+}
+
+function ezproxy_stanza_get_title($stanza) {
+  $lines = explode("\n", $stanza);
+  $title = FALSE;
+  foreach ($lines as $line) {
+    $spaces = explode(' ', trim($line));
+    $start = array_shift($spaces);
+    $start = strtolower($start);
+    if ($start === 't' || $start === 'title'
+      || substr($start, 0, 1) === 't' || substr($start, 0, 5) === 'title') {
+      $title = implode(' ', $spaces);
+      if (substr($title, 0, 6) === '-hide ') {
+        $title = substr($title, 6);
+      }
+      break;
+    }
+  }
+  if ($title) {
+    $updated_date_pos = strpos($title, ' (updated');
+    if ($updated_date_pos) {
+      $title = substr($title, 0, $updated_date_pos);
+    }
+  }
+  return $title;
+}
