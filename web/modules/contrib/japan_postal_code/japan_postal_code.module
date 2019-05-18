@@ -1,0 +1,480 @@
+<?php
+
+/**
+ * @file
+ * Provides japan postal code functionalities.
+ */
+
+use Drupal\Component\Utility\Unicode;
+use Drupal\Core\Routing\RouteMatchInterface;
+
+/**
+ * Constants.
+ */
+
+define('JAPAN_POSTAL_CODE_ENCODING', 'SJIS');
+define('JAPAN_POSTAL_CODE_FILENAME_CSV_NORMAL', 'KEN_ALL.CSV');
+define('JAPAN_POSTAL_CODE_FILENAME_CSV_SPECIAL', 'JIGYOSYO.CSV');
+define('JAPAN_POSTAL_CODE_URL_NORMAL', 'http://www.post.japanpost.jp/zipcode/dl/kogaki/zip/ken_all.zip');
+define('JAPAN_POSTAL_CODE_URL_SPECIAL', 'http://www.post.japanpost.jp/zipcode/dl/jigyosyo/zip/jigyosyo.zip');
+
+/**
+ * Hook implementations.
+ */
+
+/**
+ * Implements hook_help().
+ */
+function japan_postal_code_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.japan_postal_code':
+      $output = '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Japan postal code module provides Japan postal code data and API for them.') . '</p>';
+      $output .= '<p>' . t('This module provides Japan postal code data and API for them. This fetches the csv file from Japan post office website and insert it into the local database table. After fetching the data, developers can make a postal code related feature such as address autofill without depending on any external service.') . '</p>';
+      $output .= '<p>' . t("This module is only for developers. It provides only several simple APIs and doesn't provide any end-user functionality.") . '</p>';
+      $output .= '<p>' . t('For more information, please see the README.txt in the module directory.') . '</p>';
+
+      return $output;
+
+    case 'japan_postal_code.admin':
+      $output = '<p>' . t('You need to run this process once before using the data. If the postal code data exists in the database, it clear all the records and update the table with newly fetched data. This process takes a long time and take care of the timeout.') . '</p>';
+
+      return $output;
+  }
+}
+
+/**
+ * Private functions.
+ */
+
+/**
+ * Process all the process for japan postal code table update.
+ *
+ * @see japan_postal_code_config_form_submit()
+ */
+function _japan_postal_code_update_all_postal_code() {
+  $result = FALSE;
+  // Get normal postal code csv file.
+  $postal_codes_normal = _japan_postal_code_fetch_and_load_postal_code_csv('normal');
+
+  // Get special postal code csv file.
+  $postal_codes_special = _japan_postal_code_fetch_and_load_postal_code_csv('special');
+
+  if (!empty($postal_codes_normal) && !empty($postal_codes_special)) {
+    $transaction = db_transaction();
+
+    try {
+      _japan_postal_code_delete_all_postal_codes();
+      _japan_postal_code_insert_postal_codes($postal_codes_normal);
+      _japan_postal_code_insert_postal_codes($postal_codes_special);
+      $result = count($postal_codes_normal) + count($postal_codes_special);
+    }
+    catch (Exception $e) {
+      $transaction->rollback();
+    }
+  }
+  return $result;
+}
+
+/**
+ * Integrate csv fetch and load process.
+ *
+ * @param string $type
+ *   'special' or 'normal'. Postal code type.
+ *
+ * @return array
+ *   array of address data with postal code.
+ */
+function _japan_postal_code_fetch_and_load_postal_code_csv($type) {
+  switch ($type) {
+    case 'special':
+    case 'normal':
+      $filepath_csv = _japan_postal_code_fetch_post_office_csv($type);
+      $postal_codes = _japan_postal_code_load_postal_code_csv($filepath_csv, $type);
+      return $postal_codes;
+
+    default:
+      throw new Exception('Argument $type not valid: ' . $type);
+  }
+};
+
+/**
+ * Download the zip file containing csv from japan post office and unzip it.
+ *
+ * @param string $type
+ *   'special' or 'normal'. Postal code type.
+ *
+ * @return string|bool
+ *   Csv file name if succeeded. Otherwise, FALSE.
+ *
+ * @see _japan_postal_code_fetch_and_load_postal_code_csv()
+ */
+function _japan_postal_code_fetch_post_office_csv($type) {
+  switch ($type) {
+    case 'special':
+      $url = JAPAN_POSTAL_CODE_URL_SPECIAL;
+      $filename_csv = JAPAN_POSTAL_CODE_FILENAME_CSV_SPECIAL;
+      break;
+
+    case 'normal':
+      $url = JAPAN_POSTAL_CODE_URL_NORMAL;
+      $filename_csv = JAPAN_POSTAL_CODE_FILENAME_CSV_NORMAL;
+      break;
+
+    default:
+      throw new Exception('Argument $type not valid: ' . $type);
+  }
+
+  // Prepare a file name for the zip file in temp directory.
+  $filepath_zip = drupal_tempnam(file_directory_temp(), '');
+  if (!$filepath_zip) {
+    drupal_set_message(t('Cannot create a temp file: @filepath.',
+      ['@filepath' => $filepath_zip]), 'error');
+    return FALSE;
+  }
+
+  // Download the zip file from Japan post office website.
+  $result = system_retrieve_file($url, $filepath_zip, FALSE, FILE_EXISTS_REPLACE);
+  if (!$result) {
+    drupal_set_message(t('Cannot retrieve the file from @url into @filepath.',
+      ['@url' => $url, '@filepath' => $filepath_zip]), 'error');
+    return FALSE;
+  }
+
+  // Unzip the downloaded zip file.
+  $zip = new ZipArchive();
+  if (!$zip) {
+    drupal_set_message(t('Cannot create ZipArchive class instance.'), 'error');
+    return FALSE;
+  }
+  $result = $zip->open($filepath_zip);
+  if (!$result) {
+    drupal_set_message(t('Cannot open the zip file: @filepath.'),
+      ['@filepath' => $filepath_zip], 'error');
+    return FALSE;
+  }
+  $filepath_unzipped = $filepath_zip . '-unzipped';
+  $result = $zip->extractTo($filepath_unzipped);
+  if (!$result) {
+    drupal_set_message(t('Cannot extract the zip file: @filepath.'),
+      ['@filepath' => $filepath_zip], 'error');
+    return FALSE;
+  }
+  $zip->close();
+
+  // Check the existence of and return the name of the extracted csv file.
+  $filepath_csv = $filepath_unzipped . '/' . $filename_csv;
+  if (!file_exists($filepath_csv)) {
+    drupal_set_message(t('Cannot unzip @filepath_unzipped into @filepath_csv',
+      [
+        '@filepath_unzipped' => $filepath_unzipped,
+        '@filepath_csv' => $filepath_csv,
+      ]), 'error');
+    return FALSE;
+  }
+
+  return $filepath_csv;
+}
+
+/**
+ * Load all the rows of Japan postal code csv and extract necessary columns.
+ *
+ * @param string $filepath
+ *   The file path of the csv file containing Japan postal code data.
+ * @param string $type
+ *   Postal code type among 2: 'normal' or 'special'.
+ *
+ * @return array
+ *   Address data extracted from the csv.
+ *
+ * @see _japan_postal_code_fetch_and_load_postal_code_csv()
+ */
+function _japan_postal_code_load_postal_code_csv($filepath, $type) {
+  if (!file_exists($filepath)) {
+    drupal_set_message(t('Cannot find the file @filepath'), [
+      '@filepath' => $filepath,
+    ], 'error');
+    return FALSE;
+  }
+
+  $f = fopen($filepath, 'r');
+  if (!$f) {
+    drupal_set_message(t('Cannot open the file @filepath'), [
+      '@filepath' => $filepath,
+    ], 'error');
+    return FALSE;
+  }
+
+  $postal_codes = [];
+  while ($row = fgetcsv($f)) {
+    $postal_codes[] = _japan_postal_code_convert_csv_row($row, $type);
+  }
+
+  fclose($f);
+  return $postal_codes;
+}
+
+/**
+ * Filter one row of Japan postal code csv data.
+ *
+ * @param array $row
+ *   One row data of Japan postal code csv.
+ *   Format is as following:
+ *   - normal
+ *     http://www.post.japanpost.jp/zipcode/dl/readme.html
+ *     - 全国地方公共団体コード 半角数字
+ *     - （旧）郵便番号（5桁）半角数字
+ *     - 郵便番号（7桁） 半角数字
+ *     - 都道府県名 半角カタカナ
+ *     - 市区町村名 半角カタカナ
+ *     - 町域名 半角カタカナ
+ *     - 都道府県名 漢字
+ *     - 市区町村名 漢字
+ *     - 町域名 漢字
+ *     - その他
+ *   - special
+ *     http://www.post.japanpost.jp/zipcode/dl/jigyosyo/readme.html
+ *     - 大口事業所の所在地のJISコード（5バイト）
+ *     - 大口事業所名（カナ）（100バイト）
+ *     - 大口事業所名（漢字）（160バイト）
+ *     - 都道府県名（漢字）（8バイト）
+ *     - 市区町村名（漢字）（24バイト）
+ *     - 町域名（漢字）（24バイト）
+ *     - 小字名、丁目、番地等（漢字）（124バイト）
+ *     - 大口事業所個別番号（7バイト）
+ *     - 旧郵便番号（5バイト）.
+ * @param string $type
+ *   Address type. 'normal' or 'special'. Special is for special postal code
+ *   organization.
+ *
+ * @return array
+ *   Japan address data with:
+ *   0: postal code
+ *   1: prefecture
+ *   2: city
+ *   3: address under city
+ *   4: special organization name if exists
+ */
+function _japan_postal_code_convert_csv_row(array $row, $type) {
+  switch ($type) {
+    case 'special':
+      $code = $row[7];
+      $prefecture = _japan_postal_code_clean_japanese_string($row[3]);
+      $city = _japan_postal_code_clean_japanese_string($row[4]);
+      $address_under_city = _japan_postal_code_clean_japanese_string($row[5])
+        . _japan_postal_code_clean_japanese_string($row[6]);
+      $name = _japan_postal_code_clean_japanese_string($row[2]);
+      break;
+
+    case 'normal':
+      $code = $row[2];
+      $prefecture = _japan_postal_code_clean_japanese_string($row[6]);
+      $city = _japan_postal_code_clean_japanese_string($row[7]);
+      $address_under_city = _japan_postal_code_clean_japanese_string($row[8]);
+
+      // Strip unnecessary parts of the address data.
+      $address_under_city = _japan_postal_code_clean_address(
+        $address_under_city);
+      $name = '';
+      break;
+
+    default:
+      throw new Exception('Argument $type not valid: ' . $type);
+  }
+
+  return [$code, $prefecture, $city, $address_under_city, $name];
+}
+
+/**
+ * Convert raw Japanese string to Drupal proper format.
+ *
+ * @param string $raw_japanese_string
+ *   raw japanese string from Japan post office data.
+ */
+function _japan_postal_code_clean_japanese_string($raw_japanese_string) {
+  return Unicode::convertToUtf8(
+    $raw_japanese_string, JAPAN_POSTAL_CODE_ENCODING);
+}
+
+/**
+ * Convert raw Japan post office address data into proper format.
+ *
+ * @param string $address_under_city
+ *   Detailed raw address under city.
+ *
+ * @return string
+ *   Cleaned address without unnecessary data.
+ */
+function _japan_postal_code_clean_address($address_under_city) {
+  // Strip the unnecessary part of the address data.
+  // The sentence means "all other addresses not listed bellow" in Japanese.
+  $description_without_actual_address = '以下に掲載がない場合';
+  if ($address_under_city === $description_without_actual_address) {
+    return '';
+  }
+
+  // Remove string after '（' because it's unnecessary.
+  $brace_index = mb_strpos($address_under_city, '（');
+  if ($brace_index !== FALSE) {
+    $address_under_city = mb_substr($address_under_city, 0, $brace_index);
+  }
+
+  return $address_under_city;
+}
+
+/**
+ * Insert postal code data into the database table `japan_postal_code`.
+ *
+ * @param array $postal_codes
+ *   Address data with postal code.
+ */
+function _japan_postal_code_insert_postal_codes(array $postal_codes) {
+  if (!$postal_codes) {
+    return FALSE;
+  }
+
+  // Split the postal codes into chunks with size 1000
+  // and bulk insert them into database table for performance reason.
+  $postal_codes_chunks = array_chunk($postal_codes, 1000);
+  foreach ($postal_codes_chunks as $postal_code_chunk) {
+    $query = db_insert('japan_postal_code')
+      ->fields([
+        'postal_code',
+        'prefecture',
+        'city',
+        'address_under_city',
+        'name',
+      ]);
+    foreach ($postal_code_chunk as $postal_code) {
+      $query->values([
+        'postal_code' => $postal_code[0],
+        'prefecture' => $postal_code[1],
+        'city' => $postal_code[2],
+        'address_under_city' => $postal_code[3],
+        'name' => $postal_code[4],
+      ]);
+    }
+    $query->execute();
+  }
+}
+
+/**
+ * Database access functions.
+ */
+
+/**
+ * Load addresses data by postal code.
+ *
+ * @param string $postal_code
+ *   This is 7 digits postal code like 1000001.
+ *   It can also be the format with `-` like 100-0001.
+ *
+ * @return object[]
+ *   objects containing record data in the database table
+ *   `japan_postal_code`:
+ *   - postal_code
+ *   - prefecture
+ *   - city
+ *   - address_under_city
+ *   - name
+ */
+function japan_postal_code_get_addresses_by_postal_code($postal_code) {
+  if (!_japan_postal_code_is_valid_postal_code($postal_code)) {
+    return FALSE;
+  }
+
+  if (preg_match('/^\d{3}-\d{4}$/', $postal_code)) {
+    $postal_code = str_replace('-', '', $postal_code);
+  }
+
+  $query = db_select('japan_postal_code', 'jpc')
+    ->fields('jpc')
+    ->condition('postal_code', $postal_code, '=');
+
+  $addresses = $query->execute()->fetchAll();
+
+  if (!$addresses) {
+    return [];
+  }
+
+  return $addresses;
+}
+
+/**
+ * Load an address data by postal code.
+ *
+ * @param string $postal_code
+ *   This is 7 digits postal code like 1000001.
+ *   It can also be the format with `-` like 100-0001.
+ *
+ * @return object
+ *   An object containing one record data in the database table
+ *   `japan_postal_code`:
+ *   - postal_code
+ *   - prefecture
+ *   - city
+ *   - address_under_city
+ *   - name
+ */
+function japan_postal_code_get_address_by_postal_code($postal_code) {
+  if (!_japan_postal_code_is_valid_postal_code($postal_code)) {
+    return FALSE;
+  }
+
+  if (preg_match('/^\d{3}-\d{4}$/', $postal_code)) {
+    $postal_code = str_replace('-', '', $postal_code);
+  }
+
+  $query = db_select('japan_postal_code', 'jpc')
+    ->fields('jpc')
+    ->condition('postal_code', $postal_code, '=')
+    ->range(0, 1);
+
+  $address = $query->execute()->fetchAssoc();
+
+  if (!$address) {
+    return FALSE;
+  }
+
+  return $address;
+}
+
+/**
+ * Check if the postal code is valid or not.
+ *
+ * @param string $postal_code
+ *   string to check if it keeps the Japanese postal code format like 0001111
+ *   or 000-1111.
+ *
+ * @return bool
+ *   TRUE if the postal code is valid, otherwise FALSE.
+ */
+function _japan_postal_code_is_valid_postal_code($postal_code) {
+  if (preg_match('/^\d{3}-?\d{4}$/', $postal_code)) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Count the number of postal code records.
+ *
+ * @return int
+ *   number of the postal code records in the db table `japan_postal_code`.
+ */
+function _japan_postal_code_count_postal_code_records() {
+  $query = db_select('japan_postal_code', 'jpc')->countQuery();
+  $count = $query->execute()->fetchField();
+  return $count;
+}
+
+/**
+ * Delete all the records in `japan_postal_code` for updating.
+ *
+ * @return int
+ *   number of deleted rows.
+ */
+function _japan_postal_code_delete_all_postal_codes() {
+  return db_truncate('japan_postal_code')->execute();
+}
