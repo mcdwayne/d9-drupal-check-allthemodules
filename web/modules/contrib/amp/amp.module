@@ -1,0 +1,498 @@
+<?php
+
+use Drupal\Component\Utility\UrlHelper;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Template\Attribute;
+use Drupal\file\Entity\File;
+use Drupal\node\NodeInterface;
+use Symfony\Component\HttpFoundation\RedirectResponse;
+
+/**
+ * Implements hook_help().
+ */
+function amp_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the amp module.
+    case 'help.page.amp':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Accelerated Mobile Pages (AMP) integration. Read about it online at <a href=":url">AMP Documentation</a>.', [':url' => 'https://www.drupal.org/docs/8/modules/accelerated-mobile-pages-amp']) . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+* Implements hook_preprocess_html().
+*/
+function amp_preprocess_html(&$variables) {
+  $amp_context = \Drupal::service('router.amp_context');
+  if ($amp_context->isAmpRoute()) {
+
+    foreach ($variables['page']['#attached']['html_head'] as $key => $value) {
+      if ($value[1] === 'viewport') {
+        $value[0]['#attributes']['content'] = 'width=device-width,minimum-scale=1,initial-scale=1';
+        $variables['page']['#attached']['html_head'][$key] = $value;
+      }
+      // Remove Big Pipe's meta tag, which is invalid AMP markup.
+      // We are generating placeholders on the server so should not be needed.
+      if ($key == 'big_pipe_detect_nojs') {
+        unset($variables['page']['#attached']['html_head'][$key]);
+      }
+    }
+
+    // Remove RDF and Metatag properties incompatible with AMP specification.
+    $attribute_list= [
+      'prefix',
+      'xmlns:dc',
+      'xmlns:og',
+      'xmlns:article',
+      'xmlns:book',
+      'xmlns:product',
+      'xmlns:profile',
+      'xmlns:video',
+      'itemtype',
+      'itemscope'
+    ];
+    if (isset($variables['html_attributes'])) {
+      foreach($attribute_list as $attribute_item) {
+        if (isset($variables['html_attributes'][$attribute_item])) {
+          unset($variables['html_attributes'][$attribute_item]);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function amp_page_attachments(array &$attachments) {
+
+  // Pages with development messages should not be stored in Google's AMP cache.
+  // We prevent caching by making the page invalid.
+  // @see https://www.ampproject.org/docs/fundamentals/how_cached#can-i-opt-out-of-caching?
+  $ampService = \Drupal::service('amp.utilities');
+  if ($ampService->isDevPage()) {
+    $tag = [
+      '#tag' => 'base',
+      '#attributes' =>  [
+        'name' => 'invalid-do-not-cache',
+        'content' => 'invalid-do-not-cache',
+      ]
+    ];
+    $attachments['#attached']['html_head'][] = [$tag, 'no-cache'];
+
+  }
+}
+
+/**
+ * Implements hook_amp_rules_alter().
+ *
+ * @see Drupal\amp\Service\DrupalParsedValidatorRules::updatedRules().
+ */
+function amp_amp_rules_alter(&$rules) {
+  foreach ($rules->tags as $delta => $tag) {
+    // Multiple amp-sidebar elements are now allowed.
+    if ($tag->tag_name == 'amp-sidebar') {
+      $rules->tags[$delta]->unique = 'false';
+      break;
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_view_mode_alter().
+ */
+function amp_entity_view_mode_alter(&$view_mode, EntityInterface $entity, $context) {
+  $amp_context = \Drupal::service('router.amp_context');
+
+  // If on AMP route, and in full view mode, switch to AMP view mode.
+  if ($amp_context->isAmpRoute(NULL, $entity) && $view_mode == 'full') {
+    $view_mode = 'amp';
+  }
+}
+
+/**
+ * Implements hook_entity_view_alter().
+ */
+function amp_entity_view_alter(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display) {
+  // Check if entity is a non-new node in either full or AMP view mode.
+  /** @var NodeInterface $entity */
+  if ($entity instanceof NodeInterface && !$entity->isNew() && in_array($build['#view_mode'], ['full', 'amp'])) {
+    // Get a list of available view modes for the current entity.
+    $view_modes = \Drupal::service('entity_display.repository')->getViewModeOptionsByBundle('node', $entity->bundle());
+    // Double-check that the AMP view mode is enabled for this node type.
+    if (isset($view_modes['amp'])) {
+      $build['#cache']['contexts'][] = 'url.query_args:amp';
+      $absolute_canonical = $entity->toUrl('canonical', ['absolute' => TRUE])->toString();
+
+      if (!empty($build['#attached']['html_head_link'])) {
+        $canonical_href = '';
+        foreach ($build['#attached']['html_head_link'] as $key => $config) {
+          if ($build['#view_mode'] === 'amp') {
+            if ($config[0]['rel'] != 'canonical' && $config[0]['rel'] != 'shortlink') {
+              unset($build['#attached']['html_head_link'][$key]);
+            }
+            elseif ($config[0]['rel'] == 'canonical') {
+              // Replace the canonical link with an absolute version, this is
+              // required for AMP pages and recommended for others.
+              // @todo Remove this when https://www.drupal.org/node/2738373 is
+              //   fixed.
+              $build['#attached']['html_head_link'][$key][0]['href'] = $absolute_canonical;
+              $build['#cache']['contexts'][] = 'url.site';
+            }
+          }
+          elseif ($build['#view_mode'] === 'full') {
+            if ($config[0]['rel'] == 'canonical' && !empty($config[0]['href'])) {
+              // Check if the canonical link is absolute and external. Do not
+              // expose AMP for those.
+              $current_canonical = $config[0]['href'];
+              if (UrlHelper::isExternal($current_canonical) && !UrlHelper::externalIsLocal($current_canonical, \Drupal::service('router.request_context')->getCompleteBaseUrl())) {
+                continue;
+              }
+
+              $amp_href = \Drupal::service('amp.query_parameters')->add($absolute_canonical);
+
+              $build['#attached']['html_head_link'][] = [
+                [
+                  'rel' => 'amphtml',
+                  'href' => $amp_href,
+                ],
+                TRUE,
+              ];
+              $build['#cache']['contexts'][] = 'url.site';
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function amp_theme() {
+  $theme = [
+    'amp_iframe' => [
+      'variables' => [
+        'iframe' => NULL
+      ],
+    ],
+    'amp_ad' => [
+      'variables' => [
+        'type' => NULL, 'attributes' => []
+      ],
+    ],
+    'amp_analytics' => [
+      'variables' => [
+        'account' => NULL,
+        'attributes' => []
+      ],
+    ],
+    'block__amp_system_branding_block' => [
+      'render element' => 'elements',
+      'base hook' => 'block',
+    ],
+    'amp_custom_style' => [
+      'render element' => 'element',
+    ],
+    'amp_video' => [
+      'variables' => [
+        'attributes' => [],
+      ],
+    ],
+    'amp_image_carousel' => [
+      'variables' => [
+        'items' => [],
+        'attributes' => [],
+      ],
+    ],
+    'amp_views_carousel' => [
+      'variables' => [
+        'view' => NULL,
+        'options' => NULL,
+        'rows' => NULL,
+        'title' => NULL,
+        'attributes' => [],
+      ],
+      'file' => 'amp.theme.inc',
+    ],
+    'amp_sidebar' => [
+      'render element' => 'element',
+      'id' => NULL,
+      'tabindex' => NULL,
+      'attributes' => [],
+      'content_attributes' => [],
+      'file' => 'amp.theme.inc',
+    ],
+    'amp_sidebar_toggle' => [
+      'variables' => [
+        'sidebarid' => NULL,
+        'tabindex' => NULL,
+        'title' => NULL,
+        'attributes' => [],
+      ],
+    ],
+    'amp_social_share' => [
+      'variables' => [
+        'providers' => [],
+        'app_id' => '',
+      ],
+    ],
+    'amp_social_post_theme' => [
+      'render element' => 'element',
+      'variables' => [
+        'url' => NULL,
+        'provider' => NULL,
+        'placeholder' => NULL,
+        'attributes' => [],
+      ],
+    ],
+    'amp_pixel' => [
+      'variables' => [
+        'domain' => NULL,
+        'query_string' => NULL,
+        'subs' => [
+          'AMPDOC_HOST' => ['active' => FALSE],
+          'AMPDOC_URL' => ['active' => FALSE],
+          'CANONICAL_HOST' => ['active' => FALSE],
+          'CANONICAL_PATH' => ['active' => FALSE],
+          'CANONICAL_URL' => ['active' => FALSE],
+          'SOURCE_URL' => ['active' => FALSE],
+          'SOURCE_HOST' => ['active' => FALSE],
+          'DOCUMENT_CHARSET' => ['active' => FALSE],
+          'DOCUMENT_REFERRER' => ['active' => FALSE],
+          'TITLE' => ['active' => FALSE],
+          'VIEWER' => ['active' => FALSE],
+          'CONTENT_LOAD_TIME' => ['active' => FALSE],
+          'DOMAIN_LOOKUP_TIME' => ['active' => FALSE],
+          'DOM_INTERACTIVE_TIME' => ['active' => FALSE],
+          'PAGE_DOWNLOAD_TIME' => ['active' => FALSE],
+          'PAGE_LOAD_TIME' => ['active' => FALSE],
+          'REDIRECT_TIME' => ['active' => FALSE],
+          'SERVER_RESPONSE_TIME' => ['active' => FALSE],
+          'TCP_CONNECT_TIME' => ['active' => FALSE],
+          'AVAILABLE_SCREEN_HEIGHT' => ['active' => FALSE],
+          'AVAILABLE_SCREEN_WIDTH' => ['active' => FALSE],
+          'BROWSER_LANGUAGE' => ['active' => FALSE],
+          'SCREEN_COLOR_DEPTH' => ['active' => FALSE],
+          'VIEWPORT_HEIGHT' => ['active' => FALSE],
+          'VIEWPORT_WIDTH' => ['active' => FALSE],
+          'PAGE_VIEW_ID' => ['active' => FALSE],
+          'RANDOM' => ['active' => FALSE],
+          'TIMESTAMP' => ['active' => FALSE],
+          'TOTAL_ENGAGED_TIME' => ['active' => FALSE],
+        ],
+      ],
+    ],
+  ];
+  return $theme;
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK_alter().
+ *
+ * Add amp-image template suggestion, but only for images that have the AMP
+ * layout attribute. This will output these images as <amp-image></amp-image>.
+ * We want to control this from the module so the components will work on
+ * non-AMP pages, not just AMP pages using AMP theme. The logical name would
+ * be amp_image but that name has been used by the image formatter and is in
+ * production, it's too hard to replace it with a different implementation.
+ */
+function amp_theme_suggestions_image_alter(array &$suggestions, array $variables) {
+  if (!empty($variables['attributes']['layout'])) {
+    $suggestions[] = 'amp_image_wrapper';
+  }
+}
+
+/**
+ * Implements hook_theme_registry_alter().
+ *
+ * We still want the image_theme to process the image, just output it
+ * in a different template, and only when it used in an AMP component.
+ * A theme could do this with just theme_suggestions_alter(), but if a module
+ * provides an alternate template it won't be discovered automatically by the
+ * theme system. Using theme_register_alter() we can force the theme system to
+ * discover the alternate template by providing it in a theme we will never
+ * actually use directly, then it will be available for the suggestion.
+ */
+function amp_theme_registry_alter(&$theme_registry) {
+  $theme_registry['amp_image_wrapper'] = $theme_registry['image'];
+  $theme_registry['amp_image_wrapper']['template'] = 'amp-image-wrapper';
+  $theme_registry['amp_image_wrapper']['path'] = drupal_get_path('module', 'amp') . '/templates';
+}
+
+/**
+ * Implements hook_page_bottom for page bottom.
+ */
+function amp_page_bottom(array &$page_bottom) {
+
+  $amp_context = \Drupal::service('router.amp_context');
+  if ($amp_context->isAmpRoute()) {
+
+    $config = \Drupal::config('amp.analytics.settings');
+    $google_analytics_id = $config->get('google_analytics_id');
+    if (!empty($google_analytics_id)) {
+      $amp_analytics = [
+        '#type' => 'amp_analytics',
+        '#attributes' => [
+          'type' => 'googleanalytics'
+        ],
+        '#account' => $google_analytics_id
+      ];
+      $page_bottom['amp_analytics'] = $amp_analytics;
+    }
+
+    $amp_gtm_id = $config->get('amp_gtm_id');
+    if (!empty($amp_gtm_id)) {
+
+      $amp_gtm = [
+        '#type' => 'amp_analytics',
+        '#attributes' => [
+          'config' => 'https://www.googletagmanager.com/amp.json?id=' . $amp_gtm_id . '&gtm.url=SOURCE_URL',
+          'data-credentials' => 'include',
+        ],
+      ];
+      $page_bottom['amp_gtm'] = $amp_gtm;
+    }
+
+    if ($config->get('amp_pixel')) {
+      $domain = $config->get('amp_pixel_domain_name');
+      $query_string = $config->get('amp_pixel_query_string');
+      if (!empty($domain) && !empty($query_string)) {
+        $subs_random = $config->get('amp_pixel_random_number');
+
+        $subs = [
+          'RANDOM' => [
+            'active' => $subs_random ? TRUE : FALSE
+          ]
+        ];
+
+        $amp_pixel = [
+          '#theme' => 'amp_pixel',
+          '#domain' => $domain,
+          '#query_string' => $query_string,
+          '#subs' => $subs
+        ];
+
+        $page_bottom['amp_pixel'] = $amp_pixel;
+      }
+    }
+
+  }
+
+}
+
+/**
+* Implements hook_form_BASE_FORM_ID_alter().
+*/
+function amp_form_node_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // Check if the content is AMP enabled.
+  $amp_entity_type_service = \Drupal::service('amp.entity_type');
+  $type = $form_state->getFormObject()->getEntity()->bundle();
+  if (!$amp_entity_type_service->isAmpEnabledType($type)) {
+    return;
+  }
+
+  // Exit if the AMP submit button has been disabled.
+  if (!\Drupal::config('amp.settings')->get('show_extra_save_buttons')) {
+    return;
+  }
+
+  // Add another option to go to the AMP page after saving.
+  $form['actions']['save_view_amp'] = array(
+    '#type' => 'submit',
+    '#value' => t('Save and view AMP page'),
+    '#submit' => array('::submitForm', '::save'),
+    '#access' => TRUE,
+    '#weight' => 10,
+  );
+
+  // Add a submit handler to redirect to the AMP page.
+  $form['actions']['save_view_amp']['#submit'][] = 'amp_node_form_submit';
+  $form['actions']['save_view_amp_with_warn']['#submit'][] = 'amp_node_form_submit_with_warn';
+}
+
+/**
+* Submit handler for viewing the AMP page.
+*/
+function amp_node_form_submit(&$form, FormStateInterface $form_state) {
+  $path = $form_state->getValue('path');
+  // Redirect to the alias if it exists, otherwise use the node URL.
+  $url = !empty($path[0]['alias']) ? $path[0]['alias'] : $path[0]['source'];
+  if (isset($url)) {
+    $amp_url = \Drupal::service('amp.query_parameters')->add($url);
+    $response = new RedirectResponse($amp_url);
+    $response->send();
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function amp_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  if ($form_id == 'entity_view_display_edit_form') {
+    $form['actions']['submit']['#submit'][] = 'amp_view_modes_submit';
+  }
+}
+
+/**
+ * Submit handler for enabling or disabling AMP view modes.
+ */
+function amp_view_modes_submit(&$form, \Drupal\Core\Form\FormStateInterface $form_state) {
+  $new_values = array();
+  $old_values = array();
+  if (isset($form_state->getValues()['display_modes_custom'])) {
+    $new_values = array_filter($form_state->getValues()['display_modes_custom']);
+  }
+  if (isset($form_state->getCompleteForm()['modes']['display_modes_custom']['#default_value'])) {
+    $old_values = $form_state->getCompleteForm()['modes']['display_modes_custom']['#default_value'];
+  }
+  $removed = array_diff($old_values, $new_values);
+  $added = array_diff($new_values, $old_values);
+  if (is_array($removed) && in_array('amp', $removed) && $type = $form['#bundle']) {
+    // If the AMP view was removed, clear cache of AMP-enabled content.
+    \Drupal::cache()->delete('amp_enabled_types');
+    \Drupal::service('cache_tags.invalidator')->invalidateTags(['amp_types']);
+  }
+  if (is_array($added) && in_array('amp', $added)) {
+    // If the AMP view was added, clear cache of AMP-enabled content.
+    \Drupal::cache()->delete('amp_enabled_types');
+    \Drupal::service('cache_tags.invalidator')->invalidateTags(['amp_types']);
+  }
+}
+
+/**
+ * Implements hook_preprocess_HOOK() for block templates.
+ */
+function amp_preprocess_block(&$variables) {
+  switch ($variables['base_plugin_id']) {
+    case 'amp_system_branding_block':
+      $variables['site_logo'] = '';
+      if ($variables['content']['site_logo']['#access'] && $variables['content']['site_logo']['#uri']) {
+        $variables['site_logo'] = $variables['content']['site_logo']['#uri'];
+        $variables['logo_width'] = $variables['content']['logo_width'];
+        $variables['logo_height'] = $variables['content']['logo_height'];
+      }
+      $variables['site_name'] = '';
+      if ($variables['content']['site_name']['#access'] && $variables['content']['site_name']['#markup']) {
+        $variables['site_name'] = $variables['content']['site_name']['#markup'];
+      }
+      $variables['site_slogan'] = '';
+      if ($variables['content']['site_slogan']['#access'] && $variables['content']['site_slogan']['#markup']) {
+        $variables['site_slogan'] = [
+          '#markup' => $variables['content']['site_slogan']['#markup'],
+        ];
+      }
+      break;
+
+  }
+
+}
+
