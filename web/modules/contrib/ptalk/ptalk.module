@@ -1,0 +1,1337 @@
+<?php
+
+/**
+ * @file
+ * Allows start private conversation between multiple users.
+ */
+
+use Drupal\ptalk\MessageInterface;
+use Drupal\ptalk\ThreadInterface;
+use Drupal\node\NodeInterface;
+use Drupal\user\Entity\User;
+use Drupal\comment\CommentInterface;
+use Drupal\ptalk\Entity\Message;
+use Drupal\ptalk\Entity\Thread;
+use Drupal\Core\Url;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Template\Attribute;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\views\ViewExecutable;
+use Drupal\views\Plugin\views\PluginBase;
+use Drupal\Core\Entity\EntityInterface;
+
+/**
+ * Status constant for read messages.
+ */
+define('PTALK_READ', REQUEST_TIME);
+
+/**
+ * Status constant for unread messages.
+ */
+define('PTALK_UNREAD', 1);
+
+/**
+ * Status constant for deleted messages.
+ */
+define('PTALK_DELETED', REQUEST_TIME);
+
+/**
+ * Status constant for undeleted messages.
+ */
+define('PTALK_UNDELETED', 0);
+
+/**
+ * Format an array of user objects.
+ *
+ * @param $part_array
+ *   Array with user objects, for example the one returned by
+ *   ptalk_generate_user_array.
+ * @param $limit
+ *   Limit the number of user objects which should be displayed.
+ * @param $show_username
+ *   Show the username for the current user or a replacer 'Youyou'.
+ * @param $no_text
+ *   When TRUE, don't display the Participants/From text.
+ *
+ * @return
+ *   String with formatted user objects, like user1, user2.
+ */
+function ptalk_format_participants($part_array, $show_username = FALSE, $limit = NULL, $no_text = FALSE) {
+  $current_user = \Drupal::currentUser();
+  $renderer = \Drupal::service('renderer');
+  if (count($part_array) > 0) {
+    $to = array();
+    $limited = FALSE;
+    if (!$show_username && in_array($current_user->id(), array_keys($part_array))) {
+      $to[] = $no_text ? t('You') : t('you');
+      unset($part_array[$current_user->id()]);
+    }
+
+    foreach ($part_array as $account) {
+      if (is_int($limit) && count($to) >= $limit) {
+        $limited = TRUE;
+        break;
+      }
+      $to[] = ptalk_participant_format($account);
+    }
+
+    $limit_string = '';
+    if ($limited) {
+      $limit_string = ' ' . t('and others');
+    }
+
+    if ($no_text) {
+      $to = implode(', ', $to);
+      $to = [
+        '#markup' => $to,
+      ];
+      $to = $renderer->render($to);
+      return $to . $limit_string;
+    }
+
+    if (count($to) == 1) { // Only one participant
+      return t("From @last", array('@last' => array_pop($to)));
+    }
+    else { // Multiple participants..
+      if (!$limited) {
+        $last = array_pop($to);
+      }
+      $participants = implode(', ', $to);
+      $participants = [
+        '#markup' => $participants,
+      ];
+      $participants = $renderer->render($participants);
+      if ($limited) {
+        return t('Between @participants' . $limit_string, array('@participants' => $participants));
+      }
+      else {
+        return t('Between @participants and @last', array('@participants' => $participants, '@last' => $last));
+      }
+    }
+  }
+
+  return '';
+}
+
+/**
+ * Define if message was read or not and build sentence about it.
+ *
+ * @param $message
+ *   ptalk_message entity.
+ *
+ * @return string
+ *   String with status of the message for the current message.
+ */
+function _ptalk_define_message_status($message) {
+  // String which will be returned.
+  $msg_status = '';
+  // Array keyed by users name with status of the message.
+  $message_status = [];
+  if ($message->index->status) {
+    $status_info = explode(',', $message->index->status);
+    foreach ($status_info as $info) {
+      list($participant_name, $status) = explode(':', $info);
+      $message_status[$participant_name] = $status;
+    }
+  }
+
+  if ($message_status) {
+    // Sort message status by last updated timestamp.
+    asort($message_status);
+  }
+
+  // If current user is an author of the message.
+  if ($message->isCurrentUserOwner()) {
+    // If there are recipients who read the message.
+    if ($message_status) {
+      foreach (array_keys($message_status) as $recipient_name) {
+        $read_by[] = $recipient_name;
+      }
+      $count = count($read_by);
+      $msg_status = t('Read by') . ' ';
+      $last_one = array_pop($read_by);
+      if (count($read_by) == 0) {
+        $msg_status .= t('@recipient:', array('@recipient' => $last_one));
+      }
+      else {
+        $recipients = implode(', ', $read_by);
+        $msg_status .= t('@recipients and @last_one:', array('@recipients' => $recipients, '@last_one' => $last_one));
+      }
+
+      // Get the last updated status of the message.
+      $msg_status .= ' ' . format_date(array_pop($message_status));
+    }
+    else {
+      $msg_status = t('Is unread.');
+    }
+  }
+
+  // If current user is a potential recipient of the message.
+  else {
+    if ($message_status) {
+      // If current user is a recipient of the message.
+      if ($timeread = $message_status[$message->getCurrentUserName()]) {
+        $msg_status = t('Was read:') . ' ' . format_date($timeread);
+      }
+    }
+    else {
+      return;
+    }
+  }
+
+  if ($msg_status) {
+    return $msg_status;
+  }
+}
+
+/**
+ * Format a single participant.
+ *
+ * @param $participant
+ *   The participant object to format.
+ *
+ * @ingroup types.
+ */
+function ptalk_participant_format($participant) {
+  $username = [
+    '#theme' => 'username',
+    '#account' => $participant,
+  ];
+  return \Drupal::service('renderer')->render($username);
+}
+
+/**
+ * Generate array of user objects based on a string.
+ *
+ * @param $string
+ *   A string with user id, for example 1,2,4. Returned by the list query.
+ *
+ * @return
+ *   Array with user objects.
+ */
+function ptalk_generate_user_array($string, $slice = NULL) {
+  // Convert user uid list (uid1,uid2,uid3) into an array. If $slice is not NULL
+  // pass that as argument to array_slice(). For example, -4 will only load the
+  // last four users.
+  // This is done to avoid loading user objects that are not displayed, for
+  // obvious performance reasons.
+  $users = explode(',', rtrim($string, ','));
+  if (!is_null($slice)) {
+    $users = array_slice($users, $slice);
+  }
+  $participants = [];
+  foreach ($users as $uid) {
+    $account = user_load($uid);
+    $participants[$uid] = $account;
+  }
+
+  return $participants;
+}
+
+/**
+ * Changes the read/new status of a single message.
+ *
+ * @param \Drupal\ptalk\MessageInterface $ptalk_message
+ *   The ptalk_message entity.
+ * @param $status
+ *   Either PTALK_READ or PTALK_UNREAD
+ * @param \Drupal\Core\Session\AccountInterface $account
+ *   The account object, defaults to the current user
+ */
+function ptalk_message_change_status($mids, $status, $account = NULL) {
+  if (!$account) {
+    $user = Drupal::currentUser();
+    $account = $user;
+  }
+
+  db_update('ptalk_message_index')
+    ->fields([
+      'status' => $status
+    ])
+    ->condition('mid', $mids, 'IN')
+    ->condition('recipient', $account->id())
+    ->execute();
+
+  // Allows modules to respond to the status change.
+  $module_handler = Drupal::moduleHandler();
+  $module_handler->invokeAll('ptalk_message_status_changed', [$mids, $status, $account]);
+}
+
+/**
+ * Delete or restore a message.
+ *
+ * @param \Drupal\ptalk\MessageInterface $ptalk_message
+ *   The ptalk_message entity.
+ * @param $delete
+ *   Either deletes or restores the message (PTALK_DELETED => delete, PTALK_UNDELETED => restore)
+ * @param \Drupal\Core\Session\AccountInterface $account
+ *   The account object for which the delete action should be carried out.
+ *   Set to NULL to delete for all users.
+ */
+function ptalk_message_change_delete($message, $delete, $account = NULL) {
+  $update = db_update('ptalk_message_index')
+    ->fields(['deleted' => $delete])
+    ->condition('mid', $message->id());
+
+  if ($account) {
+    $update
+      ->condition('recipient', $account->id());
+  }
+
+  $update->execute();
+
+  $module_handler = Drupal::moduleHandler();
+  $module_handler->invokeAll('ptalk_message_delete_changed', [$message, $delete, $account]);
+}
+
+/**
+ * Implements hook_ptalk_message_delete_changed().
+ */
+function ptalk_ptalk_message_delete_changed($message, $delete, $account) {
+  $thread_manager = \Drupal::service('ptalk_thread.manager');
+  // If deletion done only for particular account, actually for the current user.
+  if ($account) {
+    // If message was deleted and this is the last message, update delete index.
+    if ($delete > 1 && $thread_manager->countMessages($message->getThread(), $account->id()) < 1) {
+      $thread_manager->deleteIndex($message->getThread(), $delete, $account->id());
+    }
+  }
+  else {
+    // Get all recipients of the message.
+    $rids = \Drupal::database()->select('ptalk_message_index', 'pmi');
+    $rids->addField('pmi', 'recipient');
+    $rids->condition('mid', $message->id());
+    foreach ($rids->execute()->fetchCol() as $rid) {
+      if ($delete > 1 && $thread_manager->countMessages($message->getThread(), $rid) < 1) {
+        $thread_manager->deleteIndex($message->getThread(), $delete, $rid);
+      }
+    }
+  }
+
+  $thread_manager->updateCounts($message->getThread(), $account ? $account->id() : NULL);
+}
+
+/**
+ * Delete indexed information of the message.
+ *
+ * @param int $mid
+ *   The ID of the ptalk_message entity.
+ * @param int $account_id
+ *   Account ID for which index must be deleted,
+ *   if NULL then deletion will be done for all recipients.
+ */
+function ptalk_delete_message_index($mid = NULL, $account_id = NULL) {
+  if ($mid || $account_id) {
+    $delete = db_delete('ptalk_message_index');
+    if ($mid) {
+      $delete->condition('mid', $mid);
+    }
+    if ($account_id) {
+      $delete->condition('recipient', $account_id);
+    }
+    $delete->execute();
+  }
+
+  // Allows modules to respond to the deletion message index.
+  $module_handler = Drupal::moduleHandler();
+  $module_handler->invokeAll('ptalk_delete_message_index', [$mid, $account_id]);
+}
+
+/**
+ * Delete indexed information of the thread.
+ *
+ * @param int $tid
+ *   The ID of the ptalk_thread entity.
+ * @param int $account_id
+ *   Account ID for which index must be deleted,
+ *   if NULL then deletion will be done for all participants.
+ */
+function ptalk_delete_thread_index($tid = NULL, $account_id = NULL) {
+  if ($tid || $account_id) {
+    $delete = db_delete('ptalk_thread_index');
+    if ($tid) {
+      $delete->condition('tid', $tid);
+    }
+    if ($account_id) {
+      $delete->condition('participant', $account_id);
+    }
+    $delete->execute();
+  }
+
+  // Allows modules to respond to the deletion thread index.
+  $module_handler = Drupal::moduleHandler();
+  $module_handler->invokeAll('ptalk_delete_thread_index', [$tid, $account_id]);
+}
+
+/**
+ * Marks thread messages as (un)read.
+ *
+ * @param \Drupal\ptalk\ThreadInterface $ptalk_thread
+ *   The ptalk_thread entity.
+ * @param $status
+ *   Either PTALK_READ or PTALK_UNREAD, sets the new status.
+ * @param \Drupal\Core\Session\AccountInterface $account
+ *   The account object, defaults to the current user.
+ */
+function ptalk_thread_change_status($thread, $status, $account = NULL) {
+  if (is_null($account)) {
+    $current_user = \Drupal::currentUser();
+    $account = $current_user;
+  }
+
+  // Record which messages will change status.
+  $query = db_select('ptalk_message_index', 'pmi');
+  $query->addField('pmi', 'mid');
+
+  $value = $status;
+  $operator = '<>';
+  // Actually if status is a timestamp (status 'read'), we avoid changing status
+  // in the database if it is a timestamp (status 'read').
+  if ($status > 1) {
+    $value = substr($status, 0, 2) . '%';
+    $operator = 'NOT LIKE';
+  }
+
+  $changed = $query
+    ->condition('tid', $thread->id())
+    ->condition('recipient', $account->id())
+    ->condition('status', $value, $operator)
+    ->condition('status', 0, '<>')
+    ->execute()
+    ->fetchCol();
+
+  if ($changed) {
+    // Update the status of the thread.
+    db_update('ptalk_message_index')
+      ->fields(['status' => $status])
+      ->condition('tid', $thread->id())
+      ->condition('recipient', $account->id())
+      ->condition('status', $value, $operator)
+      ->condition('status', 0, '<>')
+      ->execute();
+  }
+
+  // Allow modules to respond to the status changes.
+  $module_handler = Drupal::moduleHandler();
+  $module_handler->invokeAll('ptalk_thread_status_changed', [$thread, $changed, $status, $account]);
+}
+
+/**
+ * Implements hook_ptalk_thread_status_changed().
+ */
+function ptalk_ptalk_thread_status_changed($thread, $changed, $status, $account) {
+  if (count($changed) > 0) {
+    \Drupal::service('ptalk_thread.manager')->updateNewCount($thread);
+  }
+}
+
+/**
+ * Delete or restore one thread.
+ *
+ * @param \Drupal\ptalk\ThreadInterface $ptalk_thread
+ *   The ptalk_thread entity.
+ * @param $delete
+ *   Indicates if the thread should be deleted or restored. PTALK_DELETED => delete, PTALK_UNDELETED => restore.
+ * @param \Drupal\Core\Session\AccountInterface $account
+ *   The account object for which the delete action should be carried out.
+ */
+function ptalk_thread_change_delete($thread, $delete, $account = NULL) {
+  // Record which messages will change delete status.
+  $query = db_select('ptalk_message_index', 'pmi');
+  $query->addField('pmi', 'mid');
+
+  $value = $delete;
+  $operator = '<>';
+
+  if ($delete != 0) {
+    $value = substr($delete, 0, 2) . '%';
+    $operator = 'NOT LIKE';
+  }
+
+  $query
+    ->condition('tid', $thread->id())
+    ->condition('deleted', $value, $operator);
+
+  if ($account) {
+    $query
+      ->condition('recipient', $account->id());
+  }
+
+  $changed = $query
+    ->groupBy('mid')
+    ->execute()
+    ->fetchCol();
+
+  if ($changed) {
+    // Delete or restore messages of the thread.
+    $update = db_update('ptalk_message_index')
+      ->fields(['deleted' => $delete])
+      ->condition('tid', $thread->id())
+      // Do not delete already deleted messages or
+      // do not restore undeleted messages.
+      ->condition('deleted', $value, $operator);
+
+    if ($account) {
+      $update
+        ->condition('recipient', $account->id());
+    }
+
+    $update->execute();
+  }
+
+  // Allow modules to respond to the deletion thread.
+  $module_handler = Drupal::moduleHandler();
+  $module_handler->invokeAll('ptalk_thread_delete_changed', [$thread, $changed, $delete, $account]);
+}
+
+/**
+ * Implements hook_ptalk_thread_delete_changed().
+ */
+function ptalk_ptalk_thread_delete_changed($thread, $changed, $delete, $account) {
+  if (count($changed) > 0) {
+    \Drupal::service('ptalk_thread.manager')->deleteIndex($thread, $delete, $account ? $account->id() : NULL);
+    \Drupal::service('ptalk_thread.manager')->updateCounts($thread, $account ? $account->id() : NULL);
+  }
+}
+
+/**
+ * Returns a link to send message form for a specific users.
+ *
+ * Contains permission checks of author/recipient, blocking and
+ * if an anonymous user is involved.
+ *
+ * @param $recipients
+ *   Recipients of the message
+ * @param $account
+ *   Sender of the message, defaults to the current user
+ * @param $string
+ *   Subject of the message, defaults NULL
+ *
+ * @return
+ *   Either FALSE or a URL string
+ *
+ * @ingroup api
+ */
+function ptalk_get_link($recipients, $account = array(), $subject = NULL) {
+  $config = \Drupal::config('ptalk.settings');
+  $module_handler = \Drupal::moduleHandler();
+
+  if ($account == NULL) {
+    $current_user = \Drupal::currentUser();
+    $account = $current_user;
+  }
+
+  if (!is_array($recipients)) {
+    $recipients = array($recipients);
+  }
+
+  if (!$account->hasPermission('write ptalk') || $account->id() == 0) {
+    return FALSE;
+  }
+
+  $validated = array();
+  foreach ($recipients as $recipient) {
+    if (!$account->hasPermission('read ptalk')) {
+      continue;
+    }
+    if ($config->get('ptalk_display_link_self') == FALSE && $account->id() == $recipient->id()) {
+      continue;
+    }
+    $validated[] = $recipient->id();
+  }
+
+  if (empty($validated)) {
+    return FALSE;
+  }
+
+  $uri = Url::fromRoute('ptalk.start_conversation');
+  $uri->setRouteParameters(['participants' => implode(',', $validated)]);
+  if (!is_null($subject)) {
+    $uri->setRouteParameters(['subject' => $subject]);
+  }
+
+  return $uri;
+}
+
+/**
+ * Implements hook_ptalk_thread_links_alter().
+ */
+function ptalk_ptalk_thread_links_alter(array &$links, ThreadInterface $entity, array &$context) {
+  $config = \Drupal::config('ptalk.settings');
+  if ($config->get('ptalk_display_on_thread')) {
+    $uri = ptalk_get_link([$entity->getOwner()]);
+    if (!empty($uri)){
+      $links['ptalk_link'] = [
+        '#theme' => 'links__thread__ptalk',
+        '#attributes' => ['class' => ['links', 'inline']],
+        '#links' => [
+          'ptalk-link' => [
+            'title' => t('Send author a message'),
+            'url' => $uri,
+          ],
+        ],
+      ];
+    }
+  }
+}
+
+/**
+ * Implements hook_ptalk_message_links_alter().
+ */
+function ptalk_ptalk_message_links_alter(array &$links, MessageInterface $entity, array &$context) {
+  $config = \Drupal::config('ptalk.settings');
+  if ($config->get('ptalk_display_on_messages')) {
+    $uri = ptalk_get_link([$entity->getOwner()]);
+    if (!empty($uri)) {
+      $links['ptalk_link'] = [
+        '#theme' => 'links__message__ptalk',
+        '#attributes' => ['class' => ['links', 'inline']],
+        '#links' => [
+          'ptalk-link' => [
+            'title' => t('Send author a message'),
+            'url' => $uri,
+          ],
+        ],
+      ];
+    }
+  }
+}
+
+/**
+ * Implements hook_node_links_alter().
+ */
+function ptalk_node_links_alter(array &$links, NodeInterface $entity, array &$context) {
+  $config = \Drupal::config('ptalk.settings');
+  $types = array_filter($config->get('ptalk_link_node_types'));
+  if (in_array($entity->getType(), $types) && ($context['view_mode'] == 'full' || ($config->get('ptalk_display_on_teaser') && $context['view_mode'] == 'teaser'))) {
+    $uri = ptalk_get_link([$entity->getOwner()]);
+    if (!empty($uri)) {
+      $links['ptalk_link'] = [
+        '#theme' => 'links__node__ptalk',
+        '#attributes' => ['class' => ['links', 'inline']],
+        '#links' => [
+          'ptalk-link' => [
+            'title' => t('Send author a message'),
+            'url' => $uri,
+          ],
+        ],
+      ];
+    }
+  }
+}
+
+/**
+ * Implements hook_comment_links_alter().
+ */
+function ptalk_comment_links_alter(array &$links, CommentInterface $entity, array &$context) {
+  $config = \Drupal::config('ptalk.settings');
+  $types = array_filter($config->get('ptalk_link_node_types'));
+  if (in_array($entity->getCommentedEntity()->getType(), $types) && $config->get('ptalk_display_on_comments')) {
+    $uri = ptalk_get_link([$entity->getOwner()]);
+    if (!empty($uri)) {
+      $links['ptalk_link'] = [
+        '#theme' => 'links__comment__ptalk',
+        '#attributes' => ['class' => ['links', 'inline']],
+        '#links' => [
+          'ptalk-link' => [
+            'title' => t('Send author a message'),
+            'url' => $uri,
+          ],
+        ],
+      ];
+    }
+  }
+}
+
+/**
+ * Implements hook_user_view().
+ */
+function ptalk_user_view(array &$build, \Drupal\Core\Entity\EntityInterface $entity, \Drupal\Core\Entity\Display\EntityViewDisplayInterface $display, $view_mode) {
+  if ($view_mode == 'full') {
+    $config = \Drupal::config('ptalk.settings');
+    if (($uri = ptalk_get_link([$entity])) && $config->get('ptalk_display_profile_links')) {
+      $build['ptalk_link'] = [
+        '#theme' => 'links__user__ptalk',
+        '#attributes' => ['class' => ['links', 'inline']],
+        '#links' => [
+          'ptalk-link' => [
+            'title' => t('Send this user a private message'),
+            'url' => $uri,
+          ],
+        ],
+      ];
+    }
+  }
+}
+
+/**
+ * Generates a URL to the particular message on the thread page.
+ *
+ * @param \Drupal\ptalk\MessageInterface $message
+ *   The ptalk_message entity.
+ * @param \Drupal\Core\Session\AccountInterface $account
+ *   The account object for which url must be generated.
+ * @param array $options
+ *   (optional) A keyed array of url options.
+ *
+ * @return string
+ *   A URL that will redirect to the particular message on the thread
+ *   page.
+ */
+function ptalk_message_url($message, $account, $options = []) {
+  $config = \Drupal::config('ptalk.settings');
+  $per_page = $config->get('ptalk_messages_per_page');
+  $count_deleted = $account->hasPermission('read all private conversation') ? TRUE : FALSE;
+  $url = $message->getThread()->urlInfo();
+  $query = [];
+  $page = \Drupal::entityManager()->getStorage('ptalk_message')->getNumPage($message, $per_page, 'message', $count_deleted);
+  if ($page > 0) {
+    $query['page'] = $page;
+  }
+
+  // Redirect to the last message.
+  if (empty($options)) {
+    $options = ['query' => $query];
+  }
+  else {
+    $options = array_merge($options, ['query' => $query]);
+  }
+
+  $url->setOptions($options);
+
+  return $url;
+}
+
+/**
+ * Implements hook_user_login().
+ */
+function ptalk_user_login($account) {
+  $config = \Drupal::config('ptalk.settings');
+  if ($config->get('ptalk_display_loginmessage')) {
+    $count = \Drupal::entityManager()->getStorage('ptalk_thread')->countUnread($account);
+    if ($count) {
+      drupal_set_message(\Drupal::translation()->formatPlural($count, 'You have <a href="@conversations">1 unread message</a>.', 'You have <a href="@conversations">@count unread messages</a>', ['@conversations' => Drupal::url('entity.ptalk_thread.collection')]));
+    }
+  }
+}
+
+/**
+ * Loads a single ptalk_message entity.
+ *
+ * @param $mid
+ *   Message id.
+ *
+ * @return \Drupal\ptalk\Entity\Message|null
+ *   The ptalk_message entity, if exists, NULL otherwise. Results are
+ *   statically cached.
+ */
+function ptalk_message_load($mid = NULL) {
+  return Message::load($mid);
+}
+
+/**
+ * Loads multiple ptalk_message entities.
+ *
+ * @param array $mids
+ *   An array of entity IDs.
+ *
+ * @return array
+ *   An array of ptalk_message entities, indexed by mid. When no results are
+ *   found, an empty array is returned.
+ */
+function ptalk_message_load_multiple(array $mids = NULL) {
+  return Message::loadMultiple($mids);
+}
+
+/**
+ * Loads multiple ptalk_message entities by property tid (id of the ptalk_thread entity).
+ *
+ * @param $tid
+ *   Thread id of the message.
+ *
+ * @return
+ *   An array of matching ptalk_message entities.
+ */
+function ptalk_message_load_multiple_by_tid($tid) {
+  $values = ['tid' => $tid];
+  return entity_load_multiple_by_properties('ptalk_message', $values);
+}
+/**
+ * Loads a single ptalk_thread entity.
+ *
+ * @param $tid
+ *   Thread id.
+ * @param $reset
+ *   (optional) Whether to reset the internal ptalk_thread_load() cache.  Defaults to
+ *   FALSE.
+ *
+ * @return \Drupal\ptalk\Entity\Thread|null
+ *   The ptalk_thread entity, if exists, NULL otherwise. Results are
+ *   statically cached.
+ */
+function ptalk_thread_load($tid = NULL, $reset = FALSE) {
+  if ($reset) {
+    \Drupal::entityManager()->getStorage('ptalk_thread')->resetCache($tid);
+  }
+  return Thread::load($tid);
+}
+
+/**
+ * Loads multiple ptalk_thread entities.
+ *
+ * @param array $tids
+ *   An array of entity IDs.
+ * @param $reset
+ *   (optional) Whether to reset the internal ptalk_thread_load_multiple() cache. Defaults to
+ *   FALSE.
+ *
+ * @return array
+ *   An array of ptalk_thread entities, indexed by tid. When no results are
+ *   found, an empty array is returned.
+ */
+function ptalk_thread_load_multiple(array $tids = NULL, $reset = FALSE) {
+  if ($reset) {
+    \Drupal::entityManager()->getStorage('ptalk_thread')->resetCache($tids);
+  }
+  return Thread::loadMultiple($tids);
+}
+
+/**
+ * Clear all static cache variables for threads.
+ *
+ * @param $ids
+ *   An array of ids to reset in the entity cache.
+ */
+function ptalk_thread_static_reset(array $ids = NULL) {
+  \Drupal::entityManager()->getStorage('ptalk_thread')->resetCache($ids);
+}
+
+/**
+ * Clear all static cache variables for messages.
+ *
+ * @param $ids
+ *   An array of ids to reset in the entity cache.
+ */
+function ptalk_message_static_reset(array $ids = NULL) {
+  \Drupal::entityManager()->getStorage('ptalk_message')->resetCache($ids);
+}
+
+/**
+ * Implements hook_cron().
+ */
+function ptalk_cron() {
+  $config = \Drupal::config('ptalk.settings');
+  $flush_days = $config->get('ptalk_flush_days');
+  $flush_max = $config->get('ptalk_flush_max');
+
+  if ($config->get('ptalk_flush_enabled')) {
+    $query = db_select('ptalk_thread_index', 'pti');
+    $query->addField('pti', 'tid');
+    $tids = $query
+      ->groupBy('pti.tid')
+      // Checks if thread is deleted for all users and last deleted thread is older then defined in option.
+      // Only in that case thread entities and all related data will be deleted from the database.
+      ->having('MIN(pti.deleted) > 0 AND MAX(pti.deleted) < :old', array(':old' => REQUEST_TIME - $flush_days * 86400))
+      ->range(0, $flush_max)
+      ->execute()
+      ->fetchCol();
+
+    if ($tids) {
+      entity_delete_multiple('ptalk_thread', $tids);
+    }
+
+    // Select deleted message entities for flushing with same logic as for thread.
+    $query = db_select('ptalk_message_index', 'pmi');
+    $query->addField('pmi', 'mid');
+    $mids = $query
+      ->groupBy('pmi.mid')
+      ->having('MIN(pmi.deleted) > 0 AND MAX(pmi.deleted) < :old', array(':old' => REQUEST_TIME - $flush_days * 86400))
+      ->range(0, $flush_max)
+      ->execute()
+      ->fetchCol();
+
+    if ($mids) {
+      entity_delete_multiple('ptalk_message', $mids);
+    }
+  }
+}
+
+/**
+ * Implements hook_views_query_alter()
+ */
+function ptalk_views_query_alter(ViewExecutable $view, $query) {
+  $current_user = \Drupal::currentUser();
+
+  if ($view->storage->get('base_table') == 'ptalk_thread') {
+    // If we do not add to the view at least one field from the table ptalk_thread_index
+    // then this table will be not added to the tables of the view, so add this table here.
+    if (!in_array('ptalk_thread_index', array_keys($query->tables[$view->storage->get('base_table')]))) {
+      $query->addTable('ptalk_thread_index');
+    }
+    // Filters outputed threads list for the particular participant,
+    // so the thread may see only participant of the thread.
+    $query->addWhere(0, 'ptalk_thread_index.participant', $current_user->id());
+  }
+
+  if ($view->storage->get('base_table') == 'ptalk_message') {
+    if (!in_array('ptalk_message_index', array_keys($query->tables[$view->storage->get('base_table')]))) {
+      $query->addTable('ptalk_message_index');
+    }
+    $query->addWhere(0, 'ptalk_message_index.recipient', $current_user->id());
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_load()
+ */
+function ptalk_ptalk_message_load($entities) {
+  $new_messages = [];
+  $current_user = \Drupal::currentUser();
+  $route_match = \Drupal::routeMatch();
+
+  foreach ($entities as $entity) {
+    if ($thread = $route_match->getParameter('ptalk_thread')) {
+      if (ptalk_thread_is_page($thread)) {
+        // If message is unread only for recipient not for author
+        // and message is belonging to the thread
+        // and message is readed by recipient of the message.
+        if ($entity->isUnRead() && !$entity->isCurrentUserOwner() && $entity->getThreadId() == $thread->id() && $thread->participantOf($current_user)) {
+          array_push($new_messages, $entity->id());
+        }
+      }
+    }
+  }
+
+  if ($new_messages) {
+    ptalk_message_change_status($new_messages, PTALK_READ);
+    \Drupal::service('ptalk_thread.manager')->updateNewCount($thread);
+  }
+}
+
+/**
+ * Generates a message preview.
+ *
+ * @param \Drupal\ptalk\MessageInterface $message
+ *   The ptalk_message entity to preview.
+ * @param Drupal\Core\Form\FormStateInterface $form_state
+ *   The current state of the form.
+ *
+ * @return array
+ *   An array as expected by drupal_render().
+ */
+function ptalk_message_preview(MessageInterface $message, FormStateInterface $form_state) {
+  $preview_build = [];
+
+  if (!$form_state->getErrors()) {
+    $message->in_preview = TRUE;
+    $message_build = \Drupal::entityTypeManager()->getViewBuilder('ptalk_message')->view($message);
+    $message_build['#weight'] = -100;
+
+    $preview_build['ptalk_message_preview'] = $message_build;
+  }
+
+  if ($message->thread_id) {
+    $thread = Thread::load($message->thread_id);
+    $thread->in_preview = TRUE;
+    $build = \Drupal::entityTypeManager()->getViewBuilder('ptalk_thread')->view($thread);
+
+    $preview_build['ptalk_message_output_below'] = $build;
+    $preview_build['ptalk_message_output_below']['#weight'] = 100;
+  }
+
+  return $preview_build;
+}
+
+/**
+ * Checks whether the current page is the full page view of the ptalk_thread entity.
+ *
+ * @param \Drupal\ptalk\ThreadInterface $ptalk_thread
+ *   A ptalk_thread entity.
+ *
+ * @return true|false
+ *   The bool TRUE if this is a full page view, otherwise FALSE.
+ */
+function ptalk_thread_is_page(ThreadInterface $ptalk_thread) {
+  $route_match = \Drupal::routeMatch();
+
+  if ($route_match->getRouteName() == 'entity.ptalk_thread.canonical') {
+    $page_thread = $route_match->getParameter('ptalk_thread');
+  }
+
+  $is_page = (!empty($page_thread) ? $page_thread->id() == $ptalk_thread->id() : FALSE);
+
+  return $is_page;
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function ptalk_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+  if ($form_id == 'user_form') {
+    $user = $form_state->getFormObject()->getEntity();
+    if (($user->hasPermission('start private conversations') || $user->hasPermission('read private conversation')) && $user->hasPermission('allow disabling private conversation')) {
+      $form['ptalk'] = [
+        '#type' => 'fieldset',
+        '#title' => t('Private conversations'),
+        '#collapsible' => TRUE,
+        '#collapsed' => FALSE,
+        '#weight' => 10,
+      ];
+
+      $form['ptalk']['ptalk_disable'] = [
+        '#type' => 'checkbox',
+        '#title' => t('Disable private conversations'),
+        '#default_value' => ptalk_is_disabled($user),
+        '#description' => t('Disabling private conversations prevents you from reading or starting private conversations between users.'),
+        '#weight' => -10,
+      ];
+    }
+
+    $form['actions']['submit']['#submit'][] = 'ptalk_user_admin_settings_submit';
+  }
+}
+
+/**
+ * Submit handler to disabling starting or reading private conversations.
+ */
+function ptalk_user_admin_settings_submit(array &$form, FormStateInterface $form_state, $form_id) {
+  $user = $form_state->getFormObject()->getEntity();
+  $disabled = ptalk_is_disabled($user);
+  $ptalk_disable = $form_state->getValue('ptalk_disable');
+  if ($disabled != $ptalk_disable) {
+    if ($ptalk_disable) {
+      db_insert('ptalk_disable')
+        ->fields(['uid' => $user->id()])
+        ->execute();
+      drupal_static_reset('ptalk_is_disabled');
+    }
+    else {
+      db_delete('ptalk_disable')
+        ->condition('uid', $user->id())
+        ->execute();
+      drupal_static_reset('ptalk_is_disabled');
+    }
+  }
+}
+
+/**
+ * Checks the status of private messaging for provided user.
+ *
+ * @param user
+ *   User object to check.
+ *
+ * @return TRUE if user has disabled private messaging, FALSE otherwise
+ */
+function ptalk_is_disabled($account) {
+  $disabled = &drupal_static(__FUNCTION__, []);
+
+  if (!isset($disabled[$account->id()])) {
+    $query = db_select('ptalk_disable', 'pd');
+    $query->addField('pd', 'uid');
+    $id = $query
+      ->condition('uid', $account->id())
+      ->execute()
+      ->fetchField();
+
+    if ($id == FALSE) {
+      $id = 0;
+    }
+
+    $disabled[$account->id()] = $id;
+  }
+
+  return (bool) $disabled[$account->id()];
+}
+
+/**
+ * Wrapper function for user_load_multiple().
+ *
+ * The function adds the information about recipient to the account object,
+ * for exapmle - disabled ptalk module for the particular uid or not.
+ * this information also may be altered by the hook hook_query_ptalk_load_message_recipients_alter().
+ *
+ * @param array $uids
+ *   Which uid to load. Can either be a single id or an array of uids.
+ *
+ * @return array
+ *   An array keyed by users id with users object.
+ *
+ * @see hook_query_ptalk_load_message_recipients_alter()
+ */
+function ptalk_load_message_recipients($uids) {
+  $accounts = [];
+
+  $query = db_select('users_field_data', 'u');
+  $query->leftJoin('ptalk_disable', 'pd', 'u.uid = pd.uid');
+  $query->addField('u', 'uid');
+  $query->addField('pd', 'uid', 'ptalk_disabled');
+  $query->condition('u.uid', $uids, 'IN');
+  $query->addTag('ptalk_load_message_recipients');
+  $recipient_info = $query
+  ->execute()
+  ->fetchAllAssoc('uid');
+
+  foreach (user_load_multiple($uids) as $account) {
+    if ($recipient_info) {
+      $account->recipient_info = $recipient_info[$account->id()];
+    }
+    $accounts[$account->id()] = $account;
+  }
+
+  return $accounts;
+}
+
+/**
+ * Implements hook_ptalk_block_message().
+ */
+function ptalk_ptalk_block_message($author, $recipients, $context = []) {
+  $blocked = [];
+  if ($author->recipient_info->ptalk_disabled) {
+    $blocked['author']['ptalk_disabled'] = [
+      'message' => [
+        'type' => 'warning',
+        'singular' => t('You have disabled private message sending and receiving.'),
+      ]
+    ];
+    // If author has disabled ptalk module on his or her account settings,
+    // then do not need collecting other reasons because this is the highest reason to block message.
+    return $blocked;
+  }
+  foreach ($recipients as $recipient) {
+    if ($recipient->recipient_info->ptalk_disabled) {
+      if (!isset($blocked['recipients']['ptalk_disabled'])) {
+        $blocked['recipients']['ptalk_disabled'] = [
+          'ids' => [$recipient->id() => ptalk_participant_format($recipient)],
+          'message' => [
+            'type' => 'warning',
+            'plural' => t('The following users has disabled private conversation module:'),
+            'singular' => t('has disabled private message receiving.'),
+          ]
+        ];
+      }
+      else {
+        $blocked['recipients']['ptalk_disabled']['ids'][$recipient->id()] = ptalk_participant_format($recipient);
+      }
+    }
+    // Do not send private messages to blocked users.
+    else if (isset($recipient->status) && (!$recipient->status)) {
+      if (!isset($blocked['recipients']['account_disabled'])) {
+        $blocked['recipients']['account_disabled'] = [
+          'ids' => [$recipient->id() => ptalk_participant_format($recipient)],
+          'message' => [
+            'type' => 'warning',
+            'plural' => t('The following users has disabled their account:'),
+            'singular' => t('has disabled his or her account.'),
+          ]
+        ];
+      }
+      else {
+        $blocked['recipients']['account_disabled']['ids'][$recipient->id()] = ptalk_participant_format($recipient);
+      }
+    }
+  }
+
+  return $blocked;
+}
+
+/**
+ * Invoke implementations of the hook_ptalk_block_message().
+ *
+ * The function looping through implementations of the hook_ptalk_block_message()
+ * and collects types and reasons of the blocking, until finds enough reasons to block
+ * author sending message.
+ *
+ * @param object $author
+ *   Author of the message for wich blocking must be search,
+ *   must be gererated by the function ptalk_load_message_recipients().
+ * @param array $recipients
+ *   An array with recipients objects of the message
+ *   generated by the function ptalk_load_message_recipients().
+ * @param $context
+ *   Additional information. Can contain the thread object.
+ *
+ * @return array
+ *   An array with types and reasons of the blocking.
+ */
+function invoke_hooks_ptalk_block_message($author, $recipients, $context) {
+  $blocked = [];
+  $blocked_ids = [];
+  foreach (\Drupal::moduleHandler()->getImplementations('ptalk_block_message') as $module) {
+    $function = $module . '_ptalk_block_message';
+    $blocked_implementation = $function($author, $recipients, $context);
+    if ($blocked_implementation) {
+      foreach ($blocked_implementation as $type => $info) {
+        $reason = array_keys($info);
+        $reason = $reason[0];
+        // If author of the message for some reasons is blocked,
+        // then do not need to continue.
+        if ($type == 'author') {
+          $blocked[$type] = $info;
+          break 2;
+        }
+        // If we already have some reason to block author sending message to recipient
+        // then do not need add another one reason if such exists.
+        elseif ($type == 'recipients' && $ids = array_diff($info[$reason]['ids'], $blocked_ids)) {
+          $info[$reason]['ids'] = $ids;
+          $blocked[$type][$reason] = array_pop($info);
+          $blocked_ids += $ids;
+        }
+        // If all recipients of the message are blocked for the author
+        // then do not need looping through other implementations.
+        if (count($blocked_ids) == count($recipients)) {
+          break 2;
+        }
+      }
+    }
+  }
+
+  return [array_keys($blocked_ids), $blocked];
+}
+
+/**
+ * Implements hook_user_cancel().
+ */
+function ptalk_user_cancel($edit, $account, $method) {
+  switch ($method) {
+    case 'user_cancel_reassign':
+      db_update('ptalk_message')
+        ->condition('author', $account->id())
+        ->fields(['author' => 0])
+        ->execute();
+      break;
+    case 'user_cancel_block_unpublish':
+      ptalk_delete_account_data($account);
+      break;
+  }
+
+  db_delete('ptalk_disable')
+    ->condition('uid', $account->id())
+    ->execute();
+}
+
+/**
+ * Implements hook_user_delete().
+ */
+function ptalk_user_delete($account) {
+  ptalk_delete_account_data($account);
+}
+
+/**
+ * Delete all messages and threads data from an account.
+ */
+function ptalk_delete_account_data($account) {
+  $tids = db_select('ptalk_thread', 'pt')
+    ->fields('pt', ['tid'])
+    ->condition('uid', $account->id())
+    ->execute()
+    ->fetchCol();
+
+  // Delete all threads related to this account.
+  if (!empty($tids)) {
+    entity_delete_multiple('ptalk_thread', $tids);
+  }
+
+  // If user is a participant of the conversations
+  // delete his from its.
+  ptalk_delete_thread_index(NULL, $account->id());
+
+  $mids = db_select('ptalk_message', 'pm')
+    ->fields('pm', ['mid'])
+    ->condition('author', $account->id())
+    ->execute()
+    ->fetchCol();
+
+  // Delete all messages related to this account.
+  if (!empty($mids)) {
+    entity_delete_multiple('ptalk_message', $mids);
+  }
+
+  db_delete('ptalk_disable')
+    ->condition('uid', $account->id())
+    ->execute();
+}
+
+/**
+ * Implements hook_theme()
+ */
+function ptalk_theme() {
+  return [
+    'ptalk_thread' => [
+      'render element' => 'elements',
+    ],
+    'ptalk_message' => [
+      'render element' => 'elements',
+    ],
+  ];
+}
+
+/**
+ * Prepares variables for ptalk_message templates.
+ *
+ * Default template: ptalk-message.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - elements: An array of elements to display in view mode.
+ *   - ptalk_message: The ptalk_message object.
+ *   - view_mode: View mode 'full'.
+ */
+function template_preprocess_ptalk_message(&$variables) {
+  $config = \Drupal::config('ptalk.settings');
+  $current_user = \Drupal::currentUser();
+  $message = $variables['elements']['#ptalk_message'];
+  $variables['datetime'] = format_date($message->created->value);
+  $variables['status_new'] = $message->isUnread() && !$message->isCurrentUserOwner() ? 'new' : '';
+  if ($message->in_preview) {
+    $variables['message_status'] = t('Message in preview mode');
+  }
+  elseif ($config->get('ptalk_message_status')) {
+    $variables['message_status'] = _ptalk_define_message_status($message);
+  }
+  $variables['elements']['body']['#title'] = '';
+  $variables['message_body'] = $variables['elements']['body'];
+  if ($current_user->hasPermission('delete message private conversation')) {
+    $variables['message_links'] = $variables['elements']['links'];
+  }
+  if ($current_user->id() == $message->getOwnerId()) {
+    $variables['message_author'] = t('You');
+  }
+  else {
+    $message_author = $message->getOwner();
+    $variables['message_author'] = ptalk_participant_format($message_author);
+  }
+  $variables['message_id'] = $message->id();
+  foreach (Element::children($variables['elements']) as $key) {
+    if (in_array($key, ['body', 'subject', 'links'])) {
+      continue;
+    }
+    $variables['content'][$key] = $variables['elements'][$key];
+  }
+}
+
+/**
+ * Prepares variables for ptalk_thread templates.
+ *
+ * Default template: ptalk-thread.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - elements: An array of elements to display in view mode.
+ *   - ptalk_thread: The ptalk_thread object.
+ *   - view_mode: View mode 'full'.
+ */
+function template_preprocess_ptalk_thread(&$variables) {
+  $thread = $variables['elements']['#ptalk_thread'];
+  $account = $thread->getOwner();
+  $variables['author'] = ptalk_participant_format($account);
+  $variables['attributes'] = ['class' => ['permalink'], 'rel' => 'bookmark'];
+  $variables['date'] = format_date($thread->getCreatedTime());
+  $variables['thread_participants'] = $variables['elements']['participants'];
+  unset($variables['elements']['participants']);
+  $variables['thread_links'] = $variables['elements']['links'];
+  unset($variables['elements']['links']);
+  $variables['#attached']['library'][] = 'ptalk/ptalk-thread';
+  foreach (Element::children($variables['elements']) as $key) {
+    $variables['content'][$key] = $variables['elements'][$key];
+  }
+}
