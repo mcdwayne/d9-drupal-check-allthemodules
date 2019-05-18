@@ -1,0 +1,237 @@
+<?php
+
+/**
+ * @file
+ * Enables the moderator to approve/disapprove user's uploaded images.
+ *
+ * When enabled, the moderator can see the list of images uploaded
+ * by the user waiting to be approved. The moderator can either
+ * approve or disapprove the images. The approved image is allowed
+ * to be published in the user's profile.
+ */
+
+use Drupal\user\Entity\User;
+use Drupal\file\Entity\File;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\image_approval\ImageApprovalItemInterface;
+
+/**
+ * Implements hook_help().
+ */
+function image_approval_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.image_approval':
+      $filepath = dirname(__FILE__) . '/README.md';
+      if (file_exists($filepath)) {
+        $readme = file_get_contents($filepath);
+      }
+      else {
+        $filepath = dirname(__FILE__) . '/README.txt';
+        if (file_exists($filepath)) {
+          $readme = file_get_contents($filepath);
+        }
+      }
+      if (!isset($readme)) {
+        return NULL;
+      }
+      else {
+        $output = '<pre>' . $readme . '</pre>';
+      }
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function image_approval_form_user_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  array_unshift($form['actions']['submit']['#submit'], 'image_approval_form_post_submit');
+}
+
+/**
+ * Function to unset the uploaded image from the form.
+ */
+function image_approval_form_post_submit(array $form, FormStateInterface $form_state) {
+  if (!empty($form['user_picture']['widget'][0]['#default_value']['fids'])) {
+    if (!array_key_exists('target_id', $form['user_picture']['widget'][0]['#default_value'])) {
+      $pic_id = $form['user_picture']['widget'][0]['#value']['fids'][0];
+      $form_state->unsetValue('user_picture', 'widget');
+      image_approval_save_upload_file($pic_id);
+      drupal_set_message(t('Your image is sent for moderation, will be uploaded once approved.'), 'warning');
+    }
+  }
+}
+
+/**
+ * Save the uploaded image permamently in the file system.
+ *
+ * Send the image for moderation.
+ *
+ * @param int $upload
+ *   The file ID of the uploaded image.
+ *
+ * @see image_approval_image_to_be_moderated()
+ */
+function image_approval_save_upload_file($upload) {
+  $file = File::load($upload);
+  $uid = $file->getOwnerId();
+  $url = $file->getFileUri();
+  $info = pathinfo($url);
+  file_prepare_directory($info['dirname'], FILE_CREATE_DIRECTORY);
+  $destination = file_stream_wrapper_uri_normalize($info['dirname'] . '/picture-' . $uid . '-' . REQUEST_TIME . '.' . $info['extension']);
+  // Move the temporary file into the final location.
+  $file = file_move($file, $destination, FILE_EXISTS_RENAME);
+  $file->setPermanent();
+  $file->save();
+  image_approval_image_to_be_moderated($uid, $upload);
+}
+
+/**
+ * Insert the image into the table with a "pending moderation" status.
+ *
+ * Send the image for moderation.
+ *
+ * @param int $user_id
+ *   The user ID of the uploaded image.
+ * @param int $fid
+ *   The file ID of the uploaded image.
+ */
+function image_approval_image_to_be_moderated($user_id, $fid) {
+  $user = user_load($user_id);
+  $username = $user->getUsername();
+  \Drupal::database()->insert('image_approval')
+    ->fields(['uid', 'fid', 'timestamp', 'status', 'name'])
+    ->values([
+      'uid' => $user_id,
+      'fid' => $fid,
+      'timestamp' => REQUEST_TIME,
+      'status' => ImageApprovalItemInterface::IMAGE_APPROVAL_PENDING ,
+      'name' => $username ,
+    ])
+    ->execute();
+}
+
+/**
+ * Implements hook_user_login().
+ */
+function image_approval_user_login(AccountInterface $account) {
+  $uid = \Drupal::currentUser()->id();
+  if ($uid && $uid != 0) {
+    $connection = \Drupal::database();
+    $user_exists = $connection->query("SELECT uid FROM {image_approval} WHERE uid = :uid", [':uid' => $uid])->fetchField();
+    if ($user_exists) {
+      $status = $connection->queryRange("SELECT status FROM {image_approval} WHERE uid = :uid ORDER BY timestamp DESC", 0, 1, [':uid' => $uid])->fetchField();
+
+      switch ($status) {
+        case -1:
+          drupal_set_message(t('Your image is sent for moderation, will be uploaded once approved.'), 'warning');
+          break;
+
+        case 0:
+          drupal_set_message(t('Your image has been rejected, Kindly upload a new image'), 'error');
+          break;
+
+        case 1:
+          drupal_set_message(t('Your image has been approved'), 'status', FALSE);
+          break;
+      }
+    }
+  }
+}
+
+/**
+ * Image approval function.
+ *
+ * @param int $fid
+ *   The file ID of the image to be approved.
+ * @param int $status
+ *   Update the status of the image as approved.
+ */
+function image_approval_do_approval($fid, $status = ImageApprovalItemInterface::IMAGE_APPROVAL_APPROVED) {
+  $user = User::load(\Drupal::currentUser()->id());
+  $connection = \Drupal::database();
+  $connection->update('image_approval')
+    ->fields([
+      'status' => $status,
+      'moderator' => $user->getUsername(),
+      'timestamp' => REQUEST_TIME,
+    ])
+    ->condition('fid', $fid)
+    ->execute();
+
+  $affected_users = $connection->select('image_approval', 'im')
+    ->fields('im', ['uid'])
+    ->condition('fid', $fid, '=')
+    ->condition('uid', 0, '!=')
+    ->condition('status', 1, '=')
+    ->execute()->fetchField();
+
+  $user_exists = $connection->select('user__user_picture', 'u')
+    ->fields('u', ['entity_id'])
+    ->condition('entity_id', $affected_users, '=')
+    ->execute()->fetchField();
+
+  if ($user_exists) {
+    $connection->update('user__user_picture')
+      ->fields([
+        'user_picture_target_id' => $fid,
+      ])
+      ->condition('entity_id', $affected_users)
+      ->execute();
+  }
+  else {
+    $new_user = User::load($affected_users);
+    $new_user->set('user_picture', $fid);
+    $new_user->save();
+  }
+}
+
+/**
+ * Image disapprove function.
+ *
+ * @param int $fid
+ *   The file ID of the image to be approved.
+ * @param int $status
+ *   Update the status of the image as approved.
+ */
+function image_approval_do_disapprove($fid, $status = ImageApprovalItemInterface::IMAGE_APPROVAL_DISAPPROVED) {
+  $user = User::load(\Drupal::currentUser()->id());
+  $connection = \Drupal::database();
+  $connection->update('image_approval')
+    ->fields([
+      'status' => $status,
+      'moderator' => $user->getUsername(),
+      'timestamp' => REQUEST_TIME,
+    ])
+    ->condition('fid', $fid)
+    ->execute();
+
+  $file_exists = $connection->select('user__user_picture', 'u')
+    ->fields('u', ['entity_id'])
+    ->condition('user_picture_target_id', $fid, '=')
+    ->execute()->fetchField();
+
+  if ($file_exists) {
+    $connection->delete('user__user_picture')
+      ->condition('user_picture_target_id', $fid)
+      ->execute();
+  }
+  $picture = File::load($fid);
+  $file_usage = \Drupal::service('file.usage');
+  $file_usage->delete($picture, 'file', 'user', $file_exists);
+}
+
+/**
+ * Image delete function.
+ *
+ * @param int $fid
+ *   The file ID of the image to be approved.
+ */
+function image_approval_do_delete($fid) {
+  \Drupal::database()->delete('image_approval')
+    ->condition('fid', $fid)
+    ->execute();
+  drupal_flush_all_caches();
+}
