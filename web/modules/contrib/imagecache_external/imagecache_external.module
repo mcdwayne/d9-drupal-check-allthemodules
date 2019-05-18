@@ -1,0 +1,406 @@
+<?php
+/**
+ * @file
+ * Allows the usage of Image Styles on external images.
+ */
+
+use Drupal\Component\Utility\UrlHelper;
+use Drupal\Core\Messenger\MessengerInterface;
+use Drupal\file\Entity\File;
+
+/**
+ * Implements hook_theme().
+ */
+function imagecache_external_theme() {
+  return [
+    // Theme functions in image.module.
+    'imagecache_external' => [
+      'variables' => [
+        'style_name' => NULL,
+        'uri' => NULL,
+        'alt' => '',
+        'title' => NULL,
+        'width' => NULL,
+        'height' => NULL,
+        'attributes' => [],
+      ],
+    ],
+  ];
+}
+
+/**
+ * Returns HTML for an image using a specific image style.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - style_name: The name of the style to be used to alter the original image.
+ *   - path: The path of the image file relative to the Drupal files directory.
+ *     This function does not work with images outside the files directory nor
+ *     with remotely hosted images.
+ *   - alt: The alternative text for text-based browsers.
+ *   - title: The title text is displayed when the image is hovered in some
+ *     popular browsers.
+ *   - attributes: Associative array of attributes to be placed in the img tag.
+ *
+ * @ingroup themeable
+ */
+function template_preprocess_imagecache_external(&$variables) {
+  if ($variables['uri'] = imagecache_external_generate_path($variables['uri'])) {
+    template_preprocess_image_style($variables);
+  }
+  return FALSE;
+}
+
+/**
+ * Util to generate a path to an image.
+ *
+ * @param string $url
+ *   The url to the image.
+ *
+ * @return string
+ *   The url to the image.
+ */
+function imagecache_external_generate_path($url) {
+  // Get configuration.
+  $config = imagecache_external_config();
+
+  // Create the extenal images directory and ensure it's writable.
+  $hash = md5($url);
+  $filename = $hash;
+
+  // Get the FileSystem service.
+  $file_system = \Drupal::service('file_system');
+
+  // Check if this is a non-standard file stream and adjust accordingly.
+  $scheme = $file_system->uriScheme($url);
+  if ($scheme != 'http' && $scheme != 'https') {
+    // Obtain the "real" URL to this file.
+    $url = $file_system->realpath($url);
+  }
+
+  // Parse the url to get the path components.
+  $url_parameters = UrlHelper::parse($url);
+
+  // Add the extension for real images.
+  if ($extension = strtolower(pathinfo($url_parameters['path'], PATHINFO_EXTENSION))) {
+    if (in_array($extension, ['jpg', 'png', 'gif', 'jpeg'])) {
+      $filename .= '.' . $extension;
+    }
+  }
+  else {
+    // Use jpg as default extension.
+    $filename .= $config->get('imagecache_default_extension');
+  }
+
+  $default_scheme = file_default_scheme();
+  $directory = $default_scheme . '://' . $config->get('imagecache_directory');
+  if (file_prepare_directory($directory, FILE_CREATE_DIRECTORY | FILE_MODIFY_PERMISSIONS)) {
+    $needs_refresh = FALSE;
+    $filepath = $directory . '/' . $filename;
+    // Allow modules to add custom logic to check if it needs to be re-fetched.
+    \Drupal::moduleHandler()->alter('imagecache_external_needs_refresh', $needs_refresh, $filepath);
+    if ($needs_refresh === FALSE) {
+      return $filepath;
+    }
+    elseif ($filepath = imagecache_external_fetch($url, $directory . '/' . $filename)) {
+      return $filepath;
+    }
+  }
+
+  // We couldn't get the file.
+  return FALSE;
+}
+
+/**
+ * Implements hook_imagecache_external_needs_refresh_alter().
+ */
+function imagecache_external_imagecache_external_needs_refresh_alter(&$needs_refresh, $filepath) {
+  if (!file_exists($filepath)) {
+    $needs_refresh = TRUE;
+  }
+}
+
+/**
+ * Api function to fetch a url.
+ *
+ * @param string $url
+ *   The url to fetch.
+ * @param string $cachepath
+ *   The directory where to save the images within the files directory.
+ * @return bool|string
+ *   Either the URI of the file, e.g. public://directory/file.jpg. or FALSE.
+ * @throws
+ */
+function imagecache_external_fetch($url, $cachepath) {
+  // Validate the image URL against the whitelist.
+  if (imagecache_external_validate_host($url) === FALSE) {
+    return FALSE;
+  }
+
+  // Drupal config object.
+  $config = imagecache_external_config();
+
+  try {
+    // Drupal httpClient.
+    $http = \Drupal::httpClient();
+    $result = $http->request('get', $url);
+    $code   = floor($result->getStatusCode() / 100) * 100;
+    $types  = imagecache_external_allowed_mimetypes();
+
+    // If content-type not set, use the default 'application/octet-stream'.
+    $response_mimetype = isset($result->getHeaders()['content-type']) ? strtolower($result->getHeaders()['content-type']) : 'application/octet-stream';
+
+    // Add extension to the cached file to allow file_entity to use it for
+    // mimetype identification.
+    $cachepath_ext = pathinfo($cachepath, PATHINFO_EXTENSION);
+    $default_extension = $config->get('imagecache_default_extension');
+    if (!$cachepath_ext && ($default_extension != '')) {
+      $cachepath .= $default_extension;
+    }
+
+    $fallback_image_fid = $config->get('imagecache_fallback_image');
+
+    // Explode content-type to handle mimetypes with more than one
+    // property (eg. image/jpeg;charset=UTF-8).
+    $content_type_array = explode(';', $response_mimetype);
+    $content_type_allowed = FALSE;
+    foreach ($content_type_array as $content_type) {
+      if (in_array(strtolower($content_type), $types)) {
+        $content_type_allowed = TRUE;
+      }
+    }
+    if (!empty($result->getBody()) && $code != 400 && $code != 500 && $content_type_allowed) {
+      if ($config->get('imagecache_external_management') == 'unmanaged') {
+        return file_unmanaged_save_data($result->getBody(), $cachepath, FILE_EXISTS_REPLACE);
+      }
+      else {
+        $file = file_save_data($result->getBody(), $cachepath, FILE_EXISTS_REPLACE);
+        return $file->getFileUri();
+      }
+    }
+    elseif (!empty($fallback_image_fid)) {
+      $fallback_image = File::load($fallback_image_fid);
+      return $fallback_image->getFileUri();
+    }
+    else {
+      throw new Exception('Image could not be retrieved');
+    }
+  }
+  catch(Exception $e) {
+    \Drupal::logger('imagecache_external')->notice(t('The image %url could not be retrieved', array('%url' => $url)));
+    return FALSE;
+  }
+}
+
+/**
+ * Helper function to validate the image host against the whitelist.
+ *
+ * @param string $url
+ *   The URL of the image.
+ *
+ * @return bool
+ *   Can the image be fetched or not?
+ */
+function imagecache_external_validate_host($url) {
+  $config = imagecache_external_config();
+  // Extract the hostname from the url.
+  if (!($host = parse_url($url, PHP_URL_HOST))) {
+    return FALSE;
+  }
+
+  // Check if a whitelist is used and if the host is in the list.
+  if ($config->get('imagecache_external_use_whitelist')) {
+    $list = preg_split('/\s+/', $config->get('imagecache_external_hosts'));
+
+    $validhost = FALSE;
+    foreach ($list as $ext_host) {
+      if (preg_match('/\.?' . $ext_host . '/', $host) == 1) {
+        $validhost = TRUE;
+        break;
+      }
+    }
+    if (!$validhost) {
+      // If we are unsuccessful then log a message in watchdog.
+      \Drupal::logger('imagecache_external')->notice(t('The image %url could not be retrieved, it did not meet the whitelist requirements.', ['%url' => $url]));
+      return FALSE;
+    }
+  }
+
+  return TRUE;
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ *
+ * Because the Image module already checks for the image style paths,
+ * and returns and access_denied() for Imagecache External images,
+ * we need to override this function and do the check ourselves.
+ */
+function imagecache_external_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'file_download') {
+    unset($implementations['image']);
+  }
+}
+
+/**
+ * Implements hook_file_download().
+ *
+ * When using the private file system, we have to let Drupal know it's OK to
+ * download images from our Imagecache External directory.
+ */
+function imagecache_external_file_download($uri) {
+  // Check if the path contains 'imagecache/external'.
+  // If not, we fallback to the Image module.
+  if (strpos($uri, '/' . imagecache_external_config()->get('imagecache_directory') . '/') > 0) {
+    $info = image_get_info($uri);
+    // For safety, we only allow our own mimetypes.
+    if (in_array($info['mime_type'], imagecache_external_allowed_mimetypes())) {
+      return [
+        'Content-Type' => $info['mime_type'],
+        'Content-Length' => $info['file_size'],
+      ];
+    }
+  }
+  else {
+    // Do a fallback to the Image module.
+    return image_file_download($uri);
+  }
+}
+
+/**
+ * Helper function to get externals directory.
+ *
+ * @return string
+ *   The path to the external images directory.
+ */
+function imagecache_external_get_directory_path() {
+  $config  = imagecache_external_config();
+  $scheme  = file_default_scheme();
+  $wrapper = \Drupal::service('stream_wrapper_manager')->getViaScheme($scheme);
+  $path    = realpath($wrapper->getDirectoryPath() . '/' . $config->get('imagecache_directory'));
+  return $path;
+}
+
+/**
+ * Helper function to flush caches.
+ *
+ * @return bool
+ *   A Boolean value to indicate that the operation succeeded.
+ */
+function imagecache_external_flush_cache() {
+  $path = imagecache_external_get_directory_path();
+
+  if (is_dir($path)) {
+    if (imagecache_external_batch_flush($path)) {
+      \Drupal::logger('imagecache_external')->notice('Imagecache caches have been flushed');
+      return TRUE;
+    }
+    else {
+      return FALSE;
+    }
+  }
+}
+
+/**
+ * The batch callback.
+ */
+function imagecache_external_batch_flush($path) {
+  $files = scandir(imagecache_external_get_directory_path());
+  $files = array_diff($files, ['..', '.']);
+
+  if (!empty($files)) {
+    foreach ($files as &$value) {
+      $value = $path . '/' . $value;
+    }
+    unset($value);
+
+    $config = imagecache_external_config();
+    $chunks = array_chunk($files, $config->get('imagecache_external_batch_flush_limit'), TRUE);
+    $count_chunks = count($chunks);
+    $i = '';
+
+    foreach ($chunks as $chunk) {
+      $i++;
+      $operations[] = [
+        'imagecache_external_batch_flush_process', [
+          $chunk, 'details' => t('(Deleting file batch @chunk of @count)',
+            [
+              '@chunk ' => $i,
+              '@count' => $count_chunks,
+            ]
+          ),
+        ],
+      ];
+    }
+
+    $batch = [
+      'operations' => $operations,
+      'finished' => 'imagecache_external_batch_flush_finished',
+      'title' => t('Deleting Imagecache External files...'),
+      'init_message' => t('Bulk delete is starting...'),
+      'error_message' => t('Imagecache external batch flush has encountered an error.'),
+    ];
+
+    batch_set($batch);
+    return TRUE;
+  }
+  elseif (empty($files)) {
+    $directory = imagecache_external_get_directory_path();
+    file_unmanaged_delete_recursive($directory);
+    return TRUE;
+  }
+  else {
+    return FALSE;
+  }
+}
+
+/**
+ * The batch processor.
+ */
+function imagecache_external_batch_flush_process($chunk, $operation_details, &$context) {
+  foreach ($chunk as $file) {
+    file_unmanaged_delete_recursive($file);
+  }
+
+  // Show what chunk is currently being processed.
+  $context['message'] = $operation_details;
+}
+
+/**
+ * The batch finish handler.
+ */
+function imagecache_external_batch_flush_finished($success, $files, $operations) {
+  if ($success) {
+    $directory = imagecache_external_get_directory_path();
+    file_unmanaged_delete_recursive($directory);
+  }
+  else {
+    $error_operation = reset($operations);
+    $message = t('An error occurred while processing %error_operation with arguments: @arguments', [
+      '%error_operation' => $error_operation[0],
+      '@arguments' => print_r($error_operation[1], TRUE),
+    ]);
+    \Drupal::messenger()->addMessage($message, MessengerInterface::TYPE_ERROR);
+  }
+}
+
+/**
+ * Helper function that returns allowed mimetypes for external caching.
+ *
+ * @return array
+ *   The allowed mimetypes.
+ */
+function imagecache_external_allowed_mimetypes() {
+  return imagecache_external_config()->get('imagecache_external_allowed_mimetypes');
+}
+
+/**
+ * Helper function that returns a config object for imagecache_external.
+ *
+ * @return \Drupal\Core\Config\ImmutableConfig
+ *   An immutable configuration object.
+ */
+function imagecache_external_config() {
+  $config = \Drupal::config('imagecache_external.settings');
+  return $config;
+}
