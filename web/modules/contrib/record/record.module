@@ -1,0 +1,228 @@
+<?php
+
+/**
+ * @file
+ * Module file for record module.
+ */
+
+use Drupal\field\Entity\FieldStorageConfig;
+use Drupal\field\Entity\FieldConfig;
+use Drupal\record\Entity\RecordType;
+use Drupal\record\RecordTypeInterface;
+use Drupal\record\Plugin\Field\FieldType\RecordItem;
+
+/**
+ * Adds the default data field to the record type.
+ *
+ * Fundamentally this works the same as the way the node module adds the body field.
+ *
+ * @param \Drupal\record\RecordTypeInterface $type
+ *   A node type object.
+ * @param string $label
+ *   (optional) The label for the body instance.
+ *
+ * @return \Drupal\field\Entity\FieldConfig
+ *   The new field object.
+ *
+ * @todo in version 2, rename "data" to "properties" for consistency throughout.
+ *
+ * @see node_add_body_field()
+ * @see field.storage.record.data.yml
+ */
+function record_add_data_field(RecordTypeInterface $type, $label = 'Record properties') {
+  // Not sharing this field with anyone, using the type id as a prefix.
+  $field_name = $type->id();
+
+  $field_storage = FieldStorageConfig::loadByName('record', 'data');
+  $field = FieldConfig::loadByName('record', $type->id(), $field_name);
+
+  // Duplicate the persistent 'data' field.
+  $duplicate = $field_storage->createDuplicate();
+  $duplicate->set('id', 'record.' . $field_name);
+  $duplicate->set('field_name', $field_name);
+  $duplicate->save();
+
+  if (empty($field)) {
+    $field = FieldConfig::create([
+      'field_storage' => $duplicate,
+      'bundle' => $type->id(),
+      'label' => $label,
+
+    ]);
+    $field->save();
+
+    // Assign widget settings for the 'default' form mode.
+    entity_get_form_display('record', $type->id(), 'default')
+      ->setComponent($field_name, [
+        'type' => 'record_item_widget',
+      ])
+      ->save();
+
+    // Assign display settings for the 'default' and 'teaser' view modes.
+    entity_get_display('record', $type->id(), 'default')
+      ->setComponent($field_name, [
+        'label' => 'hidden',
+        'type' => 'record_item_formatter',
+      ])
+      ->save();
+  }
+
+  return $field;
+}
+
+/**
+ * This is a prototype function to be refactored once working.
+ *
+ * @param string $bundle
+ *   Record type (which is also the field name).
+ */
+function record_field_scheme_update(string $bundle) {
+  $bundle_of = 'record';
+  $type = RecordType::load($bundle);
+  $table = RecordItem::getExistingTable($bundle);
+
+  // Remove all data so the field can be removed.
+  // Manually sanitise table name as this can't be paramatized.
+  // @todo need to load all data so that it can be re-written after the need field is created.
+  $bundle = preg_replace('/[^a-zA-Z_]*/', '', $bundle);
+  $connection = \Drupal::database();
+  if ($table) {
+    $connection->query("TRUNCATE record__{$bundle}");
+    $connection->query("TRUNCATE record_revision__{$bundle}");
+  }
+
+  // Deleting field storage.
+  if ($fieldStorage = FieldStorageConfig::loadByName($bundle_of, $bundle)) {
+    $fieldStorage->delete();
+  }
+
+  // Deleting field.
+  if ($field = FieldConfig::loadByName($bundle_of, $bundle, $bundle)) {
+    $field->delete();
+  }
+
+  // Reattach new field with updated property definitions.
+  record_add_data_field($type);
+}
+
+/**
+ * Helper to define a simple database field that conforms to Schema API.
+ *
+ * This is intentionally simple, limited to a few data types and options. If you
+ * need more complex then consider a full-fledged field, or call this function
+ * and modify the result, or return your own schema without calling this function.
+ *
+ * @param string $type
+ *   Label for the field.
+ * @param string $label
+ *   Label for the field.
+ * @param int $length
+ *   Field length for varchar.
+ *
+ * @return array
+ *   Array that conforms to the Drupal schema API.
+ *
+ * @see hook_record_extended_schema()
+ *
+ * @throws \Exception().
+ */
+function record_property(string $type, string $label, int $length = 255) {
+
+  switch ($type) {
+    case 'varchar':
+      return [
+        'type' => 'varchar',
+        'length' => $length,
+        'not null' => FALSE,
+        'record_properties' => [
+          'label' => $label,
+        ],
+      ];
+
+    case 'text':
+      return [
+        'type' => 'text',
+        'not null' => FALSE,
+        'record_properties' => [
+          'label' => $label,
+        ],
+      ];
+
+    case 'int':
+      return [
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => FALSE,
+        'record_properties' => [
+          'label' => $label,
+        ],
+      ];
+
+    case 'blob':
+      return [
+        'type' => 'blob',
+        'not null' => FALSE,
+        'size' => 'medium',
+        'record_properties' => [
+          'label' => $label,
+        ],
+      ];
+
+    case 'float':
+      return [
+        'type' => 'float',
+        'size' => 'medium',
+        'not null' => FALSE,
+        'record_properties' => [
+          'label' => $label,
+        ],
+      ];
+
+    default:
+      throw new \Exception("This schema type `$type` is not supported");
+  }
+
+}
+
+/**
+ * Implements hook_menu_links_discovered_alter().
+ */
+function record_menu_links_discovered_alter(&$links) {
+  $moduleHandler = \Drupal::moduleHandler();
+  $routeProvider = \Drupal::service('router.route_provider');
+  $routes = [];
+  foreach ($routeProvider->getAllRoutes() as $route_name => $route) {
+    $routes[] = $route_name;
+  }
+
+  // Doing what `admin_toolbar_tools` does for Node and Media types.
+  if ($moduleHandler->moduleExists('admin_toolbar_tools')) {
+    $links['admin_toolbar_tools.add_record'] = [
+      'title' => t('Add record'),
+      'route_name' => 'entity.record.add_page',
+      'menu_name' => 'admin',
+      'parent' => 'system.admin_content',
+    ];
+    // Add node links for each media type.
+    foreach (\Drupal::entityTypeManager()->getStorage('record_type')->loadMultiple() as $type) {
+      $links['record.add.' . $type->id()] = [
+        'title' => t($type->label()),
+        'route_name' => 'entity.record.add_form',
+        'parent' => 'admin_toolbar_tools.add_record',
+        'route_parameters' => ['record_type' => $type->id()],
+      ];
+    }
+  }
+
+}
+
+/**
+ * Implements hook_theme().
+ */
+function record_theme() {
+  return [
+    'record_properties' => [
+      'variables' => ['properties' => NULL],
+    ],
+  ];
+}
