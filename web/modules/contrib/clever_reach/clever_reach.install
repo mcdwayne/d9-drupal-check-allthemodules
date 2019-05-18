@@ -1,0 +1,265 @@
+<?php
+
+/**
+ * @file
+ * Install, update and uninstall functions for the CleverReach module.
+ */
+
+use CleverReach\BusinessLogic\Interfaces\Proxy;
+use CleverReach\BusinessLogic\Sync\ExchangeAccessTokenTask;
+use CleverReach\BusinessLogic\Sync\RegisterEventHandlerTask;
+use CleverReach\Infrastructure\Interfaces\Required\Configuration;
+use CleverReach\Infrastructure\Logger\Logger;
+use CleverReach\Infrastructure\ServiceRegister;
+use CleverReach\Infrastructure\TaskExecution\Exceptions\QueueStorageUnavailableException;
+use CleverReach\Infrastructure\TaskExecution\Queue;
+use CleverReach\Infrastructure\TaskExecution\QueueItem;
+use Drupal\Core\Database\Database;
+use Drupal\clever_reach\Component\Utility\TaskQueue;
+
+const CLEVERREACH_PROCESS_TABLE = 'cleverreach_process';
+const CLEVERREACH_QUEUE_TABLE = 'cleverreach_queue';
+
+/**
+ * Implements hook_schema().
+ *
+ * Defines the database tables used by this module.
+ *
+ * @see hook_schema()
+ *
+ * @ingroup cleverreach
+ */
+function clever_reach_schema() {
+  $schema = Database::getConnection()->schema();
+
+  if (!$schema->tableExists(CLEVERREACH_PROCESS_TABLE)) {
+    $result[CLEVERREACH_PROCESS_TABLE] = [
+      'description' => 'Stores runner token used for synchronization.',
+      'fields' => [
+        'id' => [
+          'type' => 'varchar',
+          'length' => 191,
+          'not null' => TRUE,
+          'description' => 'Primary Key: Unique Process ID.',
+        ],
+        'runner' => [
+          'type' => 'varchar',
+          'length' => 191,
+          'not null' => TRUE,
+          'description' => 'Runner Unique ID',
+        ],
+      ],
+      'primary key' => ['id', 'runner'],
+    ];
+  }
+
+  if (!$schema->tableExists(CLEVERREACH_QUEUE_TABLE)) {
+    $result[CLEVERREACH_QUEUE_TABLE] = [
+      'description' => 'Stores synchronization tasks in the queue.',
+      'fields' => [
+        'id' => [
+          'type' => 'serial',
+          'size' => 'big',
+          'unsigned' => TRUE,
+          'not null' => TRUE,
+          'description' => 'Primary Key: Unique Queue ID.',
+        ],
+        'status' => [
+          'type' => 'varchar',
+          'length' => 30,
+          'not null' => TRUE,
+          'description' => 'Status',
+        ],
+        'type' => [
+          'type' => 'varchar',
+          'length' => 100,
+          'not null' => TRUE,
+          'description' => 'Queue type',
+        ],
+        'queue_name' => [
+          'type' => 'varchar',
+          'length' => 50,
+          'not null' => TRUE,
+          'description' => 'Queue name',
+        ],
+        'progress' => [
+          'type' => 'int',
+          'length' => 11,
+          'default' => 0,
+          'not null' => TRUE,
+          'description' => 'Task execution progress',
+        ],
+        'last_execution_progress' => [
+          'type' => 'int',
+          'length' => 11,
+          'default' => 0,
+          'not null' => TRUE,
+          'description' => 'Last task execution progress',
+        ],
+        'retries' => [
+          'type' => 'int',
+          'length' => 11,
+          'default' => 0,
+          'not null' => TRUE,
+          'description' => 'Current number of retries',
+        ],
+        'failure_description' => [
+          'type' => 'varchar',
+          'length' => 191,
+          'description' => 'Failure Description',
+        ],
+        'serialized_task' => [
+          'type' => 'text',
+          'size' => 'big',
+          'not null' => TRUE,
+          'description' => 'Serialized Task Data',
+        ],
+        'create_timestamp' => [
+          'type' => 'int',
+          'length' => 11,
+          'not null' => FALSE,
+          'description' => 'Queue Creation UNIX timestamp',
+        ],
+        'queue_timestamp' => [
+          'type' => 'int',
+          'length' => 11,
+          'not null' => FALSE,
+          'description' => 'Queuing UNIX timestamp',
+        ],
+        'last_update_timestamp' => [
+          'type' => 'int',
+          'length' => 11,
+          'not null' => FALSE,
+          'description' => 'Queue Modification UNIX timestamp',
+        ],
+        'start_timestamp' => [
+          'type' => 'int',
+          'length' => 11,
+          'not null' => FALSE,
+          'description' => 'Task Started UNIX timestamp',
+        ],
+        'finish_timestamp' => [
+          'type' => 'int',
+          'length' => 11,
+          'not null' => FALSE,
+          'description' => 'Task Finished UNIX timestamp',
+        ],
+        'fail_timestamp' => [
+          'type' => 'int',
+          'length' => 11,
+          'not null' => FALSE,
+          'description' => 'Task Failed UNIX timestamp',
+        ],
+      ],
+      'primary key' => ['id'],
+    ];
+  }
+
+  return $result;
+}
+
+/**
+ * Implements hook_uninstall().
+ *
+ * Deletes the database tables used by this module.
+ * Deletes event handler for webhooks and product search endpoint.
+ *
+ * @see hook_uninstall()
+ *
+ * @ingroup cleverreach
+ */
+function clever_reach_uninstall() {
+  \Drupal::configFactory()
+    ->getEditable('clever_reach.settings')
+    ->set('cleverreach_installed', FALSE)
+    ->save();
+
+  delete_endpoints();
+
+  $schema = Database::getConnection()->schema();
+  if ($schema->tableExists(CLEVERREACH_PROCESS_TABLE)) {
+    $schema->dropTable(CLEVERREACH_PROCESS_TABLE);
+  }
+
+  if ($schema->tableExists(CLEVERREACH_QUEUE_TABLE)) {
+    $schema->dropTable(CLEVERREACH_QUEUE_TABLE);
+  }
+
+  \Drupal::configFactory()->getEditable('clever_reach.settings')->delete();
+}
+
+/**
+ * Implements hook_update_N().
+ *
+ * Updates to plugin version 1.3
+ * Registers hooks for event notifications on Drupal 8 site.
+ *
+ * @see hook_update_N()
+ *
+ * @ingroup cleverreach
+ */
+function clever_reach_update_8103() {
+  /** @var CleverReach\Infrastructure\TaskExecution\Queue $queue */
+  $queue = ServiceRegister::getService(Queue::CLASS_NAME);
+  /** @var \Drupal\clever_reach\Component\Infrastructure\ConfigService $configService */
+  $configService = ServiceRegister::getService(Configuration::CLASS_NAME);
+  $initialSyncTaskItem = $queue->findLatestByType('InitialSyncTask');
+
+  if ($initialSyncTaskItem !== NULL
+    && $initialSyncTaskItem->getStatus() === QueueItem::COMPLETED
+  ) {
+    $configService->setImportStatisticsDisplayed(TRUE);
+    try {
+      $queue->enqueue(
+        $configService->getQueueName(),
+        new ExchangeAccessTokenTask()
+      );
+      $queue->enqueue(
+        $configService->getQueueName(),
+        new RegisterEventHandlerTask()
+      );
+      TaskQueue::wakeup();
+    }
+    catch (QueueStorageUnavailableException $e) {
+      Logger::logError($e->getMessage(), 'Integration');
+    }
+  }
+}
+
+/**
+ * Deletes registered endpoints, if they have been registered before.
+ */
+function delete_endpoints() {
+  /** @var \Drupal\clever_reach\Component\Infrastructure\ConfigService $config */
+  $config = ServiceRegister::getService(Configuration::CLASS_NAME);
+  /** @var CleverReach\Infrastructure\TaskExecution\Queue $queue */
+  $queue = ServiceRegister::getService(Queue::CLASS_NAME);
+  $initialSyncTaskItem = $queue->findLatestByType('InitialSyncTask');
+  if ($initialSyncTaskItem !== NULL
+    && $initialSyncTaskItem->getStatus() === QueueItem::COMPLETED
+    && $config->getAccessToken() !== NULL
+  ) {
+    /** @var \CleverReach\BusinessLogic\Proxy $proxy */
+    $proxy = ServiceRegister::getService(Proxy::CLASS_NAME);
+
+    try {
+      $proxy->deleteProductSearchEndpoint($config->getProductSearchContentId());
+    }
+    catch (\Exception $e) {
+      Logger::logError(
+        'Could not remove product search endpoint because: ' . $e->getMessage(),
+        'Integration'
+          );
+    }
+
+    try {
+      $proxy->deleteReceiverEvent();
+    }
+    catch (\Exception $e) {
+      Logger::logError(
+        'Could not remove event handler because: ' . $e->getMessage(),
+        'Integration'
+          );
+    }
+  }
+}
