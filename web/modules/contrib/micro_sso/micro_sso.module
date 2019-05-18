@@ -1,0 +1,131 @@
+<?php
+
+/**
+ * @file
+ * Micro_sso.module - Pseudo SSO across micro sites.
+ *
+ * 1) User already connected on site SSO:
+ *
+ * Browser             Site X     Site SSO  cache(shared)
+ *  | GET /foo            |           |
+ *  | (ano.)              |           |
+ *  |-------------------->|           |
+ *  | foo js              |           |   token+domain:
+ *  |<--------------------|           |  [session id +
+ *  | Ajax /sso/check (+credentials)  |   IP + domain + uid]
+ *  |-------------------------------->|------>|
+ *  |     json (one time token)       |       |
+ *  |<--------------------------------|       |
+ *  |GET /sso/login/token |                   |
+ *  |-------------------->|  token + domain   |
+ *  |                     |------------------>|
+ *  |                     |  login the user   |
+ *  |                     |<------------------|
+ *  | session + reload    |  here we also check the user IP
+ *  |<--------------------|  is the same and sends the session_id
+ *  |  get /foo (session) |  as a valid X domain cookie.
+ *  |-------------------->|
+ *  | foo (authenticated) |
+ *  |<--------------------|
+ * The user, having a valid session id (credentials) on SSO domain
+ * will automatically be connected on site X, with, at the end, a
+ * valid PHP session on domain X.
+ * - token can only be used 1 time.
+ * - token has a short validity (10s)
+ * - token can only be used on the Site X domain (using Ajax Origin header)
+ * - site X domain is checked out, to be a domain managed by the factory only.
+ *
+ * 2) user is not yet connected
+ *
+ * Browser             Site X     Site SSO
+ *  |  GET /foo (ano.)    |           |
+ *  |-------------------->|           |
+ *  |   foo + sso js      |           |
+ *  |<--------------------|           |
+ *  | Ajax /sso/check (no creds)      |
+ *  |-------------------------------->|
+ *  |     refusal                     |
+ *  |<--------------------------------|
+ *  | (main anonymous page is unaltered)
+ *  |
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_help().
+ */
+function micro_sso_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the micro_sso module.
+    case 'help.page.micro_sso':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Provide pseudo SSO login accross all micro sites.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Get default URL scheme. Later will always be 'https'.
+ */
+function micro_sso_scheme_get() {
+  // @TODO only https later.
+  return $GLOBALS['is_https'] ? 'https' : 'http';
+}
+
+/**
+ * Tells if the current site is master.
+ *
+ * @return bool
+ *   Return TRUE if the host is the master host.
+ */
+function micro_sso_is_master() {
+  /** @var \Drupal\micro_site\SiteNegotiatorInterface $negotiator */
+  $negotiator = \Drupal::service('micro_site.negotiator');
+  return !$negotiator->getActiveSite() && !(PHP_SAPI === 'cli') && $_SERVER['HTTP_HOST'] === \Drupal::config('micro_site.settings')->get('public_url');
+}
+
+/**
+ * Get a valid HTTP Origin uri if it matches an existing site.
+ *
+ * @return string|NULL
+ *   Return the micro site uri or NULL.
+ */
+function micro_sso_origin_get() {
+  if (!empty($_SERVER['HTTP_ORIGIN'])) {
+    /** @var \Drupal\micro_site\SiteNegotiatorInterface $negotiator */
+    $negotiator = \Drupal::service('micro_site.negotiator');
+    /** @var \Drupal\micro_site\Entity\SiteInterface $site */
+    $site = $negotiator->loadByHostname($_SERVER['HTTP_ORIGIN']);
+    // @TODO check user access to site too.
+    if ($site) {
+      return $site->getSiteUrl();
+    }
+  }
+  return NULL;
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function micro_sso_page_attachments(array &$attachments) {
+  /** @var \Drupal\micro_sso\MicroSsoHelperInterface $micro_sso_helper */
+  $micro_sso_helper = \Drupal::service('micro_sso.helper');
+  $scheme = $micro_sso_helper->getScheme();
+  $is_master = $micro_sso_helper->isMaster();
+  if (!$is_master) {
+    if (!\Drupal::currentUser()->isAuthenticated()) {
+      $masterHostname = \Drupal::config('micro_site.settings')->get('public_url');
+      if (!$masterHostname) {
+        return;
+      }
+      $master = Url::fromUri($scheme . '://' . $masterHostname . '/sso/check')->toString();
+      $attachments['#attached']['drupalSettings']['micro_sso']['master'] = $master;
+      $attachments['#attached']['library'][] = 'micro_sso/sso';
+    }
+  }
+}
