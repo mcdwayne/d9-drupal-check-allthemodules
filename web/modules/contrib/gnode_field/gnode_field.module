@@ -1,0 +1,236 @@
+<?php
+
+/**
+ * @file
+ * Contains gnode_field.module.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Url;
+use Drupal\field\Entity\FieldConfig;
+use Drupal\group\Entity\Group;
+use Drupal\node\Entity\Node;
+
+include_once 'gnode_field.util.inc';
+
+/**
+ * Implements hook_help().
+ */
+function gnode_field_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the gnode_field module.
+    case 'help.page.gnode_field':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Functionality as it relates to groups on the site.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function gnode_field_theme($existing, $type, $theme, $path) {
+  return [
+    'gnode_field_delete' => [
+      'variables' => ['nodes' => NULL],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_entity_insert().
+ *
+ * The group module takes care of hook_entity_delete().
+ */
+function gnode_field_entity_insert(EntityInterface $entity) {
+  if ($entity->getEntityTypeId() === 'node') {
+
+    // The nid isn't set on the node yet but the uuid is.
+    $uuid = $entity->get('uuid')->getValue()[0]['value'];
+
+    /** @var \Drupal\Core\Entity\EntityTypeManager $manager */
+    $manager = \Drupal::service('entity_type.manager');
+
+    // Use the uuid to load the node that was just saved. We need to pass the
+    // fully saved node in our next function.
+    $node_array = $manager->getStorage('node')->loadByProperties(['uuid' => $uuid]);
+    /** @var \Drupal\Core\Entity\EntityInterface $node */
+    $node = reset($node_array);
+
+    gnode_field_node_operations($node, 'insert');
+  }
+}
+
+/**
+ * Implements hook_entity_update().
+ *
+ * The group module takes care of hook_entity_delete(), but only when a node
+ * is deleted. We need to handle the use case in which the Group is deleted
+ * and there is a node that is referencing this group.
+ */
+function gnode_field_entity_update(EntityInterface $entity) {
+  if ($entity->getEntityTypeId() === 'node') {
+    gnode_field_node_operations($entity, 'update');
+  }
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function gnode_field_form_node_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // If this form object is an instance of NodeForm we need to ensure that
+  // this node has its group reference fields set if for some reason the
+  // relationship was created via the Group UI instead of directly on the node.
+  /** @var \Drupal\gnode_field\Service\GroupNodeFieldService $gnodeField */
+  $gnodeField = gnode_field_service($form, $form_state);
+
+  if ($gnodeField->validEntity) {
+    // Validate that at least one Group Reference field contains a value.
+    $form['#validate'][] = 'gnode_field_validate_group_reference';
+    // Get Groups that can be referenced for this user.
+    $gnodeField->getReferenceableGroups();
+  }
+}
+
+/**
+ * Validation on node forms.
+ *
+ * @param array $form
+ *   The form being validated.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   The current state of this form.
+ *
+ * @see gnode_field_form_node_form_alter()
+ */
+function gnode_field_validate_group_reference(array $form, FormStateInterface $form_state) {
+  /** @var \Drupal\gnode_field\Service\GroupNodeFieldService $gnodeField */
+  $gnodeField = gnode_field_service($form, $form_state);
+  $gnodeField->validateGroupRef();
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function gnode_field_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // When adding or editing a node type we want to allow the user to add a group
+  // reference field.
+  if ($form_id === 'node_type_edit_form' || $form_id === 'node_type_add_form') {
+
+    /** @var \Drupal\gnode_field\Service\GroupNodeFieldService $gnodeField */
+    $gnodeField = gnode_field_service($form, $form_state);
+    $group_types = $gnodeField->groupTypes();
+
+    $form['group'] = [
+      '#type' => 'details',
+      '#title' => t('Group Reference'),
+      '#group' => 'additional_settings',
+      '#open' => TRUE,
+    ];
+
+    if (empty($group_types)) {
+      $form['group']['blank'] = [
+        '#type' => 'markup',
+        '#markup' => t('You must create a Group Type to add a reference field.'),
+      ];
+    }
+    else {
+      /** @var Drupal\group\Entity\GroupType $group_type */
+      foreach ($group_types as $group_type) {
+
+        // If this is a new content type we won't have a $field yet.
+        $field = FALSE;
+
+        $label = $group_type->label();
+
+        $field_name = $gnodeField->getGroupRef($group_type->id());
+
+        $bundle = $form['type']['#default_value'];
+        if ($bundle) {
+          $field = FieldConfig::loadByName('node', $bundle, $field_name);
+        }
+
+        $disabled = $default_value = $field ? 1 : 0;
+        $description = t('Adds a group reference field for the @label group type that restricts the referenced groups to that of this type.', ['@label' => $label]);
+
+        if ($disabled) {
+          $description = t('You will need to remove the group reference field if you no longer need it.');
+        }
+
+        $form['group'][$field_name] = [
+          '#type' => 'checkbox',
+          '#title' => $label,
+          '#default_value' => $default_value,
+          '#disabled' => $disabled,
+          '#description' => $description,
+        ];
+      }
+
+      // Add a custom submit handler.
+      $gnodeField->submitHandler('gnode_field_add_group_reference_field');
+    }
+  }
+
+  /** @var \Drupal\gnode_field\Service\GroupNodeFieldService $gnodeField */
+  $gnodeField = \Drupal::service('gnode_field.node_group_ref');
+  $group_types = $gnodeField->groupTypes();
+
+  foreach ($group_types as $group_type) {
+    $id = $group_type->id();
+    if ($form_id === 'group_' . $id . '_delete_form') {
+      foreach (\Drupal::routeMatch()->getParameters() as $param) {
+        if ($param instanceof Group) {
+          $id = $param->id();
+          $connection = \Drupal::database();
+          $query = $connection->select('group_content_field_data', 'gc')
+            ->fields('gc', ['gid', 'entity_id'])
+            ->condition('gid', $id);
+          $results = $query->execute()->fetchAll();
+          if (!empty($results)) {
+            $node_list = [];
+            foreach ($results as $result) {
+              $node_list[] = $result->entity_id;
+            }
+          }
+        }
+      }
+      if (!empty($node_list)) {
+        natsort($node_list);
+        $nodes = Node::loadMultiple($node_list);
+        $form['actions']['submit']['#attributes']['disabled'] = 'disabled';
+        $render_node_list = [
+          '#theme' => 'gnode_field_delete',
+          '#nodes' => $nodes,
+        ];
+        // Render a better message with a listing of node titles that link to
+        // the node and the node id.
+        $message = \Drupal::service('renderer')->render($render_node_list);
+        \Drupal::messenger()->addMessage($message);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ */
+function gnode_field_preprocess_gnode_field_delete(&$variables) {
+  if ($variables) {
+    /** @var \Drupal\node\Entity\Node $node */
+    foreach ($variables['nodes'] as $nid => $node) {
+      $options = ['absolute' => TRUE];
+      $url = Url::fromRoute('entity.node.canonical', ['node' => $nid], $options);
+      $nodes[$nid] = [
+        'title' => $node->label(),
+        'url' => $url,
+        'nid' => $nid,
+
+      ];
+    }
+    $variables['nodes'] = $nodes;
+  }
+}
