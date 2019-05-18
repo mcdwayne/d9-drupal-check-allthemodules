@@ -1,0 +1,679 @@
+<?php
+
+/**
+ * @file
+ * Recurly.
+ *
+ * Uses Recurly's PHP client library to interact with their API and integrate it
+ * with Drupal user accounts.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_help().
+ */
+function recurly_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'recurly.subscription_plans_overview':
+      return '<p>' . t('Plans should be defined and updated at Recurly.com itself. The order and enabled state of a plan will affect the built-in signup pages.') . '</p>';
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function recurly_theme() {
+  $items['recurly_subscription_summary'] = [
+    'variables' => [
+      'plan_code' => NULL,
+      'plan_name' => NULL,
+      'state_array' => NULL,
+      'state_status' => NULL,
+      'period_end_header' => NULL,
+      'cost' => NULL,
+      'quantity' => NULL,
+      'add_ons' => [],
+      'start_date' => NULL,
+      'end_date' => NULL,
+      'current_period_start' => NULL,
+      'current_period_ends_at' => NULL,
+      'total' => NULL,
+      'subscription_links' => [],
+      'message' => NULL,
+      'subscription' => NULL,
+      'account' => NULL,
+      'custom_properties' => [],
+    ],
+    'template' => 'recurly-subscription-summary',
+  ];
+  $items['recurly_credit_card_information'] = [
+    'variables' => [
+      'first_name' => NULL,
+      'last_name' => NULL,
+      'card_type' => NULL,
+      'exp_date' => NULL,
+      'last_four' => NULL,
+      'card_num_masked' => NULL,
+    ],
+    'template' => 'recurly-credit-card-information',
+  ];
+  $items['recurly_invoice'] = [
+    'variables' => [
+      'invoice' => NULL,
+      'invoice_account' => NULL,
+      'entity_type' => NULL,
+      'entity' => NULL,
+      'error_message' => NULL,
+    ],
+    'template' => 'recurly-invoice',
+  ];
+  $items['recurly_invoice_list'] = [
+    'variables' => [
+      'invoices' => NULL,
+      'entity_type' => NULL,
+      'entity' => NULL,
+      'per_page' => NULL,
+      'total' => NULL,
+    ],
+    'template' => 'recurly-invoice-list',
+  ];
+  $items['recurly_subscription_plan_select'] = [
+    'variables' => [
+      'plans' => NULL,
+      'entity_type' => NULL,
+      'entity' => NULL,
+      'currency' => NULL,
+      'mode' => 'signup',
+      'subscriptions' => NULL,
+      'subscription_id' => NULL,
+    ],
+    'template' => 'recurly-subscription-plan-select',
+    // The $mode of "change" or "signup" may be appended to the template name.
+    'pattern' => 'recurly_subscription_plan_select__',
+  ];
+  $items['recurly_subscription_cancel_confirm'] = [
+    'render element' => 'form',
+    'template' => 'recurly-subscription-cancel-confirm',
+  ];
+  $items['recurly_subscription_price_interval'] = [
+    'variables' => [
+      'time_length' => NULL,
+      'amount' => [],
+      'time_unit' => NULL,
+      'time_indicator' => NULL,
+    ],
+    'template' => 'recurly-subscription-price-interval',
+  ];
+
+  return $items;
+}
+
+/**
+ * Implements hook_libraries_info().
+ */
+function recurly_libraries_info() {
+  $libraries['recurly'] = [
+    'name' => 'Recurly',
+    'vendor url' => 'https://github.com/recurly/recurly-client-php',
+    'download url' => 'https://github.com/recurly/recurly-client-php/releases/latest',
+    'path' => 'lib',
+    'version' => '2.*',
+    'files' => [
+      'php' => ['recurly.php'],
+    ],
+  ];
+  return $libraries;
+}
+
+/**
+ * Implements hook_entity_type_alter().
+ */
+function recurly_entity_type_alter(array &$entity_types) {
+  \Drupal::service('recurly.entity_type')->entityTypeAlter($entity_types);
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function recurly_entity_update(EntityInterface $entity) {
+  return \Drupal::service('recurly.entity_operations')->entityUpdate($entity);
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function recurly_entity_delete(EntityInterface $entity) {
+  return \Drupal::service('recurly.entity_operations')->entityDelete($entity);
+}
+
+/**
+ * Implements hook_user_cancel().
+ *
+ * Cancel a Recurly account when the user account is canceled. It's important to
+ * note this hook is *not* called if the user account is just being straight-up
+ * deleted, which is fine because hook_entity_delete() will be called for that
+ * situation.
+ */
+function recurly_user_cancel($edit, $account, $method) {
+  $entity_type = \Drupal::config('recurly.settings')->get('recurly_entity_type');
+  if ($entity_type === 'user') {
+    // Check for a local account first, no need to attempt to close an account
+    // if we don't have any information about it.
+    $local_account = recurly_account_load(['entity_type' => $entity_type, 'entity_id' => $account->id()], TRUE);
+    if ($local_account) {
+      $recurly_account = recurly_account_load(['entity_type' => $entity_type, 'entity_id' => $account->id()]);
+      recurly_account_close($recurly_account);
+    }
+  }
+}
+
+/**
+ * Loads a Recurly account record based on the given conditions.
+ *
+ * @param array $conditions
+ *   An associative array of values to look for in the conditions of the query;
+ *   normally used to look-up on account_code or uid.
+ * @param bool $local
+ *   Boolean indicating whether or not to only return local data; defaults to
+ *   FALSE, meaning it will attempt to load the full linked account object.
+ *
+ * @return object
+ *   The fully loaded account object from Recurly if possible. If Recurly cannot
+ *   be accessed, just returns an object representing the data stored locally.
+ *   If the account no longer exists at Recurly, the returned object will
+ *   include an additional 'orphaned' property set to TRUE. Returns FALSE if no
+ *   data can be found locally at all.
+ */
+function recurly_account_load(array $conditions = [], $local = FALSE) {
+  // Create a base select query object.
+  $query = \Drupal::database()->select('recurly_account', 'ra')->fields('ra');
+
+  // Add conditions to it based on the passed array.
+  foreach ($conditions as $key => $value) {
+    $query->condition($key, $value);
+  }
+
+  // Retrieve data if available.
+  $data = $query->execute()->fetchObject();
+
+  // Bail now if no data was returned.
+  if (empty($data)) {
+    return FALSE;
+  }
+
+  // If we only want local data, return it now.
+  if ($local) {
+    return $data;
+  }
+
+  // Attempt to load the full account from Recurly.
+  try {
+    \Drupal::service('recurly.client')->initialize();
+    try {
+      $recurly_account = \Recurly_Account::get($data->account_code);
+    }
+    catch (\Recurly_NotFoundError $e) {
+      // Return the orphaned data if no account was found at Recurly.
+      $data->orphaned = TRUE;
+      return $data;
+    }
+
+    // If any data has changed remotely, update it locally now.
+    if ($recurly_account->state != $data->status) {
+      recurly_account_save($recurly_account, $data->entity_type, $data->entity_id);
+    }
+  }
+  catch (Exception $e) {
+    return $data;
+  }
+
+  return $recurly_account;
+}
+
+/**
+ * Saves an account record.
+ *
+ * Optionally exporting the saved data to Recurly as a new account or update
+ * request as necessary.
+ *
+ * @param object $recurly_account
+ *   The Recurly account object to save.
+ * @param string $entity_type
+ *   The entity type with which this account is associated.
+ * @param int $entity_id
+ *   The ID of the entity with which this account is associated.
+ * @param bool $export
+ *   Boolean indicating whether or not the saved account information should also
+ *   be exported to Recurly by either creating a new account or updating an
+ *   existing account based on the saved values using the Recurly API.
+ *
+ * @return mixed
+ *   FALSE on failure of either the local save or optional export or
+ *   STATUS_INSERT or STATUS_UPDATE indicating the type of query performed to
+ *   save the account information locally.
+ */
+function recurly_account_save($recurly_account, $entity_type, $entity_id, $export = FALSE) {
+  // First attempt to save the data at Recurly if specified. Failing an export
+  // will prevent local data from being saved so you don't end up with a local
+  // record that does not match a record at Recurly.
+  if ($export) {
+    // Check to see if the record already exists.
+    try {
+      $remote_account = \Recurly_Account::get($recurly_account->account_code);
+      // If it does than update the account now.
+      try {
+        $recurly_account->update();
+      }
+      catch (\Recurly_NotFoundError $e) {
+        watchdog_exception('recurly', $e);
+        return FALSE;
+      }
+    }
+    catch (Exception $e) {
+      // Try and create the new account at Recurly now.
+      try {
+        $recurly_account->create();
+      }
+      catch (\Recurly_NotFoundError $e) {
+        watchdog_exception('recurly', $e);
+        return FALSE;
+      }
+    }
+  }
+
+  // Generate an array of data to save.
+  $fields = [
+    'entity_type' => $entity_type,
+    'entity_id' => $entity_id,
+    'updated' => REQUEST_TIME,
+  ];
+
+  // Add the status based on whatever data we have available.
+  if (!empty($recurly_account->state)) {
+    $fields['status'] = $recurly_account->state;
+  }
+  elseif (!empty($recurly_account->status)) {
+    $fields['status'] = $recurly_account->status;
+  }
+  else {
+    $fields['status'] = 'active';
+  }
+
+  // Execute a merge query that will either insert a new record or update an
+  // existing record accordingly.
+  return \Drupal::database()->merge('recurly_account')
+    ->key(['account_code' => $recurly_account->account_code])
+    ->fields($fields)
+    ->execute();
+}
+
+/**
+ * Cancel a remote Recurly account.
+ */
+function recurly_account_close($recurly_account, $cancelation_method = NULL) {
+  if (empty($cancelation_method)) {
+    $cancelation_method = \Drupal::config('recurly.settings')->get('recurly_subscription_cancel_behavior');
+  }
+
+  if (empty($recurly_account->orphaned)) {
+    try {
+      // By default, closing an account will cancel all the subscriptions in
+      // that account. If refunding accounts upon cancellation, we must manually
+      // terminate each active subscription.
+      if ($cancelation_method !== 'cancel') {
+        $subscription_list = \Recurly_SubscriptionList::getForAccount($recurly_account->account_code);
+        foreach ($subscription_list as $subscription) {
+          if ($subscription->state === 'active') {
+            $username = $recurly_account->username ? $recurly_account->username : $recurly_account->account_code;
+            if ($cancelation_method === 'terminate_prorated') {
+              drupal_set_message(t('Prorated refund for @plan refunded to @username.', ['@plan' => $subscription->plan->name, '@username' => $username]));
+              $subscription->terminateAndPartialRefund();
+            }
+            else {
+              drupal_set_message(t('Full refund for @plan refunded to @username.', ['@plan' => $subscription->plan->name, '@username' => $username]));
+              $subscription->terminateAndRefund();
+            }
+          }
+        }
+      }
+      // Then close the account.
+      $recurly_account->close();
+    }
+    catch (\Recurly_Error $e) {
+      // Throw the highest level alert. Failure could result in accounts getting
+      // charged after the Drupal account is deleted.
+      \Drupal::logger('recurly')->alert('A Recurly account with the account code @code was intended to be closed, but may still open! The Recurly API returned the error "@error".', [
+        '@code' => $recurly_account->account_code,
+        '@error' => $e->getMessage(),
+      ]);
+      return FALSE;
+    }
+  }
+
+  return TRUE;
+}
+
+/**
+ * Delete a Recurly database record and the account on Recurly.com.
+ */
+function recurly_account_delete($recurly_account, $cancelation_method = NULL) {
+  recurly_account_close($recurly_account, $cancelation_method);
+  \Drupal::database()->delete('recurly_account')
+    ->condition('account_code', $recurly_account->account_code)
+    ->execute();
+}
+
+/**
+ * Check if an account has any active subscriptions.
+ *
+ * @return bool
+ *   TRUE if the user has an active subscription, or FALSE if no
+ *   active subscriptions are located.
+ */
+function recurly_account_has_active_subscriptions($account_code) {
+  return count(recurly_account_get_subscriptions($account_code, 'active')) > 0 ? TRUE : FALSE;
+}
+
+/**
+ * Get a list of active subscriptions for a particular account code.
+ */
+function recurly_account_get_subscriptions($account_code, $state) {
+  static $accounts;
+
+  if (!isset($accounts[$account_code])) {
+    $accounts[$account_code] = [];
+
+    \Drupal::service('recurly.client')->initialize();
+    $subscription_list = \Recurly_SubscriptionList::getForAccount($account_code, ['per_page' => 200]);
+    $accounts[$account_code] = ['active' => [], 'expired' => []];
+    foreach ($subscription_list as $subscription) {
+      if ($subscription->state !== 'expired') {
+        $accounts[$account_code]['active'][$subscription->uuid] = $subscription;
+      }
+      else {
+        $accounts[$account_code]['expired'][$subscription->uuid] = $subscription;
+      }
+    }
+  }
+
+  if ($state === 'active') {
+    return $accounts[$account_code]['active'];
+  }
+  elseif ($state === 'expired') {
+    return $accounts[$account_code]['expired'];
+  }
+
+  // Otherwise return all subscriptions.
+  return $accounts[$account_code];
+}
+
+/**
+ * Returns an array of subscription plan objects for the current account.
+ *
+ * Retrieves them from a local cache if possible.
+ *
+ * @param bool $reset_cache
+ *   Boolean indicating whether or not to reset the subscription plan cache when
+ *   retrieving plans.
+ *
+ * @return array
+ *   An array of subscription plan objects.
+ */
+function recurly_subscription_plans($reset_cache = FALSE) {
+  static $plans;
+
+  // If we haven't specified a cache reset, attempt to retrieve plans from the
+  // cache before getting them from Recurly.
+  if (!$reset_cache && isset($plans)) {
+    return $plans;
+  }
+
+  // Initialize the Recurly client with the site-wide settings.
+  if (!Drupal::service('recurly.client')->initialize()) {
+    return [];
+  }
+
+  // Retrieve the subscription plans from Recurly.
+  $plans = \Recurly_PlanList::get();
+
+  return $plans;
+}
+
+/**
+ * Determines if subscription plans have been configured.
+ *
+ * Retrieves them from a local cache if possible.
+ *
+ * @param bool $reset_cache
+ *   Boolean indicating whether or not to reset the subscription plan cache when
+ *   retrieving plans.
+ *
+ * @return bool
+ *   TRUE if there is at least one plan configured, else FALSE.
+ */
+function recurly_subscription_plans_configured($reset_cache = FALSE) {
+  return !empty(recurly_subscription_plans($reset_cache));
+}
+
+/**
+ * Determine if a Recurly subscription object is currently in a trial.
+ */
+function recurly_subscription_in_trial($subscription) {
+  if ($subscription->trial_started_at && $subscription->trial_ends_at) {
+    $subscription->trial_started_at->setTimezone(new DateTimeZone('UTC'));
+    $subscription->trial_ends_at->setTimezone(new DateTimeZone('UTC'));
+    $start = $subscription->trial_started_at->format('U');
+    $end = $subscription->trial_ends_at->format('U');
+    if (REQUEST_TIME > $start && REQUEST_TIME < $end) {
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Return a URL for a specified operation.
+ *
+ * This function should be used when generating links to operations that may
+ * have variable locations, such as updating billing information or changing
+ * plan levels.
+ *
+ * @param string $operation
+ *   May be one of the following operations:
+ *    - select_plan ($context contains account_code or entity_type/entity_id).
+ *    - change_plan.
+ *    - cancel.
+ *    - update_billing ($context contains account_code).
+ *    - subscribe ($context contains plan_code).
+ *    - reactivate ($context contains account_code or entity_type/entity_id).
+ * @param array $context
+ *   An array of contextual information needed for generating the link.
+ *
+ * @return \Drupal\Core\Url
+ *   A Drupal Url object containing a route and route parameters, or NULL if no
+ *   module is available to handle the operation.
+ */
+function recurly_url($operation, array $context) {
+  $urls = \Drupal::moduleHandler()->invokeAll('recurly_url_info', [$operation, $context]);
+
+  $return_url = NULL;
+  foreach ($urls as $url) {
+    if ($url) {
+      $return_url = $url;
+    }
+  }
+  return $return_url;
+}
+
+/**
+ * Implements hook_recurly_url_info().
+ */
+function recurly_recurly_url_info($operation, $context) {
+  // Only provide URLs for built-in page types.
+  $recurly_entity_type = \Drupal::config('recurly.settings')->get('recurly_entity_type');
+  $context_entity_type = empty($context['entity_type']) ? NULL : $context['entity_type'];
+  if (empty($recurly_entity_type) || $recurly_entity_type !== $context_entity_type) {
+    return;
+  }
+
+  switch ($operation) {
+    case 'select_plan':
+      return Url::fromRoute("entity.$recurly_entity_type.recurly_signup", [
+        $recurly_entity_type => $context['entity']->id(),
+      ]);
+
+    case 'change_plan':
+      if (isset($context['plan_code'])) {
+        return Url::fromRoute("entity.$recurly_entity_type.recurly_planchange", [
+          $recurly_entity_type => $context['entity']->id(),
+          'subscription_id' => $context['subscription']->uuid,
+          'new_plan_code' => isset($context['plan_code']) ? $context['plan_code'] : NULL,
+        ]);
+      }
+      else {
+        return Url::fromRoute("entity.$recurly_entity_type.recurly_change", [
+          $recurly_entity_type => $context['entity']->id(),
+        ]);
+      }
+
+    case 'cancel':
+      return Url::fromRoute("entity.$recurly_entity_type.recurly_cancel", [
+        $recurly_entity_type => $context['entity']->id(),
+        'subscription_id' => $context['subscription']->uuid,
+      ]);
+
+    case 'reactivate':
+      return Url::fromRoute("entity.$recurly_entity_type.recurly_reactivate", [
+        $recurly_entity_type => $context['entity']->id(),
+        'subscription_id' => $context['subscription']->uuid,
+      ]);
+
+    case 'redeem_coupon':
+      return Url::fromRoute("entity.$recurly_entity_type.recurly_coupon", [
+        $recurly_entity_type => $context['entity']->id(),
+      ]);
+  }
+}
+
+/**
+ * Provide a list of currencies supported by Recurly.
+ */
+function recurly_currency_list() {
+  $currencies = [
+    'USD' => ['$', ' USD'],
+    'AUD' => ['$', ' AUD'],
+    'CAD' => ['$', ' CAD'],
+    'EUR' => ['', ' €', ' ', ','],
+    'GBP' => ['£', ''],
+    'CZK' => ['', ' Kč', ' ', ','],
+    'DKK' => ['', ' kr.', ' ', ','],
+    'HUF' => ['', ' Ft', NULL, NULL, 0],
+    'JPY' => ['¥', ''],
+    'NOK' => ['', ' Nkr', ' ', ','],
+    'NZD' => ['NZ$', ''],
+    'PLN' => ['', ' zł', ' ', ','],
+    'SGD' => ['S$', ''],
+    'SEK' => ['', ' kr', ' ', ','],
+    'CHF' => ['', ' Fr.', NULL, NULL, NULL, '0.05'],
+    'ZAR' => ['R', ''],
+  ];
+  return $currencies;
+}
+
+/**
+ * Calculate a prorated refund amount.
+ */
+function recurly_subscription_calculate_refund($subscription, $type = 'prorated') {
+  if ($type == 'none' || recurly_subscription_in_trial($subscription)) {
+    return 0;
+  }
+
+  $subscription->current_period_started_at->setTimezone(new DateTimeZone('UTC'));
+  $subscription->current_period_ends_at->setTimezone(new DateTimeZone('UTC'));
+  $start = $subscription->current_period_started_at->format('U');
+  $end = $subscription->current_period_ends_at->format('U');
+  $total_period_time = $end - $start;
+  $remaining_time = $end - REQUEST_TIME;
+
+  // Past due subscriptions get no refund.
+  if ($remaining_time < 0) {
+    return 0;
+  }
+  if ($type == 'full') {
+    return $subscription->unit_amount_in_cents;
+  }
+  elseif ($type === 'prorated') {
+    return $subscription->unit_amount_in_cents * $remaining_time / $total_period_time;
+  }
+}
+
+/**
+ * Implements hook_preprocess_recurly_subscription_plan_select().
+ *
+ * Shared preprocess function for the presentation of the signup & change page.
+ */
+function template_preprocess_recurly_subscription_plan_select(&$variables) {
+  \Drupal::service('recurly.recurly_preprocess')->preprocessRecurlySubscriptionPlanSelect($variables);
+}
+
+/**
+ * Implements hook_preprocess_recurly_subscription_cancel_confirm().
+ */
+function template_preprocess_recurly_subscription_cancel_confirm(&$variables) {
+  \Drupal::service('recurly.recurly_preprocess')->preprocessRecurlySubscriptionCancelConfirm($variables);
+}
+
+/**
+ * Implements hook_preprocess_recurly_invoice_list().
+ */
+function template_preprocess_recurly_invoice_list(&$variables) {
+  \Drupal::service('recurly.recurly_preprocess')->preprocessRecurlyInvoiceList($variables);
+}
+
+/**
+ * Implements hook_preprocess_recurly_invoice().
+ */
+function template_preprocess_recurly_invoice(&$variables) {
+  \Drupal::service('recurly.recurly_preprocess')->preprocessRecurlyInvoice($variables);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Alter the user edit form to redirect new users to plan selection.
+ */
+function recurly_form_user_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $form['actions']['submit']['#submit'][] = 'recurly_user_edit_form_submit_redirect';
+}
+
+/**
+ * Redirects to the subscription selection page after setting user password.
+ *
+ * @param array $form
+ *   The form definition.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   The current state of the form.
+ */
+function recurly_user_edit_form_submit_redirect(array $form, FormStateInterface $form_state) {
+  if (!\Drupal::currentUser()->isAuthenticated() || !recurly_subscription_plans_configured()) {
+    return;
+  }
+  $entity_type_id = \Drupal::config('recurly.settings')->get('recurly_entity_type');
+  $authenticated_route_name = "entity.$entity_type_id.recurly_signup";
+
+  try {
+    $authenticated_route = \Drupal::service('router.route_provider')->getRouteByName($authenticated_route_name);
+  }
+  catch (RouteNotFoundException $e) {
+    watchdog_exception('recurly', $e);
+    return;
+  }
+
+  $form_state->setRedirect($authenticated_route_name, [
+    'user' => \Drupal::currentUser()->id(),
+  ], $authenticated_route->getOptions());
+}

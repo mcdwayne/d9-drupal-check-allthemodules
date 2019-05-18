@@ -1,0 +1,148 @@
+<?php
+
+/**
+ * @file
+ * Uses Recurly.js to provide a Form API field to subscribe to a service.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_recurly_url_info().
+ */
+function recurlyjs_recurly_url_info($operation, $context) {
+  if (\Drupal::currentUser()->isAnonymous()) {
+    return Url::fromRoute('recurly.redirect_to_registration');
+  }
+
+  $entity_type_id = \Drupal::config('recurly.settings')->get('recurly_entity_type');
+  switch ($operation) {
+    case 'update_billing':
+      $entity_info = recurly_account_load(['account_code' => $context['account']->account_code], TRUE);
+      return Url::fromRoute("entity.$entity_type_id.recurlyjs_billing", [$entity_type_id => $context['entity']->id()]);
+
+    case 'subscribe':
+      $default_currency = \Drupal::config('recurly.settings')->get('recurly_default_currency') ?: 'USD';
+      $currency_string = !isset($context['currency']) || $context['currency'] == $default_currency ? '' : '/' . $context['currency'];
+      \Drupal::logger('recurly')->notice('subscribe', []);
+      return Url::fromRoute("entity.$entity_type_id.recurlyjs_signup", [
+        $entity_type_id => $context['entity']->id(),
+        'plan_code' => $context['plan_code'],
+        'currency' => $currency_string,
+      ]);
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function recurlyjs_theme() {
+  $items['recurlyjs_update_billing'] = [
+    'render element' => 'form',
+    'template' => 'recurlyjs-update-billing',
+  ];
+  $items['recurlyjs_subscribe_page'] = [
+    'variables' => ['form' => NULL],
+    'template' => 'recurlyjs-subscribe-page',
+  ];
+  return $items;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function recurlyjs_form_recurly_settings_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  _recurlyjs_form_recurly_settings_form_alter($form, $form_state);
+}
+
+/**
+ * Form callback; Modifies the Recurly form at admin/config/services/recurly.
+ */
+function _recurlyjs_form_recurly_settings_form_alter(&$form, FormStateInterface $form_state) {
+  $form['recurlyjs'] = [
+    '#type' => 'details',
+    '#title' => t('Recurly.js settings'),
+    '#open' => TRUE,
+  ];
+
+  $recurly_url_manager = \Drupal::service('recurly.url_manager');
+  $recurly_account_link_text = t('your Recurly account');
+  if (\Drupal::config('recurly.settings')->get('recurly_subdomain')) {
+    $url = Url::fromUri($recurly_url_manager->hostedUrl('configuration/edit')->getUri())->toString();
+    $recurly_account_link = t('<a href=":recurly_configuration_url">:recurly_account_link_text</a>', [
+      ':recurly_configuration_url' => $url,
+      ':recurly_account_link_text' => $recurly_account_link_text,
+    ]);
+  }
+  else {
+    $recurly_account_link = $recurly_account_link_text;
+  }
+  $form['recurlyjs']['recurlyjs_address_requirement'] = [
+    '#title' => t('Address requirement level'),
+    '#type' => 'select',
+    '#options' => [
+      'full' => t('Full'),
+      'zipstreet' => t('Zip code and street'),
+      'zip' => t('Zip code only'),
+      'none' => t('None'),
+    ],
+    '#default_value' => \Drupal::config('recurlyjs.settings')->get('address_requirement') ?: 'full',
+    '#description' => t('Choose the level of address information required. Collecting more address information reduces the probability of fraudulent accounts. This setting should match the address requirements as configured on @link in "Site Settings".',
+      [
+        '@link' => $recurly_account_link,
+      ]),
+  ];
+
+  $form['recurlyjs']['recurlyjs_enable_add_ons'] = [
+    '#title' => t('Enable Add-ons'),
+    '#type' => 'checkbox',
+    '#default_value' => \Drupal::config('recurlyjs.settings')->get('recurlyjs_enable_add_ons') ?: 1,
+    '#description' => t('Add-ons are options that may be displayed in addition to the base subscription. If a subscription does not have add-ons, nothing additional will be displayed.'),
+  ];
+
+  $form['recurlyjs']['recurlyjs_enable_coupons'] = [
+    '#title' => t('Enable coupons'),
+    '#type' => 'checkbox',
+    '#default_value' => \Drupal::config('recurlyjs.settings')->get('recurlyjs_enable_coupons') ?: 0,
+    '#description' => t('Display the <em>Coupon Code</em> field on Recurly.js subscription forms.'),
+  ];
+
+  $form['recurlyjs']['recurlyjs_accept_paypal'] = [
+    '#title' => t('Enable PayPal'),
+    '#type' => 'checkbox',
+    '#default_value' => \Drupal::config('recurlyjs.settings')->get('recurlyjs_accept_paypal') ?: FALSE,
+    '#description' => t('Show an option to pay with PayPal. This requires a PayPal Business account with Referential Transactions enabled. <a href="@paypal_link">See the Recurly Paypal documentation</a>.', [
+      '@paypal_link' => 'https://docs.recurly.com/payment-gateways/paypal-payments',
+    ]),
+  ];
+
+  $form['#submit'][] = 'recurlyjs_settings_form_submit';
+}
+
+/**
+ * Form submit callback.
+ */
+function recurlyjs_settings_form_submit(array &$form, FormStateInterface $form_state) {
+  \Drupal::configFactory()->getEditable('recurlyjs.settings')
+    ->set('recurlyjs_address_requirement', $form_state->getValue('recurlyjs_address_requirement'))
+    ->set('recurlyjs_enable_add_ons', $form_state->getValue('recurlyjs_enable_add_ons'))
+    ->set('recurlyjs_enable_coupons', $form_state->getValue('recurlyjs_enable_coupons'))
+    ->set('recurlyjs_accept_paypal', $form_state->getValue('recurlyjs_accept_paypal'))
+    ->save();
+}
+
+/**
+ * Implements hook_entity_type_alter().
+ */
+function recurlyjs_entity_type_alter(array &$entity_types) {
+  $recurly_entity_type = \Drupal::config('recurly.settings')->get('recurly_entity_type');
+  $entity_type = $entity_types[$recurly_entity_type];
+  // Set up our link templates to be used in our routes.
+  // See alterRoutes in Drupal\recurlyjs\Routing\RecurlyJsRouteSubscriber.
+  if ($entity_type->hasViewBuilderClass() && $entity_type->hasLinkTemplate('canonical')) {
+    $entity_type->setLinkTemplate('recurlyjs-signup', $entity_type->getLinkTemplate('canonical') . '/subscription/signup/{plan_code}');
+    $entity_type->setLinkTemplate('recurlyjs-billing', $entity_type->getLinkTemplate('canonical') . '/subscription/billing');
+  }
+
+}
