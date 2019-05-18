@@ -1,0 +1,161 @@
+<?php
+
+/**
+ * @file
+ * Apsis mail module file.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+
+/**
+ * Implements hook_theme().
+ */
+function apsis_mail_theme() {
+  return [
+    'apsis_mail_block' => [
+      'render_element' => 'element',
+      'template' => 'apsis_mail-block',
+      'variables' => [
+        'body' => NULL,
+        'form' => NULL,
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function apsis_mail_form_user_form_alter(&$form, FormStateInterface $form_state) {
+  // Get apsis data.
+  $apsis = \Drupal::service('apsis');
+  $config = $apsis->config;
+  $mailing_lists = $apsis->getAllowedMailingLists();
+
+  // Get user info.
+  $user = $form_state->getFormObject()->getEntity();
+  $email = $user->getEmail();
+  $roles = $user->getRoles();
+
+  // Get role settings and trim values.
+  $apsis_roles = $config->get('user_roles') ?: [];
+  $allowed_roles = array_keys(array_filter($apsis_roles));
+
+  // Proceed if roles are matching and there is allowed mailing lists.
+  if (!empty(array_intersect($roles, $allowed_roles)) && !empty($mailing_lists)) {
+    $subscriber_id = $apsis->getSubscriberIdByEmail($email);
+
+    // Get subscribed lists directly from apsis to use as default value.
+    $lists_subscribed = [];
+    if ($subscriber_id) {
+      $lists = $apsis->getSubscriberMailingLists($subscriber_id);
+      foreach ($lists->Mailinglists as $list) {
+        $lists_subscribed[] = $list->Id;
+      }
+    }
+
+    $form['apsis'] = [
+      '#type' => 'container',
+      // Since these are faux fields, we put them last.
+      '#weight' => 49,
+    ];
+
+    // Render demographic data.
+    $allowedDemographicData = $apsis->getAllowedDemographicData();
+
+    $form['apsis']['apsis_demographic_data'] = [
+      '#type' => 'fieldset',
+      '#title' => t('Demographic data'),
+      '#tree' => TRUE,
+    ];
+
+    // Get Demograpic data states.
+    $user_info = $apsis->getSubscriberInfoByEmail($email);
+    $demographic_states = [];
+    if ($user_info) {
+      foreach ($user_info->DemDataFields as $demdata) {
+        $demographic_states[$demdata->Key] = $demdata->Value;
+      }
+    }
+
+    foreach ($allowedDemographicData as $key => $demographic) {
+      $alternatives = $demographic['alternatives'];
+      $required = $demographic['required'];
+      $state = \Drupal::state()->get('apsis_mail.demographic_data');
+      $label = !empty($state[$key]['label']) ? $state[$key]['label'] : $key;
+      $checkbox = $state[$key]['checkbox'];
+      $return_value = !empty($state[$key]['return_value']) ? $state[$key]['return_value'] : NULL;
+
+      $form['apsis']['apsis_demographic_data'][$key] = $apsis->demographicFormElement($alternatives, $label, $required, $checkbox, $return_value);
+      // Set default value if exists.
+      if (!empty($demographic_states[$key])) {
+        $form['apsis']['apsis_demographic_data'][$key]['#default_value'] = $demographic_states[$key];
+      }
+
+    }
+
+    // Add mailing lists element to form.
+    $form['apsis']['apsis_newsletter_signup'] = [
+      '#type' => 'checkboxes',
+      '#title' => t('Newsletters'),
+      '#description' => t('Subscribe to newsletter.'),
+      '#default_value' => $lists_subscribed,
+      '#options' => $mailing_lists,
+    ];
+
+    // Add submit handler.
+    $form['actions']['submit']['#submit'][] = '_apsis_mail_submit';
+  }
+}
+
+/**
+ * Submit handler.
+ */
+function _apsis_mail_submit($form, FormStateInterface $form_state) {
+  // Get Apsis service.
+  $apsis = \Drupal::service('apsis');
+
+  // Get user info.
+  $user = $form_state->getFormObject()->getEntity();
+  $email = $user->getEmail();
+  $name = $user->getUsername();
+
+  $subscriber_id = $apsis->getSubscriberIdByEmail($email);
+
+  // Get subscribed lists directly from apsis to use as default value.
+  $lists_subscribed = [];
+  if ($subscriber_id) {
+    $lists = $apsis->getSubscriberMailingLists($subscriber_id);
+    foreach ($lists->Mailinglists as $list) {
+      $lists_subscribed[] = $list->Id;
+    }
+  }
+
+  // Format demographic data.
+  $demographics = [];
+  foreach ($form_state->getValue('apsis_demographic_data') as $key => $value) {
+    // If it's a checkbox, the value is an integer.
+    // The alternatives from Apsis can be anything.
+    if (is_integer($value)) {
+      $return_value = \Drupal::state()->get('apsis_mail.demographic_data')[$key]['return_value'];
+      $alternatives = $apsis->getDemographicData()[$key]['alternatives'];
+
+      if (!$value) {
+        unset($alternatives[$return_value]);
+        $value = reset($alternatives);
+      } else {
+        $value = $alternatives[$return_value];
+      }
+    }
+    $demographics[] = [
+      'Key' => $key,
+      'Value' => $value,
+    ];
+  }
+
+  // Subscribe or unsubscribe to newsletters.
+  $values = $form_state->getValues();
+  foreach ($values['apsis_newsletter_signup'] as $list_id => $value) {
+    ($list_id == $value) ? $apsis->addSubscriber($list_id, $email, $name, $demographics) : $apsis->deleteSubscriber($list_id, $email);
+  }
+}
