@@ -1,0 +1,127 @@
+<?php
+
+namespace Drupal\responsive_tables_filter\Plugin\Filter;
+
+use Drupal\filter\FilterProcessResult;
+use Drupal\filter\Plugin\FilterBase;
+use Drupal\Core\Form\FormStateInterface;
+
+/**
+ * Responsive Tables Filter class. Implements process() method only.
+ *
+ * @Filter(
+ *   id = "filter_responsive_tables_filter",
+ *   title = @Translation("Apply responsive behavior to HTML tables."),
+ *   type = Drupal\filter\Plugin\FilterInterface::TYPE_MARKUP_LANGUAGE,
+ *   settings = {
+ *     "tablesaw_type" = "stack"
+ *   }
+ * )
+ */
+class FilterResponsiveTablesFilter extends FilterBase {
+
+  public static $modes = [
+    'stack' => "Stack Mode",
+    'columntoggle' => "Column Toggle Mode",
+    'swipe' => "Swipe Mode",
+  ];
+
+  /**
+   * {@inheritdoc}
+   */
+  public function process($text, $langcode) {
+    if ($filtered = $this->runFilter($text)) {
+      $result = new FilterProcessResult($filtered);
+      // Attach Tablesaw library assets to this page.
+      $result->setAttachments([
+        'library' => ['responsive_tables_filter/tablesaw-filter'],
+      ]);
+    }
+    else {
+      $result = new FilterProcessResult($text);
+    }
+
+    return $result;
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function settingsForm(array $form, FormStateInterface $form_state) {
+    $form['tablesaw_type'] = [
+      '#type' => 'select',
+      '#title' => $this->t('Default mode'),
+      '#default_value' => $this->settings['tablesaw_type'] ?? 'stack',
+      '#description' => $this->t('This will apply by default to tables in WYSIWYGs, but can be overridden on an individual basis by adding the <code>class</code> "tablesaw-stack", "tablesaw-columntoggle", or "tablesaw-swipe" to the <code>table</code> tag. See documentation: https://github.com/filamentgroup/tablesaw'),
+      '#options' => self::$modes,
+    ];
+    return $form;
+  }
+
+  /**
+   * Business logic for adding classes & attributes to <table> tags.
+   */
+  public function runFilter($text) {
+    // Older versions of libxml always add DOCTYPE, <html>, and <body> tags.
+    // See http://www.php.net/manual/en/libxml.constants.php.
+    // Sometimes, PHP is >= 5.4, but libxml is old enough that the constants are
+    // not defined.
+    static $new_libxml;
+    if (!isset($new_libxml)) {
+      $new_libxml = version_compare(PHP_VERSION, '5.4', '>=') && defined('LIBXML_HTML_NOIMPLIED') && defined('LIBXML_HTML_NODEFDTD');
+    }
+    if ($text != '') {
+      $tables = [];
+      libxml_use_internal_errors(TRUE);
+      // LibXML requires that the html is wrapped in a root node.
+      $text = '<root>' . $text . '</root>';
+      $dom = new \DOMDocument();
+      if ($new_libxml) {
+        $dom->loadHTML(mb_convert_encoding($text, 'HTML-ENTITIES', 'UTF-8'), LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+      }
+      else {
+        $dom->loadHTML(mb_convert_encoding($text, 'HTML-ENTITIES', 'UTF-8'));
+      }
+
+      $tables = $dom->getElementsByTagName('table');
+      // Find all tables in text.
+      if ($tables->length !== 0) {
+        foreach ($tables as $table) {
+          // Find existing class attributes, if any, and append tablesaw class.
+          $existing_classes = $table->getAttribute('class');
+          if (strpos($existing_classes, 'no-tablesaw') === FALSE) {
+            $type = $this->settings['tablesaw_type'] ?? 'stack';
+            // Allow for class-based override of default.
+            foreach (array_keys(self::$modes) as $mode) {
+              if (strpos($existing_classes, "tablesaw-" . $mode) !== FALSE) {
+                $type = $mode;
+                break;
+              }
+            }
+            $new_classes = !empty($existing_classes) ? $existing_classes . ' tablesaw tablesaw-' . $type : 'tablesaw tablesaw-' . $type;
+            $table->setAttribute('class', $new_classes);
+            // Set data-tablesaw-mode & minimap.
+            $table->setAttribute('data-tablesaw-mode', $type);
+            $table->setAttribute('data-tablesaw-minimap', NULL);
+          }
+        }
+        // Get innerHTML of root node.
+        $html = "";
+        foreach ($dom->getElementsByTagName('root')->item(0)->childNodes as $child) {
+          // Re-serialize the HTML.
+          $html .= $dom->saveHTML($child);
+        }
+        // For lower older libxml, use preg_replace to clean up DOCTYPE.
+        if (!$new_libxml) {
+          $html_start = strpos($html, '<html><body>') + 12;
+          $html_length = strpos($html, '</body></html>') - $html_start;
+          $html = substr($html, $html_start, $html_length);
+        }
+
+        return $html;
+      }
+    }
+    return FALSE;
+  }
+
+}
