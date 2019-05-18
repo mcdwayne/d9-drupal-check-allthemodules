@@ -1,0 +1,305 @@
+<?php
+
+/**
+ * @file
+ * Provides functionality for the Commerce Canada Post module.
+ */
+
+use Drupal\commerce_canadapost\Api\TrackingService;
+use Drupal\Core\Datetime\DrupalDateTime;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+
+/**
+ * Constants.
+ */
+
+/**
+ * The name of the logger channel to use throughout this module.
+ */
+const COMMERCE_CANADAPOST_LOGGER_CHANNEL = 'commerce_canadapost';
+
+/**
+ * Hooks.
+ */
+
+/**
+ * Implements hook_help().
+ */
+function commerce_canadapost_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the commerce_canadapost module.
+    case 'help.page.commerce_canadapost':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('This module provides Canada Post shipping calculations for Drupal Commerce by extending the Drupal Commerce Shipping API. This module should be used by those that want to provide dynamic Canada Post shipping rates and tracking for their Canada based Drupal Commerce sites.') . '</p>';
+      $output .= '<h3>' . t('Configuration') . '</h3>';
+      $output .= '<dt>' . t('1. Go to /admin/commerce/config/shipping-methods/add') . '</dt>';
+      $output .= '<dt>' . t('2. Select \'Canada Post\' as the Plugin') . '</dt>';
+      $output .= '<dt>' . t('3. Enter the Canada Post API details') . '</dt>';
+      $output .= '<dt>' . t('4. Select a default package type') . '</dt>';
+      $output .= '<dt>' . t('5. Select all the shipping services that should be enabled') . '</dt>';
+      $output .= '<dt>' . t('6. Click on \'API Authentication\' and add your customer number, username, password and other optional config and save configuration.') . '</dt>';
+      $output .= '<dt>' . t('7. Go to /admin/commerce/config/order-types/{COMMERCE_ORDER_TYPE}/edit and select \'Canada Post\' for the Shipment type and save.') . '</dt>';
+      $output .= '<h3>' . t('Fetching Rates') . '</h3>';
+      $output .= '<dt>' . t('1. Add a product to cart and checkout') . '</dt>';
+      $output .= '<dt>' . t('2. Enter your shipping address and click on \'Calculate Shipping\'') . '</dt>';
+      $output .= '<dt>' . t('3. The estimated rates retrieved from Canada Post will now show up for the order.') . '</dt>';
+      $output .= '<h3>' . t('Updating Tracking Information') . '</h3>';
+      $output .= '<p>' . t('Tracking summary for each shipment on an order can be seen in the order view page.') . '</p>';
+      $output .= '<p>' . t('To add the tracking code received from Canada Post to a shipment:') . '</p>';
+      $output .= '<dt>' . t('1. Go to /admin/commerce/orders/{COMMERCE_ORDER_ID}/shipments') . '</dt>';
+      $output .= '<dt>' . t('2. Click on the \'Edit\' button under the appropriate shipment') . '</dt>';
+      $output .= '<dt>' . t('3. Enter the tracking code received from Canada Post in the \'Tracking code\' field and save') . '</dt>';
+      $output .= '<p>' . t('Once a tracking code is added to a shipment, tracking summary is automatically updated when the shipment form is saved and also via cron.
+       <br>It can also be done manually via the drush command: <code>drush cc-uptracking</code>.') . '</p>';
+
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function commerce_canadapost_form_commerce_shipment_canadapost_edit_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  array_unshift($form['actions']['submit']['#submit'], 'commerce_canadapost_commerce_shipment_form_submit');
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function commerce_canadapost_form_commerce_checkout_flow_multistep_default_alter(&$form, FormStateInterface $form_state, $form_id) {
+  if (!isset($form['shipping_information']['shipments'])) {
+    return;
+  }
+
+  $utilities_service = \Drupal::service('commerce_canadapost.utilities_service');
+  $utilities_service->hideTrackingFields($form);
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function commerce_canadapost_form_commerce_checkout_flow_alter(&$form, FormStateInterface $form_state, $form_id) {
+  if (!isset($form['shipping_information']['shipments'])) {
+    return;
+  }
+
+  $utilities_service = \Drupal::service('commerce_canadapost.utilities_service');
+  $utilities_service->hideTrackingFields($form);
+}
+
+/**
+ * Implements hook_entity_base_field_info().
+ */
+function commerce_canadapost_entity_base_field_info(EntityTypeInterface $entity_type) {
+  if ($entity_type->id() !== 'commerce_store') {
+    return;
+  }
+
+  $fields['canadapost_api_settings'] = BaseFieldDefinition::create('string_long')
+    ->setLabel(t('Canada Post API Settings'))
+    ->setDisplayOptions('view', [
+      'region' => 'hidden',
+    ])
+    ->setDisplayOptions('form', [
+      'region' => 'hidden',
+    ])
+    ->setDisplayConfigurable('form', TRUE)
+    ->setDisplayConfigurable('view', TRUE);
+
+  return $fields;
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function commerce_canadapost_form_commerce_store_form_alter(
+  &$form,
+  FormStateInterface $form_state,
+  $form_id
+) {
+  /** @var \Drupal\commerce_store\Entity\StoreInterface $store */
+  $store = $form_state->getFormObject()->getEntity();
+
+  // Build the form fields.
+  $utilities_service = \Drupal::service('commerce_canadapost.utilities_service');
+  $form += $utilities_service->buildApiForm($store);
+
+  $form['#validate'][] = 'commerce_canadapost_form_commerce_store_form_validate';
+  $form['actions']['submit']['#submit'][] = 'commerce_canadapost_form_commerce_store_form_submit';
+}
+
+/**
+ * Implements hook_cron().
+ */
+function commerce_canadapost_cron() {
+  // Update tracking data for all incomplete canadapost shipments with a
+  // tracking code.
+  commerce_canadapost_update_tracking();
+}
+
+/**
+ * Functions.
+ */
+
+/**
+ * Provides a submit handler for the 'Save commerce shipment' button.
+ */
+function commerce_canadapost_commerce_shipment_form_submit($form, FormStateInterface $form_state) {
+  if (empty($form_state->getValue('tracking_code')[0]['value'])) {
+    return;
+  }
+
+  /** @var \Drupal\commerce_shipping\Entity\Shipment $shipment */
+  $shipment = $form_state->getFormObject()->getEntity();
+  $current_tracking_pin = $shipment->get('tracking_code')->value;
+  $submitted_tracking_pin = $form_state->getValue('tracking_code')[0]['value'];
+  if ($submitted_tracking_pin === $current_tracking_pin) {
+    return;
+  }
+
+  /** @var \Drupal\commerce_canadapost\Api\TrackingService $tracking_service */
+  $tracking_service = \Drupal::service('commerce_canadapost.tracking_api');
+  $tracking_summary = $tracking_service->fetchTrackingSummary($submitted_tracking_pin, $shipment);
+
+  // Update the tracking fields with the summary.
+  if ($tracking_summary['actual-delivery-date'] != '') {
+    $form_state->setValue('canadapost_actual_delivery', [
+      0 => [
+        'value' => new DrupalDateTime($tracking_summary['actual-delivery-date']),
+      ],
+    ]);
+  }
+  if ($tracking_summary['attempted-date'] != '') {
+    $form_state->setValue('canadapost_attempted_delivery', [
+      0 => [
+        'value' => new DrupalDateTime($tracking_summary['attempted-date']),
+      ],
+    ]);
+  }
+
+  if ($tracking_summary['expected-delivery-date'] != '') {
+    $form_state->setValue('canadapost_expected_delivery', [
+      0 => [
+        'value' => new DrupalDateTime($tracking_summary['expected-delivery-date']),
+      ],
+    ]);
+  }
+
+  if ($tracking_summary['mailed-on-date'] != '') {
+    $form_state->setValue('canadapost_mailed_on', [
+      0 => [
+        'value' => new DrupalDateTime($tracking_summary['mailed-on-date']),
+      ],
+    ]);
+  }
+
+  if ($tracking_summary['event-location'] != '') {
+    $form_state->setValue('canadapost_current_location', [
+      0 => [
+        'value' => $tracking_summary['event-location'],
+      ],
+    ]);
+  }
+}
+
+/**
+ * Form validate for the commerce_store entity form.
+ */
+function commerce_canadapost_form_commerce_store_form_validate($form, FormStateInterface $form_state) {
+  $form_values = $form_state->getValues();
+
+  // If the store-wide settings are not checked, load all shipping methods that
+  // are available to that store and if there's any without settings, throw a
+  // form error.
+  if ($form_values['commerce_canadapost_store_settings']) {
+    return;
+  }
+
+  $store = $form_state->getFormObject()->getEntity();
+  $shipping_methods = \Drupal::entityTypeManager()
+    ->getStorage('commerce_shipping_method')
+    ->loadByProperties([
+      'stores' => $store->id(),
+    ]);
+
+  foreach ($shipping_methods as $shipping_method) {
+    /** @var \Drupal\commerce_canadapost\Plugin\Commerce\ShippingMethod\CanadaPost $shipping_method_plugin */
+    $shipping_method_plugin = $shipping_method->getPlugin();
+    if ($shipping_method_plugin->getPluginId() !== 'canadapost') {
+      continue;
+    }
+
+    // If settings are empty, output an error and break out of the loop.
+    if ($shipping_method_plugin->apiIsConfigured()) {
+      continue;
+    }
+
+    $form_state->setErrorByName(
+      'commerce_canadapost_store_settings',
+      t('There are shipping methods that rely on the Canada Post API settings defined here. Please configure the API settings for this store or the shipping methods.')
+    );
+  }
+}
+
+/**
+ * Form submit for the commerce_store entity form.
+ */
+function commerce_canadapost_form_commerce_store_form_submit($form, FormStateInterface $form_state) {
+  $store = $form_state->getFormObject()->getEntity();
+
+  // Grab the form values.
+  $form_values = $form_state->getValues();
+
+  // If the user has opted to create Canada Post API settings for this store.
+  $utilities_service = \Drupal::service('commerce_canadapost.utilities_service');
+
+  // If the use store-wide settings checkbox is checked.
+  if ($form_values['commerce_canadapost_store_settings']) {
+    $settings = $utilities_service->encodeSettings($form_values);
+  }
+  // Else, we empty out the store settings.
+  else {
+    $settings = NULL;
+  }
+
+  $store->set('canadapost_api_settings', $settings);
+  $store->save();
+}
+
+/**
+ * Update tracking data for all incomplete Canada Post shipments.
+ *
+ * @param array $order_ids
+ *   An array of order IDs to update the tracking data for. Leave empty to
+ *   update all orders with incomplete shipments.
+ *
+ * @return array
+ *   An array of order IDs for which the shipments were updated for.
+ */
+function commerce_canadapost_update_tracking(array $order_ids = NULL) {
+  $updated_order_ids = [];
+
+  // Fetch shipments for tracking.
+  $utilities_service = \Drupal::service('commerce_canadapost.utilities_service');
+
+  $shipments = $utilities_service->fetchShipmentsForTracking($order_ids);
+  if (!$shipments) {
+    return [];
+  }
+
+  $tracking = \Drupal::service('commerce_canadapost.tracking_api');
+  foreach ($shipments as $shipment) {
+    /** @var \Drupal\commerce_shipping\Entity\ShipmentInterface $shipment */
+    // Fetch tracking summary.
+    $tracking_summary = $tracking->fetchTrackingSummary($shipment->getTrackingCode(), $shipment);
+
+    // Update the shipment fields with the tracking data.
+    $updated_order_ids[] = $utilities_service->updateTrackingFields($shipment, $tracking_summary);
+  }
+
+  return $updated_order_ids;
+}

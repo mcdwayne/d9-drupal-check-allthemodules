@@ -1,0 +1,165 @@
+<?php
+
+/**
+ * @file
+ * Install file for Commerce Canada Post module.
+ */
+
+use Drupal\field\Entity\FieldConfig;
+use Drupal\field\Entity\FieldStorageConfig;
+use Symfony\Component\Yaml\Yaml;
+
+/**
+ * Add Commerce Canada Post as a dependency to config files.
+ */
+function commerce_canadapost_update_8001() {
+  $config_factory = \Drupal::configFactory();
+
+  // Add dependency to Canada Post shipment type.
+  $config = $config_factory->getEditable('commerce_shipping.commerce_shipment_type.canadapost');
+  $config->set('dependencies.module', ['commerce_canadapost']);
+  $config->set('dependencies.enforced.module', ['commerce_canadapost']);
+  $config->save();
+
+  // Add dependency to Canada Post field storage fields.
+  $configs = [
+    'field.storage.commerce_shipment.field_actual_delivery',
+    'field.storage.commerce_shipment.field_attempted_delivery',
+    'field.storage.commerce_shipment.field_expected_delivery',
+    'field.storage.commerce_shipment.field_mailed_on',
+  ];
+
+  foreach ($configs as $config) {
+    $config = $config_factory->getEditable($config);
+    $config->set('dependencies.config', ['commerce_shipping.commerce_shipment_type.canadapost']);
+    $config->save();
+  }
+}
+
+/**
+ * Copy Canada Post API sitewide settings to all existing store entities.
+ */
+function commerce_canadapost_update_8002() {
+  $config_factory = \Drupal::configFactory();
+
+  // Fetch the Canada Post API sitewide settings.
+  $config_id = 'commerce_canadapost.settings';
+  $config = $config_factory->get($config_id);
+
+  /** @var \Drupal\commerce_canadapost\UtilitiesService $utilities_service */
+  $utilities_service = \Drupal::service('commerce_canadapost.utilities_service');
+  $values = [];
+  foreach ($utilities_service->getApiKeys() as $key) {
+    $values[$key] = $config->get("api.$key");
+  }
+
+  // Grab all existing stores.
+  $stores = \Drupal::entityTypeManager()
+    ->getStorage('commerce_store')
+    ->loadMultiple();
+
+  // Save the settings to the store.
+  foreach ($stores as $store) {
+    $json_encoded_settings = $utilities_service->encodeSettings($values);
+    $store->set('canadapost_api_settings', $json_encoded_settings);
+    $store->save();
+  }
+
+  // Finally, delete the sitewide settings config.
+  $config = $config_factory->getEditable($config_id);
+  $config->delete();
+}
+
+/**
+ * Update Commerce Canada Post shipment type field names.
+ */
+function commerce_canadapost_update_8003() {
+  $new_fields = [
+    'field_actual_delivery' => 'canadapost_actual_delivery',
+    'field_attempted_delivery' => 'canadapost_attempted_delivery',
+    'field_current_location' => 'canadapost_current_location',
+    'field_expected_delivery' => 'canadapost_expected_delivery',
+    'field_mailed_on' => 'canadapost_mailed_on',
+  ];
+
+  // Create the new fields in the database.
+  foreach ($new_fields as $old_field => $new_field) {
+    $module_path = drupal_get_path('module', 'commerce_canadapost');
+
+    // Create the field storage.
+    $yml = Yaml::parse(file_get_contents($module_path . '/config/install/field.storage.commerce_shipment.' . $new_field . '.yml'));
+    if (!FieldStorageConfig::loadByName($yml['entity_type'], $yml['field_name'])) {
+      FieldStorageConfig::create($yml)->save();
+    }
+    // Create the field.
+    $yml = Yaml::parse(file_get_contents($module_path . '/config/install/field.field.commerce_shipment.canadapost.' . $new_field . '.yml'));
+    if (!FieldConfig::loadByName($yml['entity_type'], $yml['bundle'], $yml['field_name'])) {
+      FieldConfig::create($yml)->save();
+    }
+  }
+
+  // Re-import our default configs.
+  \Drupal::service('config.installer')->installDefaultConfig('module', 'commerce_canadapost');
+
+  // Copy over the data from the old fields to the new fields.
+  _commerce_canadapost_copy_field_data($new_fields);
+
+  // Finally, let's delete the old fields.
+  foreach ($new_fields as $old_field => $new_field) {
+    // Delete the field storage.
+    $field = FieldStorageConfig::loadByName('commerce_shipment', $old_field);
+    if ($field) {
+      $field->delete();
+    }
+    // Delete the field.
+    $field = FieldConfig::loadByName('commerce_shipment', 'canadapost', $old_field);
+    if ($field) {
+      $field->delete();
+    }
+  }
+}
+
+/**
+ * Copy over the old field data to the new renamed fields.
+ *
+ * @param array $new_fields
+ *   The old and new field names.
+ */
+function _commerce_canadapost_copy_field_data(array $new_fields) {
+  /** @var \Drupal\Core\Entity\EntityTypeManagerInterface $entity_type_manager */
+  $entity_type_manager = \Drupal::entityTypeManager();
+  /** @var \Drupal\Core\Entity\EntityStorageInterface $shipment_storage */
+  $shipment_storage = $entity_type_manager->getStorage('commerce_shipment');
+
+  if (!isset($sandbox['max'])) {
+    $sandbox['current'] = 0;
+    $sandbox['count'] = 0;
+    $sandbox['max'] = $shipment_storage->getQuery()
+      ->accessCheck(FALSE)
+      ->condition('type', 'canadapost')
+      ->count()->execute();
+  }
+  $shipment_ids = $shipment_storage->getQuery()
+    ->accessCheck(FALSE)
+    ->range(0, 50)
+    ->condition('type', 'canadapost')
+    ->condition('shipment_id', $sandbox['current'], '>')
+    ->sort('shipment_id', 'ASC')
+    ->execute();
+  $shipments = $shipment_storage->loadMultiple($shipment_ids);
+
+  /** @var \Drupal\node\NodeInterface $node */
+  foreach ($shipments as $shipment) {
+    foreach ($new_fields as $old_field => $new_field) {
+      if ($shipment->hasField($old_field)) {
+        $field_value = $shipment->get($old_field)->getValue();
+        $shipment->set($new_field, $field_value);
+      }
+    }
+
+    $shipment->save();
+    $sandbox['current'] = $shipment->id();
+    $sandbox['count']++;
+  }
+  $sandbox['#finished'] = empty($sandbox['max']) ? 1 : $sandbox['current'] / $sandbox['max'];
+}
