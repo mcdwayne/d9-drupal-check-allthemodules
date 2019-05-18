@@ -1,0 +1,234 @@
+<?php
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\node\NodeTypeInterface;
+use Drupal\nodeletter\SendingStatus;
+use Drupal\nodeletter\Entity\NodeletterSendingInterface;
+use Drupal\nodeletter\NodeletterSendException;
+use Drupal\node\Entity\Node;
+use Drupal\Core\Url;
+use Drupal\Core\Logger\RfcLogLevel;
+
+function nodeletter_entity_operation_alter(array &$operations, \Drupal\Core\Entity\EntityInterface $entity) {
+  if ($entity instanceof \Drupal\nodeletter\Entity\NodeletterSending) {
+    $operations['view'] = [
+      'title' => t('View'),
+      'url' => $entity->toUrl(),
+      'weight' => 50,
+    ];
+  } else if ($entity instanceof \Drupal\node\Entity\NodeType) {
+    $nl_srvc = nodeletter_service();
+    if ($nl_srvc->nodeTypeEnabled($entity)) {
+      $url = Url::fromRoute('nodeletter.node_type_settings', ['node_type' => $entity->id()]);
+      $operations['nodeletter'] = [
+        'title' => t('Nodeletter'),
+        'url' => $url,
+        'weight' => 70,
+      ];
+    }
+  }
+}
+
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter() for 'node_type_form'.
+ */
+function nodeletter_form_node_type_form_alter(&$form, FormStateInterface $form_state) {
+
+  /** @var \Drupal\node\NodeTypeForm $node_type_form */
+  $node_type_form = $form_state->getFormObject();
+  /** @var \Drupal\node\Entity\NodeType $node_type */
+  $node_type = $node_type_form->getEntity();
+
+  $form['nodeletter'] = [
+    '#type' => 'details',
+    '#title' => t('Nodeletter'),
+    '#group' => 'additional_settings',
+    '#tree' => TRUE,
+    '#attached' => [
+      'library' => ['nodeletter/vertical_tabs']
+    ],
+  ];
+
+  $form['nodeletter']['enabled'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Enable nodeletter functionality'),
+    '#description' => t(
+      'Check this box if newsletter functionality should be available for %type nodes.',
+      [ '%type' => $node_type->label() ]
+    ),
+    '#default_value' => $node_type->getThirdPartySetting('nodeletter', 'enabled', 0),
+  ];
+
+  /** @var \Drupal\nodeletter\NodeletterSender\NodeletterSenderManager $sender_manager */
+  $sender_manager = \Drupal::service('plugin.manager.nodeletter_sender');
+  $sender_plugins = $sender_manager->getDefinitions();
+
+  $provider_options = [];
+  foreach($sender_plugins as $service_provider_definition) {
+    $provider_options[ $service_provider_definition['id'] ] = $service_provider_definition['label'];
+  }
+  $default_provider = $node_type->getThirdPartySetting('nodeletter', 'service_provider', NULL);
+  if (!$default_provider)
+    $default_provider = array_keys($provider_options)[0];
+
+  $form['nodeletter']['service_provider'] = array(
+    '#type' => 'select',
+    '#title' => t('Newsletter Service Provider'),
+    '#description' => t('Select the service provider to use for creating and sending newsletters.'),
+    '#options' => $provider_options,
+    '#default_value' => $default_provider,
+    '#required' => TRUE,
+    '#disabled' => count($provider_options) <= 1,
+    '#states' => [
+      'visible' => [
+        ':input[name="nodeletter[enabled]"]' => ['checked' => TRUE]
+      ],
+    ],
+  );
+//
+//  $form['nodeletter']['template'] = [
+//    '#type' => 'container',
+//    '#tree' => TRUE,
+//  ];
+//
+//  $form['nodeletter']['template']['id'] = [
+//    '#type' => 'markup',
+//    '#markup' => $node_type->getThirdPartySetting('nodeletter.template', 'id', NULL)
+//  ];
+//
+//  $form['nodeletter']['template']['select'] = [
+//    '#type' => 'button',
+//    '#value' => 'Select Template',
+//    '#ajax' => [
+//      'callback' => 'Drupal\osce_press_release_newsletter\Form\NodeTypeSettingsFormHelper::templateSelectAjax',
+//    ],
+//  ];
+//
+//  $form['#attached']['library'][] = 'core/drupal.dialog.ajax';
+  $form['#entity_builders'][] = 'nodeletter_form_node_type_form_builder';
+}
+
+
+/**
+ * TODO: document!
+ * @param $entity_type
+ * @param \Drupal\node\NodeTypeInterface $type
+ * @param $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+function nodeletter_form_node_type_form_builder($entity_type,
+                                                NodeTypeInterface $type,
+                                                &$form,
+                                                FormStateInterface $form_state) {
+
+  if ( ! $form_state->isSubmitted())
+    return;
+
+  $values = $form_state->getValue('nodeletter');
+  if ($values['enabled'] === 1) {
+    $type->setThirdPartySetting('nodeletter', 'enabled', 1);
+    $type->setThirdPartySetting('nodeletter', 'service_provider',
+      $values['service_provider']);
+  } else {
+    $type->unsetThirdPartySetting('nodeletter', 'enabled');
+    $type->unsetThirdPartySetting('nodeletter', 'service_provider');
+  }
+}
+
+
+/**
+ * Implements hook_cron().
+ */
+function nodeletter_cron() {
+
+  $settings = \Drupal::config('nodeletter.settings');
+  $monitoring_interval = $settings->get('sending_monitor_interval');
+  $last_monitoring = \Drupal::state()->get('nodeletter.last_sending_monitoring', 0);
+
+  if (REQUEST_TIME - $last_monitoring < $monitoring_interval*60) {
+    // it's not yet time for monitoring the sendings.
+    return;
+  }
+
+  // TODO: Using the Queue API might help to scale up!
+
+  $query = \Drupal::entityQuery('nodeletter_sending');
+  $query->condition('sending_status', SendingStatus::listRunningStates(), 'IN');
+  $sending_ids = $query->execute();
+
+  if (empty($sending_ids)) {
+    // no running sendings.
+    return;
+  }
+
+  /** @var \Drupal\nodeletter\NodeletterService $nodeletter */
+  $nodeletter = \Drupal::service('nodeletter');
+
+  $storage = \Drupal::entityTypeManager()->getStorage('nodeletter_sending');
+  /** @var NodeletterSendingInterface[] $sendings */
+  $sendings = $storage->loadMultiple($sending_ids);
+
+  foreach($sendings as $sending) {
+    $service_provider_id = $sending->getServiceProvider();
+    $sender = $nodeletter->getNodeletterSenderByPluginId($service_provider_id);
+    $status_changed = FALSE;
+    try {
+      $status = $sender->retrieveCurrentSendingStatus($sending->getSendingId());
+      if ($status != $sending->getSendingStatus()) {
+        $sending->setSendingStatus($status);
+        $sending->save();
+        $status_changed = TRUE;
+      }
+    } catch (NodeletterSendException $e) {
+      $sending->setSendingStatus(SendingStatus::FAILED);
+      $sending->setErrorCode($e->getCode());
+      $sending->setErrorMessage($e->getMessage());
+      $sending->save();
+      $status_changed = TRUE;
+    }
+
+    if ($status_changed) {
+      $sending_node = Node::load($sending->getNodeId());
+      $sending_node_url = Url::fromRoute(
+        'entity.node.canonical',
+        ['node' => $sending_node->id()]
+      )->toString();
+
+      if ($sending->getSendingStatus() == SendingStatus::FAILED)
+        $level = RfcLogLevel::WARNING;
+      else
+        $level = RfcLogLevel::NOTICE;
+      \Drupal::logger('nodeletter')->log(
+        $level,
+        'Status of sending @id for <a href="{node_url}">node %node_title</a> ' .
+        'changed to %status',
+        [
+          '@id' => $sending->id(),
+          '%node_title' => $sending_node->getTitle(),
+          'node_url' => $sending_node_url,
+          '%status' => $sending->getSendingStatus(),
+        ]
+      );
+    }
+  }
+
+  \Drupal::state()->set('nodeletter.last_sending_monitoring', REQUEST_TIME);
+}
+
+
+
+/**
+ * Retrieve nodeletter service
+ *
+ * @deprecated use ContainerInterface instead.
+ * @return \Drupal\nodeletter\NodeletterService
+ * @throws \Exception
+ */
+function nodeletter_service() {
+  /** @var \Drupal\nodeletter\NodeletterService $service */
+  $service = \Drupal::service('nodeletter');
+  if ( ! $service instanceof \Drupal\nodeletter\NodeletterService)
+    throw new Exception('Nodeletter service not found');
+  return $service;
+}
