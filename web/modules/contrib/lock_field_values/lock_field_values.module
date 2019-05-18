@@ -1,0 +1,363 @@
+<?php
+
+/**
+ * @file
+ * Contains lock_field_values.module.
+ */
+
+use Drupal\Core\Config\Entity\ThirdPartySettingsInterface;
+use Drupal\Core\Entity\ContentEntityInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Link;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Url;
+use Drupal\field\Entity\FieldConfig;
+use Drupal\field_list_details\FieldListDetailsCollection;
+use Drupal\user\Entity\User;
+
+/**
+ * Implements hook_help().
+ */
+function lock_field_values_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.lock_field_values':
+      $project_url = Url::fromUri('https://drupal.org/project/eventbrite_attendees', ['external'=> TRUE]);
+      $project_link = Link::fromTextAndUrl('project page on Drupal.org', $project_url)->toString();
+      $output = '';
+      $output.= '<p>' . t('Allows administrators to lock the values of fields on any entity. Introduces a new setting for fields that enable the ability for the values to be locked per-entity.') . '</p>';
+      $output.= '<p>' . t('See the @project_link for more details.', ['@project_link' => $project_link]) . '</p>';
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_preprocess_field().
+ *
+ * - Add lock field values classes to fields for front-end themeing.
+ */
+function lock_field_values_preprocess_field(&$variables) {
+  if (empty($variables['element']['#items']) || empty($variables['element']['#object'])) {
+    return;
+  }
+
+  /** @var \Drupal\Core\Field\FieldDefinitionInterface $field */
+  $field = $variables['element']['#items']->getFieldDefinition();
+
+  /** @var \Drupal\Core\Entity\ContentEntityBase $entity */
+  $entity = $variables['element']['#object'];
+
+  if ($field instanceof FieldConfig && $entity instanceof ContentEntityInterface) {
+    $settings = $field->getThirdPartySettings('lock_field_values');
+
+    if (!empty($settings['lockable'])) {
+      $existing_lock = lock_field_values_get_lock($entity->getEntityTypeId(), $entity->bundle(), $entity->id(), $field->getName());
+      $variables['attributes']['class'][] = 'lock-field-values--lockable';
+
+      if ($existing_lock) {
+        $variables['attributes']['class'][] = $existing_lock->lock_state ? 'lock-field-values--locked' : 'lock-field-values--unlocked';
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_delete().
+ *
+ * - Remove all lock_field_values data on entity delete.
+ */
+function lock_field_values_entity_delete(EntityInterface $entity) {
+  \Drupal::database()->delete('lock_field_values')
+    ->condition('entity_id', $entity->id())
+    ->condition('entity_type', $entity->getEntityTypeId())
+    ->condition('bundle', $entity->bundle())
+    ->execute();
+}
+
+/**
+ * Implements hook_field_list_details_alter().
+ *
+ * - Show which fields are lockable on the manage fields list builder.
+ */
+function lock_field_values_field_list_details_alter(FieldListDetailsCollection $collection, $field) {
+
+  if ($field instanceof ThirdPartySettingsInterface) {
+    $settings = $field->getThirdPartySettings('lock_field_values');
+
+    if (!empty($settings['lockable'])) {
+      $collection->setDetail('lockable', t('true'), t('Lockable'));
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * - Add lock_field_values settings form to each configurable field.
+ */
+function lock_field_values_form_field_config_edit_form_alter(array &$form, FormStateInterface $form_state) {
+  /** @var Drupal\field\Entity\FieldConfig $field */
+  $field = $form_state->getFormObject()->getEntity();
+  $settings = $field->getThirdPartySettings('lock_field_values');
+
+  $form['settings']['lock_field_values'] = [
+    '#type'    => 'container',
+    '#tree'    => TRUE,
+    '#weight'  => 2,
+    '#parents' => ['third_party_settings', 'lock_field_values'],
+  ];
+  $form['settings']['lock_field_values']['lockable'] = [
+    '#type'          => 'checkbox',
+    '#title'         => t('Administrator can lock values'),
+    '#default_value' => !empty($settings['lockable']),
+    '#description'   => t('Enable the ability for administrators to lock the values of this field from being changed by non-authorized users.'),
+  ];
+}
+
+/**
+ * Implements hook_field_widget_form_alter().
+ *
+ * - Store an array of lockable fields within the $form_state.
+ */
+function lock_field_values_field_widget_form_alter(&$element, FormStateInterface $form_state, $context) {
+  /** @var \Drupal\Core\Field\FieldDefinitionInterface $field */
+  $field = $context['items']->getFieldDefinition();
+
+  if ($field instanceof ThirdPartySettingsInterface) {
+    $settings = $field->getThirdPartySettings('lock_field_values');
+
+    if (!empty($settings['lockable'])) {
+      $lockable_fields = $form_state->get('lock_field_values_fields');
+
+      if (empty($lockable_fields)) {
+        $lockable_fields = [];
+      }
+
+      $lockable_fields[$field->getName()] = $field->getName();
+      $form_state->set('lock_field_values_fields', $lockable_fields);
+    }
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * - Add the administrator form elements for locking fields. Field lockability
+ *   is determined by the $form_state data set in hook_widget_form_alter().
+ */
+function lock_field_values_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $lockable_fields = $form_state->get('lock_field_values_fields');
+
+  if (!empty($lockable_fields)) {
+    $can_manage_locks = \Drupal::currentUser()->hasPermission('lock and unlock fields');
+
+    foreach ($lockable_fields as $field_name) {
+      /** @var \Drupal\Core\Entity\ContentEntityBase $entity */
+      $entity = $form_state->getFormObject()->getEntity();
+      $existing_lock = lock_field_values_get_lock($entity->getEntityTypeId(), $entity->bundle(), $entity->id(), $field_name);
+
+      // Add some classes for back-end themeing.
+      $form[$field_name]['#attributes']['class'][] = 'field-settings--lock-field-values--lockable';
+
+      if ($existing_lock) {
+        $form[$field_name]['#attributes']['class'][] = $existing_lock->lock_state ? 'field-settings--lock-field-values--locked' : 'field-settings--lock-field-values--unlocked';
+      }
+
+      // Disable fields that are locked if the user doesn't have permission to
+      // manage locks.
+      if ($existing_lock && $existing_lock->lock_state && !$can_manage_locks) {
+        $form[$field_name]['#disabled'] = TRUE;
+        $form[$field_name]['widget']['add_more']['#access'] = FALSE;
+
+        // Get the max_delta, and adjust it for unlimited cardinality.
+        // Use this to determine which child elements of the widget to remove.
+        $max_delta = $form[$field_name]['widget']['#max_delta'];
+
+        if ($form[$field_name]['widget']['#cardinality'] < 0) {
+          $max_delta -= 1;
+        }
+
+        foreach (Element::children($form[$field_name]['widget']) as $key) {
+          // Disable child elements.
+          $form[$field_name]['widget'][$key]['#disabled'] = TRUE;
+
+          // Remove "new item" elements. aka, any delta over the max_delta.
+          if (!empty($form[$field_name]['widget'][$key]['#delta']) && $form[$field_name]['widget'][$key]['#delta'] > $max_delta) {
+            unset($form[$field_name]['widget'][$key]);
+          }
+        }
+      }
+
+      // Administrator field for locking values.
+      if ($can_manage_locks) {
+        $description = t('Prevent unauthorized users from further editing this field.');
+
+        if ($existing_lock) {
+          $description .= '<br>' . t('Field previously @lock_state_human by @admin_name on @timestamp_date', [
+            '@lock_state_human' => $existing_lock->lock_state ? t('locked') : t('unlocked'),
+            '@admin_name' => User::load($existing_lock->admin_id)->label(),
+            '@timestamp_date' => \Drupal::service('date.formatter')->format($existing_lock->timestamp),
+          ]);
+        }
+
+        $form[$field_name]['lock_field_values'] = [
+          '#type' => 'checkbox',
+          '#title' => t('Lock field values'),
+          '#description' => $description,
+          '#parents' => ['lock_field_values', $field_name],
+          '#default_value' => !empty($existing_lock) ? $existing_lock->lock_state : FALSE,
+          '#access' => $can_manage_locks,
+        ];
+      }
+    }
+
+    // Only add submit callbacks if user can manage field locks.
+    if ($can_manage_locks) {
+      foreach (['submit', 'publish', 'unpublish'] as $action) {
+        if (!empty($form['actions'][$action])) {
+          $form['actions'][$action]['#submit'][] = 'lock_field_values_submit_field_lock_state';
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Form submit callback.
+ *
+ * @param array $form
+ *   Normal form array.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   Normal form state.
+ */
+function lock_field_values_submit_field_lock_state(array $form, FormStateInterface $form_state) {
+  $lockable_fields = $form_state->get('lock_field_values_fields');
+
+  if (!empty($lockable_fields)) {
+    /** @var \Drupal\Core\Entity\ContentEntityBase $entity */
+    $entity = $form_state->getFormObject()->getEntity();
+    $field_values = $form_state->getValues();
+
+    foreach ($lockable_fields as $field_name) {
+      if (isset($field_values['lock_field_values'][$field_name])) {
+        lock_field_values_update_lock_state($entity->getEntityTypeId(), $entity->bundle(), $entity->id(), $field_name, $field_values['lock_field_values'][$field_name]);
+      }
+    }
+  }
+}
+
+/**
+ * Handle the updating logic of field locks.
+ *
+ * @param string $entity_type
+ *   Entity type id.
+ * @param string $bundle
+ *   Bundle machine name.
+ * @param int $entity_id
+ *   Entity id.
+ * @param string $field_name
+ *   Field machine name.
+ * @param int $lock_state
+ *   Number 1 is true, 0 is false.
+ */
+function lock_field_values_update_lock_state($entity_type, $bundle, $entity_id, $field_name, $lock_state) {
+  $has_permission = \Drupal::currentUser()->hasPermission('lock and unlock fields');
+
+  if (!$has_permission) {
+    return;
+  }
+
+  $existing_lock = lock_field_values_get_lock($entity_type, $bundle, $entity_id, $field_name);
+
+  // Add new lock data if none exists.
+  if (!$existing_lock) {
+    lock_field_values_insert_lock($entity_type, $bundle, $entity_id, $field_name, $lock_state);
+  }
+  // Only update the field data if there is a change in the state.
+  elseif ($lock_state != $existing_lock->lock_state) {
+    lock_field_values_delete_lock($entity_type, $bundle, $entity_id, $field_name);
+    lock_field_values_insert_lock($entity_type, $bundle, $entity_id, $field_name, $lock_state);
+  }
+}
+
+/**
+ * Retrieve a lock from the database.
+ *
+ * @param string $entity_type
+ *   Entity type id.
+ * @param string $bundle
+ *   Bundle machine name.
+ * @param int $entity_id
+ *   Entity id.
+ * @param string $field_name
+ *   Field machine name.
+ *
+ * @return object
+ *   Database result.
+ */
+function lock_field_values_get_lock($entity_type, $bundle, $entity_id, $field_name) {
+  $result = \Drupal::database()->select('lock_field_values', 'lfv')
+    ->fields('lfv', ['lock_state', 'admin_id', 'timestamp'])
+    ->condition('entity_id', $entity_id)
+    ->condition('entity_type', $entity_type)
+    ->condition('bundle', $bundle)
+    ->condition('field_name', $field_name)
+    ->execute();
+
+  return $result->fetchObject();
+}
+
+/**
+ * Delete a lock in the database.
+ *
+ * @param string $entity_type
+ *   Entity type id.
+ * @param string $bundle
+ *   Bundle machine name.
+ * @param int $entity_id
+ *   Entity id.
+ * @param string $field_name
+ *   Field machine name.
+ */
+function lock_field_values_delete_lock($entity_type, $bundle, $entity_id, $field_name) {
+  \Drupal::database()->delete('lock_field_values')
+    ->condition('entity_id', $entity_id)
+    ->condition('entity_type', $entity_type)
+    ->condition('bundle', $bundle)
+    ->condition('field_name', $field_name)
+    ->execute();
+}
+
+/**
+ * Insert a new lock into the database.
+ *
+ * @param string $entity_type
+ *   Entity type id.
+ * @param string $bundle
+ *   Bundle machine name.
+ * @param int $entity_id
+ *   Entity id.
+ * @param string $field_name
+ *   Field machine name.
+ * @param int $lock_state
+ *   Number 1 is true, 0 is false.
+ *
+ * @return bool
+ *   Success or not.
+ */
+function lock_field_values_insert_lock($entity_type, $bundle, $entity_id, $field_name, $lock_state) {
+  $result = \Drupal::database()->insert('lock_field_values')
+    ->fields([
+      'entity_id' => $entity_id,
+      'entity_type' => $entity_type,
+      'bundle' => $bundle,
+      'field_name' => $field_name,
+      'admin_id' => \Drupal::currentUser()->id(),
+      'lock_state' => (int) $lock_state,
+      'timestamp' => time(),
+    ])
+    ->execute();
+
+  return !empty($result);
+}
