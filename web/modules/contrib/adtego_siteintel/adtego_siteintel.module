@@ -1,0 +1,267 @@
+<?php
+
+/**
+ * @file
+ * Drupal Module: SiteIntel.
+ */
+
+use Drupal\Component\Utility\Crypt;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Url;
+use GuzzleHttp\Exception\RequestException;
+
+/**
+ * Implements hook_page_attachments().
+ *
+ * Insert JavaScript to the appropriate scope/region of the page.
+ */
+function adtego_siteintel_page_attachments(array &$page) {
+  $request = \Drupal::request();
+  if ($request->attributes->has('node')) {
+    $node = $request->attributes->get('node');
+    $type = $node->bundle();
+    $config = \Drupal::config('adtego_siteintel.settings');
+    $types = $config->get('scope.content_types');
+    $account = \Drupal::currentUser();
+    if (isset($types[$type]) && _adtego_siteintel_visibility_user($account)) {
+      $url = Url::fromRoute('adtego_siteintel.proxy', [], ['absolute' => TRUE]);
+      $page['#attached']['library'][] = 'core/drupalSettings';
+      $page['#attached']['drupalSettings']['adtego']['domain'] = $url->toString() . '/';
+      $page['#attached']['drupalSettings']['adtego']['p'] = $config->get('account');
+      $page['#attached']['drupalSettings']['adtego']['s'] = $config->get('siteid');
+      $page['#attached']['drupalSettings']['adtego']['ads'] = $types[$type]['number_of_ads'];
+      $page['#attached']['html_head'][] = [
+        [
+          '#type' => 'html_tag',
+          '#tag' => 'script',
+          '#attributes' => array('src' => _adtego_siteintel_cache('https://admin.adtego.com/drupal/checkad_8.js', FALSE)),
+        ],
+        'siteintel-script',
+      ];
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function adtego_siteintel_entity_extra_field_info() {
+  $extra['user']['user']['form']['siteintel'] = [
+    'label' => t('SiteIntel settings'),
+    'description' => t('SiteIntel module form element.'),
+    'weight' => 3,
+  ];
+
+  return $extra;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function adtego_siteintel_form_user_form_alter(&$form, FormStateInterface $form_state) {
+  $config = \Drupal::config('adtego_siteintel.settings');
+  $account = $form_state->getFormObject()->getEntity();
+
+  if ($account->hasPermission('opt-in or out of siteintel tracking') && ($visibility_user_account_mode = $config->get('scope.user_account_mode')) != 0 && _adtego_siteintel_visibility_roles($account)) {
+    $account_data_siteintel = \Drupal::service('user.data')->get('siteintel', $account->id());
+
+    $form['siteintel'] = [
+      '#type' => 'details',
+      '#title' => t('SiteIntel settings'),
+      '#weight' => 3,
+      '#open' => TRUE,
+    ];
+
+    switch ($visibility_user_account_mode) {
+      case 1:
+        $description = t('Adblockers are tracked by default, but you are able to opt out.');
+        break;
+
+      case 2:
+        $description = t('Adblockers are <em>not</em> tracked by default, but you are able to opt in.');
+        break;
+    }
+
+    $form['siteintel']['user_account_users'] = [
+      '#type' => 'checkbox',
+      '#title' => t('Enable adblocker tracking'),
+      '#description' => $description,
+      '#default_value' => isset($account_data_siteintel['user_account_users']) ? $account_data_siteintel['user_account_users'] : ($visibility_user_account_mode == 1),
+    ];
+
+    // hook_user_update() is missing in D8, add custom submit handler.
+    $form['actions']['submit']['#submit'][] = 'adtego_siteintel_user_profile_form_submit';
+  }
+}
+
+/**
+ * Submit callback for user profile form to save the SiteIntel setting.
+ */
+function adtego_siteintel_user_profile_form_submit($form, FormStateInterface $form_state) {
+  $account = $form_state->getFormObject()->getEntity();
+  if ($account->id() && $form_state->hasValue('user_account_users')) {
+    \Drupal::service('user.data')->set('siteintel', $account->id(), 'user_account_users', (int) $form_state->getValue('user_account_users'));
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function adtego_siteintel_cron() {
+  $config = \Drupal::config('adtego_siteintel.settings');
+
+  // Regenerate the tracking code file every day.
+  if (REQUEST_TIME - \Drupal::state()->get('adtego_siteintel.last_cache') >= 86400) {
+    _adtego_siteintel_cache('https://admin.adtego.com/drupal/checkad_8.js', TRUE);
+    \Drupal::state()->set('adtego_siteintel.last_cache', REQUEST_TIME);
+  }
+}
+
+/**
+ * Download/Synchronize/Cache tracking code file locally.
+ *
+ * @param string $location
+ *   The full URL to the external javascript file.
+ * @param bool $synchronize
+ *   Synchronize to local cache if remote file has changed.
+ *
+ * @return mixed
+ *   The path to the local javascript file on success, boolean FALSE on failure.
+ */
+function _adtego_siteintel_cache($location, $synchronize = FALSE) {
+  $path = 'public://siteintel';
+  $file_destination = $path . '/' . basename($location);
+
+  if (!file_exists($file_destination) || $synchronize) {
+    // Download the latest tracking code.
+    try {
+      $data = \Drupal::httpClient()
+        ->get($location)
+        ->getBody(TRUE);
+
+      if (file_exists($file_destination)) {
+        // Synchronize tracking code and and replace local file if outdated.
+        $data_hash_local = Crypt::hashBase64(file_get_contents($file_destination));
+        $data_hash_remote = Crypt::hashBase64($data);
+        // Check that the files directory is writable.
+        if ($data_hash_local != $data_hash_remote && file_prepare_directory($path)) {
+          // Save updated tracking code file to disk.
+          file_unmanaged_save_data($data, $file_destination, FILE_EXISTS_REPLACE);
+          \Drupal::logger('adtego_siteintel')->info('Locally cached adblocker tracking code file has been updated.');
+
+          // Change query-strings on css/js files to enforce reload for all
+          // users.
+          _drupal_flush_css_js();
+        }
+      }
+      else {
+        // Check that the files directory is writable.
+        if (file_prepare_directory($path, FILE_CREATE_DIRECTORY)) {
+          // There is no need to flush JS here as core refreshes JS caches
+          // automatically, if new files are added.
+          file_unmanaged_save_data($data, $file_destination, FILE_EXISTS_REPLACE);
+          \Drupal::logger('adtego_siteintel')->info('Locally cached adblocker tracking code file has been saved.');
+
+          // Return the local JS file path.
+          return file_url_transform_relative(file_create_url($file_destination));
+        }
+      }
+    }
+    catch (RequestException $exception) {
+      watchdog_exception('adtego_siteintel', $exception);
+    }
+  }
+  else {
+    // Return the local JS file path.
+    return file_url_transform_relative(file_create_url($file_destination));
+  }
+}
+
+/**
+ * Delete cached files and directory.
+ */
+function adtego_siteintel_clear_js_cache() {
+  $path = 'public://siteintel';
+  if (file_prepare_directory($path)) {
+    file_scan_directory($path, '/.*/', ['callback' => 'file_unmanaged_delete']);
+    drupal_rmdir($path);
+
+    // Change query-strings on css/js files to enforce reload for all users.
+    _drupal_flush_css_js();
+
+    \Drupal::logger('adtego_siteintel')->info('Local cache has been purged.');
+  }
+}
+
+/**
+ * Tracking visibility check for an user object.
+ *
+ * @param object $account
+ *   A user object containing an array of roles to check.
+ *
+ * @return bool
+ *   TRUE if the current user is being tracked by SiteIntel,
+ *   otherwise FALSE.
+ */
+function _adtego_siteintel_visibility_user($account) {
+  $config = \Drupal::config('adtego_siteintel.settings');
+  $enabled = FALSE;
+
+  // Is current user a member of a role that should be tracked?
+  if (_adtego_siteintel_visibility_roles($account)) {
+
+    // Use the user's block visibility setting, if necessary.
+    if (($visibility_user_account_mode = $config->get('scope.user_account_mode')) != 0) {
+      $user_data_siteintel = \Drupal::service('user.data')->get('siteintel', $account->id());
+      if ($account->id() && isset($user_data_siteintel['user_account_users'])) {
+        $enabled = $user_data_siteintel['user_account_users'];
+      }
+      else {
+        $enabled = ($visibility_user_account_mode == 1);
+      }
+    }
+    else {
+      $enabled = TRUE;
+    }
+
+  }
+
+  return $enabled;
+}
+
+/**
+ * Tracking visibility check for user roles.
+ *
+ * Based on visibility setting this function returns TRUE if JS code should
+ * be added for the current role and otherwise FALSE.
+ *
+ * @param object $account
+ *   A user object containing an array of roles to check.
+ *
+ * @return bool
+ *   TRUE if JS code should be added for the current role and otherwise FALSE.
+ */
+function _adtego_siteintel_visibility_roles($account) {
+  $config = \Drupal::config('adtego_siteintel.settings');
+  $enabled = $visibility_user_role_mode = $config->get('scope.user_role_mode');
+  $visibility_user_role_roles = $config->get('scope.user_role_roles');
+
+  if (count($visibility_user_role_roles) > 0) {
+    // One or more roles are selected.
+    foreach (array_values($account->getRoles()) as $user_role) {
+      // Is the current user a member of one of these roles?
+      if (in_array($user_role, $visibility_user_role_roles)) {
+        // Current user is a member of a role that should be tracked/excluded
+        // from tracking.
+        $enabled = !$visibility_user_role_mode;
+        break;
+      }
+    }
+  }
+  else {
+    // No role is selected for tracking, therefore all roles should be tracked.
+    $enabled = TRUE;
+  }
+
+  return $enabled;
+}
