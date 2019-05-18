@@ -1,0 +1,231 @@
+<?php
+/**
+ * Implements hook_search_preprocess().
+ */
+function xunsearch_search_preprocess($text, $langcode = NULL) {
+	$ret=$text;
+
+	if(\Drupal::config('search.settings')->get('use_scws')==FALSE) return $ret;
+	
+	// Do nothing if state says nothing
+	$sdk_method=\Drupal::config('search.settings')->get('scws_sdk_path');
+	if(empty($sdk_method)) return $ret;
+	
+	try {
+		switch($sdk_method) {
+			case 'scws://':
+				$so = scws_new();
+				$so->set_charset('utf8');
+				$so->send_text($text);
+				$results=[];
+				while ($tmp = $so->get_result()) {
+					$results[]=$tmp['word'];
+				}
+				$ret=implode(' ', $results);
+				$so->close();
+				break;
+			case '/usr/lib64/xunsearch/sdk/php':
+			case '/usr/local/xunsearch/sdk/php':
+				set_include_path(get_include_path() . PATH_SEPARATOR . $sdk_method);
+				require_once('lib/XS.php');
+			case 'composer://':
+				$xs=new \XS('demo');
+				$tokenizer=new \XSTokenizerScws;
+				$results=[];
+				$words=$tokenizer->getResult($text);
+				foreach($words as $word) {
+					$results[]=$word['word'];
+				}
+				$ret=implode(' ', $results);
+				unset($tokenizer);
+				unset($xs);
+		}
+	} catch (Exception $e) {
+	}
+
+	return $ret;
+}
+
+/**
+ * Implements hook_uninstall().
+ */
+function xunsearch_uninstall() {
+	\Drupal::configFactory()->getEditable('search.settings')
+		->clear('use_scws')
+		->clear('scws_sdk_path')
+		->save();
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for the search_admin_settings() form.
+ */
+function xunsearch_form_search_admin_settings_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+	// add a use switch
+	$form['indexing_settings']['use_scws'] = [
+		'#type' => 'checkbox',
+		'#title' => t('Use scws to tokenizer strings'),
+		'#default_value' => Drupal::config('search.settings')->get('use_scws'),
+		'#description' => t('scws is a Chinese tokenizer helper used by Xunsearch, but you can use it separately.'),
+		'#states' => [
+			'visible' => [
+				':input[name="overlap_cjk"]' => [
+					'checked' => FALSE,
+				],
+			],
+		],
+	];
+
+	// select sdk path
+	$form['indexing_settings']['scws_sdk_path'] = [
+		'#type' => 'radios',
+		'#title' => t('SCWS tokenizer method'),
+		'#default_value' => Drupal::config('search.settings')->get('scws_sdk_path'),
+		'#options' => [],
+		'#required' => TRUE,
+		'#states' => [
+			'visible' => [
+				':input[name="overlap_cjk"]' => [
+					'checked' => FALSE,
+				],
+				':input[name="use_scws"]' => [
+					'checked' => TRUE,
+				],
+			],
+			'required' => [
+				':input[name="use_scws"]' => [
+					'checked' => TRUE,
+				],
+			],
+		],
+	];
+
+	if(extension_loaded('scws'))
+		$form['indexing_settings']['scws_sdk_path']['#options']['scws://']=t('SCWS PHP extension');
+	if(file_exists('/usr/lib64/xunsearch/sdk/php/lib/XS.php'))
+		$form['indexing_settings']['scws_sdk_path']['#options']['/usr/lib64/xunsearch/sdk/php']='/usr/lib64/xunsearch/sdk/php';
+	if(file_exists('/usr/local/xunsearch/sdk/php/lib/XS.php'))
+		$form['indexing_settings']['scws_sdk_path']['#options']['/usr/local/xunsearch/sdk/php']='/usr/local/xunsearch/sdk/php';
+	if(file_exists(DRUPAL_ROOT.'/vendor/hightman/xunsearch/lib/XS.class.php'))
+		$form['indexing_settings']['scws_sdk_path']['#options']['composer://']='composer://';
+
+	if(empty($form['indexing_settings']['scws_sdk_path']['#options'])) {
+		unset($form['indexing_settings']['use_scws']);
+		unset($form['indexing_settings']['scws_sdk_path']);
+	} else {
+		$form['#submit'][]='xunsearch_form_search_admin_settings_submit';
+	}
+}
+
+/**
+ * Implements hook_form_submit() for the altered search_admin_settings() form.
+ */
+function xunsearch_form_search_admin_settings_submit($form, \Drupal\Core\Form\FormStateInterface $form_state) {
+	if($form_state->getValue('overlap_cjk')) {
+		\Drupal::configFactory()->getEditable('search.settings')
+			->set('use_scws', false)
+			->clear('scws_sdk_path')
+			->save();
+	} else {
+		\Drupal::configFactory()->getEditable('search.settings')
+			->set('use_scws', $form_state->getValue('use_scws'))
+			->set('scws_sdk_path', $form_state->getValue('scws_sdk_path'))
+			->save();
+	}
+}
+
+/**
+ * Implements hook_search_api_index_reindex().
+ */
+function xunsearch_search_api_index_reindex(\Drupal\search_api\IndexInterface $index, $clear = FALSE) {
+	// If index does not need to be cleared, the return.
+	if($clear==FALSE || $index->getServerInstance()->getBackendId()!=='search_api_xunsearch') return;
+	$configuration=$index->getServerInstance()->getBackendConfig();
+
+	if($configuration['sdk_path']!=='composer://') {
+		set_include_path(get_include_path() . PATH_SEPARATOR . $configuration['sdk_path']);
+		require_once('lib/XS.php');
+	}
+
+	$configuration_file_path=sprintf('%s/%s.ini', $configuration['ini_path'], $index->id());
+	$xs=new \XS(\Drupal::service('file_system')->realpath($configuration_file_path));
+
+	$xs->index->clean();
+	unset($xs);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for the search_api_index_fields() form.
+ */
+function xunsearch_form_search_api_index_fields_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+	if($form_state->getFormObject()->getEntity()->getServerInstance()->getBackendId()!=='search_api_xunsearch') return;
+	$form['#validate'][]='xunsearch_form_search_api_index_fields_validate';
+}
+
+/**
+ * Implements hook_form_validate() for the altered search_api_index_fields() form.
+ */
+function xunsearch_form_search_api_index_fields_validate($form, \Drupal\Core\Form\FormStateInterface $form_state) {
+	$body_field_name=[];
+	foreach($form_state->getValues()['fields'] as $fid => $setting) {
+		if($setting['type']!=='text') continue;
+		$body_field_name[]=$fid;
+		$msg='';
+		switch(count($body_field_name)) {
+			case 1: break;
+			case 2:
+				$msg=t('Only one field may be set as @fulltext_format, due to limitation of Xunsearch itself. Search operation will be always executed on all fields.',
+					['@fulltext_format'=>t('Fulltext')]);
+			default:
+				$form_state->setErrorByName(sprintf('fields][%s][type', $fid), $msg);
+		}
+	}
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for the search_api_index_form() form.
+ */
+function xunsearch_form_search_api_index_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+	if($form_state->getFormObject()->getEntity()->isNew()) return;
+	$form['actions']['submit']['#submit'][]='xunsearch_form_search_api_index_form_submit';
+}
+
+/**
+ * Implements hook_form_submit() for the altered search_api_index_form() form.
+ */
+function xunsearch_form_search_api_index_form_submit($form, \Drupal\Core\Form\FormStateInterface &$form_state) {
+	$index=$form_state->getFormObject()->getEntity();
+	if($index->getServerInstance()->getBackendId()!=='search_api_xunsearch') return;
+
+	$body_field_name='';
+	foreach($index->getFields() as $fid => $field) {
+		if($field->getType()!=='text') continue;
+		if(empty($body_field_name)) $body_field_name=$fid;
+		else {
+			$index->disable()->save();
+			drupal_set_message(t('This index has multiple Full Text fields set, but Xunsearch only supports one per database. Please reconfigure the fields, then re-enable the index.'), 'error');
+			$form_state->setRedirectUrl($index->toUrl('fields'));
+			return;
+		}
+	}
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update() for the search_api_index entity.
+ */
+function xunsearch_search_api_index_update(\Drupal\Core\Entity\EntityInterface $index) {
+	if(!($index instanceof \Drupal\search_api\IndexInterface)) return;
+	if($index->getServerInstance()->getBackendId()!=='search_api_xunsearch') return;
+	if(!$index->status()) return;
+
+	$body_field_name='';
+	foreach($index->getFields() as $fid => $field) {
+		if($field->getType()!=='text') continue;
+		if(empty($body_field_name)) $body_field_name=$fid;
+		else {
+			$index->disable()->save();
+			drupal_set_message(t('This index has multiple Full Text fields set, but Xunsearch only supports one per database. Please reconfigure the fields, then re-enable the index.'), 'error');
+			return;
+		}
+	}
+}
+?>
