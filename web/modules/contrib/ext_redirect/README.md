@@ -1,0 +1,1 @@
+Out of the box this module will raise an Exception: "Primary host not specified". 
