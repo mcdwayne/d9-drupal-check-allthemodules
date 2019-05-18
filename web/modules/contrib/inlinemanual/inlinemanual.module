@@ -1,0 +1,181 @@
+<?php
+
+/**
+ * @file
+ * Enables users to use Inline Manuals.
+ * Created by fine folks from inlinemanual.com
+ * http://inlinemanual.com
+ */
+
+ use Drupal\system\Entity\Menu;
+ use Drupal\Core\Config\ConfigFactory;
+
+/**
+ * Implements hook_permission()
+ */
+function inlinemanual_permission() {
+  $topics = inlinemanual_get_topics();
+
+  $perms = array(
+    'administer inline manual' => array(
+      'title' => t('Administer inline manual'),
+    ),
+    'view disabled inline manuals' => array(
+      'title' => t('View disabled inline manuals'),
+    ),
+    'use inline manual' => array(
+      'title' => t('Use inline manual'),
+    ),
+  );
+
+  if ($topics) {
+    foreach ($topics as $topic) {
+      $perms['view inlinemanual_topic_' . $topic->tid] = array(
+        'title' => t('View %topic_name', array('%topic_name' => $topic->title)),
+      );
+    }
+  }
+
+  return $perms;
+}
+
+/**
+ * Updates status of specified topics
+ */
+function inlinemanual_topics_update_status($status, $tids) {
+  $num_updated = db_update('inm_topics')
+    ->fields(array(
+      'status' => $status,
+    ))
+    ->condition('tid', $tids, 'IN')
+    ->execute();
+  return $num_updated;
+}
+
+function inlinemanual_static_topics() {
+  $topics = inlinemanual_available_topics();
+  return $topics;
+}
+
+ /**
+ * Fetch all topics from through the InlineManual API
+ */
+function inlinemanual_topics_fetch_all() {
+  
+  // TODO: find a better way to do this
+  module_load_include('php', 'inlinemanual', 'lib/Drupal/inlinemanual/InlineManual');
+  $config = \Drupal::config('inlinemanual.settings');
+  InlineManual::$site_api_key = $config->get('site_key');
+
+  // Update the database with topics listing and fetch all topics.
+  // Keep the visibility settings.
+  try {
+    $topics = InlineManual_Site::fetchAllTopics();
+    foreach ($topics as $topic) {
+      $topic = InlineManual_Site::fetchTopic($topic->id);
+      db_merge('inm_topics')
+          ->key(array('tid' => $topic->id))
+          ->fields(array(
+            'tid' => $topic->id,
+            'title' => $topic->title,
+            'description' => $topic->description,
+            'version' => $topic->version,
+            'steps' => serialize($topic->steps),
+            'timestamp' => 0,
+            // do not refresh status
+          ))
+          ->execute();
+    }
+    return TRUE;
+  }
+  catch (InlineManual_Error $e) {
+    watchdog('inm', 'InlineManual API request failed: %error.', array('%error' => $e->getMessage(), WATCHDOG_ERROR));
+    return FALSE;
+  }
+}
+
+/**
+ * Returns a list of topics ordered by title
+ */
+function inlinemanual_get_topics($status = NULL) {
+  $query = db_select('inm_topics', 't')->extend('Drupal\Core\Database\Query\PagerSelectExtender')->extend('Drupal\Core\Database\Query\TableSortExtender');
+  $query->fields('t', array('tid', 'title', 'description', 'status', 'version', 'steps'))->orderBy('t.title');
+  if ($status == 'active') {
+    $query->condition('status', 1, '=');
+  }
+  $topics = $query->execute()->fetchAll();
+
+  foreach($topics as $key => $topic) {
+    $topics[$key]->steps = unserialize($topic->steps);
+  }
+
+  return $topics;
+}
+
+/**
+ * Returns a list of accessible topics for current user
+ */
+function inlinemanual_available_topics($account = NULL) {
+  $user = \Drupal::currentUser();
+  $account = ($account ? $account : $user);
+
+  $available = array();
+  $topics = inlinemanual_get_topics('active');
+  if ($topics) {
+    foreach ($topics as $topic) {
+      if (user_access('view inlinemanual_topic_'. $topic->tid, $account) && ($topic->status || user_access('view disabled inline manuals', $account))) {
+        $available[$topic->tid] = $topic;
+      }
+    }
+  }
+
+  return $available;
+}
+
+/**
+ * Implements hook_page_build().
+ */
+function inlinemanual_page_build(&$page) {
+  if (user_access('use inline manual')) {
+    // TODO: check if jQuery update module is enabled and version installed
+    global $base_path;
+    $account = \Drupal::currentUser();
+    $config = \Drupal::config('inlinemanual.settings');
+
+    // TODO: allow to fetch player over http
+    $url_scheme = 'https://';
+    // $url_scheme = ($is_https) ? 'https://' : 'http://';
+
+    // We support only clean urls right now
+    // TODO: think about paths with params + FIX
+    $settings = json_encode(
+      array(
+        'basePath' => $base_path,
+        'variables' => array(
+          'user_id' => $account->id(),
+        ),
+        'l10n' => array(
+          'title' => $config->get('widget.title'),
+          'refresh' => t('Refresh'),
+          'backToTopics' => t('&laquo; Back to topics'),
+          'scrollUp' => t('Scroll up'),
+          'scrollDown' => t('Scroll down'),
+          'progress' => t('of'),
+          'poweredBy' => t('Powered by'),
+          'prev' => t('&laquo; Prev'),
+          'next' => t('Next &raquo;'),
+          'end' => t('End tour'),
+        ),
+        'topics' => inlinemanual_static_topics(),
+      )
+    );
+
+    $page['#attached']['library'][] = 'core/jquery';
+
+    // TODO: include js and css from inlinemanual CDN or local
+    $page['#attached']['js'][$url_scheme . 'inlinemanual.com/inm/player/js/inm.tour.min.js'] = array('type' => 'external');
+    $page['#attached']['js']['jQuery(document).ready( function() { myTour = new InmTour( ' . $settings . ' ); })'] = array('type' => 'inline', 'scope' => 'footer', 'weight' => 100);
+    $page['#attached']['css'][$url_scheme . 'inlinemanual.com/inm/player/css/inm.tour.min.css'] = array('type' => 'external');
+    $page['#attached']['css']['#InmPlayerWrapper .panel-heading { background-color: ' . $config->get('widget.color') . '; color: ' . $config->get('widget.text_color') . ' }'] = array('type' => 'inline');
+  }
+}
