@@ -1,0 +1,257 @@
+<?php
+
+/**
+ * @file
+ *
+ */
+
+/* values for config:name_mode */
+define('ALT_LOGIN_MODE_NORMAL', 0);
+define('ALT_LOGIN_MODE_UID', 1);
+
+/* values for config:login */
+define('ALT_LOGIN_WITH_USERNAME', 0);
+define('ALT_LOGIN_WITH_UID', 1);
+define('ALT_LOGIN_WITH_EMAIL', 2);
+
+use \Drupal\Core\Form\FormState;
+use Drupal\user\Entity\User;
+
+/**
+ * Implements hook_help().
+ */
+function alt_login_help($route_name, $route_match) {
+  if ($route_name == 'help.page.alt_login') {
+    return t("Provides automated login-name creation, allows login with the User ID and email, and formats the user's display name.");
+  }
+}
+
+/**
+ * Implement hook_form_alter().
+ *
+ * Add a validation callback to login fields
+ */
+function alt_login_form_alter(&$form, $form_state, $form_id) {
+  if (in_array($form_id, ['user_login_form', 'user_login_block', 'user_pass'])) {
+    $modes = \Drupal::config('alt_login.settings')->get('login');
+    if (array_filter(\Drupal::config('alt_login.settings')->get('login'))) {
+      // This validation happens before the main login validation.
+      $form['name']['#element_validate'][] = 'alt_login_login_name_element_validate';
+    }
+  }
+}
+
+/**
+ * Element validation callback for login form name field.
+ *
+ * Look up the real user name from the given login id and replace it ready for
+ * the form-level validation.
+ */
+function alt_login_login_name_element_validate(array &$element, FormState $form_state) {
+  $id = $element['#value'];
+  $modes = \Drupal::config('alt_login.settings')->get('login');
+  if (in_array(ALT_LOGIN_WITH_UID, $modes) and is_numeric($id)) {
+    if ($account = User::load($id)) {
+      $form_state->setValue('name', $account->getUsername());
+    }
+    else {
+      $form_state->setError($element, t('Number does not correspond to a user'));
+    }
+  }
+  elseif (in_array(ALT_LOGIN_WITH_EMAIL, $modes) and \Drupal::service('email.validator')->isValid($id)) {
+    $users = \Drupal::entityManager()->getStorage('user')->loadByProperties(['mail' => $id]);
+    if (count($users) == 1) {
+      $form_state->setValue('name', reset($users)->getUsername());
+    }
+    else {
+      $form_state->setError($element, t('Email does not correspond to a user'));
+    }
+  }
+}
+
+/**
+ * Implements hook_user_format_name_alter().
+ *
+ * Manipulate the user display name according to settings. Since results of this
+ * hook aren't cached, a static reduces calls to the token system.
+ */
+function alt_login_user_format_name_alter(&$name, $account) {
+  if ($account->isAnonymous()) {
+    // This will be the configured 'anonymous' value
+    return;
+  }
+  static $names = [];
+  $uid = $account->id();
+  if (!isset($names[$uid])) {
+    if (\Drupal::currentUser()->isAnonymous()) {
+      $names[$uid] = \Drupal::token()
+        ->replace(\Drupal::config('alt_login.settings')->get('display_anon'), ['user' => $account]);
+    }
+    elseif ($template = \Drupal::config('alt_login.settings')->get('display')) {
+      if (!$account instanceof User) {
+        $account = User::load($account->id());
+      }
+      $names[$uid] = \Drupal::token()->replace($template, ['user' => $account]);
+    }
+    else {
+      // Use the username for display i.e. do nothing.
+      $names[$uid] = $name;
+    }
+  }
+  $name = $names[$uid];
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ *
+ * Ensure that this is the last module to format the username
+ */
+function alt_login_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'user_format_name') {
+    unset($implementations ['alt_login']);
+    $implementations ['alt_login'] = FALSE;
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Hide the username field.
+ */
+function alt_login_form_user_register_form_alter(&$form, FormState $form_state) {
+  if ($username_mode = \Drupal::config('alt_login.settings')->get('name_mode')) {
+    $form['account']['name']['#access'] = FALSE;
+    $form['account']['name']['#value'] = 'TEMP';
+  }
+}
+
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Disable the username field.
+ */
+function alt_login_form_user_form_alter(&$form, FormState $form_state) {
+  if ($username_mode = \Drupal::config('alt_login.settings')->get('name_mode')) {
+    $form['account']['name']['#disabled'] = TRUE;
+    $form['account']['name']['#title'] = t('Login ID');
+    if (empty($form['account']['name']['#default_value'])) {
+      $form['account']['name']['#value'] = user_password();//temp random unique string to pass validation
+    }
+  }
+  $login_options = (array)\Drupal::config('alt_login.settings')->get('login');
+  foreach ($login_options as $opt) {
+    switch ($opt) {
+      case ALT_LOGIN_WITH_UID:
+        $alts[] = t('numeric ID'); break;
+      case ALT_LOGIN_WITH_EMAIL:
+        $alts[] = t('email'); break;
+    }
+  }
+  if ($alts) {
+    $form['account']['name']['#description'] = t('You can also login with your @alts', ['@alts' => implode(', ', $alts)]);
+  }
+
+  if (isset($form[alt_login_get_address_field_name()]) and !is_numeric($username_mode)) {
+    //validate that the login name to be generated is unique, and set it.
+    $form['#validate'][] = 'alt_login_user_custom_validation';
+  }
+}
+
+/**
+ * User form additional validation callback
+ *
+ * Check for duplicates produced by custom functions.
+ * @todo
+ */
+function alt_login_user_custom_validation(&$form, FormState $form_state) {
+  $new_user = $form_state->getFormObject()->validateForm($form, $form_state);
+  $newUsername = alt_login_generate_from_address($new_user);
+  // Don't worry this is case insensitive
+  $dupe = \Drupal::entityQuery('user')
+    ->condition('name', $newUsername)
+    ->condition('uid', $new_user->id(), '<>')
+    ->execute();
+  if ($dupe) {
+    $form_state->setErrorByName(
+      alt_login_get_address_field_name().'.given_name',
+      t('The name %name is taken by another user', ['%name' => $newUsername])
+    );
+  }
+}
+
+/**
+ * Implements hook_user_presave().
+ *
+ * Populate the username field if it is automated.
+ */
+function alt_login_user_presave($user) {
+  if ($mode = \Drupal::config('alt_login.settings')->get('name_mode')) {
+    $username = alt_login_determine_username($mode, $user);
+    if ($username != $user->getUsername()) {
+      $user->setUsername($username);
+    }
+  }
+}
+
+/**
+ * Helper function gets username depending on settings.
+ *
+ * @param UserInterface $user
+ *
+ * @return string
+ *   The adjusted username
+ */
+function alt_login_determine_username($mode, $user) {
+  switch($mode) {
+    case ALT_LOGIN_MODE_UID:
+      $max = \Drupal::entityQuery('user')->sort('uid', 'DESC')->range(0, 1)->execute();
+      $user->uid->value = reset($max) + 1;
+      return $user->uid->value;
+    default:
+      if (!is_numeric($mode)) {
+        if (function_exists($mode)) {
+          $newUsername = $mode($user);
+          //drupal_set_message(t('Note that your login name has been set to %name', ['%name' => $newUsername]), 'warning');
+          return $newUsername;
+        }
+        else {
+          throw new \Exception('Cannot fine alt_login_generate_ callback: '.$mode);
+        }
+      }
+  }
+}
+
+/**
+ * Callback function to get the name from the address module.
+ *
+ * @param type $user
+ *
+ * @return string
+ */
+function alt_login_generate_from_address($user) {
+  $fname = alt_login_get_address_field_name();
+  $address_items = $user->{$fname}->getValue();
+  $name[] = $address_items[0]['given_name'];
+  if (!empty($address_items[0]['additional_name'])) {
+    $name[] = $address_items[0]['additional_name'];
+  }
+  $name[] = $address_items[0]['family_name'];
+  return trim(implode(' ', array_filter($name)));
+}
+
+
+/**
+ * Helper
+ *
+ * Get the name of the addressfield on the user.
+ *
+ * @todo to improve performance, save the result of this in config.
+ */
+function alt_login_get_address_field_name() {
+  foreach (\Drupal::service('entity_field.manager')->getFieldDefinitions('user', 'user') as $field_name => $fieldInfo) {
+    if ($fieldInfo->getType() == 'address') {
+      return $field_name;
+    }
+  }
+}
