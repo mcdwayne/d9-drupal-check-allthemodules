@@ -1,0 +1,123 @@
+---
+version: 2
+jobs:
+  # Job syncs GitHub repository to git.drupal.org.
+  sync_drupalorg:
+    docker:
+      - image: nicksantamaria/drupal_contrib_builder:latest
+    working_directory: /data
+    environment:
+      GIT_MIRROR_URL: nickurbits@git.drupal.org:project/vault_auth_token.git
+    steps:
+      - checkout
+      - run:
+          name: Add drupal.org git remote
+          command: git remote add drupal "${GIT_MIRROR_URL}"
+      - run:
+          name: Push to drupal.org git remote
+          command: git push drupal "${CIRCLE_BRANCH:-refs/tags/${CIRCLE_TAG}}"
+
+  # Job performs code style / validation tasks.
+  lint:
+    docker:
+      - image: nicksantamaria/drupal_contrib_builder:latest
+    working_directory: /data
+    steps:
+      - checkout
+      - run:
+          name: Ensure yaml files are valid
+          command: yamllint /data
+      - run:
+          name: Ensure json files are valid
+          command: cat /data/composer.json | jq .
+      - run:
+          name: Ensure PHP meets Drupal code standards
+          command: |
+            phpcs \
+              --standard=Drupal \
+              --extensions=php,module,inc,install,test,profile,theme,css,info \
+              --ignore=*.md \
+              /data
+      - run:
+          name: Test drupal.org packager excludes
+          command: bash ./tests/package-excludes/run-test.sh $(pwd)
+      - run:
+          name: Ensure terraform code is valid
+          command: tflint
+          working_directory: /data/infracode/terraform
+  # Job template for running Drupal test suite against specified Drupal version.
+  test: &test
+    docker:
+      - image: nicksantamaria/drupal_contrib_builder:latest
+        environment:
+          SIMPLETEST_BASE_URL: http://127.0.0.1
+          SIMPLETEST_DB: mysql://drupal:drupal@127.0.0.1/local
+      - image: mariadb
+        environment:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: local
+          MYSQL_USER: drupal
+          MYSQL_PASSWORD: drupal
+    working_directory: /data/app
+    steps:
+      - run:
+          name: Download specified drupal version
+          command: |
+            git clone --depth 1 --branch ${DRUPAL_BRANCH} \
+              git://drupalcode.org/project/drupal.git .
+      - run:
+          name: Fetch drupal dependencies
+          command: composer install --prefer-dist --no-progress
+      - checkout:
+          path: /data/app/modules/vault_auth_token
+      - run:
+          name: Fetch vault_auth_token dependencies
+          command: |
+            cat modules/vault_auth_token/composer.json \
+              | jq '.require | keys[] as $k | "\($k)=\(.[$k])@dev"' \
+              | xargs composer require --no-progress
+      - run:
+          name: Install drupal
+          command: |
+            mkdir -p sites/default/files/tmp sites/default/private
+            chmod -R 777 sites/default/files sites/default/private
+            drush -yv site-install minimal --db-url="${SIMPLETEST_DB}"
+            drush -yv en vault_auth_token simpletest
+      - run: service apache2 restart
+      - run:
+          name: Run unit tests
+          command: |
+            php core/scripts/run-tests.sh --verbose --color \
+              --concurrency 4 \
+              --url "${SIMPLETEST_BASE_URL}" \
+              --dburl "${SIMPLETEST_DB}" \
+              "vault_auth_token"
+  test_84x:
+    <<: *test
+    environment:
+      - DRUPAL_BRANCH: 8.4.x
+  test_85x:
+    <<: *test
+    environment:
+      - DRUPAL_BRANCH: 8.5.x
+  test_86x:
+    <<: *test
+    environment:
+      - DRUPAL_BRANCH: 8.6.x
+
+workflows:
+  version: 2
+  main:
+    jobs:
+      - lint
+      - test_84x
+      - test_85x
+      - test_86x
+  sync:
+    jobs:
+      - sync_drupalorg:
+          filters:
+            tags:
+              only: /.*/
+            branches:
+              only: /[7-9].x-.*/
