@@ -1,0 +1,158 @@
+<?php
+
+/**
+ * @file
+ * Primary hook implementations for MRR Embed Filter.
+ */
+
+use Drupal\Component\Utility\Html;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\field\Entity\FieldConfig;
+use Drupal\media_entity\Entity\Media;
+use Drupal\media_reference_revisions\Entity\MediaReferenceRevision;
+
+/**
+ * Implements hook_entity_insert().
+ */
+function mrr_embed_filter_entity_insert(EntityInterface $entity) {
+  mrr_embed_filter_save_entity_record('create', $entity);
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function mrr_embed_filter_entity_update(EntityInterface $entity) {
+  mrr_embed_filter_save_entity_record('update', $entity);
+}
+
+/**
+ * Create or update MRR records for a given entity.
+ *
+ * @param string $operation
+ *   Either the string "create" or "update".
+ * @param Drupal\Core\Entity\EntityInterface $entity
+ *   The entity that the media item is attached to.
+ */
+function mrr_embed_filter_save_entity_record($operation, EntityInterface $entity) {
+  // Is this entity type supported?
+  if (media_reference_revisions_entity_type_supported($entity)) {
+    // Only bother with this if Embed Entity is enabled.
+    if (\Drupal::moduleHandler()->moduleExists('entity_embed')) {
+      // If a node is published and there are media items, update all other
+      // nodes to point to the same revision.
+      $update_all = media_reference_revisions_node_is_published($entity);
+
+      // Look for text fields which might have embedded media that need to be
+      // processed.
+      foreach (mrr_embed_filter_supported_text_fields($entity) as $field_name) {
+        // Loop over each value in the field; this field might allow multiple
+        // values.
+        foreach ($entity->{$field_name}->getValue() as $value) {
+          // Text fields support both a 'summary' and 'value'
+          foreach (['summary', 'value'] as $item) {
+            // Only bother processing values that exist and aren't empty.
+            if (!empty($value[$item])) {
+              $text = $value[$item];
+
+              // This code taken from EntityEmbedRevisionFilter::process().
+              if (strpos($text, 'data-entity-type') !== FALSE && (strpos($text, 'data-entity-embed-display') !== FALSE || strpos($text, 'data-view-mode') !== FALSE)) {
+                $dom = Html::load($text);
+                $xpath = new \DOMXPath($dom);
+
+                /** @var \DOMElement $node */
+                foreach ($xpath->query('//drupal-entity[@data-entity-type and (@data-entity-uuid or @data-entity-id) and (@data-entity-embed-display or @data-view-mode)]') as $node) {
+                  $media = NULL;
+                  $id = NULL;
+
+                  // Only work with the Media entity type.
+                  $entity_type = $node->getAttribute('data-entity-type');
+                  if ($entity_type != 'media') {
+                    continue;
+                  }
+
+                  // Load the entity either by UUID (preferred) or ID.
+                  if ($id = $node->getAttribute('data-entity-uuid')) {
+                    $media = \Drupal::entityTypeManager()
+                      ->getStorage('media')
+                      ->loadByProperties(['uuid' => $id]);
+                    $media = current($media);
+                  }
+                  else {
+                    $id = $node->getAttribute('data-entity-id');
+                    $media = Media::load($id);
+                  }
+
+                  // Save the record.
+                  if (!empty($media)) {
+                    // Ignore the 'delta' value.
+                    if ($operation == 'create') {
+                      media_reference_revisions_create_record($entity, $media);
+                    }
+                    else {
+                      media_reference_revisions_update_record($entity, $media, $update_all);
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Get the list of supported text fields from this entity.
+ *
+ * Currently all "string", "string_long", "text", "text_long" and
+ * "text_with_summary" fields will be processed.
+ *
+ * @todo Look at ways to optimize this.
+ *
+ * @param Drupal\Core\Entity\EntityInterface $entity
+ *   The entity to check.
+ *
+ * @return array
+ *   The field names on this entity which are supported.
+ */
+function mrr_embed_filter_supported_text_fields(EntityInterface $entity) {
+  $supported_fields = [];
+
+  // If Embed Entity isn't enabled, skip this entirely.
+  if (!\Drupal::moduleHandler()->moduleExists('entity_embed')) {
+    return $supported_fields;
+  }
+
+  // Types of fields which are supported. Ultimately all text strings could have
+  // media embedded in them, except for 'list_string'.
+  $supported_types = [
+    'string',
+    'string_long',
+    'text',
+    'text_long',
+    'text_with_summary',
+  ];
+
+  // Look for fields for this entity, see if any of them point to a media
+  // object.
+  $entity_type = $entity->getEntityTypeId();
+  $bundle = $entity->bundle();
+  $fields = \Drupal::service('entity_field.manager')
+    ->getFieldDefinitions($entity_type, $bundle);
+
+  foreach ($fields as $field_name => $field_definition) {
+    if ($field_definition instanceof FieldConfig) {
+      $field_config = $field_definition->getConfig($entity->bundle());
+      if (in_array($field_config->getType(), $supported_types)) {
+        // @todo Look at ways to narrow this list. Every text field could have
+        // embed codes, but not every one needs to be processed.
+        $supported_fields[] = $field_name;
+      }
+    }
+  }
+
+  return $supported_fields;
+}

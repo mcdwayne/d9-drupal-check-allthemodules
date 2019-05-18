@@ -1,0 +1,376 @@
+<?php
+
+/**
+ * @file
+ * Primary hook implementations for Media Reference Revisions.
+ */
+
+use Drupal\Core\Cache\Cache;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\field\Entity\FieldConfig;
+use Drupal\media_entity\Entity\Media;
+use Drupal\media_reference_revisions\Entity\MediaReferenceRevision;
+
+/**
+ * Implements hook_entity_view().
+ */
+function media_reference_revisions_entity_view(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display, $view_mode) {
+  // Is this entity type supported?
+  if (!media_reference_revisions_entity_type_supported($entity, $view_mode)) {
+    return;
+  }
+
+  // Process supported Entity Reference fields on this entity.
+  foreach (media_reference_revisions_supported_er_fields($entity) as $field_name) {
+    if (isset($build[$field_name]['#items'])) {
+      foreach ($build[$field_name]['#items'] as $delta => $item) {
+        /** @var \Drupal\Core\Field\Plugin\Field\FieldType\EntityReferenceItem $item */
+        $replacement = MediaReferenceRevision::loadMediaEntity($entity, $item->getValue()['target_id']);
+
+        if (!empty($replacement)) {
+          // This handles entities which are displayed as a title link.
+          if (isset($build[$field_name][$delta]['#title'])) {
+            $build[$field_name][$delta]['#title'] = $replacement->label();
+          }
+
+          // This handles entities which are displayed as an entity view.
+          if (isset($build[$field_name][$delta]['#media'])) {
+            $build[$field_name][$delta]['#media'] = $replacement;
+          }
+
+          // Add the revision ID to the end of the cache keys, to make this
+          // instance get reloaded when the ID is different.
+          $build[$field_name][$delta]['#cache']['keys'][] = $replacement->getRevisionId();
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_insert().
+ */
+function media_reference_revisions_entity_insert(EntityInterface $entity) {
+  // Is this entity type supported?
+  if (media_reference_revisions_entity_type_supported($entity)) {
+    // Look for fields for this entity, see if any of them point to a media
+    // object.
+    foreach (media_reference_revisions_supported_er_fields($entity) as $field_name) {
+      $medias = $entity->{$field_name}->referencedEntities();
+      if (!empty($medias)) {
+        foreach ($medias as $media) {
+          media_reference_revisions_create_record($entity, $media);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function media_reference_revisions_entity_update(EntityInterface $entity) {
+  // Is this entity type supported?
+  if (media_reference_revisions_entity_type_supported($entity)) {
+    // If a node is published and there are media items, update all other nodes
+    // to point to the same revision.
+    $update_all = media_reference_revisions_node_is_published($entity);
+
+    // Look for fields for this entity, see if any of them point to a media
+    // object.
+    foreach (media_reference_revisions_supported_er_fields($entity) as $field_name) {
+      $medias = $entity->{$field_name}->referencedEntities();
+      if (!empty($medias)) {
+        foreach ($medias as $media) {
+          media_reference_revisions_update_record($entity, $media, $update_all);
+        }
+      }
+    }
+  }
+
+  // If the entity that was updated was a media entity, update its referencee
+  // nodes with the latest revision.
+  if ($entity->getEntityTypeId() == 'media') {
+    media_reference_revisions_clear_referencee_cache($entity);
+  }
+}
+
+/**
+ * Clears the cache of all entities that reference the updated media item.
+ *
+ * @param Drupal\Core\Entity\EntityInterface $entity
+ *   The media entity being considered.
+ *
+ * @throws \Drupal\Component\Plugin\Exception\InvalidPluginDefinitionException
+ * @throws \Drupal\Component\Plugin\Exception\PluginNotFoundException
+ */
+function media_reference_revisions_clear_referencee_cache(EntityInterface $media) {
+  // Get a list of the entities that use this media revision.
+  $query = db_select('media_reference_revision', 'mrr')
+    ->fields('mrr', ['entity_id', 'entity_type'])
+    ->condition('media_vid', $media->getRevisionId())
+    ->execute();
+
+  // Compile a list of tags for the matching entities.
+  $tags = [];
+  while ($data = $query->fetchAssoc()) {
+    $tags[] = $data['entity_type'] . ':' . $data['entity_id'];
+  }
+
+  // Invalidate these tags.
+  if (!empty($tags)) {
+    Cache::invalidateTags($tags);
+  }
+}
+
+/**
+ * Identify whether a given entity is supported by the module.
+ *
+ * @param Drupal\Core\Entity\EntityInterface $entity
+ *   The entity being considered.
+ *
+ * @return bool
+ *   Indicates whether this entity type is supported by this module.
+ */
+function media_reference_revisions_entity_type_supported(EntityInterface $entity) {
+  // List of supported entity types.
+  // @todo Make this configurable, or maybe just automatic?
+  $supported = [
+    'node',
+    'paragraph',
+  ];
+
+  // Check to see if the entity is a supported type.
+  if (in_array($entity->getEntityTypeId(), $supported)) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Get the list of supported Entity Reference fields from this entity.
+ *
+ * @todo Only Entity Reference fields are considered for this because.
+ *
+ * @param Drupal\Core\Entity\EntityInterface $entity
+ *   The entity to check.
+ *
+ * @return array
+ *   The field names on this entity which are supported.
+ */
+function media_reference_revisions_supported_er_fields(EntityInterface $entity) {
+  $supported_fields = [];
+
+  // Look for fields for this entity, see if any of them point to a media
+  // object.
+  $entity_type = $entity->getEntityTypeId();
+  $bundle = $entity->bundle();
+  $fields = \Drupal::service('entity_field.manager')
+    ->getFieldDefinitions($entity_type, $bundle);
+
+  foreach ($fields as $field_name => $field_definition) {
+    if ($field_definition instanceof FieldConfig) {
+      $field_config = $field_definition->getConfig($entity->bundle());
+      $type = $field_config->getType();
+      if ($type == 'entity_reference') {
+        $settings = $field_config->getSettings();
+        if (!empty($settings['target_type']) && $settings['target_type'] == 'media') {
+          $supported_fields[] = $field_name;
+        }
+      }
+    }
+  }
+
+  return $supported_fields;
+}
+
+/**
+ * Create an MRR record for this entity/media pairing.
+ *
+ * @param Drupal\Core\Entity\EntityInterface $entity
+ *   The entity that the media item is attached to.
+ * @param Drupal\Core\Entity\EntityInterface $media
+ *   The media object that is pointed to.
+ */
+function media_reference_revisions_create_record(EntityInterface $entity, EntityInterface $media) {
+  /** @var \Drupal\Core\Database\Database $database */
+  $database = \Drupal::database();
+  $database->insert('media_reference_revision')
+    ->fields([
+      'entity_type' => $entity->getEntityTypeId(),
+      'entity_id' => $entity->id(),
+      'entity_vid' => $entity->getRevisionId(),
+      'media_id' => $media->id(),
+      'media_vid' => $media->getRevisionId(),
+    ])
+    ->execute();
+}
+
+/**
+ * Update an existing MRR record for this entity/media pairing.
+ *
+ * @param Drupal\Core\Entity\EntityInterface $entity
+ *   The entity that the media item is attached to.
+ * @param Drupal\Core\Entity\EntityInterface $media
+ *   The media object that is pointed to.
+ * @param bool $update_all
+ *   If all occurrences of this media item should also be updated to point to
+ *   the new revision; by default only the selected entity will be updated.
+ */
+function media_reference_revisions_update_record(EntityInterface $entity, EntityInterface $media, $update_all = FALSE) {
+  /** @var \Drupal\Core\Database\Database $database */
+  $database = \Drupal::database();
+
+  $newmedia = MediaReferenceRevision::loadLatestMediaRevision($media);
+
+  // See if a record exists for this combination already.
+  $query = $database->select('media_reference_revision', 'mrr')
+    ->fields('mrr')
+    ->condition('entity_type', $entity->getEntityTypeId())
+    ->condition('entity_id', $entity->id())
+    ->condition('entity_vid', $entity->getRevisionId())
+    ->condition('media_id', $media->id())
+    ->execute()
+    ->fetchAll();
+
+  // No record exists already, so create one.
+  if (empty($query)) {
+    media_reference_revisions_create_record($entity, $newmedia);
+  }
+
+  // A record already exists, so update it.
+  // @todo Should it update the revision? This might need to be a setting.
+  else {
+    $database->update('media_reference_revision')
+      ->fields([
+        'media_vid' => $newmedia->getRevisionId(),
+      ])
+      ->condition('entity_type', $entity->getEntityTypeId())
+      ->condition('entity_id', $entity->id())
+      ->condition('entity_vid', $entity->getRevisionId())
+      ->condition('media_id', $media->id())
+      ->execute();
+  }
+
+  // Optionally update records for all other entities.
+  if ($update_all) {
+    media_reference_revisions_update_media_revision($newmedia);
+  }
+}
+
+/**
+ * Implement hook_entity_delete().
+ */
+function media_reference_revisions_entity_delete(EntityInterface $entity) {
+  /** @var \Drupal\Core\Database\Database $database */
+  $database = \Drupal::database();
+
+  // Always delete records for this entity.
+  $database->delete('media_reference_revision')
+    ->condition('entity_type', $entity->getEntityTypeId())
+    ->condition('entity_id', $entity->id())
+    ->execute();
+
+  // Media objects might have an extra match.
+  if ($entity->getEntityTypeId() == 'media') {
+    $database->delete('media_reference_revision')
+      ->condition('media_id', $entity->id())
+      ->execute();
+  }
+}
+
+/**
+ * Implement hook_entity_revision_delete().
+ */
+function media_reference_revisions_entity_revision_delete(EntityInterface $entity) {
+  /** @var \Drupal\Core\Database\Database $database */
+  $database = \Drupal::database();
+
+  // Always delete records for this entity revision.
+  $database->delete('media_reference_revision')
+    ->condition('entity_type', $entity->getEntityTypeId())
+    ->condition('entity_vid', $entity->getRevisionId())
+    ->execute();
+
+  // Media revisions might have an extra match.
+  if ($entity->getEntityTypeId() == 'media') {
+    $database->delete('media_reference_revision')
+      ->condition('media_vid', $entity->getRevisionId())
+      ->execute();
+  }
+}
+
+/**
+ * Update existing references to media entities.
+ *
+ * @param Drupal\Core\Entity\EntityInterface $media
+ *   The media entity being processed.
+ */
+function media_reference_revisions_update_media_revision(EntityInterface $media) {
+  // Update all media items.
+  \Drupal::database()
+    ->update('media_reference_revision')
+    ->fields([
+      'media_vid' => $media->getRevisionId(),
+    ])
+    ->condition('media_id', $media->id())
+    ->execute();
+
+  // Clear all of the entity caches too.
+  media_reference_revisions_clear_referencee_cache($media);
+}
+
+/**
+ * Identify whether this item is published.
+ *
+ * @param Drupal\Core\Entity\EntityInterface $entity
+ *   The entity to check. If a node, will check if it is published, if a
+ *   paragraph checks its parent entity.
+ *
+ * @return bool
+ *   Whether this node, or its parent, is published.
+ */
+function media_reference_revisions_node_is_published(EntityInterface $entity) {
+  // Nodes are straight forward - is the item published? If so, return TRUE.
+  if ($entity->getEntityTypeId() == 'node') {
+    // Special handling for when processing node forms where there's a Content
+    // Moderation workflow being used. Special thanks to Samuel Mortenson for
+    // this code.
+    if (\Drupal::routeMatch()->getRouteName() === 'entity.node.edit_form') {
+      if (isset($_POST['moderation_state'][0]['state'])) {
+        /** @var \Drupal\content_moderation\ModerationInformationInterface $content_moderation_info */
+        $content_moderation_info = \Drupal::service('content_moderation.moderation_information');
+        $workflow = $content_moderation_info->getWorkflowForEntity($entity);
+        if (!empty($workflow)) {
+          $current_state = $workflow->getTypePlugin()->getState($_POST['moderation_state'][0]['state']);
+          if (!empty($current_state)) {
+            return $current_state->isPublishedState();
+          }
+        }
+      }
+    }
+
+    // Only update all items if the node is published.
+    if ($entity->isPublished()) {
+      return TRUE;
+    }
+  }
+
+  // For Paragraph entities, check the parent item.
+  elseif ($entity->getEntityTypeId() == 'paragraph') {
+    // Get the parent entity and run the function on it again.
+    $parent = $entity->getParentEntity();
+
+    // When creating a new Paragraph entity on a new node there is no parent
+    // entity.
+    if (!empty($parent)) {
+      return media_reference_revisions_node_is_published($parent);
+    }
+  }
+
+  // If no published node was found in the entity hierarchy, then return FALSE.
+  return FALSE;
+}
