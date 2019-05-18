@@ -1,0 +1,265 @@
+<?php
+/**
+ * Provides a mechanism to override the description and title fields on drupal forms.
+ * Note that this is not too useful for node fields because they all are node_edit.
+**/
+
+use Drupal\Core\Database\Database;
+use Drupal\Core\Link;
+use Drupal\Component\Utility\UrlHelper;
+
+/**
+ * Implementation of hook_help().
+ */
+function formdefaults_help($section) {
+  switch ($section) {
+    case 'admin/modules#description':
+      return t("Lets the site administrator edit the description, title and markup attributes of a form.");
+  }
+}
+
+// Adds on add-on
+function _formdefaults_addon_fields($form_def, &$form) {
+  // Add a header and a footer to all forms for instructions
+  if (@$form_def['formdefaults_header']) {
+    $form['formdefaults_header'] = array(
+      '#type' => 'markup',
+      '#value' => '',
+      '#weight' => -50,
+      );
+  }
+
+  if (@$form_def['formdefaults_footer']) {
+    $form['formdefaults_footer'] = array(
+      '#type' => 'markup',
+      '#value' => '',
+      '#weight' => 50,
+      );
+  }
+
+  // add on arbitrary fields created by the form editor.
+  foreach (@(array)$form_def['#formdefaults_addon_fields'] as $key => $field) {
+
+    $form[$key]= $field;
+  }
+
+}
+
+
+/**
+ * implements hook_form_alter
+ */
+function formdefaults_form_alter(&$form, &$form_state, $formid) {
+
+  $savedform = formdefaults_getform($formid);
+  _formdefaults_addon_fields($savedform, $form);
+  $enabled = @($_SESSION['formdefaults_enabled'] && $formid != 'formdefaults_edit');
+  //If the user has the right privs, add the links to alter the form
+  $formfieldsarray = array();
+  if (Drupal::currentUser()->hasPermission('change form labels') && $enabled) {
+    $forms = @$_SESSION['formdefaults_forms'];
+    foreach ($form as $fieldname => $value) _formdefaults_get_field($formid, $fieldname, $form[$fieldname], $formfieldsarray);
+    $forms[$formid] = $formfieldsarray;
+    $_SESSION['formdefaults_forms'] = $forms;
+  }
+
+  if ($savedform) {
+    foreach ($form as $fieldname => $value) formdefaults_alterform($formid, $fieldname, $form[$fieldname], $savedform);
+  }
+  if ($enabled) {
+    $link = Link::createFromRoute(
+      '[' . t('edit form') . ']',
+      'formdefaults.edit_w_formid', [
+        'formid' => $formid,
+    ])->toString();
+    $form['formdefaults_edit_form'] = array(
+      '#type' => 'markup',
+      '#weight' => -50,
+      '#markup' => '<p>' . $link . '</p>'
+    );
+  }
+  //drupal_set_message('<pre>'. print_r($form,1) .'</pre>');
+
+}
+
+/**
+ * Recursively iterate through the form array to save  titles and descirptions.
+ * The the resulting title/description array is intentionally flattened to make
+ * indexing easier during the "replacement" portion of the code.
+ * Also tack on the [edit] link.
+ * @param $formid the formid of the form we're altering
+ * @param $fieldname the fieldname of the last form field we found.
+ * @param $fieldvalue The array of field values that we found last.
+ * @param $fieldarray We store the array of titles and desciptions in this array for storing later.
+ */
+function _formdefaults_get_field($formid, $fieldname, &$fieldvalue, &$fieldarray) {
+    if (is_array($fieldvalue) && !(strpos($fieldname, '#')===0)) {
+      // Determine return location for links.
+      $query = array();
+      $query['destination'] = \Drupal::request()->attributes->get('_system_path');
+      if (is_array($query)) {
+        $query = UrlHelper::buildQuery($query);
+      	$options['query'] = $query;
+      }
+      $options = array();
+      $type = @$fieldvalue['#type'];
+      $fieldarray[$fieldname]['type'] = $type;
+      // Skip submit and hidden fields cause they're too dangerous to alter.
+      if ($type != 'submit' && $type != 'hidden') {
+        if (array_key_exists('#weight', $fieldvalue))
+          $fieldarray[$fieldname]['weight'] = $fieldvalue['#weight'];
+        else
+          $fieldarray[$fieldname]['weight'] = 'unset';
+
+        if ($type == 'markup') {
+          $link = Link::createFromRoute(
+            '[' . t('edit markup') . ']',
+            'formdefaults.edit', [
+              'formid' => $formid,
+              'field' => $fieldname,
+          ])->toString();
+          $fieldarray[$fieldname]['value'] = @$fieldvalue['#markup'];
+          $fieldvalue['#markup'] = $link . ' ' . @$fieldvalue['#markup'];
+        }
+        else {
+          $fieldarray[$fieldname]['title'] = @$fieldvalue['#title'];
+          $fieldarray[$fieldname]['description'] = @$fieldvalue['#description'];
+          $fieldvalue['#suffix'] = Link::createFromRoute(
+            '[' . t('edit @type', ['@type' => @$fieldvalue['#type']]) . ']',
+            'formdefaults.edit', [
+              'formid' => $formid,
+              'field' => $fieldname,
+          ])->toString();
+        }
+      }
+      foreach ($fieldvalue as $key => $value) {
+        if (!(strpos($key, '#')===0))
+          _formdefaults_get_field($formid, $key, $fieldvalue[$key], $fieldarray);
+      }
+   }
+
+}
+
+/**
+ * Hide a field by turning it into a value or markup field.
+ *
+ * @param array $fieldvalue
+ */
+function _formdefaults_hide_field(&$fieldvalue) {
+          //drupal_set_message($fieldname.":".$formreplace[$fieldname]['hide_it']);
+          switch ($fieldvalue['#type']) {
+            case "fieldset":
+            case "markup":
+              $h_type = 'value';
+              $fieldvalue['#value']='';
+              break;
+            default:
+              $h_type = 'value';
+              break;
+          }
+          $fieldvalue['#type']=$h_type;
+          if (!array_key_exists('#value', $fieldvalue)) $fieldvalue['#value'] = $fieldvalue['#default_value'];
+
+}
+
+/**
+ * Recursively iterate through all form elements and hide all children.
+ *
+ * @param array $form_element
+ */
+function _formdefaults_hide_recursive(&$form_element) {
+  // recursively iterate through all children and hide them.
+  foreach ((array)$form_element as $key => $field) if (strpos($key, '#')===FALSE) {
+     _formdefaults_hide_recursive($form_element[$key]);
+  }
+  _formdefaults_hide_field($form_element);
+}
+
+/**
+ * Alters the form based on the form replacement items passed.
+ * @param $formid the form id of the form that we're altering
+ * @param $fieldname the field name of the last field we found
+ * @param $fieldvalues the field value array form the last field we found.
+ * @param $formreplace the replacement data for the form.
+*/
+function formdefaults_alterform($formid, $fieldname, &$fieldvalue, $formreplace) {
+  // Determine return location for links.
+  $query = array();
+  $query['destination'] = $_GET['q'];
+  $enabled = @$_SESSION['formdefaults_enabled'] && $formid!='formdefaults_edit';
+  // Need to make sure we aren't processing attributes.
+  if (is_array($fieldvalue) && !(strpos($fieldname, '#')===0)) {
+    if (is_array(@$formreplace[$fieldname])) {
+      // perform the replacement.
+      // fo stands for field override
+      $fo = $formreplace[$fieldname];
+      if (@$formreplace[$fieldname]['hide_it']) {
+        _formdefaults_hide_recursive($fieldvalue);
+      }
+      if (@$fo['weight']!='unset') {
+        $fieldvalue['#weight'] = $fo['weight'];
+      }
+
+      if (@$fieldvalue['#type'] == 'fieldset' && array_key_exists('collapsible', $fo)) {
+        $fieldvalue['#collapsible'] = $fo['collapsible'];
+      }
+
+      if (@$fieldvalue['#type'] == 'fieldset' && array_key_exists('collapsed', $fo)) {
+        $fieldvalue['#collapsed'] = $fo['collapsed'];
+      }
+
+      if (@$fieldvalue['#type'] == 'markup') {
+        $fieldvalue['#markup'] = check_markup($formreplace[$fieldname]['value'], @$formreplace[$fieldname]['input_format'], FALSE);
+      }
+      else {
+        $fieldvalue['#title'] = @$fo['title'];
+        $fieldvalue['#description'] = @$fo['description'];
+      }
+
+      // add back on the edit control if appropriate.
+      $url->setOption('query', $query);
+      if (Drupal::currentUser()->hasPermission('change form labels') && $enabled) {
+        if ($fieldvalue['#type'] != 'markup') {
+          $fieldvalue['#suffix'] = Link::createFromRoute(
+            '[' . t('edit') . ' ' . t($fieldvalue['#type']) . ']',
+            'formdefaults.edit', [
+              'formid' => $formid,
+              'field' => $fieldname,
+          ])->toString();
+        }
+        else {
+          $link = Link::createFromRoute(
+            '[' . t('edit markup') . ']',
+            'formdefaults.edit', [
+              'formid' => $formid,
+              'field' => $fieldname,
+          ])->toString();
+          $fieldvalue['#markup'] = $link . ' ' . @$fieldvalue['#markup'];
+        }
+      }
+    }
+
+    // If this is a fieldset, we're going to need to recurse.
+    foreach ($fieldvalue as $key => $value) {
+      if (!(strpos($key, '#')===0)) formdefaults_alterform($formid, $key, $fieldvalue[$key], $formreplace);
+    }
+
+  }
+
+}
+
+/**
+ * Retrieve from alterations from the database
+ * @formid the form id to retrieve.
+ */
+function formdefaults_getform($formid) {
+  $result = Database::getConnection()
+    ->query('SELECT * FROM {formdefaults_forms} WHERE formid = :formid', [
+      ':formid' => $formid
+    ]);
+  $formarray = array();
+  foreach ($result as $form) {
+    $formarray = unserialize($form->formdata);
+  }
+  return $formarray;
+}
