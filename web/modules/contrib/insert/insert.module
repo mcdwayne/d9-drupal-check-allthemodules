@@ -1,0 +1,1016 @@
+<?php
+
+require_once __DIR__ . DIRECTORY_SEPARATOR . 'insert.update.php';
+
+use Drupal\Component\Utility\NestedArray;
+use Drupal\Core\Field\WidgetInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Link;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Url;
+use Drupal\file\Entity\File;
+use Drupal\insert\Utility\InsertUtility;
+use Drupal\image\Entity\ImageStyle;
+use Drupal\node\Entity\Node;
+
+const INSERT_TYPE_FILE = 'file';
+const INSERT_TYPE_IMAGE = 'image';
+
+const INSERT_DEFAULT_SETTINGS = [
+  'styles' => [],
+  'default' => 'insert__auto',
+  'auto_image_style' => 'image',
+  'link_image' => null,
+  'caption' => FALSE,
+  'width' => '',
+  'align' => FALSE,
+  'rotate' => FALSE,
+];
+
+/**
+ * Implements hook_field_widget_third_party_settings_form().
+ */
+function insert_field_widget_third_party_settings_form(WidgetInterface $plugin) {
+  $pluginId = $plugin->getPluginId();
+
+  if (
+    InsertUtility::isSourceWidget(
+      $pluginId, [INSERT_TYPE_FILE, INSERT_TYPE_IMAGE]
+    )
+  ) {
+    $insertType = _insert_get_insert_type($pluginId);
+
+    if ($insertType === INSERT_TYPE_FILE) {
+      $config = \Drupal::config('insert.config');
+      if ($config->get('file_field_images_enabled')) {
+        $insertType = INSERT_TYPE_IMAGE;
+      }
+    }
+
+    return _insert_settings_form(_insert_settings($plugin), $insertType);
+  }
+
+  return [];
+}
+
+/**
+ * @param string $pluginId
+ * @return string
+ *
+ * @throws Exception
+ *   when more than one insert type are implemented for the supplied plugin id
+ *   or no insert type is implemented for the supplied plugin id
+ */
+function _insert_get_insert_type($pluginId) {
+  $widgets = \Drupal::moduleHandler()->invokeAll('insert_widgets');
+  $insertType = null;
+
+  foreach ($widgets as $widgetInsertType => $pluginIds) {
+    if (in_array($pluginId, $pluginIds)) {
+      if ($insertType !== null) {
+        throw new Exception('Multiple insert types configured for plugin id ' . $pluginId);
+      }
+      $insertType = $widgetInsertType;
+    }
+  }
+
+  if ($insertType === null) {
+    throw new Exception('No insert type configured for plugin id ' . $pluginId);
+  }
+
+  return $insertType;
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function insert_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+  _insert_add_process($form);
+
+  if ($form_id === 'filter_format_edit_form') {
+    $text_formats = \Drupal::config('insert.config')->get('text_formats');
+
+    // Ensure attributes set by Insert are not stripped from the output:
+    if (in_array($form['format']['#default_value'], $text_formats)) {
+      $form['filters']['settings']['filter_html']['allowed_html']['#element_validate'][]
+        = '_insert_allowed_html_validate';
+    }
+  }
+}
+
+/**
+ * Returns an array with all paths removed, except for those containing the key
+ * '#insert'.
+ *
+ * @param array &$elements
+ */
+function _insert_add_process(array &$elements) {
+  if (isset($elements['#insert'])) {
+    $elements['#process'][] = '_insert_field_process';
+  }
+
+  $keys = Element::children($elements);
+
+  foreach ($keys as $key) {
+    _insert_add_process($elements[$key]);
+  }
+}
+
+/**
+ * Form API callback: Processes a file field element.
+ * @see \Drupal\file\Plugin\Field\FieldWidget\FileWidget::process()
+ *
+ * @param array $element
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ * @param array $form
+ * @return array
+ */
+function _insert_field_process(array $element, FormStateInterface $form_state, array $form) {
+  $originalElement = $element;
+  $element['#insert']['id'] = $element['#id'];
+  $insertType = $element['#insert']['type'];
+
+  $element['insert'] = [
+    '#type' => $element['#insert']['settings']['align']
+      ? 'fieldset' : 'container',
+    '#attributes' => [
+      'class' => [
+        'insert',
+        'form-item',
+        'container-inline',
+        'inline',
+      ],
+      'data-insert-type' => $insertType,
+    ],
+  ];
+
+  $continue = \Drupal::moduleHandler()->invokeAll(
+    'insert_process',
+    [&$insertType, &$element]
+  );
+
+  if (in_array(FALSE, $continue)) {
+    return $originalElement;
+  }
+
+  $settings = $element['#insert']['settings'];
+
+  $defaultStyleName = !empty($settings['default'])
+    ? $settings['default']
+    : null;
+
+  $insertStyles = _insert_retrieve_styles(
+    $settings['styles'],
+    $defaultStyleName,
+    $insertType
+  );
+
+  $insertElements = [&$element];
+
+  if (count($continue) > 0 && is_string($continue[0])) {
+    $insertElements = [];
+    foreach ($element[$continue[0]] as $key => $value) {
+      if (is_int($key)) {
+        $insertElements[] = &$element[$continue[0]][$key];
+      }
+    }
+  }
+
+  foreach ($insertElements as &$insertElement) {
+    $insertElement['insert']['insert_templates'] = [
+      '#type' => 'container',
+      '#attributes' => ['class' => ['insert-templates']],
+    ];
+
+    $styleOptions = [];
+
+    foreach ($insertStyles as $styleName => $style) {
+      $vars = [
+        'attributes' => [],
+        'field_name' => $element['#field_name'],
+        'field_type' => $insertType,
+        'id' => $element['#insert']['id'],
+        'insert_settings' => $settings,
+        'style_name' => $styleName,
+      ];
+
+      if (in_array(FALSE, \Drupal::moduleHandler()->invokeAll(
+        'insert_variables',
+        [$insertType, &$element, $styleName, &$vars]
+      ))) {
+        continue;
+      }
+
+      $insertElement['insert']['insert_templates'][$styleName] = [
+        '#type' => 'hidden',
+        '#value' => _insert_render($styleName, $vars),
+        '#id' => $vars['id'] . '-insert-template-' . str_replace('_', '-', $styleName),
+        '#name' => $element['#name'] . '[insert_template][' . $styleName . ']',
+        '#attributes' => ['class' => ['insert-template']],
+      ];
+
+      $styleOptions[$styleName] = _insert_get_style_label($style);
+    }
+
+    $config = \Drupal::config('insert.config');
+
+    $insertElement['#attached']['drupalSettings']['insert'] = [
+      'fileDirectoryPath' => file_default_scheme(),
+      // These CSS classes will be retained from being dumped by CKEditor when
+      // applying CKEditor styles using CKEditor's style drop-down.
+      'classes' => [
+        $insertType => [
+          'insertClass' => $config->get('css_classes.' . $insertType) !== null
+            ? join(' ', $config->get('css_classes.' . $insertType)) : '',
+          'styleClass' => join(' ', _insert_get_style_classes($insertStyles)),
+        ]
+      ],
+      'widgets' => [$insertType => $settings],
+    ];
+
+    /** @var \Drupal\node\NodeForm $form */
+    $form = $form_state->getFormObject();
+    $node = $form->getEntity();
+
+    $insertElement['insert']['button'] = [
+      '#theme' => 'insert_button_widget',
+      '#type' => 'markup',
+      '#options' => $styleOptions,
+      '#weight' => 5,
+      '#nid' => $node instanceof Node ? $node->id() : '',
+      '#insert' => $element['#insert'],
+    ];
+
+    if ($defaultStyleName !== null) {
+      $insertElement['insert']['button']['#default_value'] = $defaultStyleName;
+    }
+
+  }
+
+  return $element;
+}
+
+/**
+ * @param array $styleSetting
+ * @param string|null $defaultStyleName
+ * @param string $insertType
+ * @return array
+ *   The styles to consider for inserting items.
+ */
+function _insert_retrieve_styles(array $styleSetting, $defaultStyleName, $insertType) {
+  $allStyles = \Drupal::moduleHandler()->invokeAll(
+    'insert_styles',
+    [$insertType]
+  );
+  $defaultStyleName = _insert_evaluate_default_style($defaultStyleName, $insertType);
+
+  if ($insertType === INSERT_TYPE_FILE) {
+    // Filter out styles disabled per widget setting.
+    $selectedStyles = array_filter($styleSetting);
+  }
+  else {
+    // When the value is <all>, even styles that have been created since the
+    // widget settings have been altered the last time shall be enabled;
+    // Consequently, all styles have to be retrieved instead of using any actual
+    // setting value.
+    $selectedStyles = !empty($styleSetting['<all>'])
+      ? array_combine($allStyles, $allStyles)
+      // Else, filter out styles disabled per widget setting.
+      : array_filter((array)$styleSetting);
+  }
+
+  // Ensure default style is available.
+  if ($defaultStyleName !== null && !array_key_exists($defaultStyleName, $selectedStyles)) {
+    $selectedStyles[$defaultStyleName] = $allStyles[$defaultStyleName];
+  }
+
+  // Ensure only styles that are still installed are considered.
+  $selectedAndInstalled = [];
+
+  foreach (array_keys($selectedStyles) as $styleName) {
+    if (array_key_exists($styleName, $allStyles)) {
+      $selectedAndInstalled[$styleName] = $allStyles[$styleName];
+    }
+  }
+
+  return $selectedAndInstalled;
+}
+
+/**
+ * Returns the default style or a fallback style when the defined default style
+ * is not compatible to the $insertType.
+ *
+ * @param string|null $styleName
+ * @param string $insertType
+ * @return string
+ */
+function _insert_evaluate_default_style($styleName, $insertType) {
+  if (!in_array($insertType, [INSERT_TYPE_FILE, INSERT_TYPE_IMAGE])) {
+    // Core Insert module is not responsible for insert types other than file
+    // and image.
+    return $styleName;
+  }
+
+  if ($insertType === INSERT_TYPE_IMAGE) {
+    // Image widgets may use all styles
+    return $styleName;
+  }
+
+  // Prevent file widgets to use an image style for inserting:
+  $allStyles = \Drupal::moduleHandler()->invokeAll(
+    'insert_styles',
+    [INSERT_TYPE_FILE]
+  );
+
+  if (array_key_exists($styleName, $allStyles)) {
+    return $styleName;
+  }
+
+  return INSERT_DEFAULT_SETTINGS['default'];
+}
+
+/**
+ * @param array|ImageStyle $style
+ * @return string
+ */
+function _insert_get_style_label($style) {
+  return is_array($style) ? $style['label'] : $style->label();
+}
+
+
+/**
+ * Returns any CSS classes deriving from the style definitions.
+ *
+ * @param array $styles
+ * @return array
+ */
+function _insert_get_style_classes(array $styles) {
+  $styleClasses = [];
+  foreach ($styles as $styleName => $style) {
+    if ($style instanceof ImageStyle) {
+      $styleClasses[] = 'image-' . $styleName;
+    }
+  }
+  return $styleClasses;
+}
+
+/**
+ * Returns the rendered template for a specific style or pseudo-style.
+ *
+ * @param string $styleName
+ * @param array $vars
+ * @return string
+ */
+function _insert_render($styleName, array $vars) {
+  $rendered
+    = \Drupal::moduleHandler()->invokeAll('insert_render', [$styleName, $vars]);
+
+  if (count($rendered)) {
+    $rendered = $rendered[0];
+  }
+  else {
+    if ($styleName === 'insert__auto') {
+      $styleName = isset($vars['insert__auto'])
+        ? $vars['insert__auto'] : 'link';
+    }
+
+    if ($styleName === 'icon_link') {
+      $rendered = \Drupal::theme()->render(['insert_icon_link'], $vars);
+    }
+    elseif ($styleName === 'link') {
+      $rendered = \Drupal::theme()->render(['insert_link'], $vars);
+    }
+    elseif ($styleName === 'audio') {
+      $rendered = \Drupal::theme()->render(['insert_audio'], $vars);
+    }
+    elseif ($styleName === 'video') {
+      $rendered = \Drupal::theme()->render(['insert_video'], $vars);
+    }
+    else {
+      $templateStyleName = str_replace('-', '_', $styleName);
+      $templateFieldName = str_replace('-', '_', $vars['field_name']);
+
+      $rendered = \Drupal::theme()->render(
+        [
+          'insert_image__' . $templateFieldName . '__' . $templateStyleName,
+          'insert_image__' . $templateFieldName,
+          'insert_image__' . $templateStyleName,
+          'insert_image'
+        ],
+        $vars
+      );
+    }
+  }
+
+  return gettype($rendered) === 'string'
+    ? $rendered
+    : $rendered->jsonSerialize();
+}
+
+/**
+ * Implements hook_insert_widgets().
+ */
+function insert_insert_widgets() {
+  return \Drupal::config('insert.config')->get('widgets');
+}
+
+/**
+ * Implements hook_insert_process().
+ */
+function insert_insert_process(&$insertType, array &$element) {
+
+  if ($insertType !== INSERT_TYPE_FILE && $insertType !== INSERT_TYPE_IMAGE) {
+    return [];
+  }
+
+  // Prevent displaying the Insert button when the file/image is empty ("Add a
+  // new file" row).
+  if (count($element['#value']['fids']) === 0) {
+    return FALSE;
+  }
+
+  $settings = $element['#insert']['settings'];
+
+  if (!count(array_filter($settings['styles']))) {
+    // Insert is disabled (no styles selected in the widget settings).
+    return FALSE;
+  }
+
+  $item = $element['#value'];
+
+  if (!isset($item['fids']) || count($item['fids']) === 0) {
+    return FALSE;
+  }
+
+  /** @var File $file */
+  $file = File::load($item['fids'][0]);
+
+  $config = \Drupal::config('insert.config');
+  $insertType = INSERT_TYPE_FILE;
+  if (
+    $element['#insert']['type'] === INSERT_TYPE_IMAGE
+    || InsertUtility::isImage($file) && $config->get('file_field_images_enabled')
+  ) {
+    $insertType = INSERT_TYPE_IMAGE;
+  }
+
+  $element['#insert'][$insertType]['file'] = $file;
+
+  $element['#insert']['settings']['fid'] = $item['fids'][0];
+  $element['#insert']['id'] = $file->uuid();
+
+  $element['insert']['#attributes']['data-uuid'] = $file->uuid();
+
+  $element['insert']['insert_filename'] = [
+    '#type' => 'hidden',
+    '#value' => $file->getFilename(),
+    '#id' => $element['#insert']['id'] . '-insert-filename',
+    '#name' => $element['#name'] . '[insert_filename]',
+    '#attributes' => ['class' => ['insert-filename']],
+  ];
+
+  $element['#attached']['library'][] = 'insert/insert';
+
+  return [];
+}
+
+/**
+ * Implements hook_insert_variables().
+ */
+function insert_insert_variables($insertType, array &$element, $styleName, array &$vars) {
+  if (!in_array($insertType, [INSERT_TYPE_FILE, INSERT_TYPE_IMAGE])) {
+    return [];
+  }
+
+  /** @var File $file */
+  $file = $element['#insert'][$insertType]['file'];
+
+  if ($file === null) {
+    return [FALSE];
+  }
+
+  $config = \Drupal::config('insert.config');
+  $imageInfo = pathinfo($file->getFileUri());
+  $extension = $imageInfo['extension'];
+
+  if (
+    $styleName === 'audio' && !in_array($extension, $config->get('file_extensions.audio'))
+    || $styleName === 'video' && !in_array($extension, $config->get('file_extensions.video'))
+  ) {
+    return [FALSE];
+  }
+
+  $settings = $element['#insert']['settings'];
+
+  if ($styleName === 'insert__auto') {
+    $vars['insert__auto'] = null;
+
+    if (in_array($extension, $config->get('file_extensions.video'))) {
+      $vars['insert__auto'] = 'video';
+    }
+    elseif (in_array($extension, $config->get('file_extensions.audio'))) {
+      $vars['insert__auto'] = 'audio';
+    }
+    elseif (
+      InsertUtility::isImage($file) && $config->get('file_field_images_enabled')
+      || $insertType === INSERT_TYPE_IMAGE
+    ) {
+      $vars['insert__auto'] = $settings['auto_image_style'];
+    }
+  }
+
+  $styleNameSegments = explode('__', $styleName, 2);
+  if (isset($styleNameSegments[1])) {
+    $styleName = $styleNameSegments[1];
+  }
+
+  $vars += [
+    'class' => join(' ', $config->get('css_classes.' . $insertType)),
+    'file' => $file,
+    'entity_type' => $file->getEntityTypeId(),
+    'mime_type' => $file->getMimeType(),
+    'uuid' => $file->uuid(),
+    'url' => file_create_url($file->getFileUri()),
+  ];
+
+  if (!$config->get('absolute')) {
+    $parsedUrl = parse_url($vars['url']);
+    $vars['url'] = $parsedUrl['path'];
+    if (!empty($parsedUrl['query'])) {
+      $vars['url']  .= '?' . $parsedUrl['query'];
+    }
+  }
+
+  if ($insertType === INSERT_TYPE_IMAGE) {
+    $vars['url_original'] = $vars['url'];
+    $vars['url_link'] = null;
+    $vars['uuid'] = 'insert-' . $styleName . '-' . $vars['uuid'];
+
+    $styleUrl = InsertUtility::buildDerivativeUrl(
+      $vars['file'],
+      isset($vars['insert__auto']) ? $vars['insert__auto'] : $styleName,
+      $config->get('absolute')
+    );
+
+    if ($styleUrl !== null) {
+      $vars['url'] = $styleUrl;
+
+      if ($settings['link_image']) {
+        $vars['url_link'] = InsertUtility::buildDerivativeUrl(
+          $vars['file'],
+          $settings['link_image'],
+          $config->get('absolute')
+        );
+      }
+    }
+  }
+
+  return [];
+}
+
+/**
+ * @param WidgetInterface $plugin
+ * @return array
+ */
+function _insert_settings($plugin) {
+  return array_merge(INSERT_DEFAULT_SETTINGS, $plugin->getThirdPartySettings('insert'));
+}
+
+/**
+ * @param array $settings
+ * @param string $insertType
+ * @return array
+ */
+function _insert_settings_form(array $settings, $insertType) {
+  $stylesLists = [
+    INSERT_TYPE_FILE => InsertUtility::aggregateStyles(INSERT_TYPE_FILE),
+    INSERT_TYPE_IMAGE => InsertUtility::aggregateStyles(INSERT_TYPE_IMAGE),
+  ];
+
+  if (
+    !isset($stylesLists[$insertType])
+    || count($stylesLists[$insertType]) === 0
+  ) {
+    return [];
+  }
+
+  $stylesList = InsertUtility::stylesListToOptions($stylesLists[$insertType]);
+
+  $element = [
+    '#type' => 'details',
+    '#title' => t('Insert'),
+    '#weight' => 20,
+  ];
+
+  $element['styles_heading'] = [
+    '#type' => 'markup',
+    '#markup' => t('Select which styles should be available for inserting images into text areas. If no styles are selected, the option to use a style is not displayed; If only one style is selected, that one is used automatically when inserting. If all styles are selected, new styles will be enabled by default.'),
+    '#weight' => 21,
+  ];
+
+  $element['styles'] = [
+    '#type' => 'table',
+    '#default_value' => !empty($settings['styles']['<all>'])
+      ? array_keys($stylesList)
+      : $settings['styles'],
+    '#element_validate' => [[InsertUtility::class, 'validateList']],
+    '#weight' => 22,
+    '#tableselect' => TRUE,
+    '#header' => [t('Select all')],
+  ];
+
+  foreach ($stylesList as $key => $label) {
+    $element['styles'][$key][$key] = [
+      '#type' => 'markup',
+      '#markup' => $label,
+    ];
+  }
+
+  $element['default'] = [
+    '#title' => t('Default style'),
+    '#type' => 'select',
+    '#options' => $stylesList,
+    '#default_value' => $settings['default'],
+    '#description' => t('Select the style which will be selected by default or used if no specific styles above are enabled.'),
+    '#weight' => 23,
+  ];
+
+  if ($insertType === INSERT_TYPE_IMAGE) {
+    $stylesList = InsertUtility::stylesListToOptions(
+      array_diff_key($stylesLists[INSERT_TYPE_IMAGE], $stylesLists[INSERT_TYPE_FILE])
+    );
+
+    $element['auto_image_style'] = [
+      '#title' => t('Automatic option image style'),
+      '#type' => 'select',
+      '#options' => $stylesList,
+      '#default_value' => $settings['auto_image_style'],
+      '#description' => t('The style to be used when inserting images using the AUTOMATIC insert style option.'),
+      '#weight' => 24,
+    ];
+
+    $element['link_image'] = [
+      '#title' => t('Link image to'),
+      '#type' => 'select',
+      '#options' => array_merge([null => t('do not link')], $stylesList),
+      '#default_value' => $settings['link_image'],
+      '#description' => t('Select the style of the image the image shall link to.'),
+      '#weight' => 25,
+    ];
+
+    $element['caption'] = [
+      '#type' => 'checkbox',
+      '#title' => t('Apply caption to images'),
+      '#default_value' => $settings['caption'],
+      '#description' => t('Applies a <code>data-caption</code> attribute to images. Transformation into an actual caption is performed by the caption filter that needs to be enabled for the text format in use. See text format configuration per @content_authoring and ensure <em>Caption images</em> in the <em>Enabled filters</em> section is checked. By default, the image title input field content will be used as caption.', ['@content_authoring' => Link::fromTextAndUrl(t('content authoring admin page'), Url::fromRoute('filter.admin_overview'))->toString()]),
+      '#weight' => 25,
+    ];
+
+    $element['width'] = [
+      '#title' => t('Maximum image insert width'),
+      '#type' => 'textfield',
+      '#size' => 10,
+      '#field_suffix' => ' ' . t('pixels'),
+      '#default_value' => $settings['width'],
+      '#description' => t('When inserting images, the height and width of images may be scaled down to fit within the specified width. Note that this does not resize the image, it only affects the HTML output.'),
+      '#weight' => 26,
+    ];
+
+    $element['align'] = [
+      '#type' => 'checkbox',
+      '#title' => t('Alignment controls'),
+      '#default_value' => $settings['align'],
+      '#description' => t('Alignment may be applied using radio buttons.'),
+      '#weight' => 27,
+    ];
+
+    $element['rotate'] = [
+      '#type' => 'checkbox',
+      '#title' => t('Rotation controls'),
+      '#default_value' => $settings['rotate'],
+      '#description' => t('The image may be rotated by using rotation controls.'),
+      '#weight' => 28,
+    ];
+  }
+
+  return $element;
+}
+
+/**
+ * Implements hook_field_widget_settings_summary_alter().
+ */
+function insert_field_widget_settings_summary_alter(array &$summary, array $context) {
+  /** @var WidgetInterface $plugin */
+  $plugin = $context['widget'];
+  $pluginId = $plugin->getPluginId();
+
+  if (
+    InsertUtility::isSourceWidget(
+      $pluginId, [INSERT_TYPE_FILE, INSERT_TYPE_IMAGE]
+    )
+  ) {
+    $styles = InsertUtility::aggregateStyles(INSERT_TYPE_IMAGE);
+    $settings = _insert_settings($plugin);
+    $activeStyles = array_intersect_key($styles, array_filter($settings['styles']));
+
+    $summary[] = t('Insert') . ': ' . (count($activeStyles)
+        ? implode(', ', array_map(function($style) {
+            /** @var array|ImageStyle $style */
+            return is_array($style) ? $style['label'] : $style->label();
+          }, $activeStyles))
+        : t('disabled')
+      );
+  }
+}
+
+/**
+ * Implements hook_field_widget_form_alter().
+ */
+function insert_field_widget_form_alter(array &$element, FormStateInterface $form_state, array $context) {
+  /** @var WidgetInterface $plugin */
+  $plugin = $context['widget'];
+  $pluginId = $plugin->getPluginId();
+
+  if (InsertUtility::isSourceWidget($pluginId)) {
+    $element['#insert'] = [
+      'id' => null,
+      'settings' => _insert_settings($plugin),
+      'type' => _insert_get_insert_type($pluginId),
+    ];
+  }
+}
+
+/**
+ * Implements hook_insert_styles().
+ */
+function insert_insert_styles($insertType) {
+  if ($insertType !== INSERT_TYPE_FILE && $insertType !== INSERT_TYPE_IMAGE) {
+    return [];
+  }
+
+  $stylesList = [];
+
+  $stylesList['insert__auto'] = [
+    'label' => t('AUTOMATIC'),
+    'weight' => -40
+  ];
+
+  if ($insertType !== INSERT_TYPE_FILE) {
+    /* @var ImageStyle $style */
+    foreach (ImageStyle::loadMultiple() as $style) {
+      $stylesList[$style->getName()] = $style;
+    }
+
+    $stylesList['image'] = [
+      'label' => t('Original image'),
+      'weight' => -15
+    ];
+  }
+
+  $stylesList['link'] = [
+    'label' => t('Link to file'),
+    'weight' => -20
+  ];
+  $stylesList['icon_link'] = [
+    'label' => t('Link to file (with icon)'),
+    'weight' => -19
+  ];
+  $stylesList['audio'] = [
+    'label' => t('Embed audio'),
+    'weight' => -10
+  ];
+  $stylesList['video'] = [
+    'label' => t('Embed video'),
+    'weight' => -9
+  ];
+
+  return $stylesList;
+}
+
+/**
+ * Implements hook_insert_render().
+ */
+function insert_insert_render() {
+  return [];
+}
+
+/**
+ * Implements hook_editor_js_settings_alter().
+ */
+function insert_editor_js_settings_alter(array &$settings) {
+  InsertUtility::addEditorExtraAllowedContent($settings, [
+    'img[src,width,height,alt,title,data-insert-class,data-insert-type,data-insert-attach](*)',
+    'span[contenteditable,data-insert-type,data-insert-attach](*)',
+    'a[title,type,data-insert-type,data-insert-attach](*)',
+    'div[data-insert-attach]',
+    'audio[contenteditable,controls,src,type,data-insert-attach]',
+    'video[contenteditable,controls,src,type,data-insert-attach]',
+  ]);
+
+  foreach (array_keys($settings['editor']['formats']) as $text_format_id) {
+    // If drupalimage is disabled (the editor's image button is removed),
+    // still, CKEditor's naive image2 plugin wraps the image in a span tag
+    // blocking from applying a style to the image making it impossible to set
+    // alignment on the image. Therefore, the image2 plugin needs to be disabled
+    // in that case.
+    // With drupalimage enabled, the user has to set alignment using the
+    // editor's image button; With drupalimage disabled, the user has to set
+    // alignment using the styles drop-down which allows applying additional
+    // styles to images as well.
+    if (!in_array(
+      'drupalimage',
+      array_keys($settings['editor']['formats'][$text_format_id]['editorSettings']['drupalExternalPlugins'])
+    )) {
+      $settings['editor']['formats'][$text_format_id]['editorSettings']['removePlugins'] = 'image2';
+    }
+  }
+}
+
+/**
+ * @param array $element
+ * @param FormStateInterface $form_state
+ */
+function _insert_allowed_html_validate(array $element, FormStateInterface &$form_state) {
+  $tags = [
+    'img' => null,
+    'a' => null,
+    'audio' => null,
+    'span' => null,
+    'video' => null,
+  ];
+
+  $attributes = [
+    'img' => [
+      'class' => null,
+      'src' => null,
+      'width' => null,
+      'height' => null,
+      'alt' => null,
+      'title' => null,
+    ],
+    'a' => [
+      'class' => null,
+      'title' => null,
+      'type' => null,
+    ],
+    'audio' => [
+      // Although added through insert_editor_js_settings_alter, CKEditor does
+      // not accept contenteditable on <audio> and <video> if not explicitly
+      // white-listed:
+      'contenteditable' => null,
+      'controls' => null,
+      'src' => null,
+      'type' => null,
+    ],
+    'span' => [
+      'class' => null,
+    ],
+    'video' => [
+      'contenteditable' => null,
+      'controls' => null,
+      'src' => null,
+      'type' => null,
+    ],
+  ];
+
+  $additional = \Drupal::moduleHandler()->invokeAll('insert_allowed_html');
+
+  $form_state->setValueForElement($element, InsertUtility::addAllowedHtml(
+    $element['#value'],
+    NestedArray::mergeDeep($tags, isset($additional['tags']) ? $additional['tags'] : []),
+    NestedArray::mergeDeep($attributes, isset($additional['attributes']) ? $additional['attributes'] : [])
+  ));
+}
+
+/**
+ * Implements hook_theme().
+ */
+function insert_theme() {
+  return [
+    'insert_button_widget' => [
+      'render element' => 'element',
+      'template' => 'insert-button-widget',
+    ],
+    'insert_field_widget_settings_styles' => [
+      'render element' => 'element',
+    ],
+    'insert_image' => [
+      'template' => 'insert-image',
+      'pattern' => 'insert_image__[a-z0-9_]+',
+    ],
+    'insert_link' => [
+      'template' => 'insert-link',
+    ],
+    'insert_icon_link' => [
+      'template' => 'insert-icon-link',
+    ],
+    'insert_audio' => [
+      'template' => 'insert-audio',
+    ],
+    'insert_video' => [
+      'template' => 'insert-video',
+    ],
+  ];
+}
+
+/**
+ * Preprocess variables for the insert-button-widget.html.twig file.
+ */
+function template_preprocess_insert_button_widget(array &$vars) {
+  $element = $vars['element'];
+
+  $vars['insert'] = [
+    'config' => \Drupal::config('insert.config')->get(),
+    'default_style' => $element['#default_value'],
+    'id' => $element['#insert']['id'],
+    'settings' => $element['#insert']['settings'],
+    'styles' => $element['#options'],
+    'type' => $element['#insert']['type'],
+  ];
+  $vars['nid'] = $element['#nid'];
+}
+
+/**
+ * Preprocess variables for the insert-image.html.twig file.
+ * The function is called for each image style configured to be used. The
+ * particular image is transformed according to the image style.
+ */
+function template_preprocess_insert_image(array &$vars) {
+  /** @var \Drupal\Core\Image\ImageInterface $image */
+  $image = \Drupal::service('image.factory')->get($vars['file']->getFileUri());
+  if ($image->isValid()) {
+    $vars['width'] = $image->getWidth();
+    $vars['height'] = $image->getHeight();
+  }
+  else {
+    $vars['width'] = $variables['height'] = null;
+  }
+
+  if ($vars['style_name'] === 'image' && !isset($vars['insert__auto'])) {
+    // Preprocessing template for inserting original image.
+    return;
+  }
+
+  /** @var ImageStyle $style */
+  $style = ImageStyle::load(
+    isset($vars['insert__auto']) ? $vars['insert__auto'] : $vars['style_name']
+  );
+
+  if ($style === null) {
+    return;
+  }
+
+  $style->transformDimensions($vars, $vars['file']->getFileUri());
+}
+
+/**
+ * Preprocess variables for the insert-link.html.twig file.
+ */
+function template_preprocess_insert_link(array &$vars) {
+  /** @var File $vars['file'] */
+  $vars['name'] = $vars['file']->getFilename();
+}
+
+/**
+ * Preprocess variables for the insert-icon-link.html.twig file.
+ */
+function template_preprocess_insert_icon_link(array &$vars) {
+  /** @var File $file */
+  $file = $vars['file'];
+
+  $vars['name'] = $file->getFilename();
+
+  $mime_type = $file->getMimeType();
+  $vars['type'] = $file->getMimeType() . '; length=' . $file->getSize();
+
+  $vars['icon_classes'] = join(' ', [
+    'file',
+    // Add a specific class for each and every mime type.
+    'file--mime-' . strtr($mime_type, ['/' => '-', '.' => '-']),
+    // Add a more general class for groups of well known MIME types.
+    'file--' . file_icon_class($mime_type),
+  ]);
+}
+
+/**
+ * Implements hook_help().
+ */
+function insert_help($route_name) {
+  if ($route_name === 'help.page.insert') {
+    $output = '<h3>' . t('About') . '</h3>';
+    $output .= '<p>';
+    $output .= t(
+      'Insert is a utility that makes inserting images and links to files into text areas or WYSIWYGs much easier by adding a simple JavaScript-based button to file and image fields. Visit the <a href=":insert">Insert module project page</a> for a full description of the module.',
+      [':insert' => 'https://www.drupal.org/project/insert']
+    );
+    $output .= '</p>';
+    $output .= '<h3>' . t('Configuration') . '</h3>';
+    $output .= '<p>';
+    $output .= t(
+      'See the <a href=":insert-doc">online documentation</a> on how to set up and configure the module.',
+      [':insert-doc' => 'https://www.drupal.org/docs/8/modules/insert']
+    );
+    $output .= '</p>';
+    return $output;
+  }
+}

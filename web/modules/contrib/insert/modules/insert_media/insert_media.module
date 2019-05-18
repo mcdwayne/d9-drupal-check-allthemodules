@@ -1,0 +1,260 @@
+<?php
+
+use Drupal\Core\Entity\EntityViewModeInterface;
+use Drupal\Core\Field\WidgetInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\insert\Utility\InsertUtility;
+use Drupal\media\Entity\Media;
+
+const INSERT_TYPE_MEDIA = 'media';
+
+const INSERT_MEDIA_DEFAULT_SETTINGS = [
+  'view_modes' => [],
+  'default' => 'full',
+];
+
+/**
+ * Implements hook_insert_widgets().
+ */
+function insert_media_insert_widgets() {
+  return [INSERT_TYPE_MEDIA => ['media_library_widget']];
+}
+
+/**
+ * Implements hook_field_widget_third_party_settings_form().
+ */
+function insert_media_field_widget_third_party_settings_form(WidgetInterface $plugin) {
+  $pluginId = $plugin->getPluginId();
+
+  if (InsertUtility::isSourceWidget($pluginId, INSERT_TYPE_MEDIA)) {
+    return _insert_media_settings_form(_insert_media_settings($plugin));
+  }
+
+  return [];
+}
+
+/**
+ * @param WidgetInterface $plugin
+ * @return array
+ */
+function _insert_media_settings($plugin) {
+  $settings = array_merge(
+    INSERT_MEDIA_DEFAULT_SETTINGS,
+    $plugin->getThirdPartySettings('insert_media')
+  );
+
+  if (!empty($settings['view_modes']['<all>'])) {
+    $viewModeIds = array_keys(_insert_media_get_view_modes());
+    $settings['view_modes'] = array_fill_keys($viewModeIds, $viewModeIds);
+  }
+
+  // Ensure default view mode is in the set of view modes.
+  if (!in_array($settings['default'], $settings['view_modes'], TRUE)) {
+    $settings['view_modes'][$settings['default']] = $settings['default'];
+  }
+
+  return $settings;
+}
+
+/**
+ * @param array $settings
+ * @return array
+ */
+function _insert_media_settings_form(array $settings) {
+  $viewModes = _insert_media_get_view_modes();
+
+  if (count($viewModes) === 0) {
+    return [];
+  }
+
+  $element = [
+    '#type' => 'details',
+    '#title' => t('Insert Media'),
+    '#weight' => 20,
+  ];
+
+  $element['view_modes_heading'] = [
+    '#type' => 'markup',
+    '#markup' => t('Select which view modes should be available for inserting media. If no view mode is selected, no Insert functionality will be available; If only one view mode is selected, that one is used automatically when inserting. If all view modes are selected, new view modes will be enabled by default.'),
+    '#weight' => 21,
+  ];
+
+  $element['view_modes'] = [
+    '#type' => 'table',
+    '#default_value' => $settings['view_modes'],
+    '#element_validate' => [[InsertUtility::class, 'validateList']],
+    '#weight' => 22,
+    '#tableselect' => TRUE,
+    '#header' => [t('Select all')],
+  ];
+
+  foreach ($viewModes as $id => $viewMode) {
+    $element['view_modes'][$id][$id] = [
+      '#type' => 'markup',
+      '#markup' => $viewMode->label(),
+    ];
+  }
+
+  $element['default'] = [
+    '#title' => t('Default view mode'),
+    '#type' => 'select',
+    '#options' => array_map(function($viewMode) {
+      /** @var EntityViewModeInterface $viewMode */
+      return $viewMode->label();
+    }, $viewModes),
+    '#default_value' => $settings['default'],
+    '#description' => t('Select the view mode which will be selected by default or used if no other view modes are enabled above.'),
+    '#weight' => 23,
+  ];
+
+  return $element;
+}
+
+/**
+ * Implements hook_insert_process().
+ */
+function insert_media_insert_process(&$insertType, array &$element) {
+  if ($insertType !== INSERT_TYPE_MEDIA) {
+    return [];
+  }
+
+  $settings = $element['#insert_media']['settings'];
+  $element['#insert']['settings']['styles'] = $settings['view_modes'];
+  $element['#insert']['settings']['default'] = $settings['default'];
+
+  /** @var \Drupal\Core\Entity\EntityTypeManagerInterface $entityTypeManager */
+  $entityTypeManager = \Drupal::entityTypeManager();
+
+  foreach ($element['selection'] as $key => &$selectionElement) {
+    if (!is_int($key)) {
+      continue;
+    }
+
+    $media = Media::load($element['selection'][$key]['target_id']['#value']);
+    $entityTypeId = $media->getEntityTypeId();
+    $viewBuilder = $entityTypeManager->getViewBuilder($entityTypeId);
+
+    $selectionElement['insert'] = $element['insert'];
+
+    $selectionElement['insert']['templates'] = [
+      '#type' => 'container',
+      '#attributes' => ['class' => ['insert-templates']],
+    ];
+
+    $options = [];
+
+    foreach (array_values($settings['view_modes']) as $id) {
+      if ($id === 0) {
+        continue;
+      }
+
+      $viewMode = $entityTypeManager
+        ->getStorage('entity_view_mode')
+        ->load('media.' . $id);
+
+      if ($viewMode) {
+        $view = $viewBuilder->view($media, $id);
+        $markup = render($view);
+
+        $selectionElement['insert']['templates'][$id] = [
+          '#type' => 'hidden',
+          '#name' => 'template[' . $id . ']',
+          '#value' => $markup->__toString(),
+        ];
+
+        $options[$id] = $viewMode->label();
+      }
+    }
+
+    if (count($options) === 1) {
+      $selectionElement['insert']['view_modes'] = [
+        '#type' => 'hidden',
+        '#value' => array_keys($options)[0],
+      ];
+    }
+    else {
+      $selectionElement['insert']['view_modes'] = [
+        '#type' => 'select',
+        '#options' => $options,
+        '#default_value' => $settings['default'],
+      ];
+    }
+  }
+
+  $element['#attached']['library'][] = 'insert_media/insert_media';
+
+  return ['selection'];
+}
+
+/**
+ * Returns all media view modes.
+ *
+ * @return EntityViewModeInterface[]
+ */
+function _insert_media_get_view_modes() {
+  $viewModes = \Drupal::entityTypeManager()
+    ->getStorage('entity_view_mode')
+    ->loadByProperties(['targetEntityType' => 'media']);
+
+  $rekeyedViewModes = [];
+
+  foreach ($viewModes as $id => $viewMode) {
+    // Settings cannot be saved with a dot.
+    $rekeyedViewModes[str_replace('media.', '', $id)] = $viewMode;
+  }
+
+  return $rekeyedViewModes;
+}
+
+/**
+ * Implements hook_field_widget_form_alter().
+ */
+function insert_media_field_widget_form_alter(array &$element, FormStateInterface $form_state, array $context) {
+  /** @var WidgetInterface $plugin */
+  $plugin = $context['widget'];
+  $pluginId = $plugin->getPluginId();
+
+  if (InsertUtility::isSourceWidget($pluginId, INSERT_TYPE_MEDIA)) {
+    $element['#insert_media'] = [
+      'settings' => _insert_media_settings($plugin),
+    ];
+  }
+}
+
+/**
+ * Implements hook_field_widget_settings_summary_alter().
+ */
+function insert_media_field_widget_settings_summary_alter(array &$summary, array $context) {
+  /** @var WidgetInterface $plugin */
+  $plugin = $context['widget'];
+  $pluginId = $plugin->getPluginId();
+
+  if (InsertUtility::isSourceWidget($pluginId, INSERT_TYPE_MEDIA)) {
+    $viewModes = _insert_media_get_view_modes();
+    $settings = _insert_media_settings($plugin);
+    $activeViewModes = array_intersect_key($viewModes, array_filter($settings['view_modes']));
+
+    $summary[] = t('Insert Media') . ': ' . (count($activeViewModes)
+        ? implode(', ', array_map(function($viewMode) {
+          /** @var EntityViewModeInterface $viewMode */
+          return $viewMode->label();
+        }, $activeViewModes))
+        : t('disabled')
+      );
+  }
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function insert_media_module_implements_alter(array &$implementations, $hook) {
+  if ($hook === 'field_widget_third_party_settings_form') {
+    // Move hook_field_widget_third_party_settings_form() implementation to the
+    // end of the execution list to have it processed after
+    // insert_field_widget_third_party_settings_form().
+    $group = $implementations['insert_media'];
+    unset($implementations['insert_media']);
+    $implementations['insert_media'] = $group;
+  }
+}
+
