@@ -1,0 +1,230 @@
+<?php
+
+/**
+ * @file
+ * Provides a live preview for the Entity Reference autocomplete widget.
+ */
+
+use Drupal\entity_reference\Plugin\Field\FieldWidget\AutocompleteWidget;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Field\WidgetInterface;
+use Drupal\Core\Field\FieldDefinitionInterface;
+use Drupal\Component\Utility\NestedArray;
+
+/**
+ * Implements hook_field_widget_form_alter().
+ */
+function entityreference_live_preview_field_widget_form_alter(&$element, FormStateInterface $form_state, $context) {
+  if ($context['items']->getFieldDefinition()->getType() == 'entity_reference'
+      && $context['widget']->getThirdPartySetting('entityreference_live_preview', 'enabled')) {
+    $field_name = $context['items']->getFieldDefinition()->getName();
+
+    // If the widget can handle multiple values, we'll display the previews
+    // for all the deltas rather than one per instance of the widget (as there
+    // will only be one instance in that case anyway).
+    $multiple = $context['widget']->getPluginDefinition()['multiple_values'];
+
+    $ajax_id = preg_replace('/[^-a-z0-9]/i', '-', "entityreference-live-preview--$field_name");
+    if (empty($element['#multiple'])) {
+      $ajax_id .= '--' . $context['delta'];
+    }
+
+    /*$entity_type = $context['instance']['entity_type'];
+    $bundle = $context['instance']['bundle'];*/
+
+    $output = array(
+      '#weight' => 10000,
+      '#prefix' => '<div id="'. $ajax_id .'">',
+      '#suffix' => '</div>',
+    );
+
+    // TODO: currently only supports the target preview type
+    $target_type = $context['items']->getFieldDefinition()->getFieldStorageDefinition()->getSettings()['target_type'];
+    $view_builder = \Drupal::entityManager()->getViewBuilder($target_type);
+
+    if ($form_state->getValues()) {
+      $context['widget']->extractFormValues($context['items'], $form_state->getCompleteForm(), $form_state);
+    }
+    $items = $multiple ? $context['items'] : array($context['items'][$context['delta']]);
+    foreach ($items as $item) {
+      if ($item->entity) {
+        $view = $view_builder->view($item->entity, $context['widget']->getThirdPartySetting('entityreference_live_preview', 'mode'));
+        $output[] = $view;
+      }
+    }
+    $element['entityreference_live_preview'] = $output;
+    if ($multiple) {
+      $element['#ajax'] = array(
+        'callback' => 'entityreference_live_preview_multiple_ajax_render',
+        'wrapper' => $ajax_id,
+      );
+      $element['#theme_wrappers'][] = 'entityreference_live_preview_suffix_wrapper';
+    }
+    else {
+      $element['target_id']['#ajax'] = array(
+        'callback' => 'entityreference_live_preview_single_ajax_render',
+        'wrapper' => $ajax_id,
+      );
+    }
+  }
+}
+
+function entityreference_live_preview_theme() {
+  return array(
+    'entityreference_live_preview_suffix_wrapper' => array(
+      'template' => 'entityreference-live-preview-suffix-wrapper',
+      'render element' => 'element',
+    ),
+  );
+}
+
+function template_preprocess_entityreference_live_preview_suffix_wrapper(&$variables) {
+  $element = $variables['element'];
+  $variables['original'] = $element['#children'];
+  $variables['preview'] = render($element['entityreference_live_preview']);
+}
+
+function _entityreference_live_preview_extract_element($form, FormStateInterface $form_state, $backtrack, Array $local_path) {
+  $trigger = $form_state->getTriggeringElement();
+  $parents = array_merge($backtrack ? array_slice($trigger['#array_parents'], 0, -$backtrack) : $trigger['#array_parents'], $local_path);
+  $element = NestedArray::getValue($form, $parents);
+  return $element;
+}
+
+function entityreference_live_preview_single_ajax_render($form, FormStateInterface $form_state) {
+  return _entityreference_live_preview_extract_element($form, $form_state, 1, array('entityreference_live_preview'));
+}
+
+function entityreference_live_preview_multiple_ajax_render($form, $form_state) {
+  $element = _entityreference_live_preview_extract_element($form, $form_state, 0, array('entityreference_live_preview'));
+  return $element;
+}
+
+/**
+ * Implements hook_entityreference_live_preview_supported_widgets().
+ *
+ * @todo
+ *   Find a better way to name this function.
+ */
+function entityreference_live_preview_entityreference_live_preview_supported_widgets() {
+  return array(
+    'entityreference_autocomplete',
+    'options_select',
+
+    // See https://www.drupal.org/node/1295034
+    'entityreference_autocomplete_deluxe',
+  );
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for field_ui_field_edit_form().
+ */
+function entityreference_live_preview_field_widget_third_party_settings_form(WidgetInterface $plugin, FieldDefinitionInterface $field_definition, $view_mode, $form, FormStateInterface $form_state) {
+  if ($field_definition->getType() == 'entity_reference') {
+    # TODO: Default settings:
+    # enabled => FALSE
+    # preview_type => target
+    # mode => default
+
+    $preview_type = $form_state->getValue([
+      'fields',
+      $field_definition->getName(),
+      'settings_edit_form',
+      'third_party_settings',
+      'entityreference_live_preview',
+      'preview_type',
+    ], $plugin->getThirdPartySetting('entityreference_live_preview', 'preview_type'));
+
+    // Load the display modes for the appropriate entity type.
+    if ($preview_type == 'field') {
+      // To preview the field, we use a display mode of the host entity.
+      $entity_type = $field_definition->getTargetEntityTypeId();
+    }
+    else {
+      // To preview the target entity, we use its own display modes.
+      $entity_type = $field_definition->getSetting('target_type');
+    }
+    $options = \Drupal::entityManager()->getViewModeOptions($entity_type);
+
+    $element['enabled'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Live preview'),
+      '#description' => t('Enable a live preview of the referenced entities.'),
+      '#default_value' => $plugin->getThirdPartySetting('entityreference_live_preview', 'enabled'),
+    );
+
+    $ajax_id = 'entityreference-live-preview-mode-' . $field_definition->getName() . '-wrapper';
+    $states = [ 'visible' => [ ':input[name="fields[' . $field_definition->getName() . '][settings_edit_form][third_party_settings][entityreference_live_preview][enabled]"]' => array('checked' => TRUE) ] ];
+    $element['preview_type'] = array(
+      '#type' => 'radios',
+      '#title' => t('Live preview type'),
+      '#options' => array(
+        'target' => t('Display the referenced entities directly.'),
+        'field' => t('Display a preview of the entity reference field.'),
+      ),
+      '#default_value' => $plugin->getThirdPartySetting('entityreference_live_preview', 'preview_type'),
+      '#states' => $states,
+      '#ajax' => array(
+        'callback' => 'entityreference_live_preview_type_ajax_callback',
+        'wrapper' => $ajax_id,
+      ),
+    );
+    $element['mode'] = array(
+      '#type' => 'select',
+      '#title' => t('Live preview display mode'),
+      '#description' => t('Select the display mode to be used for generating the live preview.'),
+      '#options' => $options,
+      '#default_value' => $plugin->getThirdPartySetting('entityreference_live_preview', 'mode'),
+      '#states' => $states,
+      '#prefix' => '<div id="' . $ajax_id . '">',
+      '#suffix' => '</div>',
+    );
+    if ($plugin->getThirdPartySetting('entityreference_live_preview', 'preview_type') == 'field') {
+      $element['mode']['#description'] .= ' ' . t('For field previews, please select a display mode of the referencing entity.');
+    }
+    return $element;
+  }
+}
+
+function entityreference_live_preview_type_ajax_callback($form, FormStateInterface $form_state) {
+  $trigger = $form_state->getTriggeringElement();
+  $parents = array_merge(array_slice($trigger['#array_parents'], 0, -2), array('mode'));
+  $element = NestedArray::getValue($form, $parents);
+  return $element;
+}
+
+/**
+ * Renders a single item from an entity reference field.
+ *
+ * The item is defined by the provided $target_id and the entity type derived
+ * from the field's target_type.  The entity to which the field is attached
+ * does not need to exist yet; this function can be called while creating it.
+ */
+function _entityreference_live_preview_render_entity($widget, $target) {
+  $entity_info = entity_get_info($entity_type);
+  $entity = (object) array(
+    $entity_info['entity keys']['bundle'] => $bundle,
+  );
+  $field_info = field_info_field($field_name);
+  $target_type = $field_info['settings']['target_type'];
+  $instance_info = field_info_instance($entity_type, $field_name, $bundle);
+  $display = $instance_info['widget']['settings']['entityreference_live_preview']['mode'];
+
+  switch ($instance_info['widget']['settings']['entityreference_live_preview']['preview_type']) {
+    case 'target':
+      $entities = entity_load($target_type, array($target_id));
+      foreach ($entities as $entity) {
+        if (!entity_access('view', $target_type, $entity)) {
+          return '';
+        }
+      }
+      return entity_view($target_type, $entities, $display);
+
+    case 'field':
+      $item = array(
+        'target_id' => $target_id,
+        'target_type' => $target_type,
+      );
+      return field_view_value($entity_type, $entity, $field_name, $item, $display);
+  }
+}
