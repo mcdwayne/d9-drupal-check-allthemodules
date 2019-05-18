@@ -1,0 +1,225 @@
+<?php
+
+define('DATEX_USE_INTL', FALSE && class_exists('IntlDateFormatter'));
+
+use Drupal\block_content\BlockContentTranslationHandler;
+use Drupal\comment\CommentTranslationHandler;
+use Drupal\content_translation\ContentTranslationHandler;
+use Drupal\datex\Datex\DatexIntlCalendar;
+use Drupal\datex\Datex\DatexPersianIntlCalendar;
+use Drupal\datex\Datex\DatexPoorMansGregorianCalendar;
+use Drupal\datex\Datex\DatexPoorMansJaliliCalendar;
+use Drupal\datex\Plugin\Field\FieldWidget\DatexDateTimeDatelistWidget;
+use Drupal\datex\Plugin\Field\FieldWidget\DatexDateTimeDefaultWidget;
+use Drupal\datex\Plugin\Field\FieldWidget\DatexTimestampDatetimeNoDefaultWidget;
+use Drupal\datex\Plugin\Field\FieldWidget\DatexTimestampDatetimeWidget;
+use Drupal\datex\Plugin\views\argument\DatexDateDate;
+use Drupal\datex\Plugin\views\argument\DatexDateFullDate;
+use Drupal\datex\Plugin\views\argument\DatexViewsDate as DatexViewsDate_Arg;
+use Drupal\datex\Plugin\views\argument\DatexViewsFullDate;
+use Drupal\datex\Plugin\views\filter\DatexViewsDate as DatexViewsDate_Filter;
+use Drupal\datex\Plugin\views\filter\DatexViewsDateTime;
+use Drupal\datex\TranslationHack\DatexContentTranslationHandler;
+use Drupal\node\NodeTranslationHandler;
+use Drupal\taxonomy\TermTranslationHandler;
+use Drupal\user\ProfileTranslationHandler;
+
+function datex_factory($tz = NULL, $lang_code = '', $calendar_name = '') {
+  // COPY FROM common.inc::format_date() (drupal 7).
+  static $drupal_static_fast;
+  if (!isset($drupal_static_fast)) {
+    $drupal_static_fast['timezones'] = [];
+  }
+  $timezones = &$drupal_static_fast['timezones'];
+
+  if (!$tz) {
+    $tz = drupal_get_user_timezone();
+  }
+  if (is_string($tz)) {
+    if (!isset($timezones[$tz])) {
+      $timezones[$tz] = timezone_open($tz);
+    }
+    $tz = $timezones[$tz];
+  }
+
+  if (!$calendar_name) {
+    $for_lang = \Drupal::languageManager()->getCurrentLanguage()->getId();
+    if (count(\Drupal::languageManager()
+        ->getLanguages()) === 1 || $for_lang === 'fa') {
+      $calendar_name = 'persian';
+    }
+    elseif ($for_lang === 'en') {
+      $calendar_name = 'gregorian';
+    }
+  }
+  if (!$calendar_name) {
+    return NULL;
+  }
+
+  if (!$lang_code) {
+    if (count(\Drupal::languageManager()->getLanguages()) === 1) {
+      $lang_code = 'fa';
+    }
+    else {
+      $lang_code = \Drupal::languageManager()->getCurrentLanguage()->getId();
+    }
+  }
+
+  if (!DATEX_USE_INTL) {
+    switch ($calendar_name) {
+      case 'persian':
+        return new DatexPoorMansJaliliCalendar(is_string($tz) ? timezone_open($tz) : $tz, $lang_code);
+      default:
+        return new DatexPoorMansGregorianCalendar(is_string($tz) ? timezone_open($tz) : $tz, $lang_code);
+    }
+  }
+  switch ($calendar_name) {
+    case 'persian':
+      return new DatexPersianIntlCalendar($tz, $calendar_name, $lang_code);
+    default:
+      return new DatexIntlCalendar($tz, $calendar_name, $lang_code);
+  }
+}
+
+/**
+ * Calendars supported by PHP-Intl.
+ */
+function _datex_available_calendars() {
+  return [
+    'persian' => t('Persian'),
+    'gregorian' => t('Gregorian'),
+  ];
+}
+
+/**
+ * Implements hook_entity_type_alter().
+ */
+function datex_entity_type_alter(array &$entity_types) {
+  $supported = [
+    BlockContentTranslationHandler::class,
+    CommentTranslationHandler::class,
+    ContentTranslationHandler::class,
+    NodeTranslationHandler::class,
+    ProfileTranslationHandler::class,
+    TermTranslationHandler::class,
+  ];
+
+  if (!\Drupal::moduleHandler()->moduleExists('content_translation')) {
+    return;
+  }
+
+  /** @var \Drupal\Core\Entity\EntityTypeInterface $type */
+  foreach ($entity_types as $type) {
+    if (!$type->isTranslatable()) {
+      continue;
+    }
+    if (!$type->hasHandlerClass('translation')) {
+      $type->setHandlerClass('translation', DatexContentTranslationHandler::class);
+      continue;
+    }
+    $handler = $type->getHandlerClass('translation');
+    if (!in_array($handler, $supported, TRUE)) {
+      continue;
+    }
+    $handler = explode('\\', $handler);
+    $handler = array_pop($handler);
+    $type->setHandlerClass('translation', '\Drupal\datex\TranslationHack\Datex' . $handler);
+  }
+}
+
+/**
+ * Implements hook_element_info_alter().
+ *
+ * Swap drupal elements with datex elements.
+ */
+function datex_element_info_alter(array &$info) {
+  $rep = function ($find_for) {
+    switch ($find_for) {
+      case \Drupal\Core\Datetime\Element\Datelist::class:
+        $rep = \Drupal\datex\Element\DatexDateList::class;
+        break;
+      case \Drupal\Core\Datetime\Element\Datetime::class:
+        $rep = \Drupal\datex\Element\DatexDateTime::class;
+        break;
+      case \Drupal\Core\Render\Element\Date::class:
+        $rep = \Drupal\datex\Element\DatexDate::class;
+        break;
+      default:
+        $rep = NULL;
+    }
+    return $rep;
+  };
+  foreach (['date', 'datelist', 'datetime'] as $el_) {
+    if (!isset($info[$el_])) {
+      continue;
+    }
+    $el = &$info[$el_];
+    if ($el_ === 'date' || $el_ === 'datetime') {
+      $el['#attached']['library'][] = 'datex/picker';
+    }
+    foreach ([
+               '#process',
+               '#pre_render',
+               '#element_validate',
+               '#value_callback',
+             ] as $attr_) {
+      if (!isset($el[$attr_])) {
+        continue;
+      }
+      foreach ($el[$attr_] as $ai => &$a) {
+        if (is_array($a)) {
+          $a[0] = $rep($a[0]) ?: $a[0];
+        }
+        else {
+          $el[$attr_][$ai] = $rep($a) ?: $a;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_field_widget_info_alter().
+ */
+function datex_field_widget_info_alter(&$info) {
+  $info['datetime_default']['class'] = DatexDateTimeDefaultWidget::class;
+  $info['datetime_datelist']['class'] = DatexDateTimeDatelistWidget::class;
+  $info['datetime_timestamp']['class'] = DatexTimestampDatetimeWidget::class;
+  if (isset($info['datetime_timestamp_no_default'])) {
+    $info['datetime_timestamp_no_default']['class'] = DatexTimestampDatetimeNoDefaultWidget::class;
+  }
+  foreach ([
+             'default',
+             'datelist',
+             'timestamp',
+             'timestamp_no_default',
+           ] as $item) {
+    $info["datetime_$item"]['provider'] = 'datex';
+  }
+}
+
+/**
+ * Implements hook_views_plugins_filter_alter().
+ */
+function datex_views_plugins_filter_alter(array &$plugins) {
+  $plugins['date']['class'] = DatexViewsDate_Filter::class;
+  $plugins['datetime']['class'] = DatexViewsDatetime::class;
+}
+
+/**
+ * Implements hook_views_plugins_argument_alter().
+ */
+function datex_views_plugins_argument_alter(array &$plugins) {
+  if (isset($plugins['datetime'])) {
+    $plugins['datetime']['class'] = DatexDateDate::class;
+  }
+  if (isset($plugins['datetime_full_date'])) {
+    $plugins['datetime_full_date']['class'] = DatexDateFullDate::class;
+  }
+  if (isset($plugins['date'])) {
+    $plugins['date']['class'] = DatexViewsDate_Arg::class;
+  }
+  if (isset($plugins['date_fulldate'])) {
+    $plugins['date_fulldate']['class'] = DatexViewsFullDate::class;
+  }
+}
