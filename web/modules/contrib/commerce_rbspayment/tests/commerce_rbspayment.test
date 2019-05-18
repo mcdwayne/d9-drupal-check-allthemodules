@@ -1,0 +1,176 @@
+<?php
+
+/**
+ * @file
+ * Functional tests for the commerce RBS Payment module.
+ */
+
+/**
+ * Test commerce RBS Payment.
+ */
+class CommerceRBSPaymentTest extends CommerceBaseTestCase {
+
+  /**
+   * @var object
+   */
+  protected $store_admin;
+
+  /**
+   * @var object
+   */
+  protected $store_customer;
+
+  /**
+   * Implementation of getInfo().
+   */
+  public static function getInfo() {
+    return array(
+      'name' => 'Commerce RBS Payment',
+      'description' => 'Test RBS Payment method.',
+      'group' => 'Commerce RBS Payment',
+    );
+  }
+
+  /**
+   * Implementation of setUp().
+   */
+  function setUp() {
+    $modules = parent::setUpHelper('all', array('variable', 'commerce_rbspayment'));
+    parent::setUp($modules);
+
+    // User creation for different operations.
+    $this->store_admin = $this->createStoreAdmin();
+    $this->store_customer = $this->createStoreCustomer();
+  }
+
+  protected function permissionBuilder($sets) {
+    $permissions = parent::permissionBuilder($sets);
+
+    if (is_string($sets)) {
+      $sets = array($sets);
+    }
+    if (in_array('store admin', $sets)) {
+      $permissions[] = 'configure commerce rbspayment';
+    }
+
+    return $permissions;
+  }
+
+  /**
+   * Test an RBS payment method admin area.
+   */
+  public function testCommerceRBSPaymentSettingsPage() {
+    // Login with store admin.
+    $this->drupalLogin($this->store_admin);
+
+    // Access to the payment methods administration page.
+    $this->drupalGet('admin/commerce/config/payment-methods');
+
+    // Check if the payment method exists and it's listed.
+    $this->assertText(t('RBS payment'), t('RBS payment method is listed in the payment methods administration page'));
+
+
+    // Access to the RBS payment method administration page.
+    $this->drupalGet('admin/commerce/config/payment-methods/rbspayment');
+
+    $this->assertText(t('Commerce RBS payment settings'), t('RBS payment method settings page has title'));
+
+    $info = array(
+      'commerce_rbspayment_merchant_login' => 'login',
+      'commerce_rbspayment_password' => 'password',
+      'commerce_rbspayment_server_timeout' => 60,
+      'commerce_rbspayment_mode' => 1,
+    );
+    $this->drupalPost(NULL, $info, t('Save configuration'));
+
+    $this->assertText(t("Error while checking API connection! !message", array('!message' => 'Доступ запрещён')), t('Checking request to RBS API sent and access denied error occurred'));
+  }
+
+  /**
+   * Test an RBS payment method checkout.
+   */
+  public function testCommerceRBSPaymentMethod() {
+    // Create a new customer profile.
+    $profile = $this->createDummyCustomerProfile('billing', $this->store_customer->uid);
+    // Create an order for store customer.
+    $this->createDummyOrder($this->store_customer->uid, array(), 'cart', $profile->profile_id);
+
+    // Login with store customer and access to checkout.
+    $this->drupalLogin($this->store_customer);
+    $this->drupalGet($this->getCommerceUrl('checkout'));
+
+    // Process the order and check if the RBS payment is working.
+    $this->drupalPost(NULL, array(), t('Continue to next step'));
+    $this->assertText(t('Bank Card'), t('RBS payment method is listed in the checkout process form'));
+    $this->drupalPostAJAX(NULL, array('commerce_payment[payment_method]' => 'commerce_rbspayment|commerce_payment_commerce_rbspayment'), 'commerce_payment[payment_method]');
+    $this->drupalPost(NULL, array('commerce_payment[payment_method]' => 'commerce_rbspayment|commerce_payment_commerce_rbspayment'), t('Continue to next step'));
+
+    // We can test here only an error on our try to redirect to the payment gate.
+    $this->assertText('Доступ запрещён', t('RBS returned error on our try to register RBS transaction'));
+    $this->assertLink(t('Back to checkout page'), 0, t('There is a link to get back to previous step'));
+  }
+
+  /**
+   * Test order transactions filtering.
+   *
+   * @covers _commerce_rbspayment_get_order_rbs_transactions();
+   */
+  public function testCommerceRBSPaymentGetOrderRbsTransactions() {
+    // Create a new customer profile.
+    $profile = $this->createDummyCustomerProfile('billing', $this->store_customer->uid);
+    // Create an order for store customer.
+    $order = $this->createDummyOrder($this->store_customer->uid, array(), 'cart', $profile->profile_id);
+    $order->data['payment_method'] = 'dummy';
+  
+    // Creating order transaction for filtering.
+    commerce_rbspayment_create_transaction($order, CommerceRBSPaymentAPI::orderStatusPending, 100, 'USD', 1);
+    commerce_rbspayment_create_transaction($order, CommerceRBSPaymentAPI::orderStatusReversed, 100, 'USD', 2);
+    commerce_rbspayment_create_transaction($order, CommerceRBSPaymentAPI::orderStatusPartlyRefunded, 100, 'USD', 3);
+    commerce_rbspayment_create_transaction($order, CommerceRBSPaymentAPI::orderStatusAuthorized, 100, 'USD', 4);
+    commerce_rbspayment_create_transaction($order, CommerceRBSPaymentAPI::orderStatusDeclined, 100, 'USD', 5);
+  
+    $transactions1 = _commerce_rbspayment_get_order_rbs_transactions($order);
+    $this->assertEqual($this->getTransactionsRemoteIds($transactions1), array(1, 2, 3, 4, 5), t('Unfiltered transactions'));
+  
+    $transactions2 = _commerce_rbspayment_get_order_rbs_transactions($order, COMMERCE_PAYMENT_STATUS_PENDING);
+    $this->assertEqual($this->getTransactionsRemoteIds($transactions2), array(1), t('Filtered pending transactions'));
+  
+    $transactions3 = _commerce_rbspayment_get_order_rbs_transactions($order, '', array(CommerceRBSPaymentAPI::orderStatusPending));
+    $this->assertEqual($this->getTransactionsRemoteIds($transactions3), array(1), t('Filtered remotely pending transactions'));
+  
+    $transactions4 = _commerce_rbspayment_get_order_rbs_transactions($order, '', array(CommerceRBSPaymentAPI::orderStatusDeclined));
+    $this->assertEqual($this->getTransactionsRemoteIds($transactions4), array(5), t('Filtered declined transactions'));
+  
+    $transactions5 = _commerce_rbspayment_get_order_rbs_transactions($order, COMMERCE_PAYMENT_STATUS_SUCCESS, array(CommerceRBSPaymentAPI::orderStatusAuthorized, CommerceRBSPaymentAPI::orderStatusPartlyRefunded));
+    $this->assertEqual($this->getTransactionsRemoteIds($transactions5), array(3, 4), t('Filtered successful and partly refunded transactions'));
+  }
+  
+  /**
+   * Regression test for #2860876.
+   *
+   * @covers commerce_rbspayment_create_transaction();
+   */
+  public function testCommerceRBSPaymentCreateTransaction() {
+    // Create a new customer profile.
+    $profile = $this->createDummyCustomerProfile('billing', $this->store_customer->uid);
+    // Create an order for store customer.
+    $order = $this->createDummyOrder($this->store_customer->uid, array(), 'cart', $profile->profile_id);
+    $order->data['payment_method'] = 'dummy';
+  
+    $transaction = commerce_rbspayment_create_transaction($order, CommerceRBSPaymentAPI::orderStatusPending, 100, 'USD', 1);
+    $this->assertEqual($transaction->instance_id, 'commerce_rbspayment|commerce_payment_commerce_rbspayment', t('Created transaction payment method instance id'));
+  }
+  
+  /**
+   * Returns array of remote_ids of given transactions.
+   *
+   * @param array $transactions
+   *
+   * @return array
+   */
+  protected function getTransactionsRemoteIds(array $transactions) {
+    return array_values(array_map(function ($transaction) {
+      return $transaction->remote_id;
+    }, $transactions));
+  }
+}
