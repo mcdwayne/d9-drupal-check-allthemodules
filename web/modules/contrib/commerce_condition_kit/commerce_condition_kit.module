@@ -1,0 +1,90 @@
+<?php
+
+/**
+ * @file
+ * Provides additional commerce conditions.
+ */
+
+use Drupal\commerce_condition_kit\Entity\Coupon;
+use Drupal\commerce_order\Entity\OrderInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+
+/**
+ * Implements hook_entity_type_build().
+ */
+function commerce_condition_kit_entity_type_build(array &$entity_types) {
+  if (!empty($entity_types['commerce_promotion_coupon'])) {
+    /** @var \Drupal\Core\Entity\ContentEntityTypeInterface $coupon_entity_type */
+    $coupon_entity_type = $entity_types['commerce_promotion_coupon'];
+    $coupon_entity_type->setClass('Drupal\commerce_condition_kit\Entity\Coupon');
+  }
+}
+
+/**
+ * Implements hook_entity_base_field_info().
+ */
+function commerce_condition_kit_entity_base_field_info(EntityTypeInterface $entity_type) {
+  if ($entity_type->id() == 'commerce_promotion_coupon') {
+    $fields['user_usage_limit'] = BaseFieldDefinition::create('integer')
+      ->setLabel(t('Usage limit per user'))
+      ->setDescription(t('The maximum number of times the coupon can be used per user. 0 for unlimited.'))
+      ->setRequired(FALSE)
+      ->setTranslatable(FALSE)
+      ->setDefaultValue(0)
+      ->setSetting('min', 0)
+      ->setDisplayOptions('form', [
+        'type' => 'number',
+        'weight' => 5,
+      ]);
+
+    return $fields;
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update().
+ */
+function commerce_condition_kit_commerce_order_update(EntityInterface $entity) {
+  /** @var \Drupal\commerce_order\Entity\OrderInterface $order */
+  $order = $entity;
+  /** @var \Drupal\commerce_order\Entity\OrderInterface $original_order */
+  $original_order = $order->original;
+
+  $filter_coupons = function (OrderInterface $order) {
+    $limited_per_user_coupons = [];
+    foreach ($order->get('coupons')->referencedEntities() as $coupon) {
+      if ($coupon instanceof Coupon && $coupon->getUserUsageLimit()) {
+        $limited_per_user_coupons[] = $coupon->id();
+      }
+    }
+    return $limited_per_user_coupons;
+  };
+  $original_coupons = $filter_coupons($original_order);
+  $coupons = $filter_coupons($order);
+
+  if ($removed = array_diff($original_coupons, $coupons)) {
+    /** @var \Drupal\commerce_condition_kit\Entity\Coupon[] $removed_coupons */
+    $removed_coupons = \Drupal::entityTypeManager()
+      ->getStorage('commerce_promotion_coupon')
+      ->loadMultiple($removed);
+    $removed_coupons_codes = array_map(function (Coupon $coupon) {
+      return $coupon->getCode();
+    }, $removed_coupons);
+
+    /*
+     * If a user used a one time per user coupon and then tries to make an order
+     * as an anonymous user with the same coupon, but then attaches to the order
+     * an email address used before - The applied earlier coupon will be removed
+     * as it is already used by this email.
+     * To do not confuse a user - add a warning message.
+     */
+    \Drupal::messenger()->addWarning(\Drupal::translation()->formatPlural(
+      count($removed_coupons_codes),
+      'The coupon "@codes" has been removed. This coupon is a one time use coupon, and it has already been used with this account.',
+      'The coupons "@codes" has been removed. These coupons are one time use coupons, and it has already been used with this account.',
+      ['@codes' => implode(', ', $removed_coupons_codes)]
+    ));
+  }
+}
