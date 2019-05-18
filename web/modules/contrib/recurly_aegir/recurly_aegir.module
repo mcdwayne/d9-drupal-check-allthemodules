@@ -1,0 +1,265 @@
+<?php
+
+/**
+ * @file
+ * Contains recurly_aegir.module.
+ */
+
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Entity\ContentEntityInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\field\Entity\FieldStorageConfig;
+use Drupal\node\Entity\Node;
+use Drupal\node\NodeInterface;
+use Drupal\recurly_aegir\HostingServiceCalls\SiteInstallHostingServiceCall;
+use Drupal\recurly_aegir\HostingServiceCalls\ProfileListHostingServiceCall;
+use Drupal\recurly_aegir\WebhookNotificationHandlers\WebhookNotificationHandler;
+use Drupal\recurly_aegir\Wrappers\SiteWrapper;
+use Drupal\recurly_aegir\Wrappers\SubscriptionWrapper;
+
+/****************************************************************************
+ * Drupal Core Hook Implementations
+ ****************************************************************************/
+
+/**
+ * Implements hook_help().
+ */
+function recurly_aegir_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the recurly_aegir module.
+    case 'help.page.recurly_aegir':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Automatically manages Aegir sites with Recurly subscriptions.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_entity_prepare_form().
+ *
+ * Alter entities before editing.
+ */
+function recurly_aegir_entity_prepare_form(EntityInterface $entity, $operation, FormStateInterface $form_state) {
+  $container = \Drupal::getContainer();
+  $user_is_admin = \Drupal::currentUser()->hasPermission('administer recurly');
+
+  // Apply changes to sites if being edited by a non-administrator.
+  if (($entity->getEntityTypeId() == 'node') &&
+      ($entity->getType() == 'recurly_aegir_site') &&
+      (!$user_is_admin) &&
+      ($operation == 'edit') &&
+      ($entity->getTitle() == SiteWrapper::create($container, $entity)->getSubscriptionId())) {
+
+    // Unset the site's name. It was temporarily set to the ID on
+    // creation, but the subscribing user must now enter a desired subdomain
+    // so that the site can be created.
+    $entity->setTitle('');
+    $form_state->set('label_altered', TRUE);
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Alter Site edit forms.
+ */
+function recurly_aegir_form_node_recurly_aegir_site_edit_form_alter(
+    &$form,
+    FormStateInterface $form_state,
+    $form_id) {
+
+  // Enter help text for the site name (title) field. It's not possible to do
+  // this in the configuration so do it here.
+  $title_help_text = t('Enter the subdomain for your new site. For example, entering <em>mysite</em> will make your site available at <em>mysite.@domain</em>. Once set, it cannot be changed.', [
+    '@domain' => \Drupal::request()->getHost(),
+  ]);
+  $form['title']['widget'][0]['value']['#description'] = $title_help_text;
+
+  $form['title']['widget'][0]['value']['#element_validate'][] = [
+    'Drupal\recurly_aegir\HostingServiceCalls\SiteCreateHostingServiceCall',
+    'validateNewSiteName',
+  ];
+
+  // Make the profile field mandatory. This can't be done in the configuration
+  // because it needs to remain empty until configured by the subscriber.
+  $form['field_site_profile']['widget']['#required'] = TRUE;
+
+  // Disable items that cannot be changed after the site was created.
+  $site = $form_state->getFormObject()->getEntity();
+  if (count($site->get('field_site_tasks'))) {
+    $form['field_site_profile']['#disabled'] = TRUE;
+    $form['title']['#disabled'] = TRUE;
+  }
+
+  // Check if the current user is unprivileged.
+  if (!\Drupal::currentUser()->hasPermission('administer recurly')) {
+    // Hide the revision log message.
+    $form['revision_information']['#access'] = FALSE;
+    // Redirect elsewhere after submission.
+    $form['actions']['submit']['#submit'][] = 'recurly_aegir_site_save_redirect';
+  }
+}
+
+/**
+ * Set dynamic allowed values for the site profile field.
+ *
+ * @param \Drupal\field\Entity\FieldStorageConfig $definition
+ *   The field definition.
+ * @param \Drupal\Core\Entity\ContentEntityInterface|null $entity
+ *   The entity being created if applicable.
+ * @param bool $cacheable
+ *   Boolean indicating if the results are cacheable.
+ *
+ * @return array
+ *   An array of possible key and value options.
+ *
+ * @see options_allowed_values()
+ * @see https://chromatichq.com/blog/dynamic-default-and-allowed-values-list-fields-drupal-8
+ */
+function recurly_aegir_field_site_profile_allowed_values(FieldStorageConfig $definition, ContentEntityInterface $entity = NULL, $cacheable) {
+  return ProfileListHostingServiceCall::getProfileList($cacheable);
+}
+
+/**
+ * Redirects subscribers to the Subscriptions page after configuring a site.
+ *
+ * By default, saving a Site node will take the user to its view page. However,
+ * it's only meant for initial configuration by the subscriber.  It isn't meant
+ * to be viewed by him/her afterwards. So we're altering the form to redirect
+ * to the user's Subscriptions page.
+ *
+ * @param array $form
+ *   The form definition.
+ * @param Drupal\Core\Form\FormStateInterface $form_state
+ *   The current state of the form.
+ */
+function recurly_aegir_site_save_redirect($form, FormStateInterface $form_state) {
+  $entity_type_id = \Drupal::config('recurly.settings')->get('recurly_entity_type') ?: 'user';
+  $user_id = $form_state->getFormObject()->getEntity()->getOwner()->id();
+  $form_state->setRedirect("entity.$entity_type_id.recurly_subscriptionlist", [
+    $entity_type_id => $user_id,
+  ]);
+}
+
+/**
+ * Implements hook_node_access().
+ *
+ * Prevents non-admins from editing configured sites.
+ */
+function recurly_aegir_node_access(NodeInterface $node, $op, AccountInterface $account) {
+
+  // Check if non-admins are updating configured sites.
+  if (($node->getType() == 'recurly_aegir_site') &&
+      (!$account->hasPermission('administer recurly')) &&
+      ($op == 'update') &&
+      (!empty($node->get('field_site_profile')->getValue()))) {
+    // Deny access as the configuration cannot be changed.
+    return AccessResult::forbidden();
+  }
+  else {
+    return AccessResult::neutral();
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_presave() for Node.
+ *
+ * Installs and sets quotas on sites after they're configured if they haven't
+ * been installed yet (or the user is an administrator).
+ */
+function recurly_aegir_node_presave(EntityInterface $entity) {
+  if (($entity->getType() == 'recurly_aegir_site') &&
+      (!empty($entity->get('field_site_profile')->getValue())) &&
+      ((empty($entity->get('field_site_tasks')->getValue())) || \Drupal::currentUser()->hasPermission('administer recurly'))) {
+
+    $service_container = \Drupal::getContainer();
+    $site = SiteWrapper::create($service_container, $entity);
+
+    if (!$site->subscriptionIsActive()) {
+      return;
+    }
+
+    $profile = $entity->get('field_site_profile')->value;
+    $site_installer = SiteInstallHostingServiceCall::create($service_container, $entity, $profile);
+    $site_installer->performActionAndLogResults();
+
+    $subscription = $site->getSubscription();
+    $site->setQuotas($subscription->getPlanCode(), $subscription->getAddons());
+  }
+}
+
+/****************************************************************************
+ * Recurly Hook Implementations
+ ****************************************************************************/
+
+/**
+ * Implements hook_recurly_process_push_notification().
+ */
+function recurly_aegir_recurly_process_push_notification($subdomain, $notification) {
+  $container = \Drupal::getContainer();
+  $logger = \Drupal::logger('recurly_aegir');
+
+  $webhook_notification_handlers = WebhookNotificationHandler::NOTIFICATION_MAP;
+  // Add+remove space for https://netbeans.org/bugzilla/show_bug.cgi?id=240795.
+  $handler_class = trim('Drupal\recurly_aegir\WebhookNotificationHandlers\ ') . $webhook_notification_handlers[$notification->type];
+
+  $webhook_notification_handler = $handler_class::create($container, [
+    'account' => $notification->account,
+    'subscription' => $notification->subscription,
+    'transaction' => $notification->transaction,
+    'invoice' => $notification->invoice,
+  ]);
+
+  $success = $webhook_notification_handler->handleNotification()->getResult();
+
+  $placeholders = [
+    '@notification' => $notification->type,
+    '@processor' => $handler_class,
+  ];
+
+  if ($success) {
+    $logger->info('Successfully processed @notification with @processor.', $placeholders);
+  }
+  else {
+    $logger->error('Failed to process @notification with @processor.', $placeholders);
+  }
+}
+
+/**
+ * Implements hook_recurly_subscription_list_page_alter().
+ *
+ * Adds site information to the list of subscription properties.
+ */
+function recurly_aegir_recurly_subscription_list_page_alter(&$subscriptions) {
+  $container = \Drupal::getContainer();
+  $user_id = \Drupal::currentUser()->id();
+
+  // Iterate through each subscription.
+  $subscriptions_ids = Element::children($subscriptions['subscriptions']);
+  foreach ($subscriptions_ids as $subscription_id) {
+    $details = &$subscriptions['subscriptions'][$subscription_id];
+    $site_ids = SubscriptionWrapper::get($subscription_id)->getSiteIds($user_id);
+
+    // Fetch the associated entity.
+    foreach (array_values($site_ids) as $site_id) {
+      $site = SiteWrapper::create($container, Node::load($site_id));
+
+      // Determine if it's been configured. If not, the title will be still be
+      // the UUID, set temporarily.
+      $configured = $site->getTitle() != $subscription_id;
+
+      // Add the site or its configuration link.
+      $details['#custom_properties'][] = [
+        'label' => t('Site'),
+        'value' => $configured ? $site->getLink() : $site->getConfigurationLink(),
+      ];
+    }
+  }
+}
