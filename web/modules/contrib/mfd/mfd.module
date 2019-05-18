@@ -1,0 +1,149 @@
+<?php
+/**
+ * The purpose of this module is to extend the entity forms for a multilingual site.
+ * Thereby allowing an administrator to select whether a content type or entity
+ * can display for the content editor all translatable fields in one form.
+ *
+ * Due to the nature of the Field and Form API. We have to be careful not to trample
+ * all over the core and contrib widgets for fields. The best we can achieve is to
+ * play nicely with the majority of modules that enable and extend Drupal's fields.
+ *
+ * To achieve this goal, we are focusing on altering a few forms and calling on the
+ * power of OOP to re-purpose some fields, move them around and eventually get them
+ * to save back to their proper storage definitions.
+ *
+ * We do so by calling on each translation, getting the FormState to play nicely
+ * with each translation and get Drupal to sort itself out without using a heavy
+ * hammer approach at getting and setting values. We leave the power of the classes
+ * to manage this. Go Methods!!
+ *
+ * To understand what is going on here, just follow the trail of breadcrumbs. We
+ * start at the hook_widget_form_alter(). Here we begin the process for each field
+ * which is permitted to be translated:
+ *
+ *  - From the translated entity we get the appropriate field as an item.
+ *  - We tell the FormState not to recurse as we will be asking the widget for a form
+ *  - create a basic form
+ *  - Tell the FormState to shift language state
+ *  - get the widget's form
+ *  - iterate through that until we have all the languages set and saved in the FormState
+ *
+ * Now we can more onto the hook_node_form_alter() to get the NodeForm modifications
+ * done. These will ensure that we have what we need to Render a form with the proper
+ * named fields.
+ *
+ * Since we told the widget we are being used by us (#multiform_display_use) we
+ * don't need to repeat some of the housework we did in the widget alter function.
+ * Now we can just start sweeping through the form object, cleaning it up for each
+ * language instance and getting the proper values to the stored in each
+ * translated entity.
+ *
+ * The only caveat is we need to unset a few values and clean up a few #field_name
+ * and #parent properties to ensure no overlapping naming conventions. Once this
+ * is done, we're home free. The remaining functionality (validation and submission)
+ * is handled by their appropriate objects. We only have to ensure that on submit
+ * we cycle through the language fields we've created and force their values into
+ * their none languaged equivalents in their appropriate translation entity and
+ * ->save().
+ */
+
+
+/**
+ * @file
+ * Provides hook implementations for Multilingual Form Display.
+ */
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Entity\ConfirmFormInterface;
+use Drupal\Core\Plugin\WidgetPluginManager;
+use Drupal\mfd\Plugin\Field\FieldWidget\MultilingualFormDisplayWidget;
+
+/**
+ * Implements hook_help().
+ */
+function mfd_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the mfd module.
+    case 'help.page.mfd':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Extends the node form to permit editing other fields which are translatable') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for 'field_config_edit_form'.
+ */
+function mfd_form_field_config_edit_form_alter(array &$form, FormStateInterface $form_state) {
+  $field = $form_state->getFormObject()->getEntity();
+
+  if ($field->getType() == "multilingual_form_display_field_type") {
+    unset($form['default_value']);
+  }
+}
+
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function mfd_form_node_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $current_user = \Drupal::currentUser();
+  if ($current_user->hasPermission('edit multilingual form')) {
+    foreach (array_keys($form['actions']) as $action) {
+      if ($action != 'preview' && isset($form['actions'][$action]['#type']) && $form['actions'][$action]['#type'] === 'submit') {
+        $form['actions'][$action]['#submit'][] = 'mfd_form_submit';
+      }
+    }
+  }
+}
+
+/**
+ * Submit form
+ *
+ * @param array $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *
+ *  @return entity save and drupal message
+ *   Whatever the result of the entity save will be plus the drupal set message.
+ */
+function mfd_form_submit(&$form, FormStateInterface $form_state) {
+  $form_values = $form_state->getValues();
+  $form_object = $form_state->getFormObject();
+
+  // Get Node (Entity) Objects for other languages
+  $entity = $form_object->getEntity();
+  $entity->save();
+
+  // Language Manager and objects
+  $language_manager = \Drupal::languageManager();
+  $current_language = $language_manager->getCurrentLanguage()->getId();
+
+  $available_langcodes = array_flip(array_keys($language_manager->getLanguages()));
+  // Store the field translations.
+
+  ksort($available_langcodes);
+
+  foreach ($available_langcodes as $langcode => $value) {
+    if ($langcode !== $current_language) {
+      $translated_fields = [];
+
+      foreach ($entity->getFieldDefinitions() as $field_name => $definition) {
+        if ($definition->isTranslatable()) {
+          $field_name_unique = MultilingualFormDisplayWidget::getUniqueName($field_name, $langcode);
+          if (isset($form_values[$field_name_unique])) {
+           $translated_fields[$field_name] = $form_values[$field_name_unique];
+          }
+        }
+      }
+      $translation = $entity->getTranslation($langcode);
+      foreach ($translated_fields as $field => $field_value) {
+        $translation->set($field, $field_value);
+      }
+      $translation->save();
+    }
+  }
+  drupal_set_message('Translation saved');
+}
