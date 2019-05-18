@@ -1,0 +1,285 @@
+<?php
+
+/**
+ * @file
+ * This is the PriceSpider module for implementing PriceSpider actions.
+ */
+
+use Drupal\Core\Config\Entity\ConfigEntityInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Entity\EntityFormInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+
+/**
+ * Implements hook_theme().
+ */
+function pricespider_theme() {
+  $templates = [];
+
+  $templates['pricespider_wtb_button'] = [
+    'template' => 'pricespider-wtb-button',
+    'variables' => [
+      'sku' => NULL,
+      'uri' => NULL,
+    ],
+  ];
+
+  $templates['pricespider_wtb_page'] = [
+    'template' => 'pricespider-wtb-page',
+    'variables' => [],
+  ];
+
+  $templates['pricespider_wtb_block'] = [
+    'template' => 'pricespider-wtb-block',
+    'variables' => [],
+  ];
+
+  return $templates;
+}
+
+
+/**
+ * Implements hook_library_info_alter().
+ */
+function pricespider_library_info_alter(&$libraries, $extension) {
+  // Update external JS if not the defualt.
+  if ($extension == 'pricespider' && isset($libraries['pricespider.js'])) {
+    if ($external_js = \Drupal::config('pricespider.settings')->get('ps.js')) {
+      // GET THE DEFAULT KEY.
+      reset($libraries['pricespider.js']['js']);
+      $default_js = key($libraries['pricespider.js']['js']);
+      // settings not match the default?
+      if ($external_js != $default_js) {
+        // Get js settings.
+        $settings = $libraries['pricespider.js']['js'][$default_js];
+        // Remove ols include.
+        unset($libraries['pricespider.js']['js']);
+        // Replace the JS file with nes setting.
+        $libraries['pricespider.js']['js'][$external_js] = $settings;
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function pricespider_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+  // Get form object.
+  $form_object = $form_state->getFormObject();
+  // Is this an entity form?
+  if (($form_object instanceof EntityFormInterface) && ($form_object->getEntity() instanceof ConfigEntityInterface)) {
+    // Get the entity.
+    $entity = $form_object->getEntity();
+    // Get the entity type name.
+    $entity_type = $entity->getEntityType()->getProvider();
+    // Get the bundle name.
+    $bundle = $entity->getOriginalId();
+    // Check that it is fieldable.
+    $entity_types = \Drupal::service('entity_type.manager')->getDefinitions();
+    $fieldable = isset($entity_types[$entity_type]) && $entity_types[$entity_type]->isSubclassOf('\Drupal\Core\Entity\ContentEntityInterface');
+    // Have an entity type, bundle and it is fieldable?
+    if ($entity_type && $bundle && $fieldable) {
+      // Add fields for selecting this entity type as a product type.
+      $form['pricespider'] = [
+        '#type' => 'details',
+        '#title' => t('Price Spider Settings'),
+        '#group' => 'additional_settings',
+      ];
+
+      // Add a checkbox field.
+      $form['pricespider']['pricespider_product_type'] = [
+        '#type' => 'checkbox',
+        '#title' => t('Use as a Price Spider product'),
+        '#description' => t('Enable content of this type to be used as Price Spider product.'),
+        '#weight' => 0,
+        '#default_value' => \Drupal::service('pricespider')
+          ->isProductType($entity_type, $bundle),
+      ];
+
+      // Select field for choosing which field to use for the sku.
+      $form['pricespider']['pricespider_sku_field'] = [
+        '#type' => 'select',
+        '#title' => t('Product SKU Field'),
+        '#attributes' => ['class' => ['form-required']],
+        '#description' => t('Select the field that holds the Product SKU value.'),
+        '#options' => \Drupal::service('pricespider')
+          ->getSkuFieldOptions($entity_type, $bundle),
+        '#states' => [
+          'visible' => [
+            ':input[name=pricespider_product_type]' => [
+              'checked' => TRUE,
+            ],
+          ],
+          'required' => [
+            ':input[name=pricespider_product_type]' => [
+              'checked' => TRUE,
+            ],
+          ],
+        ],
+        '#default_value' => \Drupal::service('pricespider')
+          ->getSkuField($entity_type, $bundle),
+      ];
+
+      // Add custom submit handler where appropriate.
+      if (isset($form['actions']['submit']['#submit'])) {
+        $form['actions']['submit']['#submit'][] = 'pricespider_entity_type_form_submit';
+      }
+      else {
+        $form['#submit'][] = 'pricespider_entity_type_form_submit';
+      }
+    }
+  }
+}
+
+/**
+ * Callback for form alter on Enttiy Type form.
+ *
+ * @param array $form
+ *   Form array.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   Drupal Form State object.
+ */
+function pricespider_entity_type_form_submit(array &$form, FormStateInterface $form_state) {
+  // Get the entity.
+  $entity = $form_state->getFormObject()->getEntity();
+  // Get the entity type name.
+  $entity_type = $entity->getEntityType()->getProvider();
+  // Get the bundle name.
+  $bundle = $entity->getOriginalId();
+  // Marked as a product type?
+  if ($form_state->getValue('pricespider_product_type')) {
+    // Get sku field.
+    if ($sku_field = $form_state->getValue('pricespider_sku_field')) {
+      // Save the sku field.
+      \Drupal::service('pricespider')
+        ->setSkuField($entity_type, $bundle, $sku_field);
+    }
+    else {
+      // Set sku to blank and warn.
+      \Drupal::service('pricespider')->setSkuField($entity_type . $bundle);
+      drupal_set_message(t('No field selected as Sku Field for @type @bundle', [
+        '@type' => $entity_type,
+        '@bundle' => $bundle,
+      ]), 'warning');
+    }
+  }
+  else {
+    // Remove product type.
+    \Drupal::service('pricespider')->removeProductType($entity_type, $bundle);
+  }
+}
+
+/**
+ * Implements hook_field_delete().
+ */
+function pricespider_field_delete($entity_type, $entity, array $field, $instance, $langcode, &$items) {
+  // Get entity bundle.
+  $bundle = $entity->bundle();
+  // This entity type/bundle have a pricespider field?
+  if ($sku_field == \Drupal::service('pricespider')
+    ->getSkuField($entity_type, $bundle)) {
+    // Field being deleted, is being used as the sku field?
+    if ($sku_field == $field['field_name']) {
+      // Remove the field.
+      \Drupal::service('pricespider')->setSkuField($entity_type, $bundle);
+      drupal_set_message(t('No field selected as Sku Field for @type @bundle', [
+        '@type' => $entity_type,
+        '@bundle' => $bundle,
+      ]), 'warning');
+    }
+  }
+}
+
+/**
+ * Implements hook_field_delete_field().
+ */
+function pricespider_field_delete_field(array $field) {
+  // Get all pricespider products.
+  if ($product_types = \Drupal::service('pricespider')->getProductTypes()) {
+    foreach ($product_types as $entity_type => $bundles) {
+      foreach ($bundles as $bundle => $sku_field) {
+        // This field match one being deleted?
+        if ($sku_field == $field['field_name']) {
+          // Set this field to blank.
+          \Drupal::service('pricespider')->setSkuField($entity_type, $bundle);
+          drupal_set_message(t('No field selected as Sku Field for @type @bundle', [
+            '@type' => $entity_type,
+            '@bundle' => $bundle,
+          ]), 'warning');
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_field_attach_rename_bundle().
+ */
+function pricespider_entity_bundle_rename($entity_type, $bundle_old, $bundle_new) {
+  // Get old bundle settings if they exist.
+  if (\Drupal::service('pricespider')
+    ->isProductType($entity_type, $bundle_old)) {
+    // Get old sku field.
+    $sku_field = \Drupal::service('pricespider')
+      ->getSkuField($entity_type, $bundle_old);
+    // Remove old product type.
+    \Drupal::service('pricespider')
+      ->removeProductType($entity_type, $bundle_old);
+    // Set new bundle.
+    \Drupal::service('pricespdier')
+      ->setSkuField($entity_type, $bundle_new, $sku_field);
+  }
+}
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function pricespider_entity_extra_field_info() {
+  $extra = [];
+
+  // Get all pricespider product types.
+  if ($product_types = \Drupal::service('pricespider')->getProductTypes()) {
+    foreach ($product_types as $entity_type => $bundles) {
+      foreach ($bundles as $bundle => $sku_field) {
+        // Add field for the Where to Buy button.
+        $extra[$entity_type][$bundle]['display']['pricespider_wtb_button'] = [
+          'label' => t('Pricespider Where to Buy button'),
+          'description' => t('Button that links to where to buy lookup page for this product.'),
+          'weight' => 100,
+          'visible' => TRUE,
+        ];
+      }
+    }
+  }
+
+  return $extra;
+}
+
+/**
+ * Implements hook_entity_view().
+ */
+function pricespider_entity_view(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display, $view_mode) {
+  // Current entity displaying pricespider WTB button?
+  if ($display->getComponent('pricespider_wtb_button')) {
+    // Get the sku value.
+    if ($sku = \Drupal::service('pricespider')->getSkuValue($entity)) {
+      // Build render array for the button.
+      $build['pricespider_wtb_button'] = [
+        '#theme' => 'pricespider_wtb_button',
+        '#sku' => $sku,
+        '#uri' => \Drupal::service('pricespider')->getWTBUri(),
+        '#attached' => [
+          'library' => ['pricespider/pricespider.js', 'pricespider/main'],
+          // Add meta tags for product pages.
+          'html_head' => \Drupal::service('pricespider')->getMetaTags([
+            'ps-key',
+            'ps-language',
+            'ps-country',
+          ]),
+        ],
+      ];
+    }
+  }
+}
