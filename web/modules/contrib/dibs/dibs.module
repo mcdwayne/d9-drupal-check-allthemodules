@@ -1,0 +1,524 @@
+<?php
+
+/**
+ * @file
+ * Handle DIBS payment integration
+ */
+
+/**
+ * Implementation of hook_theme().
+ */
+function dibs_theme() {
+  $themes['dibs_redirect_page'] = [
+    'variables' => [
+      'form' => NULL,
+      'inline_script' => NULL,
+      'transaction' => NULL
+    ],
+  ];
+  $themes['dibs_cancel_page'] = [
+    'variables' => [
+      'transaction' => NULL,
+      'form' => NULL
+    ],
+  ];
+  $themes['dibs_accept_page'] = array(
+    'variables' => array(
+      'transaction' => NULL
+    ),
+  );
+
+  return $themes;
+}
+
+/**
+ * Gets the next order ID for a certain module / delta and depending on the arguments
+ * will the record in the table dibs_order_id_settings bed updated.
+ *
+ * @param string $module
+ * @param string $delta
+ * @param bool $update_table
+ * - Should the record in the table dibs_order_id_settings be updated?
+ * @param bool $add_prefix_suffix
+ * - Should the prefix and suffix be added to the returned string
+ * @param bool $fallback
+ * - Should we fallback to the default setting if no settings exists?
+ *
+ * @return multi
+ */
+function dibs_get_next_order_id($module, $delta, $update_table = TRUE, $add_prefix_suffix = TRUE, $fallback = TRUE) {
+  $txn = db_transaction();
+
+  $result = db_query("
+    SELECT *
+    FROM {dibs_order_id_settings}
+    WHERE api_module = :module
+    AND api_delta = :delta",
+    array(
+      ':module' => $module,
+      ':delta' => $delta,
+    )
+  );
+  $settings = $result->fetchAssoc();
+
+  if (empty($settings) && $fallback) {
+    // We try to get the data from the default setting instead
+    return dibs_get_next_order_id(DIBS_DEFAULT_MODULE, DIBS_DEFAULT_DELTA, $update_table, $add_prefix_suffix, FALSE);
+  }
+  elseif (is_array($settings)) {
+    $next_order_id = $settings['order_id'] + 1;
+
+    // Updating value in table
+    if ($update_table) {
+      db_update('dibs_order_id_settings')
+        ->fields(array('order_id' => $next_order_id))
+        ->condition('api_module', $module)
+        ->condition('api_delta', $delta)
+        ->execute();
+    }
+
+    // Returns the found value
+    return $add_prefix_suffix ? $settings['order_id_prefix'] . $next_order_id . $settings['order_id_suffix'] : $next_order_id;
+  }
+  else {
+    return NULL;
+  }
+}
+
+/**
+ * Load a transaction from the hash value or the transaction id.
+ *
+ * @param $key
+ *   Is either the transaction id (tid) or the hash value
+ * @param $op
+ *   Is either tid or hash.
+ *
+ * @return
+ *   A fully-loaded $stransaction array upon successful transaction load or FALSE if transaction
+ *   cannot be loaded.
+ */
+function dibs_transaction_load($key = NULL, $op = 'tid') {
+  if ($op == 'tid' && is_numeric($key)) {
+    $result = db_query('
+      SELECT *
+      FROM {dibs_transactions}
+      WHERE tid = :tid',
+      array(':tid' => $key)
+    );
+  }
+  elseif ($op == 'hash' && !empty($key)) {
+    $result = db_query('
+      SELECT *
+      FROM {dibs_transactions}
+      WHERE api_hash = :api_hash',
+      array(':api_hash' => $key)
+    );
+  }
+  else {
+    return FALSE;
+  }
+  if ($transaction = $result->fetchAssoc()) {
+    $transaction['order_info_long'] = unserialize($transaction['order_info_long']);
+    $transaction['order_price_info'] = unserialize($transaction['order_price_info']);
+    $transaction['params'] = !empty($transaction['params']) ? unserialize($transaction['params']) : array();
+    if ($transaction['split_payments'] > 1) {
+      $result = db_select('dibs_split_payments')
+        ->fields('dibs_split_payments', array('payment_transaction_id', 'delta'))
+        ->condition('tid', $transaction['tid'])
+        ->execute();
+      $payment_ids = array();
+      foreach ($result as $row) {
+        $payment_ids[$row->delta] = $row->payment_transaction_id;
+      }
+      $transaction['dibs_split_payments'] = $payment_ids;
+    }
+    return $transaction;
+  }
+  else {
+    return FALSE;
+  }
+}
+
+/**
+ * Preparing the payment
+ * - Creating a transaction record in the db
+ * - Redirecting the user to payment redirect page
+ *
+ * @param array $data
+ * @param bool $redirect
+ * - If set to FALSE will the function not automatically
+ *   redirect the user to the DIBS form.
+ *
+ * @return
+ * - If $redirect is set to FALSE, will the api_hash value
+ *   be returned.
+ */
+function dibs_payment_prepare($data, $redirect = TRUE) {
+  $user = \Drupal::currentUser();
+
+  // Checking required data in $data array
+  if (empty($data['payment_price']) || (!is_numeric($data['payment_price']) && !is_float($data['payment_price'])) || $data['payment_price'] <= 0) {
+    drupal_set_message(t('Error preparing the payment: payment_price is missing or not valid!'), 'error');
+    return '';
+  }
+  else if (empty($data['api_module']) || !is_scalar($data['api_delta'])) {
+    drupal_set_message(t('Error preparing the payment: api_module or api_delta is missing!'), 'error');
+    return '';
+  }
+  elseif (!empty($data['api_module']) && is_scalar($data['api_delta'])) {
+    $info = \Drupal::moduleHandler()->invoke($data['api_module'], 'dibsapi', ['info', $data['api_delta']]);
+    if (empty($info) || !is_array($info)) {
+      drupal_set_message(t('Error preparing the payment: api_module and/or api_delta is not valid!'), 'error');
+      return '';
+    }
+  }
+
+  // DIBS transaction data
+  $hash = isset($_SESSION['dibs'][$data['api_module']][$data['api_delta']]['hash']) ? $_SESSION['dibs'][$data['api_module']][$data['api_delta']]['hash'] : NULL;
+  if (!empty($hash) && is_string($hash)) {
+    // We are forcing the system to use a new transaction id for every load of this page,
+    // therefore are we deleting the old transaction record
+    $num_deleted = db_delete('dibs_transactions')
+      ->condition('payment_status', 1, '<')
+      ->condition('api_hash', $hash)
+      ->execute();
+    $hash = NULL;
+  }
+
+  // Getting DIBS settings
+  $settings = dibs_load_settings($data['api_module'], $data['api_delta']);
+
+  // Adding default data to data array if some things missing
+  $data += array(
+    'payment_transaction_type' => 'normal',
+    'order_info_short' => '',
+    'order_info_long' => array(),
+    'order_price_info' => array(),
+    'customer_uid' => $user->uid,
+    'customer_name' => '',
+    'customer_address' => '',
+    'customer_address_2' => '',
+    'customer_city' => '',
+    'customer_zipcode' => '',
+    'customer_country' => '',
+    'customer_email' => !empty($user->mail) ? $user->mail : '',
+    'customer_phone' => '',
+    'split_payments' => 1,
+    'params' => array(),
+  );
+
+  // Generating order id
+  $order_id = !empty($data['payment_order_id']) ? $data['payment_order_id'] : dibs_get_next_order_id($data['api_module'], $data['api_delta']);
+
+  // Creating new api_hash
+  $hash = sha1(microtime() . $order_id . drupal_get_private_key());
+
+  // Creating dibs transaction
+  $transaction = array(
+    'api_module' => $data['api_module'],
+    'api_delta' => $data['api_delta'],
+    'api_hash' => $hash,
+    'order_info_short' => $data['order_info_short'],
+    'order_info_long' => serialize($data['order_info_long']),
+    'order_price_info' => serialize($data['order_price_info']),
+    'payment_time' => date('Y-m-d H:i:s', time()),
+    'payment_order_id' => $order_id,
+    'payment_status' => 0,
+    'payment_currency' => !empty($data['payment_currency']) ? $data['payment_currency'] : $settings['general']['currency'],
+    'payment_price' => $data['payment_price'],
+    'split_payments' => $data['split_payments'],
+    'payment_transaction_type' => $data['payment_transaction_type'],
+    'payment_transaction_id' => NULL,
+    'customer_uid' => $data['customer_uid'],
+    'customer_name' => $data['customer_name'],
+    'customer_address' => $data['customer_address'],
+    'customer_address_2' => $data['customer_address_2'],
+    'customer_city' => $data['customer_city'],
+    'customer_zipcode' => $data['customer_zipcode'],
+    'customer_country' => $data['customer_country'],
+    'customer_email' => $data['customer_email'],
+    'customer_phone' => $data['customer_phone'],
+    'params' => serialize($data['params']),
+  );
+  $transaction_status = \Drupal::database()->insert('dibs_transactions')->fields($transaction)->execute();
+
+  if ($transaction_status != SAVED_NEW) {
+    \Drupal::logger('dibs')->error('Failed to save transaction to database, error code #@code.', array(
+      '@code' => db_error(),
+    ));
+  }
+
+  // Saving new api_hash in session
+  $_SESSION['dibs'][$data['api_module']][$data['api_delta']]['hash'] = $hash;
+
+  // Redirecting to the payment redirect page
+  if ($redirect) {
+    drupal_goto('payment/dibs/redirect/'.$hash);
+    exit;
+  }
+
+  return $hash;
+}
+
+/**
+ * Create the hidden order line fields from
+ * the order_info_long array in the transaction.
+ *
+ * @param array $data
+ *
+ * @return array $form
+ */
+function dibs_create_order_line_fields($data) {
+  $form = [];
+  if (is_array($data)) {
+    if (is_array(current($data))) {
+      $i = 0;
+      foreach ($data as $line) {
+        $j = 1;
+        foreach ($line as $column) {
+          $form['ordline' . $i . '-' . $j] = array(
+            '#type' => 'hidden',
+            '#value' => $column
+          );
+          $j++;
+        }
+        $i++;
+      }
+      $form['ordlinesx'] = array(
+        '#type' => 'hidden',
+        '#value' => $i,
+      );
+      $form['ordlinesy'] = array(
+        '#type' => 'hidden',
+        '#value' => $j-1,
+      );
+    }
+  }
+  return $form;
+}
+
+/**
+ * Create the hidden price info fields from
+ * the order_price_info array in the transaction.
+ *
+ * @param array $data
+ *
+ * @return array $form
+ */
+function dibs_create_price_line_fields($data) {
+  $form = array();
+  if (is_array($data)) {
+    $i = 1;
+    $keys = array();
+    foreach ($data as $key => $value) {
+      $field = 'priceinfo' . $i . '.' . \Drupal\Component\Utility\Unicode::ucfirst($key);
+      $keys[] = $field;
+      $form[$field] = array(
+        '#type' => 'hidden',
+        '#value' => $value
+      );
+      $i++;
+    }
+    $form['priceinfo_keys'] = array(
+      '#type' => 'hidden',
+      '#value' => implode(',', $keys),
+    );
+  }
+  return $form;
+}
+
+/**
+ * Create the hidden delivery info fields from
+ * the customer fields in the transaction.
+ *
+ * @param array $data
+ *
+ * @return array $form
+ */
+function dibs_create_delivery_line_fields($data) {
+  $form = array();
+  if (is_array($data)) {
+    $i = 1;
+    $keys = array();
+    foreach ($data as $key => $value) {
+      if (strpos($key, 'customer_') !== FALSE && !empty($value)) {
+        $key = str_replace('customer_', '', $key);
+        $field = 'delivery' . $i . '.' . \Drupal\Component\Utility\Unicode::ucfirst($key);
+        $keys[] = $field;
+        $form[$field] = array(
+          '#type' => 'hidden',
+          '#value' => $value
+        );
+        $i++;
+      }
+    }
+    $form['delivery_keys'] = array(
+      '#type' => 'hidden',
+      '#value' => implode(',', $keys),
+    );
+  }
+  return $form;
+}
+
+/**
+ * DIBS API function to capture a payment at DIBS.
+ *
+ * @param $api_module
+ *    The api module that performed the transaction.
+ * @param $api_delta
+ *    The delta for the api module that performed the transaction.
+ * @param $transaction
+ *    The DIBS transaction id for the transaction to capture.
+ *
+ * @return Array with info about how the capture when 'status' key is true on
+ *    successful capture.
+ */
+function dibs_capture_transaction($api_module, $api_delta, $transaction) {
+  $payment_data = db_query("SELECT payment_order_id AS orderid, payment_price AS amount, payment_fee AS fee FROM {dibs_transactions} WHERE payment_transaction_id = :transaction", array(':transaction' => $transaction))->fetch();
+  if (empty($payment_data->orderid) || empty($payment_data->amount)) {
+    return array(
+      'status' => FALSE,
+      'code' => 'Missing transaction',
+      'data' => 'Missing transaction in drupal db and could not get orderid or amount to capture',
+    );
+  }
+  $settings = dibs_load_settings($api_module, $api_delta);
+  $data = array(
+    'textreply' => 'true',
+    'fullreply' => 'true',
+    'force' => 'true',
+    'transact' => $transaction,
+    'orderid' => $payment_data->orderid,
+    'amount' => $payment_data->amount * 100,
+  );
+
+  // Add the fee if there is any.
+  if ($payment_data->fee > 0) {
+    $data['amount'] += $payment_data->fee;
+  }
+
+  $data['merchant'] = $settings['general']['merchant'];
+  if ($settings['general']['account']) {
+    $data['account'] = $settings['general']['account'];
+  }
+  if ($settings['general']['md5']) {
+    $data['md5key'] = md5($settings['general']['md5_key2'] . md5($settings['general']['md5_key1'] . 'merchant=' . $data['merchant'] . '&orderid=' . $data['orderid'] . '&transact=' . $data['transact'] . '&amount=' . $data['amount']));
+  }
+ // @FIXME
+// url() expects a route name or an external URI.
+// $response = drupal_http_request(url(DIBS_CAPTURE_URL, array('query' => $data, 'absolute' => TRUE)));
+
+
+  $result = array();
+  if (trim($response->data) == 'MD5 checksum is not correct') {
+    $result['status'] = FALSE;
+    $result['code'] = 'MD5';
+    $result['data'] = $response->data;
+    \Drupal::logger('dibs')->critical("MD5 key calculated for capture did not match for transaction @transaction. MD5 key calculated to @md5.", array(
+      '@transaction' => $transaction,
+      '@md5' => $data['md5key'],
+    ));
+  }
+  elseif (strpos($response->data, 'status=ACCEPTED') !== FALSE) {
+    $result['status'] = TRUE;
+    \Drupal::logger('dibs')->info("Transaction @transaction has been successfully been captured at DIBS.", array(
+      '@transaction' => $transaction,
+    ));
+  }
+  elseif (strpos($response->data, 'status=DECLINED') !== FALSE) {
+    foreach (explode('&', $response->data) as $code) {
+      if (strpos($code, 'result=') !== FALSE) {
+        $error_code = trim($code, 'result=');
+        if (!empty($error_code)) {
+          $error_code = (int) $error_code;
+        }
+      }
+    }
+    $result['status'] = FALSE;
+    $result['code'] = 'Declined';
+    $result['data'] = $response->data;
+    $error_codes = dibs_error_codes();
+    if (!empty($error_codes[$error_code])) {
+      $result['error_code'] = $error_codes[$error_code];
+      \Drupal::logger('dibs')->critical("DIBS declined to capture payment with transaction id @transaction error_code: @error_code.", array(
+        '@transaction' => $transaction,
+        '@error_code' => $result['error_code'],
+      ));
+    }
+    else {
+      \Drupal::logger('dibs')->critical("Unknown error when trying to capture DIBS payment with transaction id @transaction response: @response.", array(
+        '@transaction' => $transaction,
+        '@response' => $response->data,
+      ));
+      $result['error_code'] = 'Unknown';
+    }
+  }
+  else {
+    $result['status'] = FALSE;
+    $result['code'] = 'Unknown';
+    $result['data'] = $response->data;
+    $result['error_code'] = 'Unknown';
+    \Drupal::logger('dibs')->critical("Unknown error when trying to capture DIBS payment with transaction id @transaction response: @response.", array(
+      '@transaction' => $transaction,
+      '@response' => $response->data,
+    ));
+  }
+  return $result;
+}
+
+function dibs_error_codes($type = 'capture') {
+  $codes = array(
+    'capture' => array(
+      0 => 'Accepted',
+      1 => 'No response from acquirer',
+      2 => 'Timeout',
+      3 => 'Credit card expired',
+      4 => 'Rejected by acquirer',
+      5 => 'Authorisation older than7 days',
+      6 => 'Transaction status on the DIBS server does not allow capture',
+      7 => 'Amount too high',
+      8 => 'Error in the parameters sent to the DIBS server. An additional parameter called "message" is returned, with a value that may help identifying the error',
+      9 => 'Order number (orderid) does not correspond to the authorisation order number',
+      10 => 'Re-authorisation of the transaction was rejected',
+      11 => 'Not able to communicate with the acquier',
+      12 => 'Confirm request error',
+      14 => 'Capture is called for a transaction which is pending for batch - i.e. capture was already called',
+      15 => 'Capture was blocked by DIBS',
+    ),
+  );
+
+  if (!empty($codes[$type])) {
+    return $codes[$type];
+  }
+  return array();
+}
+
+/**
+ * Utility function to create HMAC key for some payment windows.
+ *
+ * @param $data
+ *    array with data to send
+ * @param $secret_key
+ *    string containing the hmac secret key
+ *
+ * @return generated hmac key.
+ */
+function dibs_generate_hmac_key($data, $secret_key) {
+  ksort($data);
+
+  // First get a string with all params.
+  $params = array();
+  foreach ($data as $key => $value) {
+    $params[] = $key . '=' . $value;
+  }
+  $params_string = implode('&', $params);
+
+  // Then get the key.
+  $key_as_string = array();
+  // Split as bytes in hex and convert to each byte to char
+  foreach (explode("\n", trim(chunk_split($secret_key, 2, "\n"))) as $h) {
+    $key_as_string[] = chr(hexdec($h));
+  }
+  $key_as_string = implode('', $key_as_string);
+  return hash_hmac('sha256', $params_string, $key_as_string);
+}
