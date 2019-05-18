@@ -1,0 +1,136 @@
+<?php
+
+/**
+ * @file
+ * Install, update and uninstall functions for the xquantity module.
+ */
+
+use Drupal\commerce_xquantity\Entity\XquantityOrderItem;
+use Drupal\commerce_order\Entity\OrderItem;
+
+/**
+ * Implements hook_install().
+ *
+ * Update order item xquantity field storage definition.
+ *
+ * @see https://www.drupal.org/node/2794909
+ */
+function commerce_xquantity_install() {
+  $config = \Drupal::configFactory();
+  $key_value = \Drupal::keyValue('entity.definitions.installed');
+  $database = \Drupal::database();
+  $db_schema = $database->schema();
+  $all = $updated = [];
+
+  foreach ($config->listAll('core.entity_form_display.commerce_order_item.') as $id) {
+    $editable = $config->getEditable($id);
+    $data = $editable->getRawData();
+
+    if (isset($data['targetEntityType'])) {
+      $entity_type = $data['targetEntityType'];
+      $field_name = 'quantity';
+      $definitions = $key_value->get("{$entity_type}.field_storage_definitions");
+      if (!isset($definitions[$field_name])) {
+        continue;
+      }
+      $changes = $definitions[$field_name]->getSchema()['columns']['value'];
+      $needs_change = $changes['precision'] != 14 && $changes['scale'] != 4;
+      $changes['precision'] = 14;
+      $changes['scale'] = 4;
+
+      $tables = ["{$entity_type}_revision", $entity_type];
+
+      foreach ($tables as $table) {
+        if ($needs_change && $db_schema->tableExists($table) && !isset($updated[$table])) {
+          $updated[$table] = FALSE;
+
+          // The table data to restore after the update is completed.
+          $all[$table] = $database->select($table, 'n')
+            ->fields('n')
+            ->execute()
+            ->fetchAll();
+
+          // Truncate the field table to unlock it for changes.
+          $database
+            ->truncate($table)
+            ->execute();
+
+          $db_schema->changeField($table, $field_name, $field_name, $changes);
+
+          $updated[$table] = TRUE;
+        }
+      }
+
+      if (isset($data['content'][$field_name]) && $data['content'][$field_name]['type'] !== 'xnumber') {
+        $data['content'][$field_name]['type'] = 'xnumber';
+        $data['content'][$field_name]['settings'] += [
+          'min' => '1',
+          'max' => "",
+          'default_value' => '1',
+          'step' => '1',
+          'prefix' => '',
+          'suffix' => '',
+          'disable_on_cart' => '0',
+        ];
+        $editable->setData($data);
+        $editable->save();
+      }
+    }
+  }
+
+  // Restore earlier saved number fields data.
+  foreach ($all as $table => $rows) {
+    $updated[$table] = FALSE;
+    foreach ($rows as $row) {
+      $database->insert($table)
+        ->fields((array) $row)
+        ->execute();
+    }
+    $updated[$table] = TRUE;
+  }
+
+  if (!empty($updated) && !in_array(FALSE, $updated)) {
+    $update_manager = \Drupal::entityDefinitionUpdateManager();
+    $entity_type = $update_manager->getEntityType('commerce_order_item');
+    $update_manager->installFieldStorageDefinition('quantity', 'commerce_order_item', 'commerce_order', XquantityOrderItem::baseFieldDefinitions($entity_type)['quantity']);
+
+    drupal_set_message(t('The order item quantity field definition has been successfully updated.'));
+  }
+  else {
+    drupal_set_message(t("The attempt to update order item quantity field is failed. To update the field manually go to commerce_order_item table in the site's DB and edit quantity field structure changing its Length to 14,4. Then flush caches and set Xnumber field widget for each of the order item type's enabled form display modes."), 'warning');
+  }
+}
+
+/**
+ * Implements hook_uninstall().
+ *
+ * Update order item quantity field storage definition.
+ */
+function commerce_xquantity_uninstall() {
+  $update_manager = \Drupal::entityDefinitionUpdateManager();
+  $entity_type = $update_manager->getEntityType('commerce_order_item');
+  $update_manager->installFieldStorageDefinition('quantity', 'commerce_order_item', 'commerce_order', OrderItem::baseFieldDefinitions($entity_type)['quantity']);
+
+  $config = \Drupal::configFactory();
+  foreach ($config->listAll('core.entity_form_display.commerce_order_item.') as $id) {
+    $editable = $config->getEditable($id);
+    $data = $editable->getRawData();
+    unset($data['content']['quantity']['settings']['disable_on_cart']);
+    $editable->setData($data);
+    $editable->save();
+  }
+}
+
+/**
+ * Update XquantityOrderItem 'quantity' field definition.
+ */
+function commerce_xquantity_update_8201() {
+  $update_manager = \Drupal::entityDefinitionUpdateManager();
+  $quantity = $update_manager->getFieldStorageDefinition('quantity', 'commerce_order_item');
+  if ($quantity->getType() != 'xdecimal') {
+    $entity_type = $update_manager->getEntityType('commerce_order_item');
+    $update_manager->installFieldStorageDefinition('quantity', 'commerce_order_item', 'commerce_order', XquantityOrderItem::baseFieldDefinitions($entity_type)['quantity']);
+    return t('Order item quantity field successfully updated to xdecimal type.');
+  }
+  return t('Order item quantity field does not need to be updated as that is of xdecimal type.');
+}
