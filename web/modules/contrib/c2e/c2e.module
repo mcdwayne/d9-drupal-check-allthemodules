@@ -1,0 +1,501 @@
+<?php
+
+/**
+ * @file
+ * Main procedural code file for the Collect To Entities module.
+ *
+ * This module create nodes and comments from e-mails collected by the Inmail
+ * Collect module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\media\Entity\Media;
+use Drupal\file\Entity\File;
+use Drupal\comment\Entity\Comment;
+use Drupal\collect\Entity\Container;
+use Drupal\user\Entity\User;
+use Drupal\node\Entity\Node;
+
+/**
+ * Implements hook_help().
+ *
+ * @inheritdoc
+ */
+function c2e_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.c2e':
+      $text = file_get_contents(dirname(__FILE__) . "/README.txt");
+      if (!\Drupal::moduleHandler()->moduleExists('markdown')) {
+        return '<pre>' . $text . '</pre>';
+      }
+      else {
+        // Use the Markdown filter to render the README.
+        $filter_manager = \Drupal::service('plugin.manager.filter');
+        $settings = \Drupal::configFactory()->get('markdown.settings')->getRawData();
+        $config = ['settings' => $settings];
+        $filter = $filter_manager->createInstance('markdown', $config);
+        return $filter->process($text, 'en');
+      }
+  }
+  return NULL;
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * @inheritdoc
+ */
+function c2e_cron() {
+  try {
+    if (\Drupal::config('c2e.settings')->get('cron')) {
+      c2e__process_containers(\Drupal::config('c2e.settings')->get('batch_size'));
+    }
+  }
+  catch (Exception $e) {
+    watchdog_exception('c2e', $e);
+  }
+}
+
+/**
+ * Process containers.
+ *
+ * Returns true if there was no processing.
+ * If you don't call by cron automatically, it makes sense.
+ */
+function c2e__process_containers($batch_size) {
+
+  // Set the default return value. (Has not processed anything)
+  $return = TRUE;
+
+  // Get the containers and process them.
+  if ($containers = c2e__get_unprocessed_containers($batch_size)) {
+    foreach ($containers as $container) {
+
+      // Set the return value. (There was data processed.)
+      $return = FALSE;
+
+      // Update container status to (E)rror. If any exception occurs during
+      // processing, it will remain in this state.
+      c2e__update_status($container->id, 'E');
+
+      // Process current container.
+      c2e__create_email(c2e__collect_mail_data((array) json_decode($container->data), $container->id));
+
+      // Delete container or set status to (P)rocessed.
+      if (\Drupal::config('c2e.settings')->get('delete_collect')) {
+        c2e__delete_container($container->id);
+      }
+      else {
+        c2e__update_status($container->id, 'P');
+      }
+
+      // Logs a notice.
+      \Drupal::logger('c2e')->notice(t('Collected item (@id) was processed.', ['@id' => $container->id]));
+    }
+  }
+  return $return;
+}
+
+/**
+ * Gets the oldest unprocessed containers from the database.
+ */
+function c2e__get_unprocessed_containers($batch_size) {
+  return \Drupal::database()->select('collect', 't')
+    ->fields('t', ['data', 'id'])
+    ->isNull('status')
+    ->condition('type', 'application/json')
+    ->range(0, $batch_size)
+    ->execute()
+    ->fetchAll();
+}
+
+/**
+ * Update container status.
+ */
+function c2e__update_status($id, $status) {
+  \Drupal::database()->update('collect')
+    ->fields(['status' => $status])
+    ->condition('id', $id)
+    ->execute();
+}
+
+/**
+ * Delete the container.
+ */
+function c2e__delete_container($id) {
+  Container::load($id)
+    ->delete();
+}
+
+/**
+ * Collects parts of the e-mail.
+ */
+function c2e__collect_mail_data($mail, $id) {
+  return (object) [
+    'deto' => c2e__get_mail_deto($mail, $id),
+    'from' => c2e__get_mail_from($mail, $id),
+    'subj' => c2e__get_mail_subj($mail, $id),
+    'text' => c2e__get_mail_body($mail, $id, 'text/plain'),
+    'html' => c2e__get_mail_body($mail, $id, 'text/html'),
+    'file' => c2e__get_mail_file($mail, $id),
+    'user' => 0,
+    'node' => 0,
+  ];
+}
+
+/**
+ * Collects delivered to address of the email.
+ */
+function c2e__get_mail_deto($mail, $id) {
+  return array_key_exists('header-to', $mail)
+    && is_object($mail['header-to'])
+    && property_exists($mail['header-to'], 'address')
+    && $mail['header-to']->address
+    ? $mail['header-to']->address
+    : \Drupal::config('c2e.settings')->get('header_to');
+}
+
+/**
+ * Collects the from address of the email.
+ */
+function c2e__get_mail_from($mail, $id) {
+  return array_key_exists('header-from', $mail)
+    && is_array($mail['header-from'])
+    && count($mail['header-from'])
+    && is_object($mail['header-from'][0])
+    && property_exists($mail['header-from'][0], 'address')
+    && $mail['header-from'][0]->address
+    ? $mail['header-from'][0]->address
+    : \Drupal::config('c2e.settings')->get('header_to');
+}
+
+/**
+ * Collects subject of the email.
+ */
+function c2e__get_mail_subj($mail, $id) {
+  return array_key_exists('header-subject', $mail)
+    && $mail['header-subject']
+    ? $mail['header-subject']
+    : \Drupal::config('c2e.settings')->get('header_subject');
+}
+
+/**
+ * Collects the body of the email.
+ */
+function c2e__get_mail_body($mail, $id, $type) {
+  $return = '';
+  if (preg_match('/Content-Type: multipart\/alternative; boundary="\w+"/', $mail['raw'], $line)) {
+    $boundary = str_replace('"', '', explode('=', $line[0])[1]);
+    foreach (explode("--{$boundary}", $mail['raw']) as $part) {
+      $return = c2e__get_mail_body_content($part, $id, $type);
+      if ($return) {
+        break;
+      }
+    }
+  }
+  else {
+    $return = c2e__get_mail_body_content($mail['raw'], $id, $type);
+  }
+  return $return;
+}
+
+/**
+ * Collects the body of the email.
+ */
+function c2e__get_mail_body_content($part, $id, $content_type) {
+  $return = '';
+  $headers = c2e__get_content_headers($part);
+  if (array_key_exists('Content-Type', $headers)) {
+    if ($headers['Content-Type'] == $content_type) {
+      $return = substr($part, 2 + strlen(explode("\n\n", $part)[0]));
+      $return = c2e__decode_content($id, $headers, $return);
+    }
+  }
+  return trim($return);
+}
+
+/**
+ * Collects the attachments of the email.
+ */
+function c2e__get_mail_file($mail, $id) {
+  $return = [];
+  if (preg_match('/Content-Type: multipart\/mixed; boundary="\w+"/', $mail['raw'], $line)) {
+    $boundary = str_replace('"', '', explode('=', $line[0])[1]);
+    foreach (explode("--{$boundary}", $mail['raw']) as $content) {
+      $headers = c2e__get_content_headers($content);
+      if (array_key_exists('Content-Disposition', $headers)) {
+        if ($headers['Content-Disposition'] == 'attachment') {
+          $attachment = substr($content, 2 + strlen(explode("\n\n", $content)[0]));
+          $attachment = c2e__decode_content($id, $headers, $attachment);
+          $return[] = (object) [
+            'content_type' => $headers['Content-Type'],
+            'name' => $headers['name'],
+            'filename' => $headers['filename'],
+            'content' => $attachment,
+          ];
+        }
+      }
+    }
+  }
+  return $return;
+}
+
+/**
+ * Collects the headers of the content.
+ */
+function c2e__get_content_headers($content) {
+  $return = [];
+  $parts = explode("\n\n", $content);
+  foreach (preg_split("/((\r?\n)|(\r\n?))/", $parts[0]) as $line) {
+    $line_items = explode('; ', $line);
+    foreach ($line_items as $line_item) {
+      if (strpos($line_item, '=') !== FALSE) {
+        $return[trim(explode('=', $line_item)[0])] = str_replace('"', '', trim(explode('=', $line_item)[1]));
+      }
+      elseif (strpos($line_item, ':') !== FALSE) {
+        $return[trim(explode(':', $line_item)[0])] = str_replace('"', '', trim(explode(':', $line_item)[1]));
+      }
+    }
+  }
+  return $return;
+}
+
+/**
+ * Decodes the content.
+ */
+function c2e__decode_content($id, $headers, $content) {
+  if (array_key_exists('Content-Transfer-Encoding', $headers)) {
+    switch (strtolower($headers['Content-Transfer-Encoding'])) {
+      case 'base64':
+        $content = base64_decode($content);
+        break;
+
+      case 'quoted-printable':
+        $content = quoted_printable_decode($content);
+        break;
+
+      case '7bit':
+      case '8bit':
+        break;
+
+      default:
+        throw new Exception(t('Unknown Content-Transfer-Encoding: @encoding. (collect.id = @id)', [
+          '@encoding' => $headers['Content-Transfer-Encoding'],
+          '@id'  => $id,
+        ]));
+    }
+  }
+  return $content;
+}
+
+/**
+ * Process the collected data.
+ */
+function c2e__create_email($mail) {
+  c2e__create_user_by_sender($mail);
+  c2e__create_node_or_comment($mail);
+}
+
+/**
+ * Create new user by sender email.
+ */
+function c2e__create_user_by_sender($mail) {
+  if (\Drupal::config('c2e.settings')->get('create_users')) {
+    $matched_users = \Drupal::entityTypeManager()->getStorage('user')->loadByProperties(['mail' => $mail->from]);
+    if ($matched_users) {
+      $mail->user = reset($matched_users)->id();
+    }
+    else {
+      $user = User::create();
+      $user->setPassword(uniqid());
+      $user->enforceIsNew();
+      $user->setEmail($mail->from);
+      $user->setUsername($mail->from);
+      $user->activate();
+      $user->save();
+      $mail->user = $user->id();
+    }
+  }
+}
+
+/**
+ * Decides by subject whether to get a new ticket or just add a new comment.
+ */
+function c2e__create_node_or_comment($mail) {
+  $prefix = \Drupal::config('c2e.settings')->get('prefix');
+  if (preg_match("/\[{$prefix}(\w{13})\]/", $mail->subj, $matches)) {
+    $matched_nodes = \Drupal::entityTypeManager()->getStorage('node')->loadByProperties(['field_c2e_identifier' => "{$prefix}{$matches[1]}"]);
+    if ($matched_nodes) {
+      c2e__create_comment($mail, reset($matched_nodes)->id());
+    }
+    else {
+      c2e__create_node($mail);
+    }
+  }
+  else {
+    c2e__create_node($mail);
+  }
+}
+
+/**
+ * Create node.
+ */
+function c2e__create_node($mail) {
+  $create_new_node = TRUE;
+  if (\Drupal::config('c2e.settings')->get('duplicate')) {
+    if (count($mail->file) == 0) {
+      $matched_nodes = \Drupal::entityTypeManager()
+        ->getStorage('node')
+        ->loadByProperties([
+          'title' => $mail->subj,
+        ]);
+      foreach ($matched_nodes as $node) {
+        if (is_array($node->get('field_c2e_text_plain')->getValue())
+            && count($node->get('field_c2e_text_plain')->getValue())
+            && $node->get('field_c2e_text_plain')->getValue()[0]['value'] == $mail->text) {
+          $create_new_node = FALSE;
+          $node->set('field_c2e_occurrence', 1 + $node->get('field_c2e_occurrence')->getValue()[0]['value']);
+          $node->set('field_c2e_last_occurrence', gmdate('Y-m-d') . 'T' . gmdate('H:i:s'));
+          $node->save();
+          break;
+        }
+      }
+    }
+  }
+  if ($create_new_node) {
+    $prefix = \Drupal::config('c2e.settings')->get('prefix');
+    $node = Node::create([
+      'type' => 'c2e_email',
+      'uid' => $mail->user,
+      'title' => $mail->subj,
+      'field_c2e_identifier' => strtoupper($prefix . uniqid()),
+      'field_c2e_occurrence' => 1,
+      'field_c2e_last_occurrence' => gmdate('Y-m-d') . 'T' . gmdate('H:i:s'),
+      'field_c2e_delivered_to' => $mail->deto,
+      'field_c2e_text_plain' => $mail->text,
+    ]);
+    $node->set('field_c2e_text_html', c2e__create_html_body($node, $mail));
+    $node->set('field_c2e_attachments', c2e__create_attachments($node, $mail));
+    $node->save();
+  }
+}
+
+/**
+ * Create comment.
+ */
+function c2e__create_comment($mail, $pid) {
+  $create_new_comment = TRUE;
+  if (\Drupal::config('c2e.settings')->get('duplicate')) {
+    if (count($mail->file) == 0) {
+      $matched_comments = \Drupal::entityTypeManager()
+        ->getStorage('comment')
+        ->loadByProperties([
+          'entity_id' => $pid,
+          'subject' => $mail->subj,
+        ]);
+      foreach ($matched_comments as $comment) {
+        if (is_array($comment->get('field_c2e_text_plain')->getValue())
+            && count($comment->get('field_c2e_text_plain')->getValue())
+            && $comment->get('field_c2e_text_plain')->getValue()[0]['value'] == $mail->text) {
+          $create_new_comment = FALSE;
+          $comment->set('field_c2e_occurrence', 1 + $comment->get('field_c2e_occurrence')->getValue()[0]['value']);
+          $comment->set('field_c2e_last_occurrence', gmdate('Y-m-d') . 'T' . gmdate('H:i:s'));
+          $comment->save();
+          break;
+        }
+      }
+    }
+  }
+  if ($create_new_comment) {
+    $comment = Comment::create([
+      'entity_type' => 'node',
+      'entity_id' => $pid,
+      'field_name' => 'field_c2e_comments',
+      'uid' => $mail->user,
+      'comment_type' => 'c2e_email',
+      'subject' => $mail->subj,
+      'status' => 1,
+      'field_c2e_occurrence' => 1,
+      'field_c2e_last_occurrence' => gmdate('Y-m-d') . 'T' . gmdate('H:i:s'),
+      'field_c2e_delivered_to' => $mail->deto,
+      'field_c2e_text_plain' => $mail->text,
+    ]);
+    $comment->set('field_c2e_text_html', c2e__create_html_body($comment, $mail));
+    $comment->set('field_c2e_attachments', c2e__create_attachments($comment, $mail));
+    $comment->save();
+  }
+}
+
+/**
+ * Create the HTML body (if exists).
+ */
+function c2e__create_html_body($entity, $mail) {
+  return $mail->html
+    ? [
+      'target_id' => c2e__create_file(
+        $entity->field_c2e_text_html,
+        $mail->user,
+        'text/html',
+        $mail->html
+      ),
+    ]
+    : [];
+}
+
+/**
+ * Create the attachmenst (if exists).
+ */
+function c2e__create_attachments($entity, $mail) {
+  $return = [];
+  foreach ($mail->file as $attachment) {
+    $return[] = [
+      'target_id' => c2e__create_media($entity, $mail->user, $attachment->name, $attachment->content_type, $attachment->content),
+    ];
+  }
+  return $return;
+}
+
+/**
+ * Create and save a Drupal\file\Entity\File object.
+ */
+function c2e__create_file($field, $user, $filemime, $content) {
+
+  $filename = \Drupal::service('uuid')->generate();
+  $settings = $field->getDataDefinition()->getSettings();
+  $directory = \Drupal::token()
+    ->replace("{$settings['uri_scheme']}://{$settings['file_directory']}");
+  file_prepare_directory($directory, FILE_CREATE_DIRECTORY);
+
+  $file = File::create([
+    'uid' => $user,
+    'filename' => $filename,
+    'filesize' => strlen($content),
+    'uri' => "{$directory}/{$filename}",
+    'filemime' => $filemime,
+    'status' => FILE_STATUS_PERMANENT,
+  ]);
+
+  $file->save();
+  file_put_contents($file->getFileUri(), $content);
+
+  return $file->id();
+}
+
+/**
+ * Create and save a Drupal\media\Entity\Media object.
+ */
+function c2e__create_media($entity, $user, $name, $filemime, $content) {
+
+  $media = Media::create([
+    'bundle' => 'c2e_attachment',
+    'uid'    => $user,
+    'name'   => $name,
+  ]);
+
+  $media->set('field_media_c2e_attachment', [
+    'target_id' => c2e__create_file($media->field_media_c2e_attachment, $user, $filemime, $content),
+  ]);
+
+  $media->save();
+  return $media->id();
+}
