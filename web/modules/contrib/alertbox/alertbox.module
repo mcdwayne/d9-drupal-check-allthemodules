@@ -1,0 +1,222 @@
+<?php
+
+/**
+ * @file
+ * Creates some necessary procedures to provide alertboxes.
+ */
+
+use Drupal\block\BlockInterface;
+use Drupal\block\Controller\BlockAddController;
+use Drupal\block_content\Entity\BlockContent;
+use Drupal\Core\Entity\EntityInterface;
+
+/**
+ * Implements hook_theme().
+ */
+function alertbox_theme($existing, $type, $theme, $path) {
+  // We will use the our own template, using the default block preprocess.
+  return [
+    'block__block_content__alertbox' => [
+      'preprocess functions' => [
+        'preprocess_alertbox',
+        'template_preprocess_block',
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_entity_presave().
+ */
+function alertbox_block_content_presave(EntityInterface $entity) {
+  if ($entity->getEntityTypeId() == 'block_content' && $entity->bundle() == 'alertbox') {
+    $config = \Drupal::configFactory()->getEditable('alertbox.settings');
+    if (!$config->get('alertbox_default_mode')) {
+      $is_new = FALSE;
+      if (!isset($entity->original)) {
+        $is_new = TRUE;
+      }
+      drupal_register_shutdown_function('_alertbox_entity_postsave', $entity, $is_new);
+    }
+  }
+}
+
+/**
+ * Function to update an alertbox content block configuration after node
+ * update/insert.
+ *
+ * @param \Drupal\block_content\Entity\BlockContent $entity
+ *   Entity being update/insert.
+ * @param bool $is_new
+ *   (optional) FALSE for entities being updated, TRUE when inserting a new one.
+ */
+function _alertbox_entity_postsave(BlockContent $entity, $is_new = FALSE) {
+  // Get default active theme.
+  $theme_handler = \Drupal::service('theme_handler');
+  $default_theme = $theme_handler->getDefault();
+
+  $alertbox_config = \Drupal::configFactory()->get('alertbox.settings');
+
+  // Get the entity uuid.
+  $uuid = $entity->uuid();
+
+  if ($is_new) {
+    // Place the new block.
+    $block = new BlockAddController();
+    $content_block = $block->blockAddConfigureForm('block_content:' . $uuid, $default_theme);
+
+    $block_settings = [
+      'plugin' => 'block_content:' . $uuid,
+      'region' => $alertbox_config->get('alertbox_' . $default_theme . '_region'),
+      'machine_name' => $content_block['id']['#default_value'],
+      'theme' => $default_theme,
+      'visibility' => [],
+    ];
+    $block_settings['settings'] = [
+      'label' => $entity->label(),
+      'label_display' => FALSE,
+    ];
+    $block_settings['id'] = $block_settings['machine_name'];
+    \Drupal::entityTypeManager()
+      ->getStorage('block')
+      ->create($block_settings)
+      ->save();
+  }
+
+  // Get the related block, based on the uuid.
+  /** @var \Drupal\Core\Entity\EntityTypeManagerInterface $block */
+  $block = \Drupal::service('entity_type.manager');
+  /** @var \Drupal\Core\Block\BlockManager $block_alertbox */
+  $block_alertboxes = $block->getStorage('block');
+  $block_alertboxes = $block_alertboxes->loadByProperties(['plugin' => 'block_content:' . $uuid]);
+
+  /** @var \Drupal\Core\Entity\EntityInterface $block_alertbox */
+  foreach ($block_alertboxes as $block_alertbox) {
+    // Here we get the corresponding block and now we are able to change the
+    // block configuration for this alertbox.
+    $alertbox_block_id = $block_alertbox->id();
+    $block_config = \Drupal::configFactory()
+      ->getEditable('block.block.' . $alertbox_block_id);
+
+    // We set the region and block definitions only for new nodes.
+    // Updated nodes may have been manually assigned to other regions, that
+    // will change only if field_alertbox_visibility is empty.
+    if ($is_new || ($block_config->get('region') == BlockInterface::BLOCK_REGION_NONE && $block_config->get('status') == FALSE)) {
+      // For default theme, we set "Content" region as default if no settings
+      // defined yet. Other themes will be set as Disabled.
+      if ($default_theme == $block_config->get('theme')) {
+        $region = $alertbox_config->get('alertbox_' . $default_theme . '_region');
+      }
+      else {
+        $region = $alertbox_config->get('alertbox_' . $block_config->get('theme') . '_region');
+      }
+
+      $settings = $block_config->get('settings');
+      $settings['label_display'] = FALSE;
+
+      $block_config->set('region', $region);
+      $block_config->set('status', TRUE);
+      $block_config->set('weight', '-15');
+      $block_config->set('settings', $settings);
+    }
+
+    // If the first value is "inner" this means that "home" is not selected
+    // and we should remove the block from the homepage.
+    if ($entity->field_alertbox_visibility->value == 'inner') {
+      $block_config->set('visibility.request_path.negate', TRUE);
+      $block_config->set('visibility.request_path.pages', '<front>');
+      $block_config->set('visibility.request_path.id', 'request_path');
+    }
+    // If the number of values is equal 2, we show the block on all pages.
+    elseif (count($entity->field_alertbox_visibility->getValue()) == 2) {
+      $block_config->set('visibility.request_path.negate', FALSE);
+      $block_config->set('visibility.request_path.pages', '');
+      $block_config->set('visibility.request_path.id', 'request_path');
+    }
+    // After previous validations, if the first value is "home" we should
+    // display this block only on the homepage.
+    elseif ($entity->field_alertbox_visibility->value == 'home') {
+      $block_config->set('visibility.request_path.negate', FALSE);
+      $block_config->set('visibility.request_path.pages', '<front>');
+      $block_config->set('visibility.request_path.id', 'request_path');
+    }
+    // If nothing validates, the block will be disabled.
+    else {
+      $block_config->set('region', BlockInterface::BLOCK_REGION_NONE);
+      $block_config->set('status', FALSE);
+    }
+
+    // If the content has translations, we'll set the visibility by language.
+    if ($entity->isTranslatable()) {
+      $langcodes = [];
+      foreach ($entity->getTranslationLanguages() as $langcode => $language_object) {
+        $langcodes[$langcode] = $langcode;
+      }
+      $block_config->set('visibility.language.id', 'language');
+      $block_config->set('visibility.language.langcodes', $langcodes);
+      $block_config->set('visibility.language.negate', FALSE);
+      $block_config->set('visibility.language.context_mapping.language', '@language.current_language_context:language_interface');
+    }
+
+    $block_config->save();
+  }
+}
+
+/**
+ * Processes variables to make them availble in the template.Adds library files.
+ *
+ * @param array $variables
+ *   Values to pass to the template and rendering functions.
+ */
+function preprocess_alertbox(array &$variables) {
+  // Let's add some default theming the alertbox.
+  if (isset($variables['elements']['content']['#block_content'])) {
+    $config = \Drupal::configFactory()->get('alertbox.settings');
+    // Set a default value for the close button option.
+    $variables['show_close_button'] = FALSE;
+    $alertbox_allow_hide = $config->get('alertbox_allow_hide');
+    // Default css to theme the alertbox block.
+    $variables['#attached']['library'][] = 'alertbox/alertbox.interface';
+    $variables['#attached']['drupalSettings']['alertbox']['alertbox_allow_hide'] = $alertbox_allow_hide;
+
+    // Add buttons labels.
+    $variables['#attached']['drupalSettings']['alertbox']['alertbox_label_close'] = $config->get('alertbox_label_close');
+    $variables['#attached']['drupalSettings']['alertbox']['alertbox_label_dismiss'] = $config->get('alertbox_label_dismiss');
+
+    if ($alertbox_allow_hide) {
+      $variables['show_close_button'] = TRUE;
+    }
+    $variables['attributes']['class'] = 'block-alertbox';
+  }
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK_alter().
+ */
+function alertbox_theme_suggestions_block_alter(array &$suggestions, array $variables) {
+  // Block suggestions for custom block bundles.
+  if (isset($variables['elements']['content']) && isset($variables['elements']['content']['#block_content'])) {
+    /** @var \Drupal\Core\Entity\EntityInterface $block_content */
+    $block_content = $variables['elements']['content']['#block_content'];
+    if (isset($block_content) && $block_content->bundle() == 'alertbox') {
+      array_unshift($suggestions, 'block__block_content__alertbox');
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function alertbox_form_block_content_alertbox_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  $config = \Drupal::configFactory()->getEditable('alertbox.settings');
+  if (!$config->get('alertbox_default_mode')) {
+    $form['actions']['submit']['#submit'][] = '_alertbox_goto_block_collection';
+  }
+}
+
+/**
+ * Make the form go to entity.block_content.collection.
+ */
+function _alertbox_goto_block_collection($form, \Drupal\Core\Form\FormStateInterface $form_state) {
+  $form_state->setRedirect('entity.block_content.collection');
+}
