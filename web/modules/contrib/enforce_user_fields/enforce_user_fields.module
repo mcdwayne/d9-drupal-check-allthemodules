@@ -1,0 +1,137 @@
+<?php
+
+/**
+ * @file
+ * Contains enforce_user_fields.module.
+ */
+
+use Drupal\Core\Extension\ModuleHandlerInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\Url;
+use Drupal\multiple_registration\Controller\MultipleRegistrationController;
+use Drupal\user\Entity\Role;
+use Symfony\Component\HttpFoundation\RedirectResponse;
+
+/**
+ * Implements hook_help().
+ */
+function enforce_user_fields_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the enforce_user_fields module.
+    case 'help.page.enforce_user_fields':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Force users to fill any required fields in user account at login.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_user_login().
+ */
+function enforce_user_fields_user_login($account) {
+  if (enforce_user_fields_user_has_admin_role($account)) {
+    unset($_SESSION['enforce_user_fields']);
+    return;
+  }
+  $_SESSION['enforce_user_fields'] = enforce_user_fields_have_unfilled_required_fields($account);
+  if ($_SESSION['enforce_user_fields']) {
+    return new RedirectResponse(Url::fromRoute('user.page')->toString());
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function enforce_user_fields_form_user_form_alter(&$form, FormStateInterface $form_state) {
+  $form['actions']['submit']['#submit'][] = 'enforce_user_fields_form_user_form_submit';
+}
+
+/**
+ * Checks, if the given user has admin rights.
+ *
+ * @param \Drupal\Core\Session\AccountInterface $account
+ *   The account to check.
+ *
+ * @return bool
+ *   TRUE, if the given user account has at least one role with admin rights
+ *   assigned, FALSE otherwise.
+ */
+function enforce_user_fields_user_has_admin_role(AccountInterface $account) {
+  static $user_has_admin_role = [];
+  $uid = $account->id();
+  if (!isset($user_has_admin_role[$uid])) {
+    $roles = Role::loadMultiple($account->getRoles());
+    foreach ($roles as $role) {
+      if ($role->isAdmin()) {
+        $user_has_admin_role[$uid] = TRUE;
+        break;
+      }
+      $user_has_admin_role[$uid] = FALSE;
+    }
+  }
+  return $user_has_admin_role[$uid];
+}
+
+/**
+ * @param \Drupal\Core\Session\AccountInterface $account
+ * @return bool
+ */
+function enforce_user_fields_have_unfilled_required_fields(AccountInterface $account){
+  $result = FALSE;
+
+  if ($account->isAnonymous() || enforce_user_fields_user_has_admin_role($account)) {
+    return FALSE;
+  }
+
+  /* @var \Drupal\user\UserInterface $user */
+  $user = \Drupal::entityTypeManager()->getStorage('user')->load($account->id());
+  /* @var ModuleHandlerInterface $module_handler */
+  $module_handler = \Drupal::service('module_handler');
+  $user_roles = $user->getRoles();
+  $field_names = array_keys($user->getFields());
+  foreach ($field_names as $field_name) {
+    $field_definition = $user->get($field_name)->getFieldDefinition();
+    if ($field_definition instanceof Drupal\Core\Config\Entity\ThirdPartySettingsInterface) {
+      $access = TRUE;
+      // Support multiple_registration module
+      if ($module_handler->moduleExists('multiple_registration')) {
+        $field_roles = $field_definition->getThirdPartySetting('multiple_registration', 'user_additional_register_form');
+        if (!empty($field_roles)) {
+          // If nothing was selected.
+          if (max($field_roles) === 0) {
+            $access = TRUE;
+          }
+          else {
+            $extract_keys = array_intersect($user_roles, $field_roles);
+            $access = !empty($extract_keys);
+          }
+        }
+      }
+      if ($access && $field_definition->isRequired() && $user->{$field_name}->isEmpty()) {
+        $result = TRUE;
+        break;
+      }
+    }
+  }
+  return $result;
+}
+
+/**
+ * Submit user form callback
+ * @param $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ * @param $form_id
+ */
+function enforce_user_fields_form_user_form_submit(&$form, FormStateInterface $form_state) {
+  $account = \Drupal::currentUser();
+  if (enforce_user_fields_user_has_admin_role($account)) {
+    unset($_SESSION['enforce_user_fields']);
+    return;
+  }
+  $_SESSION['enforce_user_fields'] = enforce_user_fields_have_unfilled_required_fields($account);
+}
