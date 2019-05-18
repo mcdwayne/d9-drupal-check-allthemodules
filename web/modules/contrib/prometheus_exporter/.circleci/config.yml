@@ -1,0 +1,120 @@
+---
+version: 2
+
+workflows:
+  version: 2
+  main:
+    jobs:
+    - test_86x
+    - test_87x
+    - test_88x
+  sync:
+    jobs:
+    - sync_drupalorg:
+        filters:
+          tags:
+            only: /.*/
+          branches:
+            only: /[7-9].x-.*/
+
+jobs:
+  sync_drupalorg:
+    docker:
+    - image: previousnext/pnx-packager
+    working_directory: /data
+    environment:
+      GIT_MIRROR_URL: git@git.drupal.org:project/prometheus_exporter.git
+    steps:
+    - checkout
+    - add_ssh_keys:
+        fingerprints:
+        - "b2:c1:18:11:28:a7:14:28:05:cb:fb:f4:7a:b3:79:e2"
+    - run:
+        name: Add ssh known hosts
+        command: ssh-keyscan -H git.drupal.org >> ~/.ssh/known_hosts
+    - run:
+        name: Add drupal.org git remote
+        command: git remote add drupal "${GIT_MIRROR_URL}"
+    - run:
+        name: Push to drupal.org git remote
+        command: git push drupal "${CIRCLE_BRANCH:-refs/tags/${CIRCLE_TAG}}"
+
+  test: &test
+    docker:
+      - image: previousnext/php-apache:7.2-3.x-dev
+        environment:
+          MODULE_NAME: prometheus_exporter
+          SIMPLETEST_BASE_URL: http://127.0.0.1
+          SIMPLETEST_DB: mysql://drupal:drupal@127.0.0.1/local
+      - image: mariadb
+        environment:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: local
+          MYSQL_USER: drupal
+          MYSQL_PASSWORD: drupal
+    working_directory: /data/app
+    steps:
+      - run:
+          name: Download specified drupal version
+          command: |
+            git clone --depth 1 --branch ${DRUPAL_BRANCH} \
+              https://git.drupal.org/project/drupal.git .
+      - run:
+          name: Fetch drupal dependencies
+          command: |
+            composer install --prefer-dist --no-progress
+            composer require --dev --prefer-dist --no-progress --update-with-dependencies \
+              drush/drush:~9.4 \
+              phpunit/phpunit:~6.5 \
+
+      - checkout:
+          path: modules/${MODULE_NAME}
+      - run:
+          name: Lint PHP against Drupal coding standards
+          command: |
+            vendor/bin/phpcs \
+              --standard=vendor/drupal/coder/coder_sniffer/Drupal \
+              --extensions=php,module,inc,install,test,profile,theme,css,info \
+              --ignore=*.md \
+              modules/${MODULE_NAME}
+      - run:
+          name: Fetch module dependencies
+          command: |
+            curl -Ls https://github.com/stedolan/jq/releases/download/jq-1.5/jq-linux64 -o /usr/local/bin/jq
+            chmod +x /usr/local/bin/jq
+            cat modules/${MODULE_NAME}/composer.json \
+              | jq '.require | keys[] as $k | "\($k)=\(.[$k])@dev"' \
+              | xargs composer require --no-progress
+      - run:
+          name: Install drupal
+          command: |
+            mkdir -p sites/default/files/tmp sites/default/private
+            chmod -R 777 sites/default/files sites/default/private
+            vendor/bin/drush -yv site-install minimal --db-url="${SIMPLETEST_DB}"
+            vendor/bin/drush -yv en ${MODULE_NAME} simpletest
+      - run: httpd -k restart
+      - run:
+          name: Run unit tests
+          command: |
+            mkdir -p build/phpunit
+            php core/scripts/run-tests.sh --verbose --color \
+              --concurrency 4 \
+              --url "${SIMPLETEST_BASE_URL}" \
+              --dburl "${SIMPLETEST_DB}" \
+              --xml build/phpunit \
+              "${MODULE_NAME}"
+      - store_test_results:
+          path: build
+
+  test_86x:
+    <<: *test
+    environment:
+    - DRUPAL_BRANCH: 8.6.x
+  test_87x:
+    <<: *test
+    environment:
+    - DRUPAL_BRANCH: 8.7.x
+  test_88x:
+    <<: *test
+    environment:
+      - DRUPAL_BRANCH: 8.8.x
