@@ -1,0 +1,1 @@
+Under "Administration > Reports" you will found the "Entity count" link. Click on it to get a list of entity types and their count and, if the type has more than one bundle, a per bundle report.
