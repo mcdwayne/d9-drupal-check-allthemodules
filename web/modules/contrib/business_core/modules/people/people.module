@@ -1,0 +1,182 @@
+<?php
+
+/**
+ * @file
+ * This module manages organization peoples.
+ */
+
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Database\Query\AlterableInterface;
+use Drupal\Core\Database\Query\SelectInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Core\Field\FieldDefinitionInterface;
+use Drupal\Core\Field\FieldItemListInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\people\Entity\PeopleType;
+
+/**
+ * Implements hook_entity_base_field_info().
+ */
+function people_entity_base_field_info(EntityTypeInterface $entity_type) {
+  if ($entity_type->id() == 'user') {
+    $fields = [];
+
+    $fields['people'] = BaseFieldDefinition::create('entity_reference')
+      ->setLabel(t('People'))
+      ->setSetting('target_type', 'people')
+      ->setDisplayOptions('view', [
+        'type' => 'entity_reference_label',
+        'weight' => 6,
+      ])
+      ->setDisplayConfigurable('view', TRUE)
+      ->setDisplayOptions('form', [
+        'type' => 'entity_reference_autocomplete',
+        'weight' => 6,
+        'settings' => [
+          'match_operator' => 'CONTAINS',
+          'size' => '60',
+          'placeholder' => '',
+        ],
+      ])
+      ->setDisplayConfigurable('form', TRUE);
+
+    return $fields;
+  }
+}
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function people_entity_extra_field_info() {
+  $extra = [];
+
+  foreach (PeopleType::loadMultiple() as $bundle) {
+    $extra['people'][$bundle->id()]['display']['user_roles'] = [
+      'label' => t('User roles'),
+      'description' => 'User roles',
+      'weight' => 0,
+    ];
+  }
+
+  return $extra;
+}
+
+/**
+ * Implements hook_entity_field_access().
+ */
+function people_entity_field_access($operation, FieldDefinitionInterface $field_definition, AccountInterface $account, FieldItemListInterface $items = NULL) {
+  if ($items && $operation == 'edit') {
+    if ($items->getEntity()->getEntityTypeId() == 'user' && $field_definition->getName() == 'people') {
+      return AccessResult::allowedIfHasPermission($account, 'administer peoples');
+    }
+  }
+
+  return AccessResult::neutral();
+}
+
+/**
+ * Implements hook_query_TAG_alter() for organization_access.
+ */
+function people_query_organization_access_alter(AlterableInterface $query) {
+  // Read meta-data from query, if provided.
+  if (!$account = $query->getMetaData('account')) {
+    $account = \Drupal::currentUser();
+  }
+
+  if ($account->hasPermission('bypass organization access')) {
+    return;
+  }
+
+  $tables = $query->getTables();
+  $alias = 'organization';
+  foreach ($tables as $table_info) {
+    if (!($table_info instanceof SelectInterface)) {
+      if ($table_info['table'] == 'organization') {
+        $alias = $table_info['alias'];
+        break;
+      }
+    }
+  }
+
+  if ($account->hasPermission('bypass company access')) {
+    if ($company = \Drupal::service('people.manager')->currentCompany()) {
+      $ids = _people_get_all_organization_children($company->id());
+      $ids[] = $company->id();
+      $query->condition($alias . '.oid', $ids, 'IN');
+      return;
+    }
+  }
+
+  if ($organization = \Drupal::service('people.manager')->currentOrganization()) {
+    $query->condition($alias . '.oid', $organization->id());
+  }
+  else {
+    $query->condition("1", "2");
+  }
+
+}
+
+/**
+ * Get all children organization.
+ *
+ * This function will used in query_TAG, could not using storage functions.
+ */
+function _people_get_all_organization_children($oid) {
+  $children = \Drupal::database()->query("SELECT oid FROM {organization} WHERE parent = :oid", [
+    ':oid' => $oid,
+  ])->fetchCol();
+
+  if ($children) {
+    foreach ($children as $child) {
+      $children += _people_get_all_organization_children($child);
+    }
+  }
+  else {
+    $children = [];
+  }
+
+  return $children;
+}
+
+/**
+ * Implements hook_query_TAG_alter() for people_access.
+ */
+function people_query_people_access_alter(AlterableInterface $query) {
+  // Read meta-data from query, if provided.
+  if (!$account = $query->getMetaData('account')) {
+    $account = \Drupal::currentUser();
+  }
+
+  if ($account->hasPermission('bypass people access')) {
+    return;
+  }
+
+  $tables = $query->getTables();
+  $alias = 'people';
+  foreach ($tables as $table_info) {
+    if (!($table_info instanceof SelectInterface)) {
+      if ($table_info['table'] == 'people') {
+        $alias = $table_info['alias'];
+        break;
+      }
+    }
+  }
+
+  if (isset($tables['people']['alias'])) {
+    $alias = $tables['people']['alias'];
+  }
+
+  if (!isset($tables['organization'])) {
+    $query->innerJoin('organization', NULL, $alias . '.organization = organization.oid');
+  }
+
+  people_query_organization_access_alter($query);
+}
+
+/**
+ * Implements hook_views_data_alter().
+ */
+function people_views_data_alter(array &$data) {
+  $data['organization']['table']['base']['access query tag'] = 'organization_access';
+}
