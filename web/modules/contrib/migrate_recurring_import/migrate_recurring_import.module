@@ -1,0 +1,142 @@
+<?php
+
+/**
+ * @file
+ * Module file.
+ */
+
+use \Drupal\Component\Utility\Unicode;
+use \Drupal\Core\Form\FormStateInterface;
+use \Drupal\migrate_drupal\MigrationConfigurationTrait;
+use \Drupal\migrate_plus\Entity\Migration;
+use \Drupal\Core\Entity\EntityInterface;
+
+/**
+ * Implements hook_form_alter().
+ */
+function migrate_recurring_import_form_migration_edit_form_alter(&$form, FormStateInterface $form_state) {
+  // dsm('in');
+  $migration = $form_state->getFormObject()->getEntity();
+  $times = [900, 1800, 3600, 10800, 21600, 43200, 86400, 259200, 604800, 2419200];
+
+  $period = array_map(function($time) {
+    return \Drupal::service('date.formatter')->formatInterval($time);
+  }, array_combine($times, $times));
+
+  foreach ($period as &$p) {
+    $p = t('Every @p', ['@p' => $p]);
+  }
+  
+  $period = [
+    0 => t('Never')
+  ] + $period;
+  
+  $form['interval'] = array(
+    '#type' => 'select',
+    '#title' => t('Run on'),
+    '#description' => t('Choose how often a migration should be run.'),
+    '#default_value' => $migration->getThirdPartySetting('migrate_recurring_import', 'interval'),
+    '#weight' => 10,
+    '#options' => $period
+  );
+ 
+  $form['#entity_builders'][] = 'migrate_recurring_import_form_migration_edit_form_builder';
+}
+
+/**
+ * Entity builder for the menu configuration entity.
+ */
+function migrate_recurring_import_form_migration_edit_form_builder($entity_type, Migration $migration, &$form, FormStateInterface $form_state) {
+  if ($form_state->getValue('interval')) {
+    $migration->setThirdPartySetting('migrate_recurring_import', 'interval', $form_state->getValue('interval'));
+    return;
+  }
+ 
+  $migration->unsetThirdPartySetting('migrate_recurring_import', 'interval');
+}
+
+/**
+ * Implements hook_migrate_prepare_row().
+ */
+// function migrate_recurring_import_migrate_prepare_row(\Drupal\migrate\Row $row, \Drupal\migrate\Plugin\MigrateSourceInterface $source, \Drupal\migrate\Plugin\MigrationInterface $migration) {
+//   if ($migration->id() == 'import_participants') {
+//     // print_r($row->getDestination());
+//   }
+// }
+
+
+/**
+ * Retrieve a list of active migrations.
+ *
+ * @param string $migration_ids
+ *  Comma-separated list of migrations - if present, return only these migrations.
+ *
+ * @return MigrationInterface[][]
+ *   An array keyed by migration group, each value containing an array of
+ *   migrations or an empty array if no migrations match the input criteria.
+ */
+function migrate_recurring_import_migration_list($migration_ids = '') {
+  $manager = \Drupal::service('plugin.manager.migration');
+  $plugins = $manager->createInstances([]);
+  $matched_migrations = [];
+
+  // Get the set of migrations that may be filtered.
+  if (empty($migration_ids)) {
+    $matched_migrations = $plugins;
+  }
+  else {
+    // Get the requested migrations.
+    $migration_ids = explode(',', Unicode::strtolower($migration_ids));
+    foreach ($plugins as $id => $migration) {
+      if (in_array(Unicode::strtolower($id), $migration_ids)) {
+        $matched_migrations[$id] = $migration;
+      }
+    }
+  }
+
+  // Do not return any migrations which fail to meet requirements.
+  /** @var \Drupal\migrate\Plugin\Migration $migration */
+  foreach ($matched_migrations as $id => $migration) {
+    if ($migration->getSourcePlugin() instanceof RequirementsInterface) {
+      try {
+        $migration->getSourcePlugin()->checkRequirements();
+      }
+      catch (RequirementsException $e) {
+        unset($matched_migrations[$id]);
+      }
+    }
+  }
+
+  // Filters the matched migrations if a group or a tag has been input.
+  if (!empty($filter['migration_group']) || !empty($filter['migration_tags'])) {
+    // Get migrations in any of the specified groups and with any of the
+    // specified tags.
+    foreach ($filter as $property => $values) {
+      if (!empty($values)) {
+        $filtered_migrations = [];
+        foreach ($values as $search_value) {
+          foreach ($matched_migrations as $id => $migration) {
+            // Cast to array because migration_tags can be an array.
+            $configured_values = (array) $migration->get($property);
+            $configured_id = (in_array($search_value, $configured_values)) ? $search_value : 'default';
+            if (empty($search_value) || $search_value == $configured_id) {
+              if (empty($migration_ids) || in_array(Unicode::strtolower($id), $migration_ids)) {
+                $filtered_migrations[$id] = $migration;
+              }
+            }
+          }
+        }
+        $matched_migrations = $filtered_migrations;
+      }
+    }
+  }
+
+  // Sort the matched migrations by group.
+  if (!empty($matched_migrations)) {
+    foreach ($matched_migrations as $id => $migration) {
+      $configured_group_id = empty($migration->get('migration_group')) ? 'default' : $migration->get('migration_group');
+      $migrations[$configured_group_id][$id] = $migration;
+    }
+  }
+  return isset($migrations) ? $migrations : [];
+}
