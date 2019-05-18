@@ -1,0 +1,235 @@
+<?php
+
+
+/**
+ * @file
+ * Contains assembly.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Field\FieldStorageDefinitionInterface;
+use Drupal\assembly\Entity\AssemblyInterface;
+use Drupal\assembly\Entity\AssemblyType;
+use Drupal\assembly\Entity\Assembly;
+use Drupal\Core\Entity\EntityInterface;
+
+/**
+ * Implements hook_help().
+ */
+function assembly_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the assembly module.
+    case 'help.page.assembly':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Compose rich content with modular elements using Assembly') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function assembly_theme() {
+  $theme = [];
+  $theme['assembly'] = [
+    'render element' => 'elements',
+    'file' => 'assembly.page.inc',
+    'template' => 'assembly',
+  ];
+  $theme['assembly_content_add_list'] = [
+    'render element' => 'content',
+    'variables' => ['content' => NULL],
+    'file' => 'assembly.page.inc',
+  ];
+  return $theme;
+}
+
+/**
+* Implements hook_theme_suggestions_HOOK().
+*/
+function assembly_theme_suggestions_assembly(array $variables) {
+  $suggestions = [];
+  $entity = $variables['elements']['#assembly'];
+  $sanitized_view_mode = strtr($variables['elements']['#view_mode'], '.', '_');
+
+  $suggestions[] = 'assembly__' . $sanitized_view_mode;
+  $suggestions[] = 'assembly__' . $entity->bundle();
+  $suggestions[] = 'assembly__' . $entity->bundle() . '__' . $sanitized_view_mode;
+  $suggestions[] = 'assembly__' . $entity->id();
+  $suggestions[] = 'assembly__' . $entity->id() . '__' . $sanitized_view_mode;
+  return $suggestions;
+}
+
+function assembly_allowed_visual_styles(FieldStorageDefinitionInterface $definition, AssemblyInterface $entity, &$cacheable) {
+  $cacheable = FALSE;
+  return AssemblyType::load($entity->bundle())->getVisualStylesAsOptions();
+}
+
+function assembly_entity_update(EntityInterface $entity) {
+  if ($entity->getEntityTypeId() == 'assembly') {
+    $vid = $entity->get('vid')->value;
+    _assembly_update_existing($entity->id(), $vid);
+    \Drupal\Core\Cache\Cache::invalidateTags($entity->getCacheTags());
+  }
+}
+
+function _assembly_update_existing($id, $revision_id = FALSE) {
+  if (!$revision_id) {
+    $assembly = Assembly::load($id);
+    if (!$assembly)  {
+      return;
+    }
+    $revision_id = $assembly->getRevisionId();
+  }
+
+  $instances = assembly_get_references($id);
+  if (!$instances) {
+    return;
+  }
+
+  foreach ($instances as $entity_type => $ids) {
+    foreach (\Drupal::entityTypeManager()->getStorage($entity_type)->loadMultiple($ids) as $entity) {
+      $update = FALSE;
+      $fields = _assembly_get_assembly_revision_fields($entity_type, $entity->bundle());
+
+      foreach ($fields as $field) {
+        $updateField = FALSE;
+        $old_val = $entity->get($field['field_name'])->getValue();
+        $new_val = [];
+
+        foreach ($old_val as $value) {
+          if ($value['target_id'] == $id && $value['target_revision_id'] != $revision_id) {
+            // echo "Updating value" . PHP_EOL;
+            $new_val[] = [
+              'target_id' => $id,
+              'target_revision_id' => $revision_id,
+            ];
+            $update = $updateField = TRUE;
+          }
+          else {
+            $new_val[] = $value;
+          }
+        }
+
+        if ($updateField) {
+          $entity->set($field['field_name'], $new_val);
+        }
+      }
+
+      if ($update) {
+        drupal_set_message("Updating " . $entity->label() . ' (' . $entity->id() . ')', 'status');
+        \Drupal::logger('assembly')->notice("Updating %title (%id)", ['%title' => $entity->label(), '%id' => $entity->id()]);
+        $entity->setNewRevision(TRUE);
+        $entity->revision_log = 'Update existing assembly (id: ' . $id . ') to newest revision';
+        $entity->setRevisionCreationTime(REQUEST_TIME);
+        $entity->setRevisionUserId(0);
+        $entity->save();
+      }
+    }
+  }
+}
+
+// Return a list of entities that reference the given assembly.
+function assembly_get_references($id) {
+  $fields = _assembly_get_assembly_revision_fields();
+
+  if (!$fields) {
+    return FALSE;
+  }
+
+  // Load the current assembly
+  $assembly = Assembly::load($id);
+  $bundle = $assembly->bundle();
+
+  // Narrow to fields that allow assemblies of this type
+  $query_fields = [];
+  foreach ($fields as $field) {
+    $settings = $field['settings'];
+    if (isset($settings['handler_settings']['target_bundles'])) {
+      $target_bundles = $settings['handler_settings']['target_bundles'];
+
+      if (is_array($target_bundles) && in_array($bundle, $target_bundles) || $bundle == $target_bundles) {
+        $query_fields[] = $field;
+      }
+    }
+  }
+
+  if (empty($query_fields)) {
+    return FALSE;
+  }
+
+  // gather entities to look for
+  $entity_types = [];
+  foreach ($query_fields as $field) {
+    if (!isset($entity_types[$field['entity_type']])) {
+      $entity_types[$field['entity_type']] = $field['entity_type'];
+    }
+  }
+
+  $instances = [];
+  // For each entity type, look for instances where any of the relevant fields
+  // references this entity
+  foreach ($entity_types as $entity_type) {
+    $query = \Drupal::entityQuery($entity_type);
+    $or = $query->orConditionGroup();
+    foreach ($query_fields as $field) {
+      if ($field['entity_type'] != $entity_type) {
+        continue;
+      }
+
+      $or->condition($field['field_name'], $id, '=');
+    }
+    $query->condition($or);
+    $instances[$entity_type] = $query->execute();
+  }
+
+  return $instances;
+
+}
+
+function _assembly_get_assembly_revision_fields($limit_entity_type = '', $limit_bundle = '') {
+  $field_map = \Drupal::entityManager()->getFieldMap();
+  $cached_definitions = [];
+  $fields = [];
+  foreach ($field_map as $entity_type => $maps) {
+    if ($limit_entity_type && ($limit_entity_type != $entity_type)) {
+      continue;
+    }
+
+    foreach ($maps as $field_name => $map) {
+      if ($map['type'] == 'entity_reference_revisions') {
+        foreach ($map['bundles'] as $bundle) {
+          if ($limit_bundle && ($limit_bundle != $bundle)) {
+            continue;
+          }
+
+          $key = implode(':', [$entity_type, $bundle]);
+          if (!isset($cached_definitions[$key])) {
+            $cached_definitions[$key] = \Drupal::entityManager()->getFieldDefinitions($entity_type, $bundle);
+          }
+          $settings = $cached_definitions[$key][$field_name]->get('settings');
+
+          if ($settings['handler'] != 'default:assembly') {
+            continue;
+          }
+
+          $fields[] = [
+            'field_name' => $field_name,
+            'entity_type' => $entity_type,
+            'bundle' => $bundle,
+            'settings' => $settings,
+          ];
+        }
+      }
+    }
+  }
+
+  if (empty($fields)) {
+    return FALSE;
+  }
+
+  return $fields;
+}
