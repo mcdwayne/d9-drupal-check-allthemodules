@@ -1,0 +1,172 @@
+<?php
+/**
+ * @file
+ * Pardot integration module.
+ */
+
+use Drupal\contact\MessageForm;
+use Drupal\Core\Form\FormStateInterface;
+use GuzzleHttp\Exception\RequestException;
+
+/**
+ * Implements hook_page_attachments().
+ *
+ * Adds Pardot tracking script with configuration settings when appropriate.
+ */
+function pardot_page_attachments(array &$page) {
+  // Get conditional state variable.
+  // @see \Drupal\pardot\EventSubscriber\PardotEventSubscriber
+  $include_tracking = (bool) \Drupal::state()->get('pardot.include_tracking') ? : 0;
+  $config = \Drupal::config('pardot.settings');
+
+  if (null !== $config->get('account_id') && $include_tracking) {
+    // Use default campaign ID.
+    $campaign_id = $config->get('default_campaign_id');
+
+    // Match current path to any existing campaigns and use its campaign ID.
+    $storage = \Drupal::entityManager()->getStorage('pardot_campaign');
+    $campaigns = $storage->loadMultiple();
+    if (!empty($campaigns)) {
+      $current_path = \Drupal::service('path.current')->getPath();
+      foreach ($campaigns as $campaign) {
+        if (\Drupal::service('path.matcher')->matchPath($current_path, $campaign->pages['pages'])) {
+          $campaign_id = $campaign->campaign_id;
+        }
+      }
+    }
+
+    $page['#attached']['drupalSettings']['pardot']['accountId'] = $config->get('account_id');
+    $page['#attached']['drupalSettings']['pardot']['campaignId'] = $campaign_id;
+    $page['#attached']['library'][] = 'pardot/pardot';
+
+    // Match current path to any existing scores and use its value.
+    $storage = \Drupal::entityManager()->getStorage('pardot_score');
+    $scores = $storage->loadMultiple();
+    if (!empty($scores)) {
+      $current_path = \Drupal::service('path.current')->getPath();
+      foreach ($scores as $score) {
+        if (\Drupal::service('path.matcher')->matchPath($current_path, $score->pages['pages'])) {
+          $score_value = $score->score_value;
+        }
+      }
+    }
+
+    if (isset($score_value)) {
+      $page['#attached']['drupalSettings']['pardot']['score'] = $score_value;
+    }
+
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Add submit handler if the contact form has a Pardot mapping.
+ */
+function pardot_form_contact_message_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+  // Get conditional state variable.
+  // @see \Drupal\pardot\EventSubscriber\PardotEventSubscriber
+  $include_tracking = (bool) \Drupal::state()->get('pardot.include_tracking') ? : 0;
+  $config = \Drupal::config('pardot.settings');
+
+  if (null !== $config->get('account_id') && $include_tracking) {
+    $bundle = FALSE;
+    $form_object = $form_state->getFormObject();
+    if ($form_object instanceof MessageForm) {
+      $bundle = $form_object->getEntity()->bundle();
+      $entity_manager = \Drupal::service('entity_type.manager');
+      $config_entity = $entity_manager->getStorage('pardot_contact_form_map')
+        ->loadByProperties(['contact_form_id' => $bundle, 'status' => TRUE]);
+
+      // Add submit handler if we have an enabled contact form mapping.
+      if ($config_entity) {
+        $storage = $form_state->getStorage();
+        $storage['pardot_mapping'] = reset($config_entity);
+        $form_state->setStorage($storage);
+        $form['actions']['submit']['#submit'][] = 'pardot_contact_form_submit';
+      }
+    }
+  }
+}
+
+/**
+ * Pardot contact form submit.
+ *
+ * @param array $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *
+ * @see pardot_form_contact_message_form_alter()
+ */
+function pardot_contact_form_submit(array &$form, FormStateInterface $form_state) {
+  // Retrieve storage, where pardot_mapping was set in
+  // pardot_form_contact_message_form_alter().
+  $storage = $form_state->getStorage();
+  if (isset($storage['pardot_mapping'])) {
+    $query_params = array();
+    $mapped_fields = $storage['pardot_mapping']->mapped_fields;
+    $values = $form_state->getValues();
+
+    foreach ($mapped_fields as $field_name => $pardot_key) {
+      if (!empty($values[$field_name])) {
+        $field_values = $form_state->getValue($field_name);
+
+        if (!is_array($field_values)) {
+          $query_params[] = array(
+            $pardot_key => $field_values,
+          );
+        }
+        else {
+          foreach ($field_values as $k => $value) {
+            $query_params[] = array(
+              $pardot_key => reset($value),
+            );
+          }
+        }
+      }
+    }
+
+    // Unable to use \Drupal\Component\Utility\UrlHelper::buildQuery() b/c
+    // Pardot accepts multiple values using the same parameter key.
+    $query_string = '';
+    foreach ($query_params as $param) {
+      $keys = array_keys($param);
+      $key = reset($keys);
+      $query_string .= rawurlencode($key) . '=' . str_replace('%2F', '/', rawurlencode($param[$key])) . '&';
+    }
+
+    $url = $storage['pardot_mapping']->post_url;
+    $options = array(
+      'timeout' => 5,
+      'query' => $query_string,
+    );
+
+    $response = $result = NULL;
+    try {
+      $client = \Drupal::httpClient();
+      $response = $client->request('POST', $url, $options);
+      $result = $response->getBody();
+    }
+    catch (RequestException $e) {
+      watchdog_exception('pardot', $e);
+    }
+
+    // Log the submission.
+    $context = array(
+      'timestamp' => time(),
+      'response' => $response,
+      'result' => $result,
+    );
+    if (!empty($response) && $response->getStatusCode() == '200') {
+      \Drupal::logger('pardot')->notice('Submitted Pardot Contact Form Map @label.',
+        array(
+          '@label' => $storage['pardot_mapping']->label,
+        ), $context);
+    }
+    else {
+      \Drupal::logger('eloqua_entity_bridge')->error('Error submitting Pardot Contact Form Map @label.',
+        array(
+          '@label' => $storage['pardot_mapping']->label,
+        ), $context);
+    }
+  }
+}
