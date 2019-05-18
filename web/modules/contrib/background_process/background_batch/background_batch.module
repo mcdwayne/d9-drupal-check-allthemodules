@@ -1,0 +1,273 @@
+<?php
+
+/**
+ * @file
+ * This module adds background processing to Drupals batch API.
+ *
+ * @todo Add option to stop a running batch job.
+ */
+
+/**
+ * Default value for delay (in microseconds).
+ */
+use Drupal\Core\Url;
+use Drupal\Component\Utility\Timer;
+use Symfony\Component\HttpFoundation\RedirectResponse;
+
+/**
+ * Define Default value for Batch Delay (in miliseconds).
+ */
+const BACKGROUND_BATCH_DELAY = 1000000;
+/**
+ * Define Default value for process lifespan (in miliseconds).
+ */
+const BACKGROUND_BATCH_PROCESS_LIFESPAN = 10000;
+
+/**
+ * Define Default value wether ETA information should be shown.
+ */
+const BACKGROUND_BATCH_PROCESS_ETA = TRUE;
+
+/**
+ * Implements to Steal the operation and hook into context data.
+ */
+function background_batch_batch_alter(&$batch) {
+  if ($batch['progressive'] && $batch['url'] == 'batch') {
+    foreach ($batch['sets'] as &$set) {
+      if (!empty($set['operations'])) {
+        foreach ($set['operations'] as &$operation) {
+          $operation = [
+            '_background_batch_operation', [$operation],
+          ];
+        }
+      }
+    }
+    $batch['timestamp'] = microtime(TRUE);
+  }
+  // In order to make this batch session independend we save the owner UID.
+  $user = \Drupal::currentUser();
+  $batch['uid'] = $user->uid;
+}
+
+/**
+ * Implements hook_library().
+ */
+function background_batch_library() {
+  $libraries = [];
+
+  $libraries['background-process.batch'] = [
+    'title' => 'Background batch API',
+    'version' => '1.0.0',
+    'js' => [
+      drupal_get_path('module', 'background_batch') . '/js/batch.js' => ['group' => JS_DEFAULT, 'cache' => FALSE],
+    ],
+    'dependencies' => [
+        ['background_batch', 'background-process.progress'],
+    ],
+  ];
+  $libraries['background-process.progress'] = [
+    'title' => 'Background batch progress',
+    'version' => VERSION,
+    'js' => [
+      drupal_get_path('module', 'background_batch') . '/js/progress.js' => ['group' => JS_DEFAULT, 'cache' => FALSE],
+    ],
+  ];
+  return $libraries;
+}
+
+/**
+ * Implements to Run a batch operation with "listening" context.
+ */
+function _background_batch_operation($operation, &$context) {
+  // Steal context and trap finished variable.
+  $fine_progress = !empty($context['sandbox']['background_batch_fine_progress']);
+  if ($fine_progress) {
+    $batch_context = new BackgroundBatchContext($context);
+  }
+  else {
+    $batch_context = $context;
+  }
+
+  // Call the original operation.
+  $operation[1][] = &$batch_context;
+  call_user_func_array($operation[0], $operation[1]);
+
+  if ($fine_progress) {
+    // Transfer back context result to batch api.
+    $batch_context = (array) $batch_context;
+    foreach (array_keys($batch_context) as $key) {
+      $context[$key] = $batch_context[$key];
+    }
+  }
+  else {
+    $batch_context = new BackgroundBatchContext($context);
+    $batch_context['finished'] = $context['finished'];
+  }
+}
+
+/**
+ * Implements to Process a batch step.
+ */
+function _background_batch_process($id = NULL) {
+  if (!$id) {
+    return;
+  }
+
+  // Retrieve the current state of batch from db.
+  $data = db_query("SELECT batch FROM {batch} WHERE bid = :bid", [
+    ':bid' => $id,
+  ])->fetchColumn();
+  if (!$data) {
+    return;
+  }
+
+  require_once 'includes/batch.inc';
+  $batch =& batch_get();
+  $batch = unserialize($data);
+
+  // Check if the current user owns (has access to) this batch.
+  $user = \Drupal::currentUser();
+  if ($batch['uid'] != $user->uid) {
+    return drupal_access_denied();
+  }
+  // Register database update for the end of processing.
+  drupal_register_shutdown_function('_batch_shutdown');
+  Timer['start']['$id']['background_batch_processing'];
+
+  $percentage = 0;
+  $mem_max_used = 0;
+  $mem_last_used = memory_get_usage();
+  $mem_limit = ini_get('memory_limit');
+  preg_match('/(\d+)(\w)/', $mem_limit, $matches);
+  switch ($matches[2]) {
+    case 'M':
+    default:
+      $mem_limit = $matches[1] * 1024 * 1024;
+      break;
+  }
+
+  while ($percentage < 100) {
+    list ($percentage) = _batch_process();
+
+    $mem_used = memory_get_usage();
+    // If we memory usage of last run will exceed the
+    // memory limit in next run then bail out.
+    if ($mem_limit < $mem_used + $mem_last_used) {
+      break;
+    }
+
+    $mem_last_used = $mem_used - $mem_last_used;
+    // If we maximum memory usage of previous runs will exceed
+    // the memory limit in next run then bail out.
+    $mem_max_used = $mem_max_used < $mem_last_used ? $mem_last_used : $mem_max_used;
+    if ($mem_limit < $mem_used + $mem_max_used) {
+      break;
+    }
+    if (Timer['read']['background_batch_processing'] > \Drupal::config('background_batch.settings')->get('background_batch_process_lifespan')) {
+      break;
+    }
+  }
+  if ($percentage < 100) {
+    background_process_keepalive($id);
+  }
+}
+
+/**
+ * Implements to Processes the batch.
+ */
+function background_batch_process_batch($redirect = NULL, $url = 'batch', $redirect_callback = '') {
+  $batch =& batch_get();
+  if (isset($batch)) {
+    // Add process information.
+    $process_info = [
+      'current_set' => 0,
+      'progressive' => TRUE,
+      'url' => $url,
+      'url_options' => [],
+      'source_url' => $_GET['q'],
+      'redirect' => $redirect,
+      'theme' => \Drupal::theme()->getActiveTheme()->getName(),
+      'redirect_callback' => ((isset($redirect_callback)) ? RedirectResponse('/admin/config/system/batch/overview') : ''),
+    ];
+    $batch += $process_info;
+
+    // The batch is now completely built.
+    // Allow other modules to make changes.
+    \Drupal::moduleHandler()->alter('batch', $batch);
+
+    // Assign an arbitrary id: don't rely
+    // on a serial column in the 'batch'.
+    $batch['id'] = db_next_id();
+
+    // Move operations to a job queue.
+    // Non-progressive batches will use a memory-based queue.
+    foreach ($batch['sets'] as $key => $batch_set) {
+      _batch_populate_queue($batch, $key);
+    }
+    $t = 't';
+    $batch['error_message'] = $t('Please continue to <a href="@error_url">the error page</a>', [
+      '@error_url' => Url::fromUri($url, [
+        'query' => [
+          'id' => $batch['id'],
+          'op' => 'finished',
+        ],
+      ]
+      ),
+    ]);
+    if (isset($_GET['destination'])) {
+      $batch['destination'] = $_GET['destination'];
+      unset($_GET['destination']);
+    }
+    // Store the batch.
+    db_insert('batch')
+      ->fields([
+        'bid' => $batch['id'],
+        'timestamp' => REQUEST_TIME,
+        'token' => drupal_get_token($batch['id']),
+        'batch' => serialize($batch),
+      ])
+      ->execute();
+    // Set the batch number in the session
+    // to guarantee that it will stay alive.
+    $_SESSION['batches'][$batch['id']] = TRUE;
+
+    // Redirect for processing.
+    $function = $batch['redirect_callback'];
+    return $function;
+  }
+  background_process_start('_background_batch_process_callback', $batch);
+}
+
+/**
+ * Implements For Batch Process Callback.
+ */
+function _background_batch_process_callback($batch) {
+  $rbatch =& batch_get();
+  $rbatch = $batch;
+  require_once 'background_batch.pages.inc';
+  _background_batch_page_start();
+}
+
+/**
+ * Implements hook_menu_links_discovered_alter().
+ */
+function background_batch_menu_links_discovered_alter(array &$links) {
+}
+
+/**
+ * Implements hook_menu_local_tasks_alter().
+ */
+function background_batch_menu_local_tasks_alter(array &$data, $route_name) {
+}
+
+/**
+ * Implements hook_menu_local_actions_alter().
+ */
+function background_batch_menu_local_actions_alter(array &$local_actions) {
+}
+
+/**
+ * Implements hook_contextual_links_view_alter().
+ */
+function background_batch_contextual_links_view_alter(array &$element, array $items) {
+}
