@@ -1,0 +1,228 @@
+<?php
+
+/**
+ * @file
+ * Parse.ly Tag module file.
+ */
+
+use Drupal\Component\Utility\Html;
+use Drupal\Component\Serialization\Json;
+use Drupal\Core\Datetime\DrupalDateTime;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\node\Entity\NodeType;
+
+/**
+ * Implements hook_ENTITY_TYPE_view().
+ */
+function parsely_tag_node_view(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display, $view_mode) {
+  if ($view_mode == 'full') {
+    $config = \Drupal::config('parsely_tag.settings');
+    $bundle = NodeType::load($entity->bundle());
+
+    $settings = $bundle->getThirdPartySettings('parsely_tag');
+    if (!isset($settings['enable'])) {
+      $settings['enable'] = $config->get('default_enable');
+    }
+
+    if ($settings['enable']) {
+
+      if (empty($build['#attached'])) {
+        $build['#attached'] = [];
+      }
+
+      // Add the Parse.ly Javascript file.
+      if (!isset($build['#attached']['library'])) {
+        $build['#attached']['library'] = [];
+      }
+      $build['#attached']['library'][] = 'parsely_tag/tag';
+
+      // Add JSONLD properties tag to <head>.
+      foreach (_parsely_tag_properties() as $property => $info) {
+        if (!isset($settings[$property])) {
+          $settings[$property] = $config->get('default_' . $property);
+        }
+      }
+      $json = parsely_tag_generate_json($settings, $entity);
+      $tag = [
+        '#type' => 'html_tag',
+        '#tag' => 'script',
+        '#attributes' => [
+          'type' => 'application/ld+json',
+        ],
+        '#value' => $json,
+      ];
+      if (!isset($build['#attached']['html_head'])) {
+        $build['#attached']['html_head'] = [];
+      }
+      $build['#attached']['html_head'][] = [$tag, 'parsely_tag_tag'];
+    }
+  }
+}
+
+/**
+ * Generate final property values and json for Parse.ly's JSONLD tag.
+ *
+ * @param array $settings
+ *   Parse.ly Tags settings for the node type.
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ *   The node that the properties are being generated for.
+ *
+ * @return string
+ *   The final properties for JSONLD as a json-encoded string.
+ *
+ * @see parsely_tag_node_view()
+ */
+function parsely_tag_generate_json(array $settings, EntityInterface $entity) {
+  $properties = ['@context' => 'http://schema.org'];
+
+  foreach (_parsely_tag_properties() as $property => $info) {
+    // These properties need to be tokenized individually to allow for final
+    // formatting of specific properties.
+    $value = \Drupal::token()->replace(
+      $settings[$property],
+      ['node' => $entity],
+      ['clear' => TRUE]
+    );
+    $value = strip_tags($value);
+
+    // These values will often have html entity encoding. Json::encode() will do
+    // it's own encoding so any HTML entities are decoded before processing.
+    $value = Html::decodeEntities($value);
+
+    switch ($property) {
+      case 'article_section':
+      case 'headline':
+      case 'thumbnail_url':
+      case 'type':
+      case 'url':
+        $properties[$info['json_property']] = $value;
+        break;
+
+      case 'date_created':
+        // Attempt to format any type of date.
+        if (!is_numeric($value)) {
+          $value = strtotime($value);
+        }
+        if (!empty($value)) {
+          $date = new DrupalDateTime('@' . $value);
+          $utc = new DateTimeZone('UTC');
+          $date->setTimezone($utc);
+          $value = $date->format('Y-m-d\TH:i:s\Z');
+          $properties[$info['json_property']] = $value;
+        }
+        break;
+
+      case 'creator':
+      case 'keywords':
+        // Explode comma-separated lists so Json::encode() turns them in to
+        // lists.
+        if (strpos($value, ',')) {
+          $properties[$info['json_property']] = explode(', ', $value);
+        }
+        else {
+          $properties[$info['json_property']] = $value;
+        }
+        break;
+    }
+  }
+
+  return Json::encode($properties);
+}
+
+/**
+ * Implements hook_page_bottom().
+ */
+function parsely_tag_page_bottom(array &$page_bottom) {
+  if (!\Drupal::service('router.admin_context')->isAdminRoute()) {
+    /* @todo Only print this for node views with Parse.ly enabled. */
+    $config = \Drupal::config('parsely_tag.settings');
+
+    if ($site_id = $config->get('site_id')) {
+      $page_bottom['parsely_tag_root'] = [
+        '#type' => 'container',
+        '#attributes' => [
+          'id' => 'parsely-root',
+          'style' => 'display: none',
+        ],
+      ];
+
+      $page_bottom['parsely_tag_root']['config'] = [
+        '#type' => 'html_tag',
+        '#tag' => 'span',
+        '#attributes' => [
+          'id' => 'parsely-cfg',
+          'data-parsely-site' => $site_id,
+        ],
+      ];
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function parsely_tag_form_node_type_form_alter(array &$form, FormStateInterface $form_state) {
+  // Load the real code only when needed.
+  module_load_include('inc', 'parsely_tag', 'parsely_tag.admin');
+  _parsely_tag_form_node_type_form_alter($form, $form_state);
+}
+
+/**
+ * Configurable properties for Parse.ly's JSONLD tag.
+ *
+ * @return array
+ *   All available configurable tag names.
+ *
+ * @url https://www.parse.ly/help/integration/jsonld/
+ */
+function _parsely_tag_properties() {
+  return [
+    'type' => [
+      'title' => t('Type'),
+      'description' => t('The specific schema being used. For post pages 
+        that Parse.ly should track, this must be <code>NewsArticle</code>.'),
+      'json_property' => '@type',
+    ],
+    'headline' => [
+      'title' => t('Headline'),
+      'description' => t('Post or page title.'),
+      'json_property' => 'headline',
+    ],
+    'url' => [
+      'title' => t('URL'),
+      'description' => t('Canonical URL for post/page.'),
+      'json_property' => 'url',
+    ],
+    'thumbnail_url' => [
+      'title' => t('Thumbnail URL'),
+      'description' => t('URL of the image associated with the 
+        post/page.'),
+      'json_property' => 'thumbnailUrl',
+    ],
+    'date_created' => [
+      'title' => t('Date Created'),
+      'description' => t('Publication date. Will be converted to ISO 8601
+        per Parse.ly documentation.'),
+      'json_property' => 'dateCreated',
+    ],
+    'article_section' => [
+      'title' => t('Section'),
+      'description' => t('Primary section/category of the post/page.'),
+      'json_property' => 'articleSection',
+    ],
+    'creator' => [
+      'title' => t('Creator(s)'),
+      'description' => t('Author(s) of the post. For multiple authors, a
+        comma-separated list should be provided.'),
+      'json_property' => 'creator',
+    ],
+    'keywords' => [
+      'title' => t('Keywords'),
+      'description' => t('A comma-separated list of arbitrary data to 
+        attach to post.'),
+      'json_property' => 'keywords',
+    ],
+  ];
+}
