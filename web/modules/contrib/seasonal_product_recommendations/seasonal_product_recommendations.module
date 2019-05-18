@@ -1,0 +1,184 @@
+<?php
+
+/**
+ * @file
+ * The module file.
+ */
+
+use Drupal\field\Entity\FieldConfig;
+use Drupal\field\Entity\FieldStorageConfig;
+use Drupal\taxonomy\Entity\Vocabulary;
+use Drupal\taxonomy\Entity\Term;
+
+/**
+ * Implements hook_views_query_alter().
+ */
+function seasonal_product_recommendations_views_query_alter($view, $query) {
+  if ($view->id() == 'seasonal_product_recommendations' && $view->getDisplay()->display['id'] == 'block_1') {
+    $ip = $_SERVER['REMOTE_ADDR']?:($_SERVER['HTTP_X_FORWARDED_FOR']?:$_SERVER['HTTP_CLIENT_IP']);
+    $localIP = getHostByName(getHostName());
+    $config = \Drupal::config('seasonal_product_recommendations.settings');
+    $config_url = $config->get('ip_config_url');
+    $trim_url = rtrim("http://ip-api.com/json/", "/");
+    //$localIP = "67.135.155.98";
+    $ch = curl_init();
+    $url = $trim_url . '/' . $localIP;
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_HEADER, 0);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, TRUE);
+
+    $ip_data_in = curl_exec($ch);
+    curl_close($ch);
+    if ($ip_data_in) {
+      $location = json_decode($ip_data_in);
+      $latitude = $location->lat;
+      $longitude = $location->lon;
+    }
+    if ($latitude > 23.5 && $latitude < 90) {
+      $hemisphereOfUser = 'Northern';
+    }
+    elseif ($latitude < -23.5 && $latitude > -90) {
+      $hemisphereOfUser = 'Southern';
+    }
+    elseif ($latitude < 0 && $latitude > -23.5) {
+      $hemisphereOfUser = 'Equator-Capricorn';
+    }
+    elseif ($latitude < 23.5 && $latitude > 0) {
+      $hemisphereOfUser = 'Equator-Cancer';
+    }
+
+    $current_date = format_date(time(), 'custom', 'Y-m-d');
+    $query_season = \Drupal::database()->select('hemisphere_seasons', 'hs');
+    $query_season->fields('hs');
+    //$query_season->condition('hs.hemisphere', $hemisphereOfUser, '=');
+    $query_season->condition('hs.start_date', $current_date, '<=');
+    $query_season->condition('hs.end_date', $current_date, '>=');
+    $result = $query_season->execute()->fetch();
+//    print"<pre>";
+//    print_r($result);
+//    die;
+    if (isset($result)) {
+      $season_tid = $result->season;
+      // Traverse through the 'where' part of the query.
+      foreach ($query->where as &$condition_group) {
+        foreach ($condition_group['conditions'] as &$condition) {
+          $condition['value'][':taxonomy_term_field_data_tid'] = $season_tid;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Function to create a vocabulary with terms.
+ */
+function create_vocabulary_and_terms() {
+  $vid = "season";
+  $name = "Season";
+  $vocabularies = Vocabulary::loadMultiple();
+  if (!isset($vocabularies[$vid])) {
+    $vocabulary = Vocabulary::create([
+      'vid' => $vid,
+      'description' => '',
+      'name' => $name,
+    ]);
+    $vocabulary->save();
+    $config = \Drupal::config('seasonal_product_recommendations.settings');
+    // List of terms.
+    $categories = $config->get('season_term_list');
+    foreach ($categories as $category) {
+      $term = Term::create(['parent' => [], 'name' => $category, 'vid' => $vid])->save();
+    }
+  }
+  else {
+    // Vocabulary Already exist.
+    $query = \Drupal::entityQuery('taxonomy_term');
+    $query->condition('vid', $vid);
+    $tids = $query->execute();
+  }
+}
+
+/**
+ * Add field function.
+ */
+function add_field($bundle) {
+  $config = \Drupal::config('seasonal_product_recommendations.settings');
+  $entity_type = $config->get('entity_type');
+
+  // Optional to target bundles.
+  FieldConfig::create([
+    'field_name' => 'field_season',
+    'entity_type' => $entity_type,
+    'bundle' => $bundle,
+    'label' => 'Season',
+    'settings' => ['handler' => 'default', 'handler_settings' => ['target_bundles' => ['season']]],
+  ])->save();
+
+  entity_get_form_display('commerce_product', $bundle, 'default')->setComponent('field_season', ['type' => 'options_select'])->save();
+
+  entity_get_display('commerce_product', $bundle, 'default')->setComponent('field_season', ['type' => 'entity_reference_label'])->save();
+}
+
+/**
+ * Function to create a entity reference field.
+ */
+function create_product_custom_field() {
+  $config = \Drupal::config('seasonal_product_recommendations.settings');
+  $entity_type = $config->get('entity_type');
+
+  // Gets the list of product types.
+  $query = \Drupal::entityQuery('commerce_product_type');
+  $result = $query->execute();
+
+  // Stores the name of the first product type to create the field.
+  $first_product_type = array_shift($result);
+  $field_defs = \Drupal::service('entity_field.manager')->getFieldDefinitions('commerce_product', $first_product_type);
+  foreach ($field_defs as $key => $values) {
+    $field[] = $key;
+  }
+  if (!in_array("field_season", $field)) {
+    FieldStorageConfig::create([
+      'field_name' => 'field_season',
+      'entity_type' => $entity_type,
+      'type' => 'entity_reference',
+      'cardinality' => -1,
+      'settings' => ['target_type' => 'taxonomy_term'],
+    ])->save();
+
+    add_field($first_product_type);
+  }
+}
+
+/**
+ * Function adds taxonomy(Season) entity reference field to the product types.
+ */
+function add_product_custom_field() {
+  // Gets the list of product types.
+  $query = \Drupal::entityQuery('commerce_product_type');
+  $result = $query->execute();
+  // Stores the name of the first product type to create the field.
+  $first_product_type = array_shift($result);
+  $field_defs = \Drupal::service('entity_field.manager')->getFieldDefinitions('commerce_product', $first_product_type);
+  foreach ($field_defs as $key => $values) {
+    $field[] = $key;
+  }
+  if (in_array("field_season", $field)) {
+    foreach ($result as $keys => $values) {
+      $field_defs = \Drupal::service('entity_field.manager')->getFieldDefinitions('commerce_product', $values);
+      foreach ($field_defs as $key => $value) {
+        $fields[] = $key;
+      }
+      if (!in_array("field_season", $fields)) {
+        add_field($values);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_type_insert().
+ */
+function seasonal_product_recommendations_commerce_product_type_insert($entity) {
+  $new_product_type = $entity->get('id');
+  add_field($new_product_type);
+}
