@@ -1,0 +1,75 @@
+<?php
+
+namespace Drupal\commerce_omise\PluginForm\Omise;
+
+use Drupal\commerce_payment\PluginForm\PaymentMethodAddForm as BasePaymentMethodAddForm;
+use Drupal\Core\Form\FormStateInterface;
+
+/**
+ * {@inheritdoc}
+ */
+class PaymentMethodAddForm extends BasePaymentMethodAddForm {
+
+  /**
+   * {@inheritdoc}
+   */
+  public function buildCreditCardForm(array $element, FormStateInterface $form_state) {
+    $element = parent::buildCreditCardForm($element, $form_state);
+
+    // This ensure the add payment method from user account works.
+    $element['#attached']['library'][] = 'commerce_omise/form';
+    // Alter the form with Omise specific needs.
+    $element['#attributes']['class'][] = 'omise-form';
+
+    // Set our key to settings array.
+    /** @var \Drupal\commerce_omise\Plugin\Commerce\PaymentGateway\OmiseInterface $plugin */
+    $plugin = $this->plugin;
+    $element['#attached']['drupalSettings']['commerceOmise'] = [
+      'publicKey' => $plugin->getPublicKey(),
+    ];
+
+    // To display validation errors.
+    $element['payment_errors'] = [
+      '#type' => 'markup',
+      '#markup' => '<div class="payment-errors"></div>',
+      '#weight' => -200,
+    ];
+
+    // Add class identifiers for card data.
+    // Remove required for card data.
+    $element['number']['#attributes']['class'][] = 'card-number';
+    $element['number']['#required'] = FALSE;
+    $element['expiration']['month']['#attributes']['class'][] = 'card-expiry-month';
+    $element['expiration']['month']['#required'] = FALSE;
+    $element['expiration']['year']['#attributes']['class'][] = 'card-expiry-year';
+    $element['expiration']['year']['#required'] = FALSE;
+    $element['security_code']['#title'] = t('CVC');
+    $element['security_code']['#attributes']['class'][] = 'card-cvc';
+    $element['security_code']['#required'] = FALSE;
+
+    // Populated by the JS library.
+    $element['omise_token'] = [
+      '#type' => 'hidden',
+      '#attributes' => [
+        'id' => 'omise_token',
+      ],
+    ];
+
+    return $element;
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  protected function validateCreditCardForm(array &$element, FormStateInterface $form_state) {
+    // The JS library performs its own validation.
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function submitCreditCardForm(array $element, FormStateInterface $form_state) {
+    // The payment gateway plugin will process the submitted payment details.
+  }
+
+}
