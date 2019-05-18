@@ -1,0 +1,1 @@
+CoinGate Payment Gateway Module
