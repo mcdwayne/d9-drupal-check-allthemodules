@@ -1,0 +1,129 @@
+<?php
+
+use Drupal\mail_entity_queue\Entity\MailEntityQueueItemInterface;
+use Drupal\mail_entity_queue\Entity\MailEntityQueueItem;
+use Drupal\Core\Form\FormStateInterface;
+
+/**
+ * Implements hook_cron().
+ */
+function mail_entity_queue_cron() {
+  if (!\Drupal::moduleHandler()->moduleExists('mail_entity_queue_ultimate_cron')) {
+    /** @var \Drupal\mail_entity_queue\Entity\MailEntityQueueInterface[] $queues */
+    $queues = \Drupal::entityTypeManager()->getStorage('mail_entity_queue')->loadMultiple();
+
+    foreach ($queues as $queue) {
+      $queue->getQueueProcessor()->processQueue($queue->id());
+    }
+  }
+
+  // @TODO Purge older items.
+}
+
+/**
+ * Sets a batch to process mail queue queue items.
+ *
+ * @param \Drupal\mail_entity_queue\Entity\MailEntityQueueItemInterface[] $items
+ */
+function mail_entity_queue_item_process_batch(array $items = []) {
+  // Add one operation per queue item.
+  $operations = [];
+  foreach ($items as $item) {
+    // Skip already sent items.
+    if ((integer) $item->getStatus() !== MailEntityQueueItemInterface::SENT) {
+      $operations[] = [
+        'mail_entity_queue_item_process_batch_op',
+        [$item],
+      ];
+    }
+  }
+
+  $batch = [
+    'title' => t('Processing mail queue items'),
+    'operations' => $operations,
+    'finished' => 'mail_entity_queue_item_process_batch_finish',
+  ];
+  batch_set($batch);
+}
+
+/**
+ * Batch operation to process a single queue item.
+ *
+ * @param \Drupal\mail_entity_queue\Entity\MailEntityQueueItemInterface $item
+ *   The item to process.
+ */
+function mail_entity_queue_item_process_batch_op(MailEntityQueueItemInterface $item, &$context) {
+  $queue = $item->queue();
+  $success = $queue->getQueueProcessor()->processItem($item, $queue->getCronDelay());
+
+  $key = $success ? 'success' : 'failed';
+  $context['results'][$key][] = $item->id();
+  $context['message'] = t('Processed @item', ['@item' => $item->id()]);
+}
+
+/**
+ * Batch finish callback.
+ */
+function mail_entity_queue_item_process_batch_finish($success, $results, $operations) {
+  if (!$success) {
+    \Drupal::messenger()->addError(t('Finished with an error.'));
+  }
+
+  $results += [
+    'failed' => [],
+    'success' => [],
+  ];
+  $failed = count($results['failed']);
+  $total = count($results['success']) + $failed;
+  \Drupal::messenger()->addStatus(t('@count items processed.', ['@count' => $total]));
+
+  if ($failed) {
+    $t_args = [
+      '@count' => $failed,
+      '@items' => implode(', ', $results['failed'])
+    ];
+    \Drupal::messenger()->addError(t('@count items failed: @items', $t_args));
+  }
+}
+
+/**
+ * Implements hook_mail().
+ *
+ * Default behaviour to include subject and message in the message and apply
+ * other properties such as headers and format.
+ *
+ * @see hook_mail_alter().
+ */
+function mail_entity_queue_mail($key, &$message, $params) {
+  if ($message['module'] == 'mail_entity_queue') {
+    // @TODO alter in case we add more processors in this module.
+    switch ($key) {
+      default:
+        $message['subject'] = $params['subject'];
+        $message['body'] = $params['body'];
+        if (isset($params['headers']) && is_array($params['headers'])) {
+          $message['headers'] = array_merge($message['headers'], $params['headers']);
+        }
+        $message['format'] = $params['mail_entity_queue']->getFormat();
+        break;
+    }
+  }
+}
+
+/**
+ * Implements hook_form_form_views_exposed_form_alter().
+ *
+ * Overriding the status exposed form as list_integers seem to be displayed as
+ * textfields by Views.
+ *
+ * @TODO: Is there a more automatic way to do this?
+ */
+function mail_entity_queue_form_views_exposed_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $view = $form_state->getStorage('view');
+  if ($view['view']->id() == 'mail_entity_queue_items' && $view['view']->getDisplay()->display['id'] == 'mail_queue_item_page') {
+    $form['status'] = [];
+    $form['status']['#type'] = 'select';
+    $form['status']['#options'] = MailEntityQueueItem::getStatusOptions();
+    $form['status']['#empty_option'] = t('- All -');
+  }
+}
