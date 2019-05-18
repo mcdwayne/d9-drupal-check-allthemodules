@@ -1,0 +1,331 @@
+<?php
+
+/**
+ * @file
+ * Registers various hooks for Pubkey Encrypt to act upon.
+ */
+
+use \Drupal\Core\Form\FormStateInterface;
+use \Drupal\user\UserInterface;
+use \Drupal\user\RoleInterface;
+use \Drupal\user\Entity\Role;
+
+/**
+ * Implements hook_form_alter().
+ */
+function pubkey_encrypt_form_alter(&$form, $form_state, $form_id) {
+  switch ($form_id) {
+    case 'user_login_form':
+      // Try to have this form pass through our custom handler first.
+      array_unshift($form['#submit'], 'pubkey_encrypt_login_submit');
+      break;
+
+    case 'user_form':
+      // Have this form pass through our custom handler too.
+      $form['actions']['submit']['#submit'][] = 'pubkey_encrypt_form_submit';
+      // Have this form pass through our custom validator too.
+      $form['#validate'][] = 'pubkey_encrypt_user_form_validate';
+  }
+}
+
+/**
+ * Custom submit handler for login form.
+ */
+function pubkey_encrypt_login_submit($form, FormStateInterface &$form_state) {
+  // Fetch inputted login credentials to be used by the module.
+  $pubkey_encrypt_manager = \Drupal::service('pubkey_encrypt.pubkey_encrypt_manager');
+  $credentials = $pubkey_encrypt_manager
+    ->fetchLoginCredentials($form, $form_state);
+
+  // Tell the keys manager service that the user just logged in.
+  $users = \Drupal::entityTypeManager()->getStorage('user')
+    ->loadByProperties(['name' => $form_state->getValue('name')]);
+  $user = reset($users);
+  $pubkey_encrypt_manager = \Drupal::service('pubkey_encrypt.pubkey_encrypt_manager');
+  $pubkey_encrypt_manager->userLoggedIn($user, $credentials);
+}
+
+/**
+ * Custom submit handler for user form.
+ */
+function pubkey_encrypt_form_submit($form, FormStateInterface &$form_state) {
+  // Fetch changed login credentials to be used by the module.
+  $pubkey_encrypt_manager = \Drupal::service('pubkey_encrypt.pubkey_encrypt_manager');
+  $credentials = $pubkey_encrypt_manager
+    ->fetchChangedLoginCredentials($form, $form_state);
+
+  $old_credentials = $credentials['old'];
+  $new_credentials = $credentials['new'];
+
+  // Check if a user has requested to change credentials.
+  if ($old_credentials != '' && $new_credentials != '' && $old_credentials != $new_credentials) {
+    // Manage the credentials change.
+    $user_id = $form_state->getValue('uid');
+    $pubkey_encrypt_manager = \Drupal::service('pubkey_encrypt.pubkey_encrypt_manager');
+    $pubkey_encrypt_manager->userCredentialsChanged($user_id, $old_credentials, $new_credentials);
+  }
+}
+
+/**
+ * Custom validator for user form.
+ */
+function pubkey_encrypt_user_form_validate($form, FormStateInterface &$form_state) {
+  // Fetch changed login credentials to be used by the module.
+  $pubkey_encrypt_manager = \Drupal::service('pubkey_encrypt.pubkey_encrypt_manager');
+  $credentials = $pubkey_encrypt_manager
+    ->fetchChangedLoginCredentials($form, $form_state);
+
+  $old_credentials = $credentials['old'];
+  $new_credentials = $credentials['new'];
+
+  // Check that a user has provided both old and new credentials if he is trying
+  // to change his credentials.
+  if ($old_credentials == '' && $new_credentials != '') {
+    // Manage the credentials change.
+    $form_state->setErrorByName('', t('Pubkey Encrypt does not allow a user credentials change if existing credentials are not provided.'));
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ */
+function pubkey_encrypt_user_insert(UserInterface $account) {
+  // Initialize keys for the newly registered user.
+  $pubkey_encrypt_manager = \Drupal::service('pubkey_encrypt.pubkey_encrypt_manager');
+  $pubkey_encrypt_manager->initializeUserKeys($account);
+
+  // If the new user is given "administer permissions" permission, update all
+  // Role keys so to give him complete control over them.
+  if ($account->hasPermission('administer permissions')) {
+    $pubkey_encrypt_manager->updateAllRoleKeys();
+  }
+  // Otherwise update the relevant Role keys so to give him access to those.
+  else {
+    foreach ($account->getRoles(TRUE) as $role) {
+      $role = Role::load($role);
+      $pubkey_encrypt_manager
+        ->updateRoleKey($role);
+    }
+  }
+}
+
+/**
+ * Implements hook_user_role_delete().
+ */
+function pubkey_encrypt_user_role_delete(RoleInterface $role) {
+  $pubkey_encrypt_manager = \Drupal::service('pubkey_encrypt.pubkey_encrypt_manager');
+
+  // Remove the corresponding Encryption Profile for the Role first.
+  $pubkey_encrypt_manager->removeEncryptionProfile($role);
+
+  // Now delete the Role key.
+  $pubkey_encrypt_manager->deleteRoleKey($role);
+
+  // If the role had "administer permissions" permission in it, we need to
+  // update all Role keys. This would cause all users updated with "administer
+  // permissions" permission get complete control over all Role keys.
+  if ($role->hasPermission("administer permissions")) {
+    $pubkey_encrypt_manager->updateAllRoleKeys();
+  }
+}
+
+/**
+ * Implements hook_user_role_insert().
+ */
+function pubkey_encrypt_user_role_insert(RoleInterface $role) {
+  $pubkey_encrypt_manager = \Drupal::service('pubkey_encrypt.pubkey_encrypt_manager');
+
+  // Add role to the list of enabled roles.
+  $pubkey_encrypt_manager->enableRole($role);
+
+  // Create a Role key upon Role creation.
+  $pubkey_encrypt_manager->generateRoleKey($role);
+
+  // Create a corresponding Encryption Profile for the Role key.
+  $pubkey_encrypt_manager->generateEncryptionProfile($role);
+}
+
+/**
+ * Implements hook_user_update().
+ */
+function pubkey_encrypt_user_update(UserInterface $account) {
+  // Check if the user roles have been modified.
+  $new_roles = $account->getRoles();
+  $previous_roles = $account->original->getRoles();
+
+  if ($new_roles != $previous_roles) {
+    $added_roles = array_diff($new_roles, $previous_roles);
+    $removed_roles = array_diff($previous_roles, $new_roles);
+    $changed_roles = array_merge($added_roles, $removed_roles);
+
+    // Update Role keys.
+    $pubkey_encrypt_manager = \Drupal::service('pubkey_encrypt.pubkey_encrypt_manager');
+    foreach ($changed_roles as $role) {
+      $role = Role::load($role);
+
+      // We need to update all Role keys if any changed role has "administer
+      // permissions" permission in it.
+      if ($role->hasPermission("administer permissions")) {
+        // This would cause all users updated with "administer permissions"
+        // permission get complete control over all Role keys.
+        $pubkey_encrypt_manager->updateAllRoleKeys();
+
+        // Break the loop as all Role keys just got updated so moving forward
+        // is unnecessary.
+        break;
+      }
+
+      // Otherwise just update the specific Role key.
+      $pubkey_encrypt_manager
+        ->updateRoleKey($role);
+    }
+  }
+}
+
+/**
+ * Implements hook_user_role_update().
+ */
+function pubkey_encrypt_user_role_update(RoleInterface $role) {
+  // If a Role is given "administer permissions" permission, trigger the Role
+  // key updates.
+  if ($role->hasPermission("administer permissions") != $role->original->hasPermission("administer permissions")) {
+    $pubkey_encrypt_manager = \Drupal::service('pubkey_encrypt.pubkey_encrypt_manager');
+    // This would cause all users updated with "administer permissions"
+    // permission get complete control over all Role keys.
+    $pubkey_encrypt_manager->updateAllRoleKeys();
+  }
+}
+
+/**
+ * Initialize the Pubkey Encrypt module via Batch API.
+ */
+function pubkey_encrypt_initialize_module() {
+  // Reflect in state that the initialization process has just started.
+  \Drupal::state()->set('pubkey_encrypt_initialization_in_progress', TRUE);
+
+  $batch = array(
+    'title' => t('Initializing the Pubkey Encrypt module.'),
+    'operations' => array(),
+    'progress_message' => t('Completed @current out of @total operations.'),
+    'finished' => '_pubkey_encrypt_module_initialize_batch_finished',
+  );
+
+  // Add operations in the batch related to User Keys generation.
+  $users = \Drupal::entityTypeManager()->getStorage('user')->loadMultiple();
+  foreach ($users as $user) {
+    $batch['operations'][] = array(
+      '_pubkey_encrypt_initialize_user_keys',
+      array($user),
+    );
+  }
+
+  // Add operations in the batch related to Role Keys generation and Encryption
+  // Profiles generation.
+  $roles = \Drupal::entityTypeManager()->getStorage('user_role')->loadMultiple();
+  foreach ($roles as $role) {
+    if ($role->id() != UserInterface::ANONYMOUS_ROLE && $role->id() != UserInterface::AUTHENTICATED_ROLE) {
+      $batch['operations'][] = array(
+        '_pubkey_encrypt_initialize_role_key',
+        array($role),
+      );
+      $batch['operations'][] = array(
+        '_pubkey_encrypt_initialize_encryption_profile',
+        array($role),
+      );
+    }
+  }
+
+  batch_set($batch);
+  // Batch processing is handled via the Form API where this function is called.
+}
+
+/**
+ * Implements callback_batch_operation().
+ *
+ * Generate the Asymmetric keys for a user.
+ *
+ * @param \Drupal\user\UserInterface $user
+ *   The user for which keys will be created.
+ */
+function _pubkey_encrypt_initialize_user_keys(UserInterface $user, &$context) {
+  $pubkey_encrypt_manager = \Drupal::service('pubkey_encrypt.pubkey_encrypt_manager');
+  $pubkey_encrypt_manager->initializeUserKeys($user);
+
+  $context['message'] = t('Initializing User keys for @username.', array('@username' => $user->getDisplayName()));
+}
+
+/**
+ * Implements callback_batch_operation().
+ *
+ * Generate the Role key for a role.
+ *
+ * @param \Drupal\user\Entity\Role $role
+ *   The role for which a Role key will be created.
+ */
+function _pubkey_encrypt_initialize_role_key(Role $role, &$context) {
+  $pubkey_encrypt_manager = \Drupal::service('pubkey_encrypt.pubkey_encrypt_manager');
+  $pubkey_encrypt_manager->enableRole($role);
+  $pubkey_encrypt_manager->generateRoleKey($role);
+
+  $context['message'] = t('Initializing Role key for @label role.', array('@label' => $role->label()));
+}
+
+/**
+ * Implements callback_batch_operation().
+ *
+ * Generate the Encryption Profile for a role.
+ *
+ * @param \Drupal\user\Entity\Role $role
+ *   The role for which a Role key will be created.
+ */
+function _pubkey_encrypt_initialize_encryption_profile(Role $role, &$context) {
+  $pubkey_encrypt_manager = \Drupal::service('pubkey_encrypt.pubkey_encrypt_manager');
+  $pubkey_encrypt_manager->generateEncryptionProfile($role);
+
+  $context['message'] = t('Initializing Encryption Profile for @label role.', array('@label' => $role->label()));
+}
+
+/**
+ * Implements callback_batch_finished().
+ *
+ * Finish the module initialization batch processing.
+ */
+function _pubkey_encrypt_module_initialize_batch_finished($success, $results, $operations) {
+  if ($success) {
+    // Force logout all users after module initialization.
+    // Logout the current user, if any.
+    if (!\Drupal::currentUser()->isAnonymous()) {
+      user_logout();
+    }
+    // Logout all other active users on the website.
+    $connection = \Drupal::service('database');
+    $sessions = $connection
+      ->select('sessions', 's')
+      ->fields('s', array('uid', 'sid'))
+      ->execute();
+    while ($session = $sessions->fetch()) {
+      // Invoke hook_user_logout for a user before removing his session.
+      $user = \Drupal::entityTypeManager()
+        ->getStorage('user')
+        ->load($session->uid);
+      \Drupal::moduleHandler()->invokeAll('user_logout', array($user));
+
+      // Remove the user session.
+      $connection
+        ->delete('sessions')
+        ->condition('sid', $session->sid)
+        ->execute();
+    }
+  }
+  else {
+    $error_operation = reset($operations);
+    $message = t('An error occurred while processing %error_operation with arguments: @arguments', array(
+      '%error_operation' => $error_operation[0],
+      '@arguments' => print_r($error_operation[1], TRUE),
+    ));
+    drupal_set_message($message, 'error');
+  }
+
+  // Reflect in state that the initialization process has been completed.
+  \Drupal::state()->delete('pubkey_encrypt_initialization_in_progress');
+}
