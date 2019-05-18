@@ -1,0 +1,168 @@
+<?php
+
+use Drupal\Core\Database\Database;
+use Drupal\Core\Database\StatementInterface;
+use Drupal\Core\Extension;
+use Drupal\Core\State;
+use Drupal\user\Entity\Role;
+use Drupal\user;
+use Drupal\Core\Config;
+/**
+ * @file
+ * Security check module functions.
+ */
+
+ /**
+ * Checks a site for potential security issues.
+ */
+function securitycheck_review_site() {
+  $issues = array();
+
+  $admin_role = securitycheck_determine_admin_role();
+  $permissions = securitycheck_get_permissions();
+  $modules = securitycheck_get_modules();
+  try {
+    $updates = securitycheck_get_updates();
+  }
+  catch (Exception $e) {
+    $issues[] = $e->getMessage();
+    $updates = array();
+  }
+
+  $variables = securitycheck_get_variables();
+
+  // This is a little inefficient by it means we use an existing API call.
+  foreach ($permissions as $name => $label) {
+    foreach (user_roles(FALSE, $name) as $rid => $role) {
+      if ($admin_role != $rid) {
+        $issues[] = t('The @perm permission is assigned to @role role', array('@perm' => $label, '@role' => $role));
+      }
+    }
+  }
+
+  $undefined = '__securitycheck_UNDEFINED_VALUE__';
+  foreach ($variables as $name => $expected) {
+    $value = \Drupal::state()->get($name, $undefined);
+    if ($value !== $undefined && $value != $expected) {
+      $args = array('@var' => $name, '@value' => $value, '@expected' => $expected);
+      $issues[] = t('Variable @var is to set "@value", expected "@expected"', $args);
+    }
+  }
+  $moduleHandler = \Drupal::service('module_handler');
+  foreach ($modules as $module) {
+    if ($moduleHandler->moduleExists($module)) {
+      $issues[] = t('The @module module is enabled', array('@module' => $module));
+    }
+  }
+
+  foreach ($updates as $project => $status) {
+    $issues[] = t('The @project requires updating: @status', array('@project' => $project, '@status' => $status));
+  }
+
+  return $issues;
+}
+
+/**
+ * Make a best effort attempt to determine the admin role.
+ */
+function securitycheck_determine_admin_role() {
+  $by_var = \Drupal::config('user.role.administrator')->get('id');
+  return $by_var;
+}
+
+/**
+ * Fetches a list of blacklisted modules.
+ *
+ * @return array
+ *   List of modules which shouldn't be used on a site.
+ */
+function securitycheck_get_modules() {
+  $modules = array(
+    'comment',
+    'contact',
+    'devel', // this will also catch devel_theme
+    'forum',
+    'openid',
+    // 'overlay', 'toolbar', 'dashboard', 'shortcut', //I wish I could uncomment this line
+    'php',
+    'statistics',
+  );
+
+  // Include the paranoia blacklist if it is available.
+  $modules += Drupal::moduleHandler()->invokeAll('paranoia_disable_modules',$modules);
+  $modules = array_unique($modules);
+
+  return $modules;
+}
+
+/**
+ * Fetches the restricted permissions for a site.
+ */
+function securitycheck_get_permissions() {
+  $permissions = array();
+  foreach (  Drupal::moduleHandler()->invokeAll('permission',$permissions) as $perm => $info) {
+    if (!empty($info['restrict access'])) {
+      $permissions[$perm] = $info['title'];
+    }
+  }
+
+  $permissions = array_merge($permissions,Drupal::moduleHandler()->invokeAll('securitycheck_variables',$permissions));
+  return $permissions;
+}
+
+/**
+ * Fetches a list of variables and their expected values.
+ *
+ * @return array
+ *   List of variable values indexed by name.
+ */
+function securitycheck_get_variables() {
+  $vars = array(
+    'clean_url' => TRUE,
+    'error_level' => ERROR_REPORTING_HIDE,
+    'maintenance_mode' => FALSE,
+    'user_register' => USER_REGISTER_ADMINISTRATORS_ONLY,
+  );
+
+  return $vars;
+}
+
+/**
+ * Checks for projects with updates available.
+ *
+ * @return array
+ *   List of update statuses keyed by project names.
+ */
+function securitycheck_get_updates() {
+  // We can only perform this check if the update module is enabled.
+  $moduleHandler = \Drupal::service('module_handler');
+  if (!$moduleHandler->moduleExists('update')) {
+    throw new ErrorException(t("Update module isn't enabled."), 0, E_USER_ERROR);
+  }
+
+  $available = update_get_available();
+  $updates = update_calculate_project_data($available);
+
+  $status = array();
+  foreach ($updates as $project => $info) {
+    switch ($info['status']) {
+      case 'UPDATE_NOT_CURRENT':
+        $status[$project] = t('Update available');
+        break;
+
+      case 'UPDATE_NOT_SECURE':
+        $status[$project] = t('SECURITY update available');
+        break;
+
+      case 'UPDATE_NOT_SUPPORTED':
+        $status[$project] = t('Unsupported release');
+        break;
+
+      case 'UPDATE_REVOKED':
+        $status[$project] = t('Release revoked');
+        break;
+    }
+  }
+
+  return $status;
+}
