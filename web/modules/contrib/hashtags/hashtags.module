@@ -1,0 +1,409 @@
+<?php
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\field\Entity\FieldConfig;
+use Drupal\field\Entity\FieldStorageConfig;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Entity\ContentEntityType;
+use Drupal\Core\Routing\RouteMatchInterface;
+
+/**
+ * Implements hook_help().
+ */
+function hashtags_help($route_name, RouteMatchInterface $route_match) {
+    switch ($route_name) {
+        case 'help.page.hashtags':
+            $output = '';
+            $output .= '<h3>' . t('Hashtags') . '</h3>';
+            $path = drupal_get_path('module', 'hashtags');
+            $output .= '<p>' . t('The Hashtags module allows to create hashtags taxonomy terms
+                                for the content entities. Go to <a href=":config">Hashtags
+                                configuration page</a> and click on <b>Activate Hashtags</b>
+                                button for the corresponding content type. This will create
+                                <em>Hashtags taxonomy term</em> field and hashtags will be
+                                activated for the <em>Body</em> field of the content type.
+                                Also you can activate hashtags for other Text fields. To do
+                                this go to the <b>Manage fields</b> of the content type,
+                                click on <b>edit</b> link of the Text field and check the
+                                <em>Hashtags Activate</em> box. <p>Check the images below to
+                                see the tips how to configure the module.</p><div>
+                                <div><img style="width:100%;" src=":hashtags1" /></div>
+                                <div><img style="width:100%;" src=":hashtags2" /></div>
+                                <div><img style="width:100%;" src=":hashtags3" /></div>
+                                <div><img style="width:100%;" src=":hashtags4" /></div>
+                                <div><img style="width:100%;" src=":hashtags5" /></div>
+                                </div>', array(':config' => \Drupal::url('hashtags.manager_form'),
+                                ':hashtags1' => '/'.$path.'/images/hashtags1.png',
+                                ':hashtags2' => '/'.$path.'/images/hashtags2.png',
+                                ':hashtags3' => '/'.$path.'/images/hashtags3.png',
+                                ':hashtags4' => '/'.$path.'/images/hashtags4.png',
+                                ':hashtags5' => '/'.$path.'/images/hashtags5.png')) . '</p>';
+            return $output;
+    }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function hashtags_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+    if ($form_state->getFormObject() instanceof \Drupal\Core\Entity\EntityFormInterface) {
+        $entity = $form_state->getFormObject()->getEntity();
+        $entity_type = $entity->getEntityTypeId();
+        $bundle = $entity->bundle();
+        $config = \Drupal::config('hashtags.settings');
+        $hashtags_field_name = $config->get('hashtags_taxonomy_terms_field_name');
+        if (!_hashtags_is_field_exists($entity_type, $bundle, $hashtags_field_name)) {
+            return;
+        }
+        $hide_field_hashtags = $config->get('hide_field_hashtags');
+        if (isset($form[$hashtags_field_name])) {
+            $form[$hashtags_field_name]['#access'] = !$hide_field_hashtags;
+        }
+    }
+}
+
+/**
+ * Implements hook_form_field_config_edit_form_alter().
+ */
+function hashtags_form_field_config_edit_form_alter(&$form, FormStateInterface $form_state) {
+    if (!\Drupal::currentUser()->hasPermission('administer hashtags')) {
+        return;
+    }
+    $field = $form_state->getFormObject()->getEntity();
+    $entity_type = $field->getTargetEntityTypeId();
+    $bundle = $field->getTargetBundle();
+    $field_type = $field->getType();
+    $config = \Drupal::config('hashtags.settings');
+    $hashtags_field_name = $config->get('hashtags_taxonomy_terms_field_name');
+    if (in_array($field_type, _hashtags_get_field_text_types()) &&
+        _hashtags_is_field_exists($entity_type, $bundle, $hashtags_field_name)) {
+        $form['field']['hashtags'] = [
+          '#type' => 'fieldset',
+          '#title' => t('Hashtags'),
+          '#collapsible' => TRUE,
+          '#collapsed' => FALSE,
+        ];
+        $form['field']['hashtags']['hashtags_activate'] = [
+            '#type' => 'checkbox',
+            '#title' => t('Activate'),
+            '#description' => t('This allows to use hashtags for this field.'),
+            '#default_value' => $field->getThirdPartySetting('hashtags', 'hashtags_activate', FALSE),
+        ];
+        $form['actions']['submit']['#submit'][] = 'hashtags_form_field_config_edit_form_submit';
+    }
+}
+
+/**
+ * Form submission handler for hashtags_form_field_config_edit_form_alter.
+ *
+ * @param array $form
+ *   The form array.
+ * @param FormStateInterface $form_state
+ *   The form state.
+ */
+function hashtags_form_field_config_edit_form_submit(array $form, FormStateInterface $form_state) {
+    $field = $form_state->getFormObject()->getEntity();
+    $form_fields = &$form_state->getValues();
+    // If the private option is checked, update settings.
+    if ($form_fields['hashtags_activate']) {
+        $field->setThirdPartySetting('hashtags', 'hashtags_activate', TRUE);
+        $field->save();
+    }
+    else {
+        $field->unsetThirdPartySetting('hashtags', 'hashtags_activate');
+        $field->save();
+    }
+}
+
+/**
+ * Implements hook_entity_presave().
+ */
+function hashtags_entity_presave(EntityInterface $entity) {
+    $config = \Drupal::config('hashtags.settings');
+    $hashtags_field_name = $config->get('hashtags_taxonomy_terms_field_name');
+    $hashtags_vid = $config->get('hashtags_vid');
+    $entity_type = $entity->getEntityTypeId();
+    $bundle = $entity->bundle();
+    if (!_hashtags_is_field_exists($entity_type, $bundle, $hashtags_field_name)) {
+        return;
+    }
+    $vid = $config->get('hashtags_vid');
+    $text = '';
+    $activated_text_fields = _hashtags_get_activated_text_fields($entity_type, $bundle);
+    foreach ($activated_text_fields as $field_name) {
+        foreach ($entity->{$field_name} as $item) {
+            $text .= ' '. $item->value;
+        }
+    }
+    $tags = _hashtags_parse_tags($text, FALSE);
+    $tag_ids = [];
+    if (!$tags) {
+        return;
+    }
+    foreach ($tags as $tag_name) {
+        $terms = \Drupal::entityTypeManager()
+            ->getStorage('taxonomy_term')
+            ->loadByProperties(['name' => $tag_name]);
+        $term = reset($terms);
+        if (empty($term)) {
+            $term = \Drupal\taxonomy\Entity\Term::create([
+                'name' => $tag_name,
+                'vid' => $vid,
+            ]);
+            $term->save();
+        }
+        $tag_ids[] = $term->id();
+    }
+    _hashtags_field_attach_terms($entity->{$hashtags_field_name}, $tag_ids, $hashtags_vid);
+}
+
+/**
+ * Get taxonomy term ids by text that contains hashtags
+ * @param $text
+ * @return array
+ */
+function _hashtags_get_tids_by_text($text) {
+    $tags = _hashtags_parse_tags($text, FALSE);
+    $tag_ids = [];
+    if (!$tags) {
+        return $tag_ids;
+    }
+    foreach ($tags as $tag_name) {
+        $terms = \Drupal::entityTypeManager()
+            ->getStorage('taxonomy_term')
+            ->loadByProperties(['name' => $tag_name]);
+        $term = reset($terms);
+        if (!empty($term)) {
+            $tag_ids[strtolower($tag_name)] = $term->id();
+        }
+    }
+    return $tag_ids;
+}
+
+/**
+ *  Get field Text types that are avaiable for hashtags activation
+ * @return array
+ *
+ */
+function _hashtags_get_field_text_types() {
+    return array(
+        'text',
+        'text_long',
+        'text_with_summary',
+        'string',
+        'string_long'
+    );
+}
+
+/**
+ * Check weither a hashtags feature is activated for passed field (text)
+ * @param $entity_type
+ * @param $bundle
+ * @param $field_name
+ * @return boolean
+ */
+function _hashtags_is_field_activated($entity_type, $bundle, $field_name) {
+    $field = \Drupal::entityTypeManager()->getStorage('field_config')->load("{$entity_type}.{$bundle}.{$field_name}");
+    return $field->getThirdPartySetting('hashtags', 'hashtags_activate', FALSE);
+}
+
+/**
+ * Check if field storage / field exist
+ * @param $entity_type
+ * @param $bundle
+ * @param $field_name
+ * @return bool|static
+ */
+function _hashtags_is_field_exists($entity_type, $bundle, $field_name) {
+    $field_storage = FieldStorageConfig::loadByName($entity_type, $field_name);
+    if (empty($field_storage)) {
+        return FALSE;
+    }
+    $field = FieldConfig::loadByName($entity_type, $bundle, $field_name);
+    if (empty($field)) {
+        return FALSE;
+    }
+    return $field;
+}
+
+/**
+ * Helper function that attach a term to the taxonomy terms hashtags field
+ * @param $field
+ * @param $tid
+ * @param string $vid
+ */
+function _hashtags_field_attach_term($field, $tid, $vid = 'hashtags') {
+    // create term and attach to the field
+    $hashtags = $field->getValue();
+    $hashtags[] = array('target_id' => $tid);
+    $field->setValue($hashtags);
+}
+
+/**
+ * Helper function that attach a number of terms to the taxonomy terms hashtags field
+ * @param $field
+ * @param $tids
+ * @param string $vid
+ */
+function _hashtags_field_attach_terms($field, $tids, $vid = 'hashtags') {
+    // create term and attach to the field
+    $hashtags = array();
+    foreach ($tids as $tid) {
+        $hashtags[] = array('target_id' => $tid);
+    }
+    $field->setValue($hashtags);
+}
+
+/**
+ * Helper function that remove a term from the taxonomy terms hashtags field
+ * @param $field
+ * @param $tid
+ * @param string $vid
+ */
+function _hashtags_field_remove_term($field, $tid) {
+    $hashtags = $field->getValue();
+    $key = _hashtags_get_tt_key($hashtags, $tid);
+    unset($hashtags[$key]);
+    $field->setValue($hashtags);
+}
+
+/**
+* Get taxonomy term key from the array of term values.
+*
+* @param $tags term values that are returned with .getValue()
+* Format:
+* [ 0 => [ target_id: tid1 ], 1 => [ target_id: tid2 ] ]
+* @param $property_value - term id that should be found
+* @param $property_name - 'target_id' by default
+* @return - the key of the term id
+*/
+function _hashtags_get_tt_key($tags, $property_value, $property_name = 'target_id') {
+    return array_search(
+        $property_value,
+        array_filter(
+            array_combine(
+                array_keys($tags),
+                array_column(
+                    $tags, $property_name
+                )
+            )
+        )
+    );
+}
+
+/**
+ * Parse a string and return an array or comma-separated
+ * string of tags depending on the mode (second parameter)
+ * @param $text
+ * @param bool $is_string_return
+ * @param bool $capture_position
+ * @return array|string
+ */
+function _hashtags_parse_tags($text, $is_string_return = TRUE, $capture_position = FALSE) {
+    // capture_position == PREG_OFFSET_CAPTURE;
+    // save position to avoid replacing hashtags
+    // inside links (<a href="#ball">)
+    $flag = $capture_position ? PREG_OFFSET_CAPTURE : PREG_PATTERN_ORDER;
+
+    $tags_list = array();
+    // 1) 2+ character after #
+    // 2) Don't start with or use only numbers (0-9) (#123abc, #123 etc)
+    // 3) Letters - digits work correct (#abc123, #conference2013)
+    // 4) No Special Characters “!, $, %, ^, &, *, +, .”
+    // 5) No Spaces
+    // 6) May use an underscore. Hyphens and dashes will not work.
+    // 7) <p>#hashtag</p> - is valid
+    // 8) <a href="#hashtag">Link</p> - is not valid
+    $pattern = "/[\s>]+?#([[:alpha:]][[:alnum:]_]*[^<\s[:punct:]])/iu";
+    // add <htest> to process first #hastag - string beginning
+    preg_match_all($pattern, '<htest>'.$text.'<htest>', $tags_list, $flag);
+    // no hashtags has been found
+    if (isset($tags_list[0]) && !sizeof($tags_list[0])) {
+        if ($is_string_return) {
+            return '';
+        }
+        return array();
+    }
+    // save position
+    if ($capture_position) {
+        foreach ($tags_list[1] as $key => $data) {
+            $result[$data[1]] = strtolower($data[0]);
+        }
+    } else {
+        // turn tags into lowercase
+        foreach ($tags_list[1] as $key => $tag) {
+            $tags_list[1][$key] = strtolower($tag);
+        }
+        if ($is_string_return) {
+            $result = implode(',', $tags_list[1]);
+        } else {
+            $result = $tags_list[1];
+        }
+    }
+    return array_unique($result);
+}
+
+/**
+ * Get entity type label by entity type id.
+ * @param $entity_type
+ */
+function _hashtags_get_entity_type_label($entity_type) {
+    return \Drupal::entityTypeManager()
+        ->getStorage($entity_type)
+        ->getEntityType()
+        ->getLabel();
+}
+
+/**
+ * Get bundle label by entity type id and bundle id.
+ * @param $entity_type
+ * @param $bundle
+ */
+function _hashtags_get_bundle_label($entity_type, $bundle) {
+    return \Drupal::service("entity_type.bundle.info")
+        ->getAllBundleInfo()[$entity_type][$bundle]['label'];
+}
+
+/**
+ * Get Content Entity Types
+ * @param array $excluded_types
+ * @return array
+ */
+function _hashtags_get_content_entity_types($excluded_types = [
+                                                'block_content',
+                                                'contact_message',
+                                                'file',
+                                                'shortcut',
+                                                'menu_link_content'
+                                            ]) {
+    $definitions = \Drupal::entityTypeManager()->getDefinitions();
+    $types = [];
+    foreach ($definitions as $id => $definition) {
+        if ($definition instanceof ContentEntityType && !in_array($id, $excluded_types)) {
+            $types[$id] = $id;
+        }
+    }
+    return $types;
+}
+
+/**
+ * Get the field names of the Text type that have Hashtags flag activated
+ * @param $entity_type
+ * @param $bundle
+ * @return array
+ */
+function _hashtags_get_activated_text_fields($entity_type, $bundle) {
+    $fields  =\Drupal::entityManager()->getFieldDefinitions($entity_type, $bundle);
+    $activated_text_fields = [];
+    foreach ($fields as $field) {
+        // check if a field is added through Manage Fields (FieldConfig class)
+        // and it has one of the Text types
+        $field_name = $field->getName();
+        if ($field instanceof FieldConfig &&
+            in_array($field->getType(), _hashtags_get_field_text_types()) &&
+            _hashtags_is_field_activated($entity_type, $bundle, $field_name)) {
+            $activated_text_fields[] = $field_name;
+        }
+    }
+    return $activated_text_fields;
+}
