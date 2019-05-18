@@ -1,0 +1,93 @@
+<?php
+
+/**
+ * @file
+ * Autotrader CSV module file.
+ */
+
+use Drupal\Core\StreamWrapper\PublicStream;
+
+/**
+ * Implements hook_cron().
+ */
+function autotrader_csv_cron() {
+  $now = \Drupal::time()->getRequestTime();
+  $next_cron = \Drupal::state()->get('autotrader_csv.next_cron', \Drupal::time()->getRequestTime());
+  if ($now >= $next_cron) {
+    // Get variables.
+    $ftp_host = \Drupal::config('autotrader_csv.settings')->get('ftp_host');
+    $ftp_username = \Drupal::config('autotrader_csv.settings')->get('ftp_username');
+    $ftp_password = \Drupal::config('autotrader_csv.settings')->get('ftp_password');
+    $ftp_filename = \Drupal::config('autotrader_csv.settings')->get('ftp_filename');
+    $content_types = array_filter(\Drupal::config('autotrader_csv.settings')->get('content_types'));
+
+    if (!empty($ftp_host) && !empty($ftp_username) && !empty($ftp_password) && !empty($ftp_filename) && !empty($content_types)) {
+      // Don't proceed if we can't connect.
+      $conn_id = ftp_connect($ftp_host);
+      $login_result = ftp_login($conn_id, $ftp_username, $ftp_password);
+      if ($conn_id && $login_result) {
+        // Turn passive mode on.
+        ftp_pasv($conn_id, TRUE);
+        try {
+          $file = autotrader_csv_create_csv($content_types, $ftp_filename);
+          if (!empty($file['path_to_file'])) {
+            $upload = ftp_put($conn_id, $ftp_filename, $file['path_to_file'], FTP_ASCII);
+            ftp_close($conn_id);
+            // @todo - Manage the outcome.
+          }
+          else {
+            ftp_close($conn_id);
+          }
+        }
+        catch (Exception $exception) {
+          // Ignore for now.
+        }
+      }
+    }
+
+    // Until next time.
+    $seconds_between_uploads = \Drupal::config('autotrader_csv.settings')->get('seconds_between_uploads');
+    \Drupal::state()->set('autotrader_csv.next_cron', \Drupal::time()->getRequestTime() + $seconds_between_uploads);
+  }
+}
+
+/**
+ * Create the CSV file.
+ *
+ * @param null|array $content_types
+ *   Optional. Provide content types.
+ * @param null|string $filename
+ *   Optional. Provide a filename.
+ *
+ * @return array
+ *   Returns an array with the real path and file object if successful.
+ *
+ * @throws \Drupal\Component\Plugin\Exception\InvalidPluginDefinitionException
+ */
+function autotrader_csv_create_csv(array $content_types = NULL, $filename = NULL) {
+  if ($content_types == NULL) {
+    $content_types = array_filter(\Drupal::config('autotrader_csv.settings')->get('content_types'));
+  }
+  if ($filename == NULL) {
+    $filename = \Drupal::config('autotrader_csv.settings')->get('ftp_filename');
+  }
+
+  // Grab node ids to use.
+  $nids = \Drupal::entityQuery('node')
+    ->condition('status', 1)
+    ->condition('type', $content_types, 'IN')
+    ->execute();
+  // @todo - Work out a performance enhancement here. This won't scale.
+  $nodes = \Drupal::entityTypeManager()->getStorage('node')->loadMultiple($nids);
+  /** @var Drupal\file\Entity\File $file */
+  $node_exporter = \Drupal::service('autotrader_csv.node_exporter');
+  $node_exporter->setup($nodes, $filename);
+  $file = $node_exporter->toFile();
+  $stream = new PublicStream();
+  $stream->setUri($file->getFileUri());
+  $path_to_file = $stream->realpath();
+  return [
+    "path_to_file" => $path_to_file,
+    "file" => $file,
+  ];
+}
