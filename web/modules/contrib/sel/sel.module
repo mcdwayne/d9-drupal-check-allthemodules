@@ -1,0 +1,243 @@
+<?php
+
+/**
+ * @file
+ * Hooks and private functions for Safe External Links.
+ */
+
+use Drupal\Component\Utility\Unicode;
+use Drupal\Core\Routing\RouteMatchInterface;
+
+/**
+ * Implements hook_help().
+ */
+function sel_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for Safe External Links module.
+    case 'help.page.sel':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Safe External Links (<code>sel</code>) is a topical module which addresses user editable external links on a Drupal site. It processes links and adds <code>target="_blank"</code> and <code>rel="noreferrer"</code> or <code>rel="noopener"</code> attributes if the link is external.') . '</p>';
+
+      $output .= '<h4>' . t('Menu links') . '</h4>';
+      $output .= '<p>' . t('Menu links are processed right after the module is enabled and the cache of the site is rebuilt.') . '</p>';
+
+      $output .= '<h4>' . t('Link field formatter') . '</h4>';
+      $output .= '<p>' . t('The content of link fields could be handled by the <strong>Safe external link</strong> (<code>sel_link</code>) formatter.') . '</p>';
+      $output .= '<p>' . t("After that this module is installed, newly created link fields will have the <code>sel_link</code> as default formatter, but pre-existing field formatters won't be changed.") . '</p>';
+      $output .= '<p>' . t('If the optional SpamSpan filter module is available, the formatter will obfuscate email links as well (which are starting with <code>mailto:</code> protocol).') . '</p>';
+
+      $output .= '<h4>' . t('Filter plugin') . '</h4>';
+      $output .= '<p>' . t('The filter plugin implicitly requires the <code>filter_url</code> filter.') . '</p>';
+      $output .= '<p>' . t("The content of these fields can be processed by the <strong>Safe external link filter</strong> (<code>filter_sel</code>) filter plugin. If it's enabled, please move it after the <code>filter_url</code> filter (<em>Convert URLs into links</em>).") . '</p>';
+
+      $output .= '<h3>' . t('Recommended modules') . '</h3>';
+      $output .= '<p>' . t('<a href=":spamspan-project">SpamSpan filter</a>: When enabled, emails in link fields will be obfuscated if the Link Filter is enabled for the selected format.', [
+        ':spamspan-project' => 'https://www.drupal.org/project/spamspan',
+      ]) . '</p>';
+
+      $output .= '<h3>' . t('Configuration') . '</h3>';
+      $output .= '<p>' . t('The module <em>requires</em> zero configuration. When enabled, it will') . '</p>';
+      $output .= '<ul>';
+      $output .= '<li>' . t('preprocess rendered menus (if any),') . '</li>';
+      $output .= '<li>' . t('provide an external link filter for filter formats which processes external
+        links,') . '</li>';
+      $output .= '<li>' . t('provide a link formatter for link fields which processes external links and
+        obfuscates email (mailto:...) links if SpamSpan filter module is available') . '</li>';
+      $output .= '</ul>';
+      $output .= '<p>' . t('Menu link processing and default settings for the provided link formatter could
+      be configured on Administration » Configuration » Content authoring » Standard
+      Link Settings.') . '</p>';
+
+      $output .= '<h3>' . t('Configuration options') . '</h3>';
+      $output .= '<ul>';
+      $output .= '<li>' . t('The default <code>noreferrer</code> rel attribute value may be changed to <code>noopener</code>.') . '</li>';
+      $output .= '<li>' . t('Other optional rel attribute values may be configured as well: <code>external</code> and <code>nofollow</code>.') . '</li>';
+      $output .= '</ul>';
+      $output .= '<p>' . t('Menu link processing could be disabled on the Safe External Links config form.') . '</p>';
+      $output .= '<p>' . t('External link processing and email link sanitization could be disabled at the
+      <code>sel_link</code> formatter configuration.') . '</p>';
+
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function sel_theme() {
+  return [
+    'sel_spamspan' => [
+      'file' => 'sel.theme.inc',
+      'variables' => [
+        'email' => '',
+        'title' => '',
+        'settings' => [],
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_preprocess_HOOK() for 'menu'.
+ */
+function sel_preprocess_menu(&$variables) {
+  if (!empty(\Drupal::config('sel.settings')->get('menu_links.enabled'))) {
+    _sel_menulink_processor($variables['items']);
+  }
+  $variables['#cache']['tags'][] = 'config:sel.settings';
+}
+
+/**
+ * Helper callback to add "_blank" target to external links.
+ *
+ * @param array $items
+ *   The array of menu items to process.
+ *
+ * @TODO: add recursive limit.
+ */
+function _sel_menulink_processor(array &$items) {
+  $rel = \Drupal::config('sel.settings')->get('menu_links.rel');
+  $rel_required = !empty($rel) && in_array($rel, array_keys(_sel_rel_defaults())) ?
+    $rel : 'noreferrer';
+  $rel_values = \Drupal::config('sel.settings')->get('menu_links.rel_optionals') ?: [];
+  array_unshift($rel_values, $rel_required);
+
+  foreach ($items as $id => $item) {
+    /* @var \Drupal\Core\Url $item['url'] */
+    if (
+      !empty($item['url']) &&
+      $item['url']->isExternal()
+    ) {
+      // This means only that the url begins with 'http://' or 'https://'.
+      $uri_string = $item['url']->toUriString();
+
+      if (
+        _sel_uri_is_external($uri_string)
+      ) {
+        $url_attributes = $item['url']->getOption('attributes') ?: [];
+        $url_attributes['target'] = '_blank';
+
+        foreach ($rel_values as $rel_value) {
+          if (
+            empty($url_attributes['rel']) ||
+            strpos($url_attributes['rel'], $rel_value) === FALSE
+          ) {
+            $url_attributes['rel'] = empty($url_attributes['rel']) ?
+              $rel_value :
+              $url_attributes['rel'] . ' ' . $rel_value;
+          }
+        }
+
+        $items[$id]['url']->setOption('attributes', $url_attributes);
+      }
+    }
+
+    if (!empty($item['below'])) {
+      _sel_menulink_processor($item['below']);
+    }
+  }
+}
+
+/**
+ * Decide whether the provided external uri string is really external.
+ *
+ * ...or just an internal link in absolute format.
+ *
+ * @param string $uri_string
+ *   An uri string provided by e.g. Url objects' toUriString method.
+ *
+ * @return bool
+ *   TRUE if the uri string is external, FALSE if it is an internal but
+ *   absolute.
+ */
+function _sel_uri_is_external($uri_string) {
+  static $drupal_static_fast;
+  if (!isset($drupal_static_fast)) {
+    $drupal_static_fast['host'] = &drupal_static(__FUNCTION__);
+  }
+  $host = &$drupal_static_fast['host'];
+  if (!isset($host)) {
+    $host = \Drupal::request()->getHost();
+  }
+
+  $host_pos = Unicode::strpos($uri_string, '://' . $host);
+  $host_length = Unicode::strlen('://' . $host);
+
+  return
+    Unicode::strpos($uri_string, 'http') === 0 &&
+    (
+      ($host_pos + $host_length) === Unicode::strlen($uri_string) ||
+      strpos($uri_string, '://' . $host . '/') === FALSE
+    );
+}
+
+/**
+ * Flattens multidimensional array.
+ *
+ * @param array $array
+ *   A potentially multidimensional array to flatten.
+ *
+ * @return array
+ *   A flattended array.
+ */
+function _sel_array_flattener(array $array) {
+  $flattened = [];
+
+  foreach ($array as $array_key => $array_value) {
+    if (!is_array($array_value)) {
+      $flattened[$array_key] = $array_value;
+    }
+    else {
+      foreach ($array_value as $array_subkey => $array_subvalue) {
+        if (!is_array($array_subvalue)) {
+          $flattened[$array_subkey] = $array_subvalue;
+        }
+        else {
+          $flattened[$array_subkey] = _sel_array_flattener($array_subvalue);
+        }
+      }
+    }
+  }
+
+  return $flattened;
+}
+
+/**
+ * Implements hook_field_info_alter().
+ */
+function sel_field_info_alter(&$info) {
+  if (
+    isset($info['link']) &&
+    !empty(\Drupal::config('sel.settings')->get('link_fields.default'))
+  ) {
+    $info['link']['default_formatter'] = 'sel_link';
+  }
+}
+
+/**
+ * Helper function which returns required rel attributes for external links.
+ *
+ * @return array
+ *   An array of accepted rel attribute value names keyed by attribute value.
+ */
+function _sel_rel_defaults() {
+  return [
+    'noreferrer' => t('No referrer (noreferrer)'),
+    'noopener' => t('No opener (noopener)'),
+  ];
+}
+
+/**
+ * Helper function which returns optional rel attributes for external links.
+ *
+ * @return array
+ *   An array of optional valid rel attribute value names  keyed by attribute
+ *   value.
+ */
+function _sel_rel_optionals() {
+  return [
+    'external' => t('External (external)'),
+    'nofollow' => t('Nofollow (nofollow)'),
+  ];
+}
