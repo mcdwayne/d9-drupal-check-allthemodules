@@ -1,0 +1,530 @@
+<?php
+
+/**
+ * @file
+ */
+
+use Drupal\image\Entity\ImageStyle;
+use Drupal\rokka\Entity\RokkaStack;
+use GuzzleHttp\Exception\ClientException;
+use GuzzleHttp\Psr7\Uri;
+use Rokka\Client\Core\DynamicMetadata\CropArea;
+use Rokka\Client\Core\DynamicMetadata\MultiAreas;
+use Rokka\Client\Core\DynamicMetadata\SubjectArea;
+use Rokka\Client\Core\Stack;
+use Rokka\Client\UriHelper;
+
+/**
+ * Implements hook_ENTITY_TYPE_presave().
+ *
+ * @param \Drupal\image\Entity\ImageStyle $entity
+ *
+ * @throws \GuzzleHttp\Exception\GuzzleException
+ * @throws \Drupal\Component\Plugin\Exception\InvalidPluginDefinitionException
+ */
+function rokka_image_style_presave(ImageStyle $entity) {
+  /** @var \Drupal\rokka\RokkaService $rokkaService */
+  $rokkaService = \Drupal::service('rokka.service');
+  $client = $rokkaService->getRokkaImageClient();
+
+  $effectStack = rokka_getEffectStack($entity);
+
+  $config = \Drupal::config('rokka.settings');
+
+  // Create the stack on rokka.
+  $stackOptionsForm = $entity->get('rokka_stack_options');
+  if(empty($stackOptionsForm)) {
+    // Fallback to stack data
+    $rokkaStack = $rokkaService->loadStackByName($entity->getName());
+    if ($rokkaStack instanceof RokkaStack) {
+      $stackOptionsForm['rokka_jpg_quality'] = $rokkaStack->getStackOptions()['jpg.quality'];
+      $stackOptionsForm['rokka_webp_quality'] = $rokkaStack->getStackOptions()['webp.quality'];
+      $stackOptionsForm['rokka_output_format'] = $rokkaStack->getOutputFormat();
+    }
+  }
+
+  $stackOptions = [];
+
+  // Set jpg quality.
+  if (!empty($stackOptionsForm['rokka_jpg_quality']) && (integer) $stackOptionsForm['rokka_jpg_quality'] >= 1) {
+    $stackOptions['jpg.quality'] = (integer) $stackOptionsForm['rokka_jpg_quality'];
+  }
+  elseif ((int) $config->get('jpg_quality') >= 1) {
+    $stackOptions['jpg.quality'] = $config->get('jpg_quality');
+  }
+
+  // Set webp quality.
+  if (!empty($stackOptionsForm['rokka_webp_quality']) && (integer) $stackOptionsForm['rokka_webp_quality'] >= 1) {
+    $stackOptions['webp.quality'] = (integer) $stackOptionsForm['rokka_webp_quality'];
+  }
+  elseif ((int) $config->get('webp_quality') >= 1) {
+    $stackOptions['webp.quality'] = $config->get('webp_quality');
+  }
+
+  // Set autoformat value.
+  $stackOptions['autoformat'] = $config->get('autoformat');
+  if (!empty($stackOptionsForm['rokka_autoformat'])) {
+    $stackOptions['autoformat'] = $stackOptionsForm['rokka_autoformat'];
+  }
+  if (!empty($stackOptionsForm['rokka_autoformat']) && ($stackOptionsForm['rokka_autoformat'] === 'none' ||
+    $stackOptionsForm['rokka_autoformat'] === NULL)) {
+    unset($stackOptions['autoformat']);
+  }
+
+  // Set output format.
+  $outputFormat = $config->get('output_format');
+  if(!empty($stackOptionsForm['rokka_output_format'])) {
+    $outputFormat = $stackOptionsForm['rokka_output_format'];
+  }
+
+  $stack = new Stack($rokkaService->getRokkaOrganizationName(), $entity->getName(), $effectStack, $stackOptions);
+  $remoteStack = $client->saveStack($stack, ['overwrite' => TRUE]);
+  // Create the config entity object.
+  $entity_manager = $rokkaService->getEntityManager();
+  $rokkaStack = $entity_manager->getStorage('rokka_stack')->load($entity->getName());
+
+  if ($rokkaStack instanceof RokkaStack) {
+    $rokkaStack->setStackOptions($remoteStack->stackOptions);
+    $rokkaStack->setOrganization($remoteStack->organization);
+    $rokkaStack->setOutputFormat($outputFormat);
+  }
+  else {
+    $rokkaStack = RokkaStack::create([
+      'id' => $remoteStack->name,
+      'organization' => $remoteStack->organization,
+      'stackOperations' => $remoteStack->stackOperations,
+      'stackOptions' => $remoteStack->stackOptions,
+      'outputFormat' => $outputFormat,
+      'label' => $remoteStack->name,
+    ]);
+  }
+  $rokkaStack->enforceIsNew(FALSE);
+  $rokkaStack->save();
+
+  // Flush the image style cache.
+  $entity->flush();
+}
+
+/**
+ * @param array $effects
+ *
+ * @return \Rokka\Client\Core\StackOperation[]
+ */
+function rokka_buildStackOperationCollection($effects) {
+  if (empty($effects)) {
+    $effects = [
+      [
+        'id' => 'noop',
+        'data' => NULL,
+        'weight' => 0
+      ],
+    ];
+  }
+
+  $operations = [];
+  $currentId = 0;
+
+  // Sort effects by defined weight.
+  usort($effects, function($a, $b) {
+    return $a['weight'] - $b['weight'];
+  });
+
+  foreach ($effects as $effect) {
+    $ops = rokka_buildStackOperation($effect);
+    if (!empty($ops)) {
+      foreach ($ops as $op) {
+        $operations[$currentId++] = $op;
+      }
+    }
+  }
+
+  if (empty($operations)) {
+    return NULL;
+  }
+
+  ksort($operations);
+  return $operations;
+}
+
+/**
+ * @param array $effect
+ *
+ * @return \Rokka\Client\Core\StackOperation[]
+ */
+function rokka_buildStackOperation(array $effect) {
+  $name = $effect['id'];
+  $className = 'Drupal\rokka\StyleEffects\Effect' . rokka_camelCase($name, TRUE);
+
+  $ret = [];
+  if (class_exists($className) && in_array('Drupal\rokka\StyleEffects\InterfaceEffectImage', class_implements($className))) {
+    /** @var \Drupal\rokka\StyleEffects\InterfaceEffectImage $className */
+    $ret = $className::buildRokkaStackOperation($effect['data']);
+  }
+  else {
+    \Drupal::logger('rokka')->error('Can not convert effect "%effect" to Rokka.io StackOperation: "%class" Class missing!', [
+      '%effect' => $name,
+      '%class' => $className,
+    ]);
+  }
+
+  return $ret;
+}
+
+/**
+ * @param \Drupal\image\Entity\ImageStyle $imageStyle
+ *
+ * @return \Rokka\Client\Core\StackOperation[]
+ */
+function rokka_getEffectStack(ImageStyle $imageStyle = NULL) {
+
+  if ($imageStyle === NULL) {
+    return [];
+  }
+  return !empty(rokka_buildStackOperationCollection($imageStyle->getEffects()
+    ->getConfiguration())) ? rokka_buildStackOperationCollection($imageStyle->getEffects()
+    ->getConfiguration()) : [];
+}
+
+/**
+ * @param string $str
+ *
+ * @return string
+ */
+function rokka_camelCase($str, $classCase = FALSE) {
+  // non-alpha and non-numeric characters become spaces.
+  $str = preg_replace('/[^a-z0-9]+/i', ' ', $str);
+  $str = trim($str);
+  // Uppercase the first character of each word.
+  $str = ucwords($str);
+  $str = str_replace(' ', '', $str);
+  if (!$classCase) {
+    $str = lcfirst($str);
+  }
+
+  return $str;
+}
+
+/**
+ * @param $variables
+ *
+ * @throws \Drupal\Component\Plugin\Exception\InvalidPluginDefinitionException
+ */
+function rokka_preprocess_image_style_preview(&$variables) {
+  $preview_url = $variables['derivative']['url'];
+  $previewUri = new Uri($preview_url);
+  $components = UriHelper::decomposeUri($previewUri);
+
+  if ($components === NULL) {
+    return;
+  }
+  /** @var \Drupal\rokka\RokkaService $rokkaService */
+  $rokkaService = \Drupal::service('rokka.service');
+
+  $stackUri = $components->getStack();
+  /** @var \Drupal\image\Entity\ImageStyle $imageStyle */
+  $imageStyle = $rokkaService->getEntityManager()->getStorage('image_style')->load($stackUri->getName());
+  /** @var \Drupal\rokka\Entity\RokkaStack $stackEntity */
+  $stackEntity = $rokkaService->getEntityManager()->getStorage('rokka_stack')->load($stackUri->getName());
+
+  $effectStack = rokka_getEffectStack($imageStyle);
+  $stack = new Stack(NULL, $components['stack'], $effectStack);
+  if ($stackEntity instanceof RokkaStack) {
+    $stackOptions = $stackEntity->getStackOptions();
+    if (is_array($stackOptions)) {
+      $stack->setStackOptions($stackOptions);
+    }
+  }
+  $dynamicStack = $stack->getDynamicUriString();
+  $components->setStack($dynamicStack);
+  $preview_url = UriHelper::composeUri($components, $previewUri);
+  $variables['derivative']['rendered']['#uri'] = (string) $preview_url;
+  $variables['derivative']['url'] = (string) $preview_url;
+  // We have to get the image from rokka to know its dimensions
+  // that makes is a little bit slower, if anyone has a better idea..
+  $image = @file_get_contents($preview_url);
+  if ($image !== FALSE) {
+    $dimensions = rokka_getImageDimensionsFromContent($image);
+    $variables['derivative']['width'] = $dimensions['width'];
+    $variables['derivative']['height'] = $dimensions['height'];
+  }
+  else {
+    $variables['derivative']['width'] = 'unknown ';
+    $variables['derivative']['height'] = 'unknown ';
+  }
+}
+
+/**
+ * Gets image dimensions via finfo.
+ *
+ * Finfo is a pretty fast way to get the dimensions of an image, unfortunately it doesn't do that in an
+ * easy accessible way. We do it here from the FILEINFO_RAW string and some regex magic.
+ *
+ * @param string $content
+ *
+ * @return array
+ */
+function rokka_getImageDimensionsFromContent(string $content) {
+  $answer = finfo_buffer(finfo_open(FILEINFO_RAW), $content);
+  if (preg_match('/, *([0-9]{1,6}) *x *([0-9]{1,6})/', $answer, $matches)) {
+    return ['width' => (int) $matches[1], 'height' => (int) $matches[2]];
+  }
+
+  return ['width' => NULL, 'height' => NULL];
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ *
+ * @param \Drupal\image\Entity\ImageStyle $entity
+ *
+ * @return bool
+ *
+ * @throws \GuzzleHttp\Exception\GuzzleException
+ */
+function rokka_image_style_delete(ImageStyle $entity) {
+  /** @var \Drupal\rokka\RokkaService $rokkaService */
+  $rokkaService = \Drupal::service('rokka.service');
+  $client = $rokkaService->getRokkaImageClient();
+
+  try {
+    Drupal::configFactory()
+      ->getEditable('rokka.rokka_stack.' . $entity->getName())
+      ->delete();
+
+    return $client->deleteStack($entity->getName());
+  } catch (Exception $e) {
+    // If the Stack is not found, that means that it is already deleted.
+    if (404 === $e->getCode()) {
+      return TRUE;
+    }
+    // // If an exception is raised, no ImageStack could be deleted.
+    //    watchdog('rokka', 'Exception while deleting ImageStack "%name" in "%function": error: "%error"', array(
+    //      '%name' => $name,
+    //      '%function' => __FUNCTION__,
+    //      '%error' => $e->getMessage(),
+    //    ));
+  }
+
+  return FALSE;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * @param $form
+ * @param \Drupal\Core\Form\FormState $form_state
+ * @param $form_id
+ *
+ * @throws \Drupal\Component\Plugin\Exception\InvalidPluginDefinitionException
+ */
+function rokka_form_image_style_form_alter(&$form, &$form_state, $form_id) {
+  /** @var \Drupal\image\Form\ImageStyleEditForm $form_object */
+  $form_object = $form_state->getFormObject();
+  /** @var \Drupal\rokka\RokkaService $rokkaService */
+  $rokkaService = \Drupal::service('rokka.service');
+  /** @var Drupal\Core\Config\ $config */
+  $config = \Drupal::config('rokka.settings');
+
+  /** @var \Drupal\rokka\Entity\RokkaStack $stackEntity */
+  $stackEntity = NULL;
+  // Can be empty, if we create a new image style
+  if (!empty($form_object->getEntity()->get('name'))) {
+    $stackEntity = $rokkaService->getEntityManager()->getStorage('rokka_stack')->load($form_object->getEntity()
+      ->get('name'));
+  }
+
+  if ($stackEntity instanceof RokkaStack) {
+    $stackOptions = $stackEntity->getStackOptions();
+    $defaultFormat = $stackEntity->getOutputFormat();
+  }
+  else {
+    $stackOptions = [];
+    $defaultFormat = $config->get('output_format');
+  }
+
+  $userInput = $form_state->getUserInput();
+  $form['rokka_stack_options'] = [
+    '#type' => 'fieldset',
+    '#title' => 'Rokka Stack settings',
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE,
+    '#tree' => TRUE,
+  ];
+
+  $form['rokka_stack_options']['rokka_output_format'] = [
+    '#type' => 'select',
+    '#title' => t('Output format '),
+    '#description' => t('Defines the delivered image format.'),
+    '#required' => TRUE,
+    '#default_value' =>  $defaultFormat,
+    '#options' => [
+      'jpg' => t('JPG'),
+      'png' => t('PNG'),
+      'gif' => t('GIF'),
+    ],
+  ];
+
+  $form['rokka_stack_options']['rokka_jpg_quality'] = [
+    '#type' => 'textfield',
+    '#title' => t('JPG quality'),
+    '#description' => t('JPEG Quality: from 1 (high compression, low quality) to 100 (low compression, high quality)'),
+    '#size' => 20,
+    '#maxlength' => 3,
+    '#required' => FALSE,
+    '#default_value' => $config->get('jpg_quality') ?? 0,
+    '#min' => 0,
+    '#max' => 100,
+  ];
+  rokka_setValueForField('rokka_jpg_quality', 'jpg.quality', $form, $userInput, $stackOptions);
+
+  $form['rokka_stack_options']['rokka_webp_quality'] = [
+    '#type' => 'textfield',
+    '#title' => t('WEBP quality'),
+    '#description' => t('WEBP Quality: from 1 (high compression, low quality) to 100 (low compression, high quality)'),
+    '#size' => 20,
+    '#maxlength' => 3,
+    '#required' => FALSE,
+    '#default_value' => $config->get('webp_quality') ?? 0,
+    '#min' => 0,
+    '#max' => 100,
+  ];
+
+  rokka_setValueForField('rokka_webp_quality', 'webp.quality', $form, $userInput, $stackOptions);
+
+  $form['rokka_stack_options']['rokka_autoformat'] = [
+    '#type' => 'radios',
+    '#title' => t('autoformat '),
+    '#description' => t('If set, rokka delivers the best format supported by the browser.'),
+    '#required' => FALSE,
+    '#default_value' => $config->get('autoformat') ?? 'none',
+    '#options' => [
+      'true' => t('True'),
+      'false' => t('False'),
+      'none' => t('Rokka default (false)'),
+    ],
+
+  ];
+
+  rokka_setValueForField('rokka_autoformat', 'autoformat', $form, $userInput, $stackOptions);
+
+}
+
+/**
+ * @param string $formFieldName
+ * @param string $stackOptionName
+ * @param array $form
+ * @param array $userInput
+ * @param array $stackOptions
+ */
+function rokka_setValueForField($formFieldName, $stackOptionName, &$form, $userInput, $stackOptions) {
+  if (isset($userInput['rokka_stack_options'][$formFieldName])) {
+    $form['rokka_stack_options'][$formFieldName]['#value'] = $userInput['rokka_stack_options'][$formFieldName];
+  }
+  elseif (isset($stackOptions[$stackOptionName])) {
+    if ($stackOptions[$stackOptionName] === TRUE) {
+      $form['rokka_stack_options'][$formFieldName]['#value'] = 'true';
+    }
+    elseif ($stackOptions[$stackOptionName] === FALSE) {
+      $form['rokka_stack_options'][$formFieldName]['#value'] = 'false';
+    }
+    else {
+      $form['rokka_stack_options'][$formFieldName]['#value'] = $stackOptions[$stackOptionName];
+
+    }
+  }
+  if (isset($form['rokka_stack_options'][$formFieldName]['#value'])) {
+    $form['rokka_stack_options'][$formFieldName]['#default_value'] = $form['rokka_stack_options'][$formFieldName]['#value'];
+  }
+}
+
+/**
+ * Implements hook_crop_insert().
+ */
+function rokka_crop_insert($entity) {
+  if ($entity instanceOf \Drupal\crop\CropInterface) {
+    rokka_update_crop_metadata($entity);
+  }
+}
+
+/**
+ * Implements hook_crop_update().
+ */
+function rokka_crop_update($entity) {
+  if ($entity instanceOf \Drupal\crop\CropInterface) {
+    rokka_update_crop_metadata($entity);
+  }
+}
+
+/**
+ * Update cropping metadata in Rokka.
+ *
+ * @param \Drupal\crop\CropInterface $crop
+ */
+function rokka_update_crop_metadata($crop) {
+  /** @var \Drupal\rokka\RokkaService $rokkaService */
+  $rokkaService = \Drupal::service('rokka.service');
+  $client = $rokkaService->getRokkaImageClient();
+
+  // Special handling for focal points, they are not saved using MultiAreas.
+  // Instead, they are used as the default SubjectArea for all crops that are
+  // not using a named MultiArea.
+  if ($crop->bundle() == 'focal_point') {
+    $coords = $crop->anchor();
+    $dynamic_md = new SubjectArea($coords['x'], $coords['y'], 1, 1);
+  }
+  else {
+    // For multiarea crops, we need to send all custom crops on the image in one
+    // single structure, so load them all first.
+    $crop_storage = \Drupal::entityTypeManager()
+      ->getStorage('crop');
+
+    $image_crops = $crop_storage->loadByProperties(['uri' => $crop->uri->value]);
+
+    $areas = [];
+
+    foreach ($image_crops as $image_crop) {
+      // Skip focal_point crops here, these are handled above.
+      if ($image_crop->bundle() == 'focal_point') {
+        continue;
+      }
+
+      $coords = $image_crop->anchor();
+      $size = $image_crop->size();
+
+      $area_crop = new CropArea($coords['x'], $coords['y'], $size['width'], $size['height']);
+
+      $areas[$image_crop->bundle()] = [$area_crop];
+    }
+
+    if (count($areas) > 0) {
+      $dynamic_md = new MultiAreas($areas);
+    }
+  }
+
+  if (!empty($dynamic_md)) {
+    $metas = $rokkaService->loadRokkaMetadataByUri($crop->uri->value);
+    foreach ($metas as $meta) {
+      $old_hash = $meta->getHash();
+
+      try {
+        $newHash = $client->setDynamicMetadata($dynamic_md, $old_hash, NULL, ['deletePrevious' => TRUE]);
+        if ($newHash) {
+          // Check if the old hash has been updated
+          if ($meta->getHash() !== $newHash) {
+            $meta->hash = $newHash;
+            $meta->save();
+          }
+        }
+      }
+      catch (ClientException $clientException) {
+        // Fail silently if image has been deleted from Rokka.
+        if ($clientException->getCode() == 404) {
+          continue;
+        }
+        else {
+          throw $clientException;
+        }
+      }
+    }
+  }
+}
