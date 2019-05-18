@@ -1,0 +1,46 @@
+<?php
+/**
+ * @file
+ * Mock headers and server variables for tests.
+ */
+
+return [
+  'REDIRECT_protossl' => '',
+  'REDIRECT_HTTP_AUTHORIZATION' => '',
+  'REDIRECT_STATUS' => '200',
+  'protossl' => '',
+  'HTTP_AUTHORIZATION' => '',
+  'HTTP_X_AMZ_SNS_MESSAGE_TYPE' => 'Notification',
+  'HTTP_X_AMZ_SNS_MESSAGE_ID' => 'f93edf3e-bee9-57f3-8752-8e97b283e829',
+  'HTTP_X_AMZ_SNS_TOPIC_ARN' => 'arn:aws:sns:us-east-1:222524823419:drupal-sns-test',
+  'HTTP_X_AMZ_SNS_SUBSCRIPTION_ARN' => 'arn:aws:sns:us-east-1:222524823419:drupal-sns-test:84a1d410-a187-44b9-b611-e82307fceb87',
+  'CONTENT_LENGTH' => '1177',
+  'CONTENT_TYPE' => 'text/plain; charset=UTF-8',
+  'HTTP_HOST' => 'example.com',
+  'HTTP_CONNECTION' => 'Keep-Alive',
+  'HTTP_USER_AGENT' => 'Amazon Simple Notification Service Agent',
+  'HTTP_ACCEPT_ENCODING' => 'gzip,deflate',
+  'PATH' => '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+  'SERVER_SOFTWARE' => 'Apache/2.4.25 (Ubuntu)',
+  'SERVER_NAME' => 'example.com',
+  'SERVER_ADDR' => '127.0.0.1',
+  'SERVER_PORT' => '80',
+  'REMOTE_ADDR' => '127.0.0.1',
+  'DOCUMENT_ROOT' => '/var/www/docroot',
+  'REQUEST_SCHEME' => 'http',
+  'CONTEXT_PREFIX' => '',
+  'CONTEXT_DOCUMENT_ROOT' => '/var/www/docroot',
+  'SERVER_ADMIN' => 'webmaster@localhost',
+  'SCRIPT_FILENAME' => '/var/www/docroot/index.php',
+  'REMOTE_PORT' => '12345',
+  'REDIRECT_URL' => '/_amazon-sns/notify',
+  'GATEWAY_INTERFACE' => 'CGI/1.1',
+  'SERVER_PROTOCOL' => 'HTTP/1.1',
+  'REQUEST_METHOD' => 'POST',
+  'QUERY_STRING' => '',
+  'REQUEST_URI' => '/_amazon-sns/notify',
+  'SCRIPT_NAME' => '/index.php',
+  'PHP_SELF' => '/index.php',
+  'REQUEST_TIME_FLOAT' => 1496255020.1140001,
+  'REQUEST_TIME' => 1496255020,
+];
