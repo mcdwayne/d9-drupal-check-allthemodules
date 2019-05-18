@@ -1,0 +1,248 @@
+<?php
+
+/**
+ * @file
+ * Provides a method to compile and bundle/package content and associated media.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\views\Views;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Database\IntegrityConstraintViolationException;
+
+/**
+ * Implements hook_help().
+ */
+function content_packager_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.content_packager':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('The Content Packager module gives developers of applications or other offline deployments a convenient way to extract assets and content from Drupal for use as app resources.') . '</p>';
+      $output .= '<h3>' . t('Using this Module') . '</h3>';
+      $output .= '<p>' . t('After <a href=":admin-module">configuring</a> the module, visit the <a href=":create-package">Content Packager page</a> to start the process.', [':admin-module' => \Drupal::url('content_packager.admin'), ':create-package' => \Drupal::url('content_packager.create')]) . '</p>';
+      $output .= '<h3>' . t('Uses') . '</h3>';
+      $output .= '<dl>';
+      $output .= '<dt>' . t('Creating Application Resource Bundles') . '</dt>';
+      $output .= '<dd>' . t("Create a bundle of assets and text content from entities you care about without having to worry about accidentally getting files you don\'t need or want in your application.  Especially useful for apps that can't rely on a internet connection to load content from.") . '</dd>';
+      $output .= '<dt>' . t('Content Archiving') . '</dt>';
+      $output .= '<dd>' . t('Archive your CMS content and assets in a somewhat human-readable format and folder structure, without having to manage large disk images or database dumps.') . '</dd>';
+      $output .= '</dl>';
+      return $output;
+
+    case 'content_packager.create':
+      $output = '<h3>' . t('Copying files and zipping them') . '</h3>';
+      $output .= '<p>' . t('Creating a Content Package is a multi-step process!') . '</p>';
+      $output .= '<dl>';
+      $output .= '<dt>' . t('Make a REST View') . '</dt>';
+      $output .= '<dd>' . t('This module requires a REST view to begin with; this view will be used to determine what entities (and which attachments) matter.') . '</dd>';
+      $output .= '<dt>' . t('Copy the files (including the REST view)') . '</dt>';
+      $output .= '<dd>' . t('Refresh this page and select the appropriate REST view; this view will be processed and entities within the view will have their Media copied.') . '</dd>';
+      $output .= '<dt>' . t('Make a Zip File') . '</dt>';
+      $output .= '<dd>' . t('Zip all those files that were generated into a nice compact zip file for easy downloading and transferring!  Note: This step might fail on large files; in these cases you will probably want to rely on generating a zip file via other means.') . '</dd>';
+      $output .= '</dl>';
+
+      return $output;
+
+    case 'content_packager.admin':
+      $output = '';
+      $output .= '<h3>' . t('Content Packager Configurations') . '</h3>';
+      $output .= '<dl>';
+      $output .= '<dt>' . t('Packaging Behaviors') . '</dt>';
+      $output .= '<dd>' . t('Changes to these settings are tweaks that can have an impact on the speed of the packaging process and variables that can be changed to work around potential crashes.') . '</dd>';
+      $output .= '<dt>' . t('Filesystem') . '</dt>';
+      $output .= '<dd>' . t('Tell this module where to put files with these settings.  Files are saved to the "public://" file location, as defined in your File System settings.') . '</dd>';
+      $output .= '<dt>' . t('Image Styles') . '</dt>';
+      $output .= '<dd>' . t('Save disk space and package size by only collecting the image styles you actually want.') . '</dd>';
+      $output .= '<dt>' . t('Fields to Ignore') . '</dt>';
+      $output .= '<dd>' . t('Your application or bundle might not need some fields, such as user information.  Save space by making sure those fields get ignored!') . '</dd>';
+      $output .= '<dl>';
+      return $output;
+  }
+}
+
+/**
+ * Defines the default set of accepted field types.
+ *
+ * @return array
+ *   A string of accepted types.  Current support is 'image', 'file', and
+ *   'entity_reference' field types.
+ *
+ * @see \hook_content_packager_accepted_field_types_alter()
+ */
+function content_packager_accepted_field_types() {
+  return ['entity_reference', 'image', 'file'];
+}
+
+/**
+ * Return a list of view IDs and display IDs for available rest_export views.
+ *
+ * @see \Drupal\views\Views::getApplicableViews()
+ *
+ * @return array
+ *   A list of arrays containing the $view_id and $display_id.
+ *
+ * @throws \Drupal\Component\Plugin\Exception\InvalidPluginDefinitionException
+ * @throws \Drupal\Component\Plugin\Exception\PluginNotFoundException
+ */
+function content_packager_get_rest_export_views() {
+
+  $plugins = Views::getPluginDefinitions();
+  $display_plugins = isset($plugins['display']) ? $plugins['display'] : [];
+
+  $type = 'rest_export';
+  $plugin_ids = [];
+  foreach ($display_plugins as $id => $definition) {
+    if ($id === $type) {
+      $plugin_ids['display'] = $id;
+    }
+  }
+
+  $entity_ids = \Drupal::entityQuery('view')
+    ->condition('status', TRUE)
+    ->condition("display.*.display_plugin", $plugin_ids, 'IN')
+    ->accessCheck(TRUE)
+    ->execute();
+
+  $result = [];
+  foreach (\Drupal::entityTypeManager()->getStorage('view')->loadMultiple($entity_ids) as $view) {
+    /* @var \Drupal\views\ViewExecutable $executable */
+    $executable = $view->getExecutable();
+    foreach ($view->get('display') as $id => $display) {
+
+      // Avoid leaking any displays a user shouldn't be seeing.
+      if (!$executable->access($id)) {
+        continue;
+      }
+
+      // If the key doesn't exist, enabled is assumed.
+      $enabled = !empty($display['display_options']['enabled']) || !array_key_exists('enabled', $display['display_options']);
+
+      if ($enabled && in_array($display['display_plugin'], $plugin_ids)) {
+        $result[] = [$view->id(), $id];
+      }
+    }
+  }
+
+  return $result;
+}
+
+/**
+ * Checks the existence of the directory specified in $form_element.
+ *
+ * This function is called from the CreatePackage form to check the directory
+ * specified.
+ *
+ * @param array $form_element
+ *   The form element containing the name of the directory to check.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   The current state of the form.
+ *
+ * @see \system_check_directory()
+ */
+function content_packager_check_directory_form(array $form_element, FormStateInterface $form_state) {
+  $scheme = $form_element['package_scheme']['#value'];
+  $base_folder = $form_element['base_folder']['#value'];
+  $destination = $form_element['package_destination']['#value'];
+
+  if (strlen($destination) == 0) {
+    return $form_element;
+  }
+
+  $uri = $scheme . trim($base_folder, '\\/') . DIRECTORY_SEPARATOR . trim($destination, '\\/');
+  $errors = content_packager_prepare_directory($uri);
+
+  foreach ($errors as $error) {
+    $form_state->setErrorByName('package_destination', $error);
+  }
+
+  return $form_element;
+}
+
+/**
+ * Prepares the content packager directory.
+ *
+ * @param string $uri
+ *   URI to set up.
+ *
+ * @return array
+ *   An array of error strings, if any.  Empty array if no errors.
+ */
+function content_packager_prepare_directory($uri) {
+  $logger = \Drupal::logger('content_packager');
+  /** @var \Drupal\Core\File\FileSystem $file_system */
+  $file_system = \Drupal::service('file_system');
+  $errors = [];
+  if (!is_dir($uri) && !$file_system->mkdir($uri, NULL, TRUE)) {
+    // If the directory does not exist and cannot be created.
+    $errors[] = t('The directory %directory does not exist and could not be created.', ['%directory' => $uri]);
+    $logger->error('The directory %directory does not exist and could not be created.', ['%directory' => $uri]);
+  }
+  if (is_dir($uri) && !is_writable($uri) && $file_system->chmod($uri)) {
+    // If the directory is not writable and cannot be made so.
+    $errors[] = t('The directory %directory exists but is not writable and could not be made writable.', ['%directory' => $uri]);
+    $logger->error('The directory %directory exists but is not writable and could not be made writable.', ['%directory' => $uri]);
+  }
+  elseif (is_dir($uri)) {
+    file_save_htaccess($uri, FALSE);
+  }
+
+  return $errors;
+}
+
+/**
+ * Get the full uri to store package files into.
+ *
+ * @return string
+ *   The uri.
+ */
+function content_packager_package_uri() {
+  $config = \Drupal::config('content_packager.settings');
+  return $config->get('scheme') . $config->get('base_folder') . DIRECTORY_SEPARATOR . trim($config->get('destination'), '\\/');
+}
+
+/**
+ * Verify whether the content packager has processed a given entity.
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ *   The entity to verify.
+ *
+ * @return bool
+ *   TRUE is the entity appears processed, FALSE if not.
+ */
+function content_packager_is_processed(EntityInterface $entity) {
+  $connection = \Drupal::database();
+  $query = $connection->query("SELECT eid FROM {content_packager_processed} WHERE eid = :id AND entitytype = :type LIMIT 1", [':id' => $entity->id(), ':type' => $entity->getEntityTypeId()]);
+  $result = $query->fetchAll();
+  return count($result) > 0;
+}
+
+/**
+ * Mark a particular entity as processed.
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ *   The entity to mark as 'processed'.
+ */
+function content_packager_add_processed(EntityInterface $entity) {
+  $connection = \Drupal::database();
+  try {
+    $connection->insert('content_packager_processed')
+      ->fields([
+        'entitytype' => $entity->getEntityTypeId(),
+        'eid' => $entity->id(),
+      ])
+      ->execute();
+  }
+  catch (IntegrityConstraintViolationException $e) {
+    // Sometimes the latest insert is not finished by the next call to
+    // content_packager_is_processed(), it seems.
+  }
+}
+
+/**
+ * Clear out the processing data.
+ */
+function content_packager_clear_processed() {
+  \Drupal::database()->truncate('content_packager_processed')->execute();
+}
