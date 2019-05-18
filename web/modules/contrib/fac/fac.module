@@ -1,0 +1,117 @@
+<?php
+
+/**
+ * @file
+ * This file contains the main functions of the Fast Autocomplete module.
+ */
+
+use Drupal\Core\StreamWrapper\PublicStream;
+use Drupal\Component\Plugin\Exception\InvalidPluginDefinitionException;
+
+/**
+ * Implements hook_page_attachments().
+ */
+function fac_page_attachments(array &$page) {
+  $fac_js_settings = [];
+  $highlight_enabled = FALSE;
+
+  if ($fac_config_ids = \Drupal::entityQuery('fac_config')->execute()) {
+    try {
+      $fac_configs = \Drupal::EntityTypeManager()->getStorage('fac_config')->loadMultiple(array_keys($fac_config_ids));
+    }
+    catch (InvalidPluginDefinitionException $e) {
+      \Drupal::logger('fac')->error('An error occurred: ' . $e->getMessage());
+      return;
+    }
+
+    foreach ($fac_configs as $fac_config) {
+      /** @var \Drupal\fac\Entity\FacConfig $fac_config */
+      if ($fac_config->status()) {
+        $empty_result = $fac_config->getEmptyResult();
+        $context = [
+          'fac_config' => clone $fac_config,
+        ];
+        // Allow other modules to modify the empty result.
+        \Drupal::moduleHandler()->alter('fac_empty_result', $empty_result, $context);
+
+        try {
+          if ($fac_config->anonymousSearch()) {
+            \Drupal::service('account_switcher')->switchTo(\Drupal::EntityTypeManager()->getStorage('user')->load(0));
+          }
+          $hash = \Drupal::service('fac.hash_service')->getHash();
+          if ($fac_config->anonymousSearch()) {
+            \Drupal::service('account_switcher')->switchBack();
+          }
+        }
+        catch (InvalidPluginDefinitionException $e) {
+          \Drupal::logger('fac')->error('An error occurred: ' . $e->getMessage());
+          break;
+        }
+
+        $fac_js_settings[$fac_config->id()] = [
+          'id' => $fac_config->id(),
+          'jsonFilesPath' => '/' . PublicStream::basePath() . '/fac-json/' . $fac_config->id() . '/' . \Drupal::languageManager()->getCurrentLanguage()->getId() . '/' . $hash . '/',
+          'inputSelectors' => $fac_config->getInputSelectors(),
+          'keyMinLength' => $fac_config->getKeyMinLength(),
+          'keyMaxLength' => $fac_config->getKeyMaxLength(),
+          'breakpoint' => $fac_config->getBreakpoint(),
+          'emptyResult' => $fac_config->getEmptyResult(),
+          'allResultsLink' => $fac_config->showAllResultsLink(),
+          'allResultsLinkThreshold' => $fac_config->getAllResultsLinkThreshold(),
+          'highlightingEnabled' => $fac_config->highlightingEnabled(),
+          'resultLocation' => $fac_config->getResultLocation(),
+        ];
+
+        if ($fac_config->highlightingEnabled()) {
+          $highlight_enabled = TRUE;
+        }
+      }
+    }
+
+    if (!empty($fac_js_settings)) {
+      if ($highlight_enabled) {
+        if (\Drupal::config('fac.settings')->get('highlighting_script_use_cdn')) {
+          $page['#attached']['library'][] = 'fac/fac.markjs_cdn';
+        }
+        else {
+          $page['#attached']['library'][] = 'fac/fac.markjs';
+        }
+      }
+      $page['#attached']['drupalSettings']['fac'] = $fac_js_settings;
+      $page['#attached']['library'][] = 'fac/fac.fac_plugin';
+      $page['#attached']['library'][] = 'fac/fac.fac';
+    }
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function fac_cron() {
+  // Clean up the JSON files.
+  if ($fac_config_ids = \Drupal::entityQuery('fac_config')->execute()) {
+    try {
+      $fac_configs = \Drupal::EntityTypeManager()->getStorage('fac_config')->loadMultiple(array_keys($fac_config_ids));
+
+      foreach ($fac_configs as $fac_config) {
+        /** @var \Drupal\fac\Entity\FacConfig $fac_config */
+        if ($fac_config->cleanUpFiles()) {
+          $expiry_time = strtotime($fac_config->getFilesExpiryTime());
+          $fac_config->deleteFiles($expiry_time);
+        }
+      }
+    }
+    catch (InvalidPluginDefinitionException $e) {
+      \Drupal::logger('fac')->error('An error occurred: ' . $e->getMessage());
+    }
+  }
+
+  $key_interval = \Drupal::config('fac.settings')->get('key_interval');
+  // Change the key.
+  $key_timestamp = \Drupal::state()->get('fac_key_timestamp');
+  if (time() > $key_timestamp + $key_interval) {
+    \Drupal::service('fac.hash_service')->getKey(TRUE);
+    // Clean up files; the paths are no longer valid with the new key.
+    file_unmanaged_delete_recursive(PublicStream::basePath() . '/fac-json');
+  }
+}
