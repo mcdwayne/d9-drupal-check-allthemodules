@@ -1,0 +1,171 @@
+<?php
+
+/**
+ * @file
+ * Contains layout functionality for Lightning.
+ */
+
+use Drupal\Core\Entity\Entity\EntityViewMode;
+use Drupal\Core\Field\EntityReferenceFieldItemListInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\block_content\BlockContentInterface;
+
+/**
+ * Implements hook_modules_installed().
+ */
+function lightning_layout_modules_installed(array $modules) {
+  // Don't do anything during config sync.
+  if (\Drupal::isConfigSyncing()) {
+    return;
+  }
+
+  if (in_array('lightning_roles', $modules, TRUE)) {
+    \Drupal::service('lightning.content_roles')
+      ->grantPermissions('creator', ['configure any layout']);
+  }
+
+  if (in_array('lightning_dev', $modules, TRUE)) {
+    /** @var \Drupal\Core\Extension\ModuleInstallerInterface $module_installer */
+    $module_installer = Drupal::service('module_installer');
+
+    // Lightning Roles is an optional dependencies, and we provide optional
+    // configuration for Pathauto, so install it in order to test our
+    // integrations.
+    $module_installer->install(['lightning_roles', 'menu_ui', 'pathauto']);
+
+    // BigPipe replaces the local tasks with a placeholder, which can cause
+    // non-JavaScript tests to fail. To make things easier, just shut it off.
+    $module_installer->uninstall(['big_pipe']);
+
+    // Grant permissions needed for testing.
+    user_role_grant_permissions('landing_page_creator', [
+      'access user profiles',
+      'use editorial transition create_new_draft',
+      'use editorial transition publish',
+    ]);
+
+    // Use Bartik for testing.
+    \Drupal::service('theme_installer')->install(['seven', 'bartik']);
+    \Drupal::configFactory()
+      ->getEditable('system.theme')
+      ->set('admin', 'seven')
+      ->set('default', 'bartik')
+      ->save();
+  }
+
+  // Install Entity Browser Block if Lightning Media is enabled so that the
+  // Media Library Entity Browser is available from the Layout Builder.
+  if (in_array('lightning_media', $modules, TRUE)) {
+    \Drupal::service('module_installer')->install(['entity_browser_block']);
+  }
+}
+
+/**
+ * Implements hook_block_content_delete().
+ */
+function lightning_layout_block_content_delete(BlockContentInterface $block_content) {
+  \Drupal::service('block_content.uuid_lookup')->delete($block_content->uuid());
+}
+
+/**
+ * Implements hook_block_alter().
+ */
+function lightning_layout_block_alter(array &$blocks) {
+  $allow = \Drupal::config('lightning_layout.settings')->get('entity_blocks');
+
+  // Suppress all entity_block derivatives for non-whitelisted entity types.
+  $plugins = preg_grep('/^entity_block:/', array_keys($blocks));
+  foreach ($plugins as $plugin_id) {
+    if (!in_array(substr($plugin_id, 13), $allow)) {
+      unset($blocks[$plugin_id]);
+    }
+  }
+
+  // This section is @deprecated and should be removed once Lightning Layout
+  // requires Drupal 8.7.x.
+  foreach ($blocks as &$block) {
+    if (isset($block['context_definitions']) && ! isset($block['context'])) {
+      $block['context'] = &$block['context_definitions'];
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function lightning_layout_form_entity_view_display_edit_form_alter(array &$form, FormStateInterface $form_state) {
+  $form['#process'][] = 'lightning_layout_tweak_layout_builder_ui';
+}
+
+/**
+ * Tweaks the Layout Builder stuff on an entity view display form.
+ *
+ * @param array $element
+ *   The form element containing Layout Builder's entity view display options.
+ * @param FormStateInterface $form_state
+ *   The current form state.
+ *
+ * @return array
+ *   The processed element.
+ */
+function lightning_layout_tweak_layout_builder_ui(array $element, FormStateInterface $form_state) {
+  /** @var \Drupal\Core\Entity\Display\EntityViewDisplayInterface $display */
+  $display = $form_state->getFormObject()->getEntity();
+
+  $layout_builder_enabled = $display->getThirdPartySetting('layout_builder', 'enable', FALSE);
+
+  // Check if this display is for an internal view mode.
+  $view_mode = EntityViewMode::load($display->getTargetEntityTypeId() . '.' . $display->getMode());
+  if ($view_mode) {
+    $internal = $view_mode->getThirdPartySetting('lightning_core', 'internal');
+    if ($internal) {
+      // If it's not already applied, don't allow Layout Builder.
+      $element['layout']['#access'] = $layout_builder_enabled;
+
+      // Inform the user what's up.
+      drupal_set_message(t('This display is internal and will not be seen by normal users.'), 'warning');
+    }
+  }
+
+  return $element;
+}
+
+/**
+ * Implements template_preprocess_block().
+ */
+function lightning_layout_preprocess_block(array &$variables) {
+  if ($variables['base_plugin_id'] === 'inline_block') {
+    /** @var BlockContentInterface $block_content */
+    $block_content = $variables['content']['#block_content'];
+    $variables['attributes']['data-inline-block-uuid'] = $block_content->uuid();
+  }
+}
+
+/**
+ * Implements hook_layout_builder_section_storage_alter().
+ *
+ * @deprecated This will be removed once Lightning Layout requires Drupal 8.7.x.
+ */
+function lightning_layout_layout_builder_section_storage_alter(array &$storages) {
+  /** @var \Drupal\layout_builder\SectionStorage\SectionStorageDefinition $storage */
+  foreach ($storages as $storage) {
+    $context_definitions = $storage->getContextDefinitions();
+
+    if ($context_definitions && $storage->get('context') === NULL) {
+      $storage->set('context', $context_definitions);
+    }
+  }
+}
+
+/**
+ * Implements hook_field_widget_form_alter().
+ */
+function lightning_layout_field_widget_form_alter(&$element, FormStateInterface &$form_state, $context) {
+  $items = isset($context['items']) ? $context['items']: NULL;
+
+  // Hide the Layout field's select widget if it only has the default "none"
+  // option.
+  if ($items instanceof EntityReferenceFieldItemListInterface && $items->getName() === 'layout_selection' && isset($element['#type']) && $element['#type'] === 'select' && count($element['#options']) === 1) {
+    $element['#access'] = FALSE;
+  }
+}
