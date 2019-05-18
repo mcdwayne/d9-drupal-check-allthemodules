@@ -1,0 +1,192 @@
+<?php
+
+namespace Drupal\hidden_tab\Form;
+
+use Drupal\Component\Datetime\TimeInterface;
+use Drupal\Component\Uuid\Php;
+use Drupal\Core\Entity\EntityRepositoryInterface;
+use Drupal\Core\Entity\EntityStorageInterface;
+use Drupal\Core\Entity\EntityTypeBundleInfoInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Messenger\MessengerInterface;
+use Drupal\hidden_tab\Entity\HiddenTabMailerInterface;
+use Drupal\hidden_tab\Form\Base\EntityFormBase;
+use Drupal\hidden_tab\Plugable\MailDiscovery\HiddenTabMailDiscoveryInterface;
+use Drupal\hidden_tab\Plugable\MailDiscovery\HiddenTabMailDiscoveryPluginManager;
+use Drupal\hidden_tab\Plugable\TplContext\HiddenTabTplContextInterface;
+use Drupal\hidden_tab\Plugable\TplContext\HiddenTabTplContextPluginManager;
+use Symfony\Component\DependencyInjection\ContainerInterface;
+use Symfony\Component\HttpFoundation\ParameterBag;
+
+/**
+ * Form controller for the hidden tab mailer entity edit forms.
+ */
+class HiddenTabMailerForm extends EntityFormBase {
+
+  protected $type = 'hidden_tab_mailer';
+
+  /**
+   * To find mail discoverers.
+   *
+   * @var \Drupal\hidden_tab\Plugable\MailDiscovery\HiddenTabMailDiscoveryPluginManager
+   */
+  protected $discoveryMan;
+
+  /**
+   * To find template context plugins.
+   *
+   * @var \Drupal\hidden_tab\Plugable\TplContext\HiddenTabTplContextPluginManager
+   */
+  protected $contextMan;
+
+  public function __construct(EntityRepositoryInterface $entity_repository = NULL,
+                              EntityTypeBundleInfoInterface $entity_type_bundle_info = NULL,
+                              TimeInterface $time = NULL,
+                              EntityStorageInterface $user_storage = NULL,
+                              MessengerInterface $messenger = NULL,
+                              ParameterBag $params = NULL,
+                              Php $uuid = NULL,
+                              HiddenTabMailDiscoveryPluginManager $discovery_man = NULL,
+                              HiddenTabTplContextPluginManager $context_man = NULL) {
+    parent::__construct($entity_repository, $entity_type_bundle_info, $time, $user_storage, $messenger, $params, $uuid);
+    if ($discovery_man === NULL || $context_man === NULL) {
+      throw new \LogicException('illegal state');
+    }
+    $this->discoveryMan = $discovery_man;
+    $this->contextMan = $context_man;
+  }
+
+  public static function create(ContainerInterface $container) {
+    /** @noinspection PhpParamsInspection */
+    return new static(
+      $container->get('entity.repository'),
+      $container->get('entity_type.bundle.info'),
+      $container->get('datetime.time'),
+      $container->get('entity_type.manager')->getStorage('user'),
+      $container->get('messenger'),
+      $container->get('request_stack')->getCurrentRequest()->query,
+      $container->get('uuid'),
+      $container->get('plugin.manager.hidden_tab_mail_discovery'),
+      $container->get('plugin.manager.hidden_tab_tpl_context')
+    );
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function buildForm(array $form, FormStateInterface $form_state) {
+    /** @var \Drupal\hidden_tab\Entity\HiddenTabMailerInterface $entity */
+    $form = parent::buildForm($form, $form_state);
+
+    $entity = $this->getEntity();
+
+    $d_pid = HiddenTabMailDiscoveryInterface::PID;
+    $form[$d_pid] = [
+      '#type' => 'fieldset',
+      '#title' => $this->t('Email Discovery'),
+    ];
+    $form[$d_pid]['_active_' . $d_pid] = [
+      '#type' => 'select',
+      '#multiple' => TRUE,
+      '#title' => $this->t('Discovery plugin'),
+      '#options' => $this->discoveryMan->pluginsForSelectElement(NULL, TRUE),
+      '#default_value' => $entity->pluginConfiguration('_active', $d_pid),
+      '#description' => 'TODO: make orderable.',
+    ];
+    if ($this->discoveryMan->plugins()) {
+      foreach ($this->discoveryMan->plugins() as $discovery_plugin) {
+        $discovery_plugin->handleConfigForm($form, $form_state, $d_pid,
+          $entity->pluginConfiguration($d_pid, $discovery_plugin->id())
+        );
+      }
+    }
+
+    $x_pid = HiddenTabTplContextInterface::PID;
+    $form[$x_pid] = [
+      '#type' => 'fieldset',
+      '#title' => $this->t('Template Context Provider'),
+    ];
+    $form[$x_pid]['_active_' . $x_pid] = [
+      '#type' => 'select',
+      '#multiple' => TRUE,
+      '#title' => $this->t('Template Context Provider Plugin'),
+      '#options' => $this->contextMan->pluginsForSelectElement(NULL, TRUE),
+      '#default_value' => $entity->pluginConfiguration('_active', $x_pid),
+    ];
+    foreach ($this->contextMan->plugins() as $context_plugin) {
+      $context_plugin->handleConfigForm($form, $form_state, $x_pid,
+        $entity->pluginConfiguration($x_pid, $context_plugin->id())
+      );
+    }
+
+    return parent::buildForm($form, $form_state);
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function validateForm(array &$form, FormStateInterface $form_state) {
+    parent::validateForm($form, $form_state); // TODO: Change the autogenerated stub
+
+    /** @var \Drupal\hidden_tab\Entity\HiddenTabMailerInterface $entity */
+    $entity = $this->getEntity();
+
+    $d_pid = HiddenTabMailDiscoveryInterface::PID;
+    foreach ($this->discoveryMan->plugins() as $discovery_plugin) {
+      $discovery_plugin->handleConfigFormValidate($form, $form_state,
+        $entity->pluginConfiguration($d_pid, $discovery_plugin->id())
+      );
+    }
+
+    $x_pid = HiddenTabTplContextInterface::PID;
+    foreach ($this->contextMan->plugins() as $context_plugin) {
+      $context_plugin->handleConfigFormValidate($form, $form_state,
+        $entity->pluginConfiguration($x_pid, $context_plugin->id())
+      );
+    }
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function buildEntity(array $form, FormStateInterface $form_state): HiddenTabMailerInterface {
+    /** @var \Drupal\hidden_tab\Entity\HiddenTabMailerInterface $entity */
+    $entity = parent::buildEntity($form, $form_state);
+
+    // Bad, we might loss config of other things.
+    $entity->resetPluginConfigurations(NULL);
+
+    $d_pid = HiddenTabMailDiscoveryInterface::PID;
+    $d_active = static::filter($form_state->getValue('_active_' . $d_pid));
+    $entity->setPluginConfiguration('_active', $d_pid, $d_active);
+    foreach ($this->discoveryMan->plugins() as $discovery_plugin) {
+      $d_cfg = $discovery_plugin->handleConfigFormSubmit($form, $form_state);
+      $entity->setPluginConfiguration($d_pid, $discovery_plugin->id(), $d_cfg);
+    }
+
+    $x_pid = HiddenTabTplContextInterface::PID;
+    $x_active = static::filter($form_state->getValue('_active_' . $x_pid));
+    $entity->setPluginConfiguration('_active', $x_pid, $x_active);
+    foreach ($this->contextMan->plugins() as $context_plugin) {
+      $x_cfg = $context_plugin->handleConfigFormSubmit($form, $form_state);
+      $entity->setPluginConfiguration($x_pid, $context_plugin->id(), $x_cfg);
+    }
+
+    return $entity;
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  protected function prepareEntity0() {
+  }
+
+  private static function filter(array $v) {
+    $v = array_keys($v);
+    $v = array_filter($v, function ($vv) {
+      return $vv;
+    });
+    return $v;
+  }
+
+}
