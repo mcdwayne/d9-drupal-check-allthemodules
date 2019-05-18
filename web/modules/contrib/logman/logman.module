@@ -1,0 +1,252 @@
+<?php
+/**
+ * @file
+ * Logman module file.
+ */
+
+use Drupal\Core\Url;
+use Drupal\Core\Link;
+use Drupal\logman\Helper\LogmanWatchdogSearch;
+use Drupal\logman\Helper\LogmanApacheSearch;
+
+/**
+ * Implements hook_page_attachments().
+ */
+function logman_page_attachments(array &$attachments) {
+  $attachments['#attached']['library'][] = 'logman/logman-page-statistics';
+}
+
+/**
+ * Implements hook_page_bottom().
+ *
+ * Insert the logman on page statistics at
+ * the default bottom right hand side corner.
+ */
+function logman_page_bottom(array &$page_bottom) {
+  if (logman_visibility() === TRUE) {
+    // Prepare the renderable array for logman statistics.
+    $logman_page_statistics = logman_get_page_statistics();
+    $page_bottom['logman'] =  array(
+      '#type' => 'container',
+      '#attributes' => array(
+        'id' => array('logman_container'),
+        'class' => array($logman_page_statistics['log_class']),
+      ),
+    );
+    $page_bottom['logman']['icon'] =  array(
+      '#type' => 'container',
+      '#attributes' => array(
+        'id' => array('logman_icon'),
+      ),
+    );
+    $page_bottom['logman']['icon']['#markup'] = t('Logman');
+    $page_bottom['logman']['close'] =  array(
+      '#type' => 'container',
+      '#attributes' => array(
+        'id' => array('logman_icon_close'),
+      ),
+    );
+    $page_bottom['logman']['close']['#markup'] = t('Close');
+    $page_bottom['logman']['statistics'] =  array(
+      '#type' => 'container',
+      '#attributes' => array(
+        'id' => array('logman_statistics'),
+        'class' => array('inactive'),
+      ),
+    );
+    $page_bottom['logman']['statistics']['#markup'] = $logman_page_statistics['logman_page_statistics'];
+    $page_bottom['logman']['clear'] =  array(
+      '#type' => 'container',
+      '#attributes' => array(
+        'class' => array('logman_clear'),
+      ),
+    );
+  }
+}
+
+/**
+ * Helper function to get the themed statistics.
+ *
+ * @return array
+ *   Themed page statistics.
+ */
+function logman_get_page_statistics() {
+  $statistics_duration = \Drupal::config('logman.settings')->get('logman_page_statistics_duration');
+  $statistics_duration_unit = \Drupal::config('logman.settings')->get('logman_page_statistics_duration_unit');
+  // Prepare date range array.
+  switch ($statistics_duration_unit) {
+    case 'hours':
+      $date_range = array((time() - ($statistics_duration * 60 * 60)), time());
+      break;
+
+    case 'days':
+      $date_range = array((time() - ($statistics_duration * 24 * 60 * 60)), time());
+      break;
+
+    default:
+      $date_range = array();
+  }
+
+  $path = \Drupal::service('path.current')->getPath();
+  $watchdog = new LogmanWatchdogSearch();
+  $statistics = $watchdog->getPageStatistics($path, $date_range);
+
+  // Theme the statistics.
+  $duration_token = array(
+    '@duration' => $statistics_duration,
+    '@unit' => $statistics_duration_unit,
+  );
+  if (!empty($statistics)) {
+    $themed_statistics_details = array();
+    foreach ($statistics as $item) {
+      $error_type = logman_get_severity_name($item->severity);
+      $error_count = $item->count;
+      $options = array(
+        'query' => array(
+          'location' => $path,
+          'date_from' => array(
+            'date' => isset($date_range[0]) ? date('Y-m-d', $date_range[0]) : '',
+            'time' => isset($date_range[0]) ? date('H:i:s', $date_range[0]) : '',
+          ),
+          'date_to' => array(
+            'date' => isset($date_range[1]) ? date('Y-m-d', $date_range[1]) : '',
+            'time' => isset($date_range[1]) ? date('H:i:s', $date_range[1]) : '',
+          ),
+          'severity' => $item->severity,
+        ),
+      );
+
+      $url = \Drupal\Core\Url::fromRoute('logman.statistics_form', [], $options);
+      $themed_statistics_details[] =  Drupal::l("$error_count $error_type", $url);
+    }
+    $statistics_class = strtolower(logman_get_severity_name($statistics[0]->severity));
+    $themed_statistics_details[] .= ' ' . t('since last @duration @unit', $duration_token);
+    $themed_statistics = '<div class="statistics_item">' . implode(',</div><div class="statistics_item">', $themed_statistics_details) . '</div></div>';
+  }
+  else {
+    $statistics_class = 'no_errors';
+    $themed_statistics = '<div>' . t('No errors on this page since last @duration @unit', $duration_token) . '</div>';
+  }
+
+  return array(
+    'logman_page_statistics' => $themed_statistics,
+    'log_class' => 'lm_' . $statistics_class,
+  );
+}
+
+/**
+ * Helper function for visibility check.
+ *
+ * Decide whether or not to display the survey on a particular path.
+ *
+ * @return bool
+ *   Visibility decision.
+ */
+function logman_visibility() {
+  // Display on all pages based on permission
+  // but hide it on logman pages.
+  if (\Drupal::currentUser()->hasPermission('access logman') && \Drupal::config('logman.settings')->get('logman_show_page_statistics') == 1
+      && strpos(\Drupal::service('path.current')->getPath(), \Drupal\Core\Url::fromRoute('logman.statistics_form')->toString()) === FALSE) {
+    return TRUE;
+  }
+}
+
+/**
+ * Helper function to populate form state from $_GET values.
+ *
+ * This is for using pagination that passes data as query string.
+ *
+ * @param array $field_keys
+ *   The search field keys.
+ * @param array $form_state
+ *   The form_state array.
+ */
+function logman_prepare_form_state($field_keys, $form_state) {
+  foreach ($field_keys as $key) {
+    $value = $form_state->getValue($key);
+    if (isset($_GET[$key]) && !isset($value)) {
+      $form_state->setValue($key, $_GET[$key]);
+    }
+  }
+
+  // Properly format the date range values into form_state
+  // if it is not formatted to a string.
+  $value = $form_state->getValue('date_from');
+  if (!empty($value) && is_array($value)) {
+    $form_state->setValue('date_from', trim(implode(' ', $value)));
+  }
+  $value = $form_state->getValue('date_to');
+  if (!empty($value) && is_array($value)) {
+    $form_state->setValue('date_to', trim(implode(' ', $value)));
+  }
+}
+
+/**
+ * Helper function to prepare statistics chart data.
+ *
+ * This returns a string in javascript array format.
+ *
+ * @param array $data
+ *   Statistics data.
+ * @param string $log_type
+ *   Log type watchdog or apache.
+ * @param string $against
+ *   Entity on which the lg statistics is based.
+ *
+ * @return string
+ *   JS array formatted string for chart data.
+ */
+function logman_prepare_chartable_data($data, $log_type, $against) {
+  $chart_data = array("['$against', 'Counts']");
+  foreach ($data as $key => $item) {
+    if ($log_type == 'watchdog') {
+      if ($against == 'severity') {
+        $key = logman_get_severity_name($item->$against);
+      }
+      else {
+        $key = ucwords($item->$against);
+      }
+      $chart_data[] = "['$key', " . $item->count . "]";
+    }
+    else {
+      $chart_data[] = "['$key', $item]";
+    }
+  }
+  return $chart_data = "[" . implode(', ', $chart_data) . "]";
+}
+
+
+/**
+ * Submit handler for graylog2/gelf log reset.
+ */
+function logman_settings_form_gelf_reset(&$form, &$form_state) {
+  $form_state['storage']['confirm'] = TRUE;
+}
+
+/**
+ * Provides severity name.
+ *
+ * @param object $against
+ *   Severity level.
+ *
+ * @return \Drupal\Core\StringTranslation\TranslatableMarkup|string
+ */
+function logman_get_severity_name($against) {
+  // Severity levels.
+  $severity_levels = drupal_error_levels();
+  $severity_name = '';
+  foreach ($severity_levels as $level) {
+    list($name, $level_num) = $level;
+    if ($level_num == $against) {
+      $severity_name[] = ucwords($name);
+    }
+  }
+  if (empty($severity_name)) {
+    $severity_name = t('Unknown');
+  }
+  else {
+    $severity_name = reset($severity_name);
+  }
+
+  return $severity_name;
+}
