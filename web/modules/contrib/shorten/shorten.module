@@ -1,0 +1,597 @@
+<?php
+
+/**
+ * @file
+ *   Shortens URLs via external services.
+ */
+
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_help().
+ */
+function shorten_help($path, $arg) {
+  $output = '';
+  switch ($path) {
+    case 'admin/help#shorten':
+      $output = '<p>' . t('This module shortens URLs.') . '</p>';
+      break;
+  }
+  return $output;
+}
+
+/**
+ * Implements hook_perm().
+ */
+function shorten_permission() {
+  return array(
+    'use Shorten URLs page' => array(
+      'title' => t('Use URL shortener page'),
+    ),
+    'manage Shorten URLs API keys' => array(
+      'title' => t('Manage URL shortener API keys'),
+      'description' => t('Allow viewing and editing the API keys for third-party URL shortening services.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_flush_caches().
+ */
+function shorten_flush_caches() {
+  // if (\Drupal::config('shorten.settings')->get('shorten_cache_clear_all')) {
+  //   return array('cache_shorten');
+  // }
+  return array();
+}
+
+/**
+ * Retrieves and beautifies the abbreviated URL.
+ * This is the main API function of this module.
+ *
+ * @param $original
+ *   The URL of the page for which to create the abbreviated URL.  If not passed
+ *   uses the current page.
+ * @param $service
+ *   The service to use to abbreviate the URL.
+ *   For services available by default, see shorten_shorten_service().
+ * @return
+ *   An abbreviated URL.
+ */
+function shorten_url($original = '', $service = '') {
+  if (!$original) {
+    $original = Url::fromRoute('<current>',array(),array('absolute'=>'true'))->toString();
+    // print $original; die();
+  }
+  $original_for_caching = urlencode($original); // https://www.drupal.org/node/2324925
+  if (!$service) {
+    $service = \Drupal::config('shorten.settings')->get('shorten_service');
+  }
+  // $cached = \Drupal::cache('cache_shorten')->get($original_for_caching);
+  // if (!empty($cached->data) && REQUEST_TIME < $cached->expire) {
+  //   return $cached->data;
+  // }
+  $services = \Drupal::moduleHandler()->invokeAll('shorten_service');
+  if (isset($services[$service])) {
+    $url = _shorten_get_url($original, $services[$service], $service);
+  }
+  // If the primary service fails, try the secondary service.
+  if (empty($url)) {
+    $service = \Drupal::config('shorten.settings')->get('shorten_service_backup');
+    if (isset($services[$service])) {
+      $url = _shorten_get_url($original, $services[$service], $service);
+    }
+    // If the secondary service fails, use the original URL.
+    if (empty($url)) {
+      $url = $original;
+    }
+  }
+  $url = trim($url); // Redundant for most services.
+  // Replace "http://" with "www." if the URL is abbreviated because it's shorter.
+  if ($url != $original && \Drupal::config('shorten.settings')->get('shorten_www')) {
+    if (strpos($url, 'http://') === 0) {
+      $url = \Drupal\Component\Utility\Unicode::substr($url, 7);
+      if (strpos($url, 'www.') !== 0) {
+        $url = 'www.' . $url;
+      }
+    }
+    elseif (strpos($url, 'https://') === 0) {
+      $url = \Drupal\Component\Utility\Unicode::substr($url, 8);
+      if (strpos($url, 'www.') !== 0) {
+        $url = 'www.' . $url;
+      }
+    }
+  }
+  $cache_duration = \Drupal::config('shorten.settings')->get('shorten_cache_duration');
+  // Only cache failed retrievals for a limited amount of time.
+  if ($url == $original) {
+    $expire = REQUEST_TIME + \Drupal::config('shorten.settings')->get('shorten_cache_fail_duration');
+  }
+  elseif (is_numeric($cache_duration)) {
+    $expire = REQUEST_TIME + $cache_duration;
+  }
+  else {
+    $expire = \Drupal\Core\Cache\Cache::PERMANENT;
+  }
+  // \Drupal::cache('cache_shorten')->set($original_for_caching, $url, $expire);
+  \Drupal::moduleHandler()->invokeAll('shorten_create', [$original, $url, $service]);
+  return $url;
+}
+
+/**
+ * Shortens URLs. Times out after three (3) seconds.
+ *
+ * @param $original
+ *   The URL of the page for which to retrieve the abbreviated URL.
+ * @param $api
+ *   A string or array used to retrieve a shortened URL. If it is an array, it
+ *   can have the elements 'custom,' 'url,' 'tag,' 'json,' and 'args.'
+ * @param $service
+ *   The service to use to abbreviate the URL.
+ *   For services available by default, see shorten_shorten_service().
+ * @return
+ *   An abbreviated URL.
+ */
+function _shorten_get_url($original, $api, $service) {
+  $method = \Drupal\Component\Utility\Unicode::strtoupper(\Drupal::config('shorten.settings')->get('shorten_method'));
+  $service = t('an unknown service');
+  if (is_string($api)) {
+    $url = shorten_fetch($api . $original);
+    $service = $api;
+  }
+  elseif (is_array($api)) {
+    // Merge in defaults.
+    $api += array(
+      'custom' => FALSE,
+      'json' => FALSE,
+    );
+    if (!empty($api['url'])) {
+      $original = urlencode($original);
+      // Typically $api['custom'] == 'xml' although it doesn't have to.
+      if (!empty($api['tag'])) {
+        $url = shorten_fetch($api['url'] . $original, $api['tag']);
+      }
+      elseif (!empty($api['json'])) {
+        $url = shorten_fetch($api['url'] . $original, $api['json'], 'json');
+      }
+      elseif (!$api['custom']) {
+        $url = shorten_fetch($api['url'] . $original);
+      }
+      $service = $api['url'];
+    }
+    elseif (is_string($api['custom']) && function_exists($api['custom'])) {
+      $method =  t('A custom method: @method()', array('@method' => $api['custom']));
+      if (!empty($api['args']) && is_array($api['args'])) {
+        $args = $api['args'];
+        array_unshift($args, $original);
+        $url = call_user_func_array($api['custom'], $args);
+      }
+      else {
+        $url = call_user_func($api['custom'], $original);
+      }
+    }
+  }
+
+  if (isset($url)) {
+    if (\Drupal\Component\Utility\Unicode::substr($url, 0, 7) == 'http://' || \Drupal\Component\Utility\Unicode::substr($url, 0, 8) == 'https://') {
+      return $url;
+    }
+  }
+  \Drupal::logger('shorten')->notice('%method failed to return an abbreviated URL from %service.', array('%method' => $method, '%service' => $service));
+  return FALSE;
+}
+
+/**
+ * Implements hook_shorten_service().
+ */
+function shorten_shorten_service() {
+  $services = array();
+  if (\Drupal::config('shorten.settings')->get('shorten_budurl')) {
+    $services['budurl'] = array(
+      'url' => 'http://budurl.com/api/v1/budurls/shrink?api_key=' . \Drupal::config('shorten.settings')->get('shorten_budurl') . '&format=txt&long_url=',
+    );
+  }
+  if (\Drupal::config('shorten.settings')->get('shorten_ez')) {
+    $services['ez'] = array(
+      'url' => 'http://ez.com/api/v1/ezlinks/shrink?api_key=' . \Drupal::config('shorten.settings')->get('shorten_ez') . '&format=txt&long_url=',
+    );
+  }
+  if (\Drupal::config('shorten.settings')->get('shorten_bitly_login') && \Drupal::config('shorten.settings')->get('shorten_bitly_key')) {
+    $services['bit.ly'] = 'https://api-ssl.bitly.com/v3/shorten?format=txt&login=' .
+      \Drupal::config('shorten.settings')->get('shorten_bitly_login') . '&apiKey=' .
+      \Drupal::config('shorten.settings')->get('shorten_bitly_key') . '&x_login=' .
+      \Drupal::config('shorten.settings')->get('shorten_bitly_login') . '&x_apiKey=' .
+      \Drupal::config('shorten.settings')->get('shorten_bitly_key') . '&longUrl=';
+    $services['j.mp'] = 'https://api-ssl.bitly.com/v3/shorten?format=txt&domain=j.mp&login=' .
+      \Drupal::config('shorten.settings')->get('shorten_bitly_login') . '&apiKey=' .
+      \Drupal::config('shorten.settings')->get('shorten_bitly_key') . '&x_login=' .
+      \Drupal::config('shorten.settings')->get('shorten_bitly_login') . '&x_apiKey=' .
+      \Drupal::config('shorten.settings')->get('shorten_bitly_key') . '&longUrl=';
+  }
+  if (\Drupal::config('shorten.settings')->get('shorten_googl')) {
+    $services['goo.gl'] = array(
+      'custom' => '_shorten_googl',
+    );
+  }
+  $services += array(
+    'is.gd' => 'http://is.gd/api.php?longurl=',
+    'migre.me' => 'http://migre.me/api.txt?url=',
+    'Metamark' => 'http://metamark.net/api/rest/simple?long_url=',
+    'PeekURL' => 'http://peekurl.com/api.php?desturl=',
+    'qr.cx' => 'http://qr.cx/api/?longurl=',
+    'ri.ms' => 'http://ri.ms/api-create.php?url=',
+    'TinyURL' => 'http://tinyurl.com/api-create.php?url=',
+  );
+  if (\Drupal::config('shorten.settings')->get('shorten_fwd4me')) {
+    $services['fwd4.me'] = 'http://api.fwd4.me/?key=' . \Drupal::config('shorten.settings')->get('shorten_fwd4me') . '&url=';
+  }
+  if (\Drupal::moduleHandler()->moduleExists('shurly')) {
+    $services['ShURLy'] = array(
+      'custom' => '_shorten_shurly',
+    );
+  }
+  // Alphabetize. ksort() is case-sensitive.
+  uksort($services, 'strcasecmp');
+  return $services;
+}
+
+/**
+ * Helps get a shortened URL from Goo.gl.
+ */
+function _shorten_googl($original) {
+  $url = 'https://www.googleapis.com/urlshortener/v1/url?key='. \Drupal::config('shorten.settings')->get('shorten_googl');
+  $context = stream_context_create();
+  stream_context_set_option($context, 'ssl', 'verify_host', TRUE);
+  $options = array(
+    'method' => 'POST',
+    'data' => json_encode(array('longUrl' => $original)),
+    'context' => $context,
+    'headers' => array('Content-type' => 'application/json'),
+  );
+  $googl = shorten_fetch($url, 'id', 'json', $options);
+  if ($googl) {
+    return $googl;
+  }
+  \Drupal::logger('shorten')->error('Error fetching shortened URL from goo.gl.', array());
+  return FALSE;
+}
+
+/**
+ * Helps get a shortened URL via the ShURLy module.
+ */
+function _shorten_shurly($original) {
+  $result = shurly_shorten($original);
+  return $result['shortUrl'];
+}
+
+/**
+ * Downloads the response of the URL abbreviation service.
+ *
+ * @param $url
+ *   The URL which will return an abbreviated URL from any service. Includes
+ *   both the service and the URL to be shortened.
+ * @param $tag
+ *   If the response is XML, the tag within which to look for the shortened URL.
+ * @param $special
+ *   A special format the service will return. Currently only supports 'json.'
+ * @param $options
+ *   An associative array of options to allow executing an advanced request.
+ *   Valid keys include anything that would work with drupal_http_request()
+ *   except that $options['context'] is only used with the PHP request method.
+ * @return
+ *   An abbreviated URL or FALSE if fetching the abbreviated URL fails.
+ */
+function shorten_fetch($url, $tag = '', $special = '', $options = array()) {
+  $options += array(
+    'headers' => array(),
+    'method' => 'GET',
+    'data' => NULL,
+    'max_redirects' => 3,
+    'timeout' => \Drupal::config('shorten.settings')->get('shorten_timeout'),
+    'context' => NULL, // only used with the PHP method
+  );
+
+  if (\Drupal::config('shorten.settings')->get('shorten_method') == 'php') {
+    try {
+      $response = \Drupal::httpClient()->get($url, $options);
+      $result = stripslashes( (string) $response->getBody());
+    }
+    catch (RequestException $e) {
+      \Drupal::logger('shorten')->error('@code error shortening the URL @url using the PHP request method. Error message: %error', array('@code' => $result->code, '@url' => $url, '%error' => $e));
+    }
+
+    $contents = empty($result)? NULL : $result;
+
+  }
+  elseif (\Drupal::config('shorten.settings')->get('shorten_method') == 'curl') {
+    $c = curl_init();
+    curl_setopt($c, CURLOPT_RETURNTRANSFER, 1);
+    curl_setopt($c, CURLOPT_CONNECTTIMEOUT, $options['timeout']);
+    // https://drupal.org/node/1481634
+    //if (ini_get('open_basedir') == '' && ini_get('safe_mode' == 'Off')) {
+    //  curl_setopt($c, CURLOPT_FOLLOWLOCATION, TRUE);
+    //}
+    curl_setopt($c, CURLOPT_MAXREDIRS, $options['max_redirects']);
+    // defined() checks due to https://drupal.org/node/1469400
+    // Specifying the protocol is necessary to avoid malicious redirects to POP
+    // in libcurl 7.26.0 to 7.28.1
+    if (defined('CURLOPT_REDIR_PROTOCOLS') && defined('CURLPROTO_HTTP') && defined('CURLPROTO_HTTPS')) {
+      curl_setopt($c, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    }
+    curl_setopt($c, CURLOPT_URL, $url);
+    if ($options['method'] != 'GET') {
+      $uri = @parse_url($url);
+      if ($uri['scheme'] == 'http') {
+        curl_setopt($c, CURLOPT_PORT, isset($uri['port']) ? $uri['port'] : 80);
+        if (defined('CURLOPT_PROTOCOLS') && defined('CURLPROTO_HTTP')) {
+          curl_setopt($c, CURLOPT_PROTOCOLS, CURLPROTO_HTTP);
+        }
+      }
+      elseif ($uri['scheme'] == 'https') {
+        curl_setopt($c, CURLOPT_PORT, isset($uri['port']) ? $uri['port'] : 443);
+        if (defined('CURLOPT_PROTOCOLS') && defined('CURLPROTO_HTTPS')) {
+          curl_setopt($c, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
+        }
+      }
+      if (!empty($options['headers'])) {
+        $curl_headers = array();
+        foreach ($options['headers'] as $key => $value) {
+          $curl_headers[] = trim($key) . ': ' . trim($value);
+        }
+        curl_setopt($c, CURLOPT_HTTPHEADER, $curl_headers);
+      }
+      if ($options['method'] == 'POST') {
+        curl_setopt($c, CURLOPT_POST, TRUE);
+        curl_setopt($c, CURLOPT_POSTFIELDS, $options['data']);
+      }
+      else {
+        curl_setopt($c, CURLOPT_CUSTOMREQUEST, $options['method']);
+      }
+      curl_setopt($c, CURLOPT_SSL_VERIFYPEER, FALSE);
+    }
+    $contents = curl_exec($c);
+    curl_close($c);
+  }
+  else {
+    return FALSE;
+  }
+  if (!$contents) {
+    return FALSE;
+  }
+  if ($tag) {
+    if (!$special) {
+      $contents = _shorten_xml($contents, $tag);
+    }
+    elseif ($special == 'json') {
+      $contents = json_decode($contents, TRUE);
+      $contents = shorten_get_value_from_json($contents, $tag);
+    }
+  }
+  if (!$contents || $contents == $url) {
+    return FALSE;
+  }
+  return $contents;
+}
+
+/**
+ * Extracts a value from a json object given a json member name or path.
+ *
+ * @param array $contents
+ *  The decoded json object containing the data to extract.
+ * @param string $expression
+ *  A single json member name or a dot notation path expression.
+ *
+ * @return string
+ *  A value from the json object.
+ */
+function shorten_get_value_from_json($contents, $expression) {
+  $exploded_expression = str_getcsv($expression, '.', '"', '\\');
+  if (count($exploded_expression) === 1) {
+    if (!isset($contents[$expression])) {
+      \Drupal::logger('shorten')->error('json response does not contain specified member name or path expression: @expression', array('@expression' => $expression));
+      return null;
+    }
+    return $contents[$expression];
+  }
+  return shorten_get_path_in_array($contents, $exploded_expression);
+}
+
+/**
+ * Follows a path in a multidimensional array and returns a corresponding value.
+ *
+ * @param array $data
+ *  A single or multi dimensional array to extract a value from.
+ * @param array $path
+ *  An single dimensional array of the nested keys to look for in $data.
+ *
+ * @return
+ *  The value found at the end of the path followed in the data array.
+ */
+function shorten_get_path_in_array($data, $path) {
+  if (isset($path[0])) {
+    $element = $path[0];
+    array_shift($path);
+
+    if (isset($data[$element])) {
+      $data = shorten_get_path_in_array($data[$element], $path);
+    }
+  }
+  return $data;
+}
+
+/**
+ * Parses the value between tags in an XML document.
+ *
+ * @param $xml
+ *   The contents of the XML document.
+ * @param $tag
+ *   The tag to get the value from.
+ * @return
+ *   The value from the specified tag, typically an abbreviated URL.
+ */
+function _shorten_xml($xml, $tag) {
+  $start = strpos($xml, $tag) + \Drupal\Component\Utility\Unicode::strlen($tag) + 1;
+  $end = strpos($xml, $tag, $start + 1) - 2;
+  $length = -(\Drupal\Component\Utility\Unicode::strlen($xml) - $end);
+  return \Drupal\Component\Utility\Unicode::substr($xml, $start, $length);
+}
+
+/**
+ * JS callback for submitting the Shorten form.
+ */
+function shorten_save_js(array &$form, $form_state) {
+  $storage = &$form_state->getStorage();
+  $step = $storage['step'];
+  $new_form = array();
+  $new_form['opendiv'] = $form['opendiv'];
+  $new_form['shortened_url_' . $step] = $form['shortened_url_' . $step];
+  $new_form['url_' . $step] = $form['url_' . $step];
+  $new_form['closediv'] = $form['closediv'];
+  return $new_form;
+}
+
+/**
+ * Form which displays a list of URL shortening services.
+ *
+ * @param $last_service
+ *   The last service used on this page, if applicable.
+ */
+function _shorten_service_form($last_service = NULL) {
+  if (\Drupal::config('shorten.settings')->get('shorten_show_service') && _shorten_method_default() != 'none') {
+    $all_services = \Drupal::moduleHandler()->invokeAll('shorten_service');
+    $services = array();
+    $disallowed = unserialize(\Drupal::config('shorten.settings')->get('shorten_invisible_services'));
+    foreach ($all_services as $key => $value) {
+      if (!$disallowed[$key]) {
+        $services[$key] = $key;
+      }
+    }
+    $default = \Drupal::config('shorten.settings')->get('shorten_service');
+    if ($default == 'none') {
+      $default = 'TinyURL';
+    }
+    // Remember the last service that was used.
+    if (isset($_SESSION['shorten_service']) && $_SESSION['shorten_service']) {
+      $default = $_SESSION['shorten_service'];
+    }
+    // Anonymous users don't have $_SESSION, so we use the last service used on this page, if applicable.
+    if (!empty($last_service)) {
+      $default = $last_service;
+    }
+    $count = count($services);
+    if ($count > 1) {
+      if (isset($services[$default])) {
+        unset($default);
+        $default = NULL;
+      }
+      return array(
+        '#type' => 'select',
+        '#title' => t('Service'),
+        '#description' => t('The service to use to shorten the URL.'),
+        '#required' => TRUE,
+        '#default_value' => $default,
+        '#options' => $services,
+      );
+    }
+    elseif ($count) {
+      return array(
+        '#type' => 'value',
+        '#value' => array_pop($services),
+      );
+    }
+    return array(
+      '#type' => 'value',
+      '#value' => $default,
+    );
+  }
+}
+
+/**
+ * Determines the default method for retrieving shortened URLs.
+ * cURL is the preferred method, but sometimes it's not installed.
+ */
+function _shorten_method_default() {
+  if (function_exists('curl_exec')) {
+    return 'curl';
+  }
+  elseif (function_exists('file_get_contents')) {
+    return 'php';
+  }
+  return 'none';
+}
+
+/**
+ * Implements hook_token_info().
+ */
+function shorten_token_info() {
+  $info = array();
+
+  $info['tokens']['node']['short-url'] = array(
+    'name' => t('Short Url'),
+    'description' => t('The shortened URL for the node. <strong>Deprecated:</strong> use [node:url:shorten] or [node:url:unaliased:shorten] instead.'),
+  );
+
+  $info['tokens']['url']['shorten'] = array(
+   'name' => t('Shorten'),
+    'description' => t("Shorten URL using the default service."),
+  );
+
+  return $info;
+}
+
+/**
+ * Implements hook_tokens().
+ */
+function shorten_tokens($type, $tokens, array $data = array(), array $options = array()) {
+  $replacements = array();
+  if ($type == 'node'
+      && !empty($data['node'])
+      && isset($tokens['short-url'])) {
+    $node = (object) $data['node'];
+    // @FIXME
+    // url() expects a route name or an external URI.
+    $url = Url::fromUri('internal:/node' . $node->nid, array(
+      'absolute' => TRUE,
+      'alias' => \Drupal::config('shorten.settings')->get('shorten_use_alias'),
+    ))->toString();
+
+    $replacements[$tokens['short-url']] = shorten_url($url);
+
+  }
+
+  // General URL token replacement
+  $url_options = array('absolute' => TRUE);
+  if (isset($options['language'])) {
+    $url_options['language'] = $options['language'];
+    $language_code = $options['language']->language;
+  }
+  else {
+    $language_code = NULL;
+  }
+
+  $sanitize = !empty($options['sanitize']);
+
+  // URL tokens.
+  if ($type == 'url' && !empty($data['path'])) {
+    $path = $data['path'];
+
+    if (isset($data['options'])) {
+      // Merge in the URL options if available.
+      $url_options = $data['options'] + $url_options;
+    }
+
+    foreach ($tokens as $name => $original) {
+      switch ($name) {
+        case 'shorten':
+          // @FIXME
+          // url() expects a route name or an external URI.
+          $value = Url::fromUri('internal:/' . $path, $url_options)->toString();
+
+          $replacements[$original] = shorten_url($value);
+          break;
+      }
+    }
+  }
+
+  return $replacements;
+}
