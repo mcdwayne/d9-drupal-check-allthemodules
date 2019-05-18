@@ -1,0 +1,586 @@
+<?php
+
+  /**
+   * @file
+   * This module is an add-on to FAQ module, allows users to 'ask question'.
+   *
+   * Permission to create questions, will be queued for an 'expert' to answer.
+   */
+
+use Drupal\Component\Render\FormattableMarkup;
+use Drupal\Component\Utility\Html;
+use Drupal\Component\Utility\SafeMarkup;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Url;
+use Drupal\faq_ask\Utility;
+use Drupal\node\NodeInterface;
+use Symfony\Component\HttpFoundation\RedirectResponse;
+
+/**
+ * Implements hook_help().
+ */
+function faq_ask_help($route_name, RouteMatchInterface $route_match) {
+  $output = '';
+  switch ($route_name) {
+    case 'help.page.faq_ask':
+      $output .= '<p>' . t("This module is an add-on to the FAQ module that allows users with the 'ask question' permission to create a question which will be queued for an 'expert' to answer.") . '</p>' .
+        '<p>' . t("The module shows an abbreviated version of the FAQ form without an answer field. The node is created without the 'published' attribute. There is a block that will show the unanswered questions to the 'expert' (generally, this requires a separate role).") . '</p>' .
+        '<p>' . t("Viewing of the completed question and answer pair is done by the FAQ module.") . '</p>' .
+        '<p>' . t("Simply adding the 'FAQ' content type to a vocabulary will not make it eligible for experts; you must go to the settings page and add it there.") . '</p>';
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * This is how we build the "ask question" form.
+ *
+ * @TODO: Make sure this is called after the taxonomy is added, so that we may delete or modify the taxonomy part of the form if we want to.
+ */
+function faq_ask_form_node_faq_form_alter(&$form, FormStateInterface $form_state) {
+
+  $user = \Drupal::currentUser();
+
+  // Issue #1280446 by deck7uk.
+  // If this form is reached, user can ask question but should not answer.
+  if ($user->hasPermission('ask question') && !$user->hasPermission('answer question')) {
+    // Make sure the ask query is set.
+    $_GET['ask'] = 1;
+  }
+
+  if (!isset($_GET['ask']) || ($_GET['ask'] != 1 && $_GET['ask'] != 'TRUE')) {
+    // Do not modify form if ask query is not set.
+    return;
+  }
+
+  $language = \Drupal::languageManager()->getCurrentLanguage()->getId();
+
+  if (!$user->hasPermission('view own unpublished content') || ($user->id() == 0)) {
+    $form_state->setRedirect('faq-page');
+  }
+  $form['#title'] = t('Ask a Question');
+
+  // Set the published field off and make sure they can't override it.
+  $form['options']['status']['#default_value'] = FALSE;
+  $form['options']['status']['#disabled'] = TRUE;
+
+  $faq_ask_settings = \Drupal::config('faq_ask.settings');
+
+  // Add default text to body field.
+  $form['body']['#default_value'] = $faq_ask_settings->get('unanswered');
+
+  // Hide the body elements (we'll dummy one later) and the menu elements.
+  hide($form['body']);
+  hide($form['menu']);
+  hide($form['options']);
+  hide($form['upload']);
+  $form['additional_settings']['#access'] = FALSE;
+  $form['upload']['#access'] = FALSE;
+
+  // Check if only experts can categorize the question.
+  if ($faq_ask_settings->get('categorize')) {
+    // Hide all taxonomy fields.
+    $fields = \Drupal::entityManager()->getFieldDefinitions('node', 'faq');
+    foreach ($fields as $name => $properties) {
+      if (!empty($properties->getTargetBundle())) {
+        $fieldSettings = $properties->getSettings();
+        if (array_key_exists('handler', $fieldSettings)) {
+          if ($fieldSettings['handler'] == 'default:taxonomy_term' && isset($form[$name])) {
+            // Hide form if it is a taxonomy field.
+            hide($form[$name]);
+            // If hidden, then do not expect it to be required.
+            $form[$name][$language]['#required'] = FALSE;
+          }
+        }
+      }
+    }
+  }
+
+  // If we're supposed to notify asker on answer, add form item for this.
+  if ($faq_ask_settings->get('notify_asker')) {
+
+    // If asker is anonymous, add an optional e-mail field.
+    if ($user->id() == 0) {
+      // Form field for e-mail.
+      $form['faq_email'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Notification E-mail (optional)'),
+        '#default_value' => '',
+        '#weight' => 10,
+        '#description' => t('Write your e-mail here if you would like to be notified when the question is answered.'),
+      );
+    }
+    else {
+      // Checkbox for notification.
+      $form['notify_mail'] = array(
+        '#type' => 'checkbox',
+        '#title' => t('Notify by E-mail (optional)'),
+        '#default_value' => FALSE,
+        '#weight' => 10,
+        '#description' => t('Check this box if you would like to be notified when the question is answered.'),
+      );
+    }
+  }
+
+  // Add validation of the e-mail field.
+  if (!isset($form['#validate'])) {
+    $form['#validate'] = array();
+  }
+  $form['#validate'][] = 'faq_ask_form_validate';
+
+  // Make sure we know we came from here.
+  $form['faq_ask'] = array('#type' => 'value', '#value' => TRUE);
+  $form['actions']['submit']['#submit'][] = 'faq_ask_submit';
+
+  // Handle special cases if this is a block form.
+  if (isset($_GET['block'])) {
+    if ($_GET['block']) {
+      // Shorter description on Qestion field + move it higher.
+      $form['title']['#description'] = t('Question to be answered.');
+      $form['title']['#weight'] = '-5';
+      // Make sure it is not set to 60 as default.
+      $form['title']['#size'] = '';
+      // Shorter description on detailed question field.
+      $form['detailed_question']['#description'] = t('Longer question text.');
+      // Make sure it is not set to 60 as default.
+      $form['detailed_question']['#size'] = '';
+      // Make sure the category field does not expand too wide.
+      $fields = \Drupal::entityManager()->getFieldDefinitions('node', 'faq');
+      foreach ($fields as $name => $properties) {
+        if ($properties['display']['default']['module'] != 'taxonomy' && isset($form[$name]) && $properties['field_name'] == 'field_tags') {
+          $form[$name][$form[$name]['#language']]['#cols'] = '';
+          $form[$name][$form[$name]['#language']]['#size'] = '';
+        }
+      }
+      // Email field.
+      if (isset($form['faq_email'])) {
+        // Make sure it is not set to 60 as default.
+        $form['faq_email']['#size'] = '';
+      }
+    }
+  }
+}
+
+/**
+ * Validation form for the FAQ Ask form.
+ *
+ * Verifies that the e-mail entered seems to be a valid e-mail.
+ */
+function faq_ask_form_validate($form, FormStateInterface &$form_state) {
+  $email = $form_state->getValue('faq_email');
+  if (isset($email) && 2 < strlen($email)) {
+    if (!valid_email_address($email)) {
+      $form_state->setErrorByName('email', t('That is not a valid e-mail address.'));
+    }
+  }
+}
+
+/**
+ * Implements hook_node_update().
+ *
+ * Checks if the node being updated is a question that has been answered.
+ */
+function faq_ask_node_update($node) {
+  if ($node->getType() == 'faq') {
+    $nid = $node->id();
+    $faq_ask_settings = \Drupal::config('faq_ask.settings');
+    // Update faq_ask_term_index on removing nid/tid pairs on node published.
+    if ($node->get('status')->value == 1 || !empty($node->body->value)) {
+      $delete_query = \Drupal::database()->delete('faq_ask_term_index');
+      $delete_query->condition('nid', $nid)->execute();
+    }
+
+    // Return if the asker notification should be done by cron.
+    if ($faq_ask_settings->get('notify_by_cron')) {
+      return;
+    }
+    $node_title = $node->get('title')->value;
+    // Check if the node is published and asker notified.
+    $email = Utility::faqAskGetFaqNotificationEmail($nid);
+    if ($node->get('status')->value == 1 && $email != '') {
+      // Get the asker account.
+      $account = user_load_by_mail($email);
+      $params['question'] = $node_title;
+      $params['nid'] = $nid;
+
+      // Send the e-mail to the asker. Drupal calls hook_mail() via this.
+      $mail_sent = \Drupal::service('plugin.manager.mail')->mail('faq_ask', 'notify_asker', $email, $account->getPreferredLangcode(), $params, NULL, TRUE);
+
+      // Handle sending result.
+      if ($mail_sent) {
+        \Drupal::logger('Faq_Ask')->notice("Asker notification email sent to @to for question @quest", array('@to' => $email, '@quest' => SafeMarkup::checkPlain($node_title)));
+        // If email sent, remove the notification from the queue.
+        Utility::faqAskDeleteFaqNotification($nid);
+      }
+      else {
+        \Drupal::logger('Faq_Ask')->error('Asker notification email to @to failed for the "@quest" question.', array('@to' => $email, '@quest' => SafeMarkup::checkPlain($node_title)));
+        drupal_set_message(t('Asker notification email to @to failed for the "@quest" question.', array('@to' => $email, '@quest' => SafeMarkup::checkPlain($node_title))));
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_node_insert().
+ *
+ * Handles the creation of a question node after the node is created. This
+ * ensures that the node ID is available, needed for sending e-mail
+ * notifications.
+ */
+function faq_ask_node_insert($node) {
+  $faq_ask_settings = \Drupal::config('faq_ask.settings');
+  $user = \Drupal::currentUser();
+  // Handle only faq node types.
+  if ($node->getType() == 'faq') {
+    $terms = Utility::faqAskGetTerms($node);
+    // Update the faq_ask_term_index table if node is unpublished.
+    if (empty($node->body->value) && (!$user->hasPermission('answer question') && $user->hasPermission('ask question'))) {
+      \Drupal::database()->delete('faq_ask_term_index')->condition('nid', $node->id())->execute();
+      foreach ($terms as $tid => $term) {
+        // If term is available.
+        if ($tid) {
+          \Drupal::database()->insert('faq_ask_term_index')
+            ->fields(array(
+              'nid' => intval($node->id()),
+              'tid' => $tid,
+              'sticky' => intval($node->get('sticky')->value),
+              'created' => intval($node->get('created')->value),
+            ))
+            ->execute();
+        }
+      }
+    }
+
+    // Are we notifying the expert(s).
+    if ($faq_ask_settings->get('notify')) {
+      // Use only the first term entered in the correct vocabulary.
+      $term = taxonomy_term_load(array_shift(array_keys($terms)));
+
+      // Find out who the experts are.
+      $query = \Drupal::database()->select('faq_expert', 'fe')->fields('fe', ['uid'])->condition('fe.tid', array_keys($terms), 'IN');
+      $experts = $query->execute()->fetchAllKeyed();
+
+      foreach ($experts as $expert => $expertData) {
+        $account = user_load($expert);
+        $params = array(
+          'category' => is_object($term) ? $term->id() : -1,
+          'question' => $node->get('title')->value,
+          'question_details' => $node->get('field_detailed_question')->value,
+          'nid' => $node->id(),
+          'creator' => $account->get('name')->value,
+          'account' => $account,
+        );
+
+        $mail_sent = \Drupal::service('plugin.manager.mail')->mail('faq_ask', 'notify_expert', $account->get('mail')->value, $account->getPreferredLangcode(), $params, NULL, TRUE);
+
+        if ($mail_sent) {
+          \Drupal::logger('Faq_Ask')->notice('Expert notification email sent to @to', array('@to' => $account->get('mail')->value));
+        }
+        else {
+          \Drupal::logger('Faq_Ask')->error('Expert notification email to @to failed for the "@cat" category.', array('@to' => $account->get('mail')->value, '@cat' => SafeMarkup::checkPlain($term->get('name')->value)));
+          drupal_set_message(t('Expert notification email failed for the "@cat" category.', array('@cat' => SafeMarkup::checkPlain($term->get('name')->value))));
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * This is how we build the "ask question" form.
+ *
+ * @TODO: Make sure this is called after the taxonomy is added, so that we may delete or modify the taxonomy part of the form if we want to.
+ */
+function faq_ask_form_node_faq_edit_form_alter(&$form, FormStateInterface $form_state) {
+  $node = \Drupal::routeMatch()->getParameter('node');
+  $user = \Drupal::currentUser();
+  if ($user->hasPermission('answer question')) {
+    $form['body']['widget'][0]['#required'] = TRUE;
+    $form['actions']['submit']['#submit'][] = 'faq_ask_edit_submit';
+  }
+  elseif ($user->hasPermission('ask question') && !$user->hasPermission('answer question')) {
+    if (!$node->status->value) {
+      // Hide the body elements (we'll dummy one later) and the menu elements.
+      hide($form['body']);
+      hide($form['menu']);
+      hide($form['options']);
+      hide($form['upload']);
+      $form['actions']['submit']['#submit'][] = 'faq_ask_submit';
+    }
+    elseif ($node->status->value) {
+      drupal_set_message(t('Content is published, So you can not edit.'), 'warning');
+      $response = new RedirectResponse(URL::fromUserInput('/node/' . $node->id())->toString());
+      $response->send();
+      exit();
+    }
+  }
+}
+
+/**
+ * Custom submit handler for faq node edit.
+ */
+function faq_ask_edit_submit($form, FormStateInterface $form_state) {
+  $node_id = $form_state->getValue('nid');
+  $node = node_load($node_id);
+  if (is_object($node->body) && empty($node->body->value)) {
+    $node->set("status", 1);
+    $node->save();
+  }
+}
+
+/**
+ * Handles the ask form submission.
+ */
+function faq_ask_submit($form, FormStateInterface $form_state) {
+  $user = \Drupal::currentUser();
+  if ($user->hasPermission('ask question') && !$user->hasPermission('answer question')) {
+    $node_id = $form_state->getValue('nid');
+    $node = node_load($node_id);
+    if (is_object($node)) {
+      $node->status->value = 0;
+      $node->save();
+    }
+  }
+  // Issue #1554912 by jlea9378: Access Denied for Anonymous.
+  if ((!$user->hasPermission('view own unpublished content')) || ($user->id() == 0)) {
+    // Redirect to faq-page if the user is not allowed to view content.
+    $form_state->setRedirect('faq.faq-page');
+  }
+  $faq_email = $form_state->getValue('faq_email');
+  $faq_notify = $form_state->getValue('notify_mail');
+  // Save this is the node to be created.
+  $asker_email = isset($faq_email) ? $faq_email : FALSE;
+  // Handle the notification of asker.
+  if (isset($asker_email) && $asker_email) {
+
+    // If this user is not registered as a user before - check if all asking
+    // anonymous users should be added to the newsletter list.
+    if (\Drupal::moduleHandler()->moduleExists('simplenews') && $tid = $faq_ask_settings->get('notify_asker_simplenews_tid')) {
+      // If we have selected a newsletter to add.
+      if (function_exists('simplenews_subscribe_user')) {
+        simplenews_subscribe_user($asker_email, $tid, $faq_ask_settings->get('notify_asker_simplenews_confirm'), 'FAQ-Ask');
+      }
+    }
+  }
+  elseif (isset($faq_notify) && $faq_notify) {
+    $account = user_load($user->id());
+    $asker_email = $account->get('mail')->value;
+  }
+  else {
+    drupal_set_message(t('Your question has been submitted. It will appear in the FAQ listing as soon as it has been answered.'), 'status');
+  }
+  if ($asker_email) {
+    Utility::faqAskSetFaqNotification($node->get('nid')->value, $asker_email);
+    drupal_set_message(t('Your question has been submitted. An e-mail will be sent to <i>@mail</i> when answered.', array('@mail' => $asker_email)), 'status');
+  }
+  // Handle the notification of asker.
+}
+
+/**
+ * Handle deletion of questions.
+ *
+ * Removes any pending answer notifications and
+ * term mappings for unpublished questions.
+ */
+function faq_ask_node_delete($node) {
+  if ($node->getType() == 'faq') {
+    // Remove notifications.
+    \Drupal::database()->delete('faq_ask_notify')
+      ->condition('nid', $node->id())
+      ->execute();
+
+    // Remove term/nid pairs.
+    \Drupal::database()->delete('faq_ask_term_index')
+      ->condition('nid', $node->id())
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function faq_ask_theme() {
+  return array(
+    'faq_ask_unanswered' => array(
+      'template' => 'faq-ask-unanswered',
+      'variables' => array(
+        'data' => '',
+        'term' => '',
+        'class' => '',
+        'mode' => '',
+      ),
+    ),
+    'faq_ask_unanswered_block' => array(
+      'template' => 'faq-ask-unanswered-block',
+      'variables' => array('data' => '', 'more_link' => '', 'mode' => ''),
+    ),
+  );
+}
+
+/**
+ * Create a categorized list of nodes that are not answered.
+ */
+function template_preprocess_faq_ask_unanswered(&$variables) {
+  return Utility::faqAskUnansweredBuild($variables);
+}
+
+/**
+ * Implements hook_node_access().
+ */
+function faq_ask_node_access(NodeInterface $node, $op, $account) {
+  // Ignore non-FAQ node.
+  if ($node->getType() != 'faq') {
+    return NULL;
+  }
+
+  if ($node->status->value == 1) {
+    return NULL;
+  }
+
+  if ($op == 'view') {
+    if (($node->status->value == 0) && (\Drupal::currentUser()->hasPermission('ask question'))) {
+      return NULL;
+    }
+    else {
+      return NULL;
+    }
+  }
+
+  if ($op == 'delete') {
+    if (($node->status->value == 0) && (\Drupal::currentUser()->hasPermission('ask question'))) {
+      return NULL;
+    }
+    else {
+      return NULL;
+    }
+  }
+
+  if ($op == 'create') {
+    return (\Drupal::currentUser()->hasPermission('ask question') || \Drupal::currentUser()->hasPermission('answer question'));
+  }
+
+  if ($op == 'update') {
+    if (($node->status->value == 0) && (\Drupal::currentUser()->hasPermission('ask question'))) {
+      return NULL;
+    }
+    else {
+      return (\Drupal::currentUser()->hasPermission('ask question') || \Drupal::currentUser()->hasPermission('answer question'));
+    }
+  }
+}
+
+/**
+ * Create list of unanswered questions for display in block.
+ */
+function template_preprocess_faq_ask_unanswered_block(&$variables) {
+  return Utility::faqAskUnansweredBlockBuild($variables);
+}
+
+/**
+ * Implements hook_mail().
+ *
+ * This function completes the email, allowing for placeholder substitution.
+ *
+ * @TODO: define messages & subjects on settings page, with list of tokens.
+ */
+function faq_ask_mail($key, &$message, $params) {
+  if (($key == 'notify_asker') || ($key == 'notify_expert')) {
+    $body = array();
+    // Initiate text variables.
+    $variables = array(
+      '@question' => $params['question'],
+      '@question_details' => isset($params['question_details']) ? strip_tags($params['question_details']) : '',
+      '@site-name' => \Drupal::config('system.site')->get('name'),
+    );
+
+    // Find category name.
+    if (isset($params['category']) && $params['category']) {
+      $term = '';
+      if (is_array($params['category'])) {
+        $term = taxonomy_term_load(array_shift($params['category']));
+      }
+      else {
+        $term = taxonomy_term_load($params['category']);
+      }
+      if (is_object($term)) {
+        $variables['!cat'] = $term->name;
+      }
+      else {
+        $params['category'] = -1;
+      }
+    }
+    else {
+      $params['category'] = -1;
+    }
+    // Handle user names.
+    if (!isset($variables['!username']) || $variables['!username'] == '') {
+      if (isset($params['account']) && is_object($params['account'])) {
+        $variables['!username'] = $params['account']->get('name')->value;
+      }
+      else {
+        $variables['!username'] = 'user';
+      }
+    }
+
+    switch ($key) {
+      case 'notify_expert':
+
+        $url_options = array(
+          'options' => array('absolute' => TRUE),
+          'query' => array('token' => Utility::faqAskGetToken('faq_ask/answer/' . $params['nid'])),
+        );
+
+        $variables = array_merge(
+          $variables, array(
+            '!answer_uri' => Url::fromUserInput('/faq_ask/answer/' . $params['nid'], $url_options)->toString(),
+            '!asker' => $params['creator'],
+            '!login_uri' => Url::fromUserInput('/user')->toString(),
+          )
+        );
+
+        $subject = Html::decodeEntities(new FormattableMarkup('You have a question waiting on @site-name', $variables));
+        $body[] = Html::decodeEntities(new FormattableMarkup('Dear !username,<br/><br/>', $variables));
+
+        if ($params['category'] == -1) {
+          $body[] = Html::decodeEntities(new FormattableMarkup('The following question has been posted.<br/><br/>', array()));
+        }
+        else {
+          $body[] = Html::decodeEntities(new FormattableMarkup('The following question has been posted in the "!cat" category by !asker.<br/><br/>', $variables));
+        }
+
+        $body[] = Html::decodeEntities(new FormattableMarkup('<strong><i>@question</i></strong>', $variables));
+
+        if ($variables['@question_details']) {
+          $body[] = Html::decodeEntities(new FormattableMarkup('<p><i>@question_details</i></p><br/><br/>', $variables));
+        }
+
+        $body[] = Html::decodeEntities(new FormattableMarkup('In order to answer it you will first need to <a href="!login_uri">login</a> to the site.<br/><br/>', $variables));
+        $body[] = Html::decodeEntities(new FormattableMarkup('Once logged in, you may proceed <a href="!answer_uri">directly to the question</a> to answer it.<br/><br/>', $variables));
+        $body[] = Html::decodeEntities(new FormattableMarkup('By clicking on the above question link you will be redirected to the login form if you are currently logged out.<br/><br/>', $variables));
+
+        break;
+
+      case 'notify_asker':
+        $url_options = array(
+          'absolute' => TRUE,
+        );
+
+        $variables = array_merge($variables, array(
+          '!question_uri' => Url::fromUserInput('/node/' . $params['nid'])->toString(),
+        ));
+
+        $subject = Html::decodeEntities(new FormattableMarkup('A question you asked has been answered on @site-name<br/><br/>', $variables));
+        $body[] = Html::decodeEntities(new FormattableMarkup('Dear !username,<br/><br/>', $variables));
+        $body[] = Html::decodeEntities(new FormattableMarkup('The question: "@question" you asked on @site-name has been answered.<br/><br/>', $variables));
+        $body[] = Html::decodeEntities(new FormattableMarkup('To view the answer, please visit the question you created on !question_uri.<br/><br/>', $variables));
+        $body[] = Html::decodeEntities(new FormattableMarkup('Thank you for visiting.<br/><br/>', $variables));
+        break;
+    }
+    $message['headers']['Content-Type'] = 'text/html; charset=UTF-8; format=flowed; delsp=yes';
+    $message['body'] = $body;
+    $message['subject'] = $subject;
+  }
+}
