@@ -1,0 +1,179 @@
+<?php
+
+/**
+ * @file
+ * Module file for the Better field descriptions module.
+ *
+ * The module hooks into forms and adds a better description to fields.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Component\Utility\Xss;
+use Drupal\Core\Render\Element;
+
+/**
+ * Implements hook_help().
+ */
+function better_field_descriptions_help($route_name, RouteMatchInterface $route_match) {
+  if ($route_name == 'help.page.better_field_descriptions') {
+    return t('Allows users with certain roles to add themeable descriptions to fields in forms. The module consists of two parts. One is configuring which fields in which content types that should be configured to have a better description. The other part is editing the descriptions themselves.');
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function better_field_descriptions_theme($existing, $type, $theme, $path) {
+
+  $bfd = \Drupal::config('better_field_descriptions.settings')->get('better_field_descriptions');
+
+  // Find the theme template or use default if not configured.
+  if (isset($bfd['template']) == FALSE || empty($bfd['template'])) {
+    $template_file = 'better-field-descriptions-fieldset';
+  }
+  else {
+    $template_file = $bfd['template'];
+  }
+
+  // Find the theme template URI .
+  if ($template_file == 'better-field-descriptions-fieldset') {
+    $template_uri = drupal_get_path('module', 'better_field_descriptions') . '/templates';
+  }
+  else {
+    $template_uri = $bfd['template_uri'];
+    $template_uri = str_replace('/' . $template_file . '.html.twig', '', $template_uri);
+  }
+
+  return [
+    'better_field_descriptions' => [
+      'variables' => [
+        'label' => NULL,
+        'description' => NULL,
+        'required' => NULL,
+      ],
+      'template' => $template_file,
+      'path' => $template_uri,
+    ],
+  ];
+}
+
+/**
+ * Implements hook_field_widget_form_alter().
+ *
+ * Alter field forms as defined by the BFD configuration.
+ */
+function better_field_descriptions_field_widget_form_alter(&$element, FormStateInterface $form_state, $context) {
+  // Get better descriptions.
+  $bfd = \Drupal::config('better_field_descriptions.settings')->get('better_field_descriptions');
+
+  // Get better descriptions settings.
+  $bfd_settings = \Drupal::config('better_field_descriptions.settings')->get('better_field_descriptions_settings');
+
+  // Get the entity type, bundle, and field to check against bfd configuration.
+  $field_name = $context['items']->getName();
+  $bundle = $context['items']->getEntity()->bundle();
+  $entity_type = $context['items']->getEntity()->getEntityTypeId();
+  // Verify if the better description for the field is enabled.
+  if (isset($bfd_settings[$entity_type][$bundle][$field_name]) && !empty($bfd_settings[$entity_type][$bundle][$field_name])) {
+    $data = $bfd[$entity_type][$bundle][$field_name];
+    // Stop processing if this is just defaults.
+    if (!empty($data['description']) || !empty($data['label']) || $data['position'] != 1) {
+      // In many cases we want the first child of the widget instead.
+      $use_child = FALSE;
+      if (!isset($element['#title']) || isset($element['value'])) {
+        $use_child = TRUE;
+      }
+
+      if ($use_child) {
+        $child_keys = Element::children($element, TRUE);
+        if (!empty($child_keys)) {
+          $element =& $element[current($child_keys)];
+        }
+      }
+      // The description as configured.
+      $description = $data['description'];
+      // Allow the original description to be used (only position will change).
+      if (empty($description) && !empty($element['#description'])) {
+        $description = $element['#description'];
+        unset($element['#description']);
+      }
+      // Available positions.
+      $positions = [0 => '#prefix', 1 => '#suffix', 2 => 'between'];
+      // Default label.
+      $default_label = !empty($bfd['default_label']) ? Xss::filter($bfd['default_label']) : '';
+
+      // Apply required symbol if the fields is set as required.
+      $required = (isset($element['#required']) && $element['#required']) ? TRUE : FALSE;
+
+      // Set position if configured or set default to #suffix.
+      $position = isset($data['position']) ? $positions[$data['position']] : '#suffix';
+
+      switch ($position) {
+
+        case '#suffix':
+        case '#prefix':
+
+          $label = empty($data['label'])
+            ? $default_label
+            : $data['label'];
+
+          if ($element['#type'] == 'managed_file' && $position == '#suffix') {
+            $position = '#field_suffix';
+          }
+          if ($element['#type'] == 'managed_file' && $position == '#prefix') {
+            $position = '#field_prefix';
+          }
+          break;
+
+        case 'between':
+
+          $label = (empty($data['label']) && !empty($element['#title']))
+            ? $element['#title']
+            : $data['label'];
+
+          $element['#title_display'] = 'invisible';
+          // In some elements, the title is duplicated and must also be hidden.
+          if (isset($element['#title'])) {
+            better_field_descriptions_hide_duplicate_titles($element, $element['#title']);
+          }
+          $position = '#prefix';
+          if (isset($element['#type']) && $element['#type'] == 'managed_file' && $position == '#prefix') {
+            $position = '#field_prefix';
+          }
+          break;
+      }
+      $output = [
+        '#theme' => 'better_field_descriptions',
+        '#label' => Xss::filter($label),
+        '#description' => Xss::filter($description),
+        '#required' => Xss::filter($required),
+      ];
+      $output = \Drupal::service('renderer')->render($output);
+
+      // Add description to element, appending to other markup if present.
+      if (!isset($element[$position])) {
+        $element[$position] = '';
+      }
+      $element[$position] .= $output;
+    }
+  }
+}
+
+/**
+ * Sets display of duplicate titles in children to 'invisible'.
+ *
+ * @param array &$element
+ *   The widget render array.
+ * @param string $title
+ *   The title to be hidden if present.
+ */
+function better_field_descriptions_hide_duplicate_titles(array &$element, $title) {
+  foreach (Element::children($element) as $key) {
+    if (isset($element[$key]['#title']) && $title == $element[$key]['#title']) {
+      $element[$key]['#title_display'] = 'invisible';
+      // Recurse into children of this element (some widgets triplicate).
+      better_field_descriptions_hide_duplicate_titles($element[$key], $title);
+    }
+  }
+}
