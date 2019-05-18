@@ -1,0 +1,275 @@
+<?php
+
+/**
+ * @file
+ * Main module file for Lionbridge translation provider.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\lionbridge_translation_provider\LionbridgeConnector;
+use Drupal\tmgmt\JobInterface;
+use Drupal\tmgmt\JobItemInterface;
+use Drupal\Component\Utility\SafeMarkup;
+
+/**
+ * Implements hook_theme().
+ */
+function lionbridge_translation_provider_theme($existing, $type, $theme, $path) {
+  return [
+    'lionbridge_add_project' => [
+      'variables' => [
+        'project_title' => '',
+        'service_id' => '',
+        'source_language' => '',
+        'target_languages' => [],
+        'files' => [],
+      ],
+    ],
+    'lionbridge_generate_quote' => [
+      'variables' => [
+        'currency' => '',
+        'notification_url' => '',
+        'project_id' => 0,
+      ],
+    ],
+    'lionbridge_authorize_quote' => [
+      'variables' => [
+        'quote' => [],
+        'service_id' => 0,
+        'total_translations' => 0,
+        'po_number' => 0,
+        'project' => [],
+        'source_language' => '',
+        'target_language' => '',
+      ],
+    ],
+    'lionbridge_update_content' => [
+      'variables' => [
+        'source_language' => '',
+        'target_language' => '',
+        'item_path' => '',
+        'content_corrections' => [],
+      ],
+    ],
+  ];
+}
+
+/**
+ * Submit callback to poll translations from Lionbridge.
+ */
+function _lionbridge_translation_provider_poll_submit($form, &$form_state) {
+  $job = $form_state->getFormObject()->getEntity();
+
+  // Fetch everything for this job, this updates the mapping and saves
+  // translation data so it can be reviewed if it exists.
+  $job->requestTranslation();
+
+  // Set redirect for `Poll translations` button to the same page.
+  $form_state->setRedirect('entity.tmgmt_job.canonical', ['tmgmt_job' => $job->id()]);
+  \Drupal::request()->query->remove('destination');
+}
+
+/**
+ * Submit callback to poll translations from Lionbridge.
+ */
+function _lionbridge_translation_provider_authorize_quote(array $form, FormStateInterface $form_state) {
+  $job = $form_state->getFormObject()->getEntity();
+  $translator = $job->getTranslator();
+  $api_client = new LionbridgeConnector($translator);
+  $quote = $api_client->getQuote($job->getReference());
+  $auth = $api_client->authorizeQuote($quote);
+
+  if ($quote['Status'] === LionbridgeConnector::QUOTE_STATUS_PENDING && $auth['Status'] === LionbridgeConnector::AUTH_STATUS_NOT_CREATED) {
+    drupal_set_message(t("Unable to authorize quote. Payment failed."), 'error');
+  }
+
+  // Set redirect for `Authorize quote` button to the same page.
+  $form_state->setRedirect('entity.tmgmt_job.canonical', ['tmgmt_job' => $job->id()]);
+  \Drupal::request()->query->remove('destination');
+}
+
+/**
+ * Submit callback to re-deliver translations from Lionbridge.
+ */
+function _lionbridge_translation_provider_redeliver($form, &$form_state) {
+  $job = $form_state->getFormObject()->getEntity();
+  $translator = $job->getTranslator();
+  $api_client = new LionbridgeConnector($translator);
+  $quote = $api_client->getQuote($job->getReference());
+
+  // Do not re-download if Quote's status does not equal "Complete".
+  if (isset($quote['Status']) && $quote['Status'] != LionbridgeConnector::QUOTE_STATUS_COMPLETE) {
+    $message = 'Translation revision is in progress. Please check back later for an updated status.';
+    $job->addMessage($message);
+    \Drupal::messenger()->addWarning($message);
+
+    // Set redirect for `Force re-download` button to the same page.
+    $form_state->setRedirect('entity.tmgmt_job.canonical', ['tmgmt_job' => $job->id()]);
+    \Drupal::request()->query->remove('destination');
+
+    return;
+  }
+
+  $job_items = $job->getItems();
+
+  // Process Data items within each Job item.
+  foreach ($job_items as $job_item) {
+    $data = $job_item->getData();
+
+    // Collect the Data item keys that will be used to modify Data item
+    // components.
+    $keys = _lionbridge_translation_provider_get_data_keys($data);
+
+    // Set Data item origin to 'remote' before it is sent to the
+    // addRecursiveData() method. Otherwise values pulled from the server
+    // will not be applied.
+    foreach ($keys as $key => $value) {
+      $updated_values = [
+        // Status of the data item must be changed to TRANSLATED prior to forced
+        // re-download, because some data items may still have status REVIEWED
+        // due to discrepancies in plain text field revisioning workflow.
+        '#status' => TMGMT_DATA_ITEM_STATE_TRANSLATED,
+        '#translation' => [
+          '#origin' => 'remote',
+        ],
+      ];
+      $job_item->updateData($key, $updated_values);
+    }
+  }
+
+  // Set Job state to Active in order to apply re-downloaded translations.
+  $job->setState(JobInterface::STATE_ACTIVE, 'The translation job has been re-downloaded.');
+
+  foreach ($job_items as $job_item) {
+    $job_item->setState(JobItemInterface::STATE_ACTIVE, FALSE);
+  }
+
+  // Fetch everything for this Job. Update the mapping and save
+  // translation data so it can be reviewed.
+  $job->getTranslatorPlugin()->requestTranslation($job);
+}
+
+/**
+ * This creates an operations array.
+ *
+ * Each item in the array is a single data item. Each data item is an array,
+ * potentially containing multiple fields with translated text.
+ */
+function _lionbridge_translation_provider_batch(JobInterface $job, $data) {
+  $operations = [];
+
+  foreach ($data as $tjiid => $data_items) {
+    $operations[] = [
+      '_lionbridge_translation_provider_batch_op',
+      [
+        $job,
+        $tjiid,
+        $data_items,
+      ],
+    ];
+  }
+
+  $batch = [
+    'operations' => $operations,
+    'finished' => '_lionbridge_translation_provider_batch_finished',
+  ];
+
+  return $batch;
+}
+
+/**
+ * Batch operation for _lionbridge_translation_provider_batch().
+ *
+ * This function is called for each data item.
+ */
+function _lionbridge_translation_provider_batch_op(JobInterface $job, $tjiid, $data_items, &$context) {
+  foreach ($data_items as $data_item_key => $translated) {
+    $remote_data_item_key = str_replace('__', '][', $data_item_key);
+    $job->addTranslatedData(['#text' => $translated], $tjiid . '][' . $remote_data_item_key);
+    $context['results'][] = $data_item_key . ' : ' . SafeMarkup::checkPlain($translated);
+  }
+}
+
+/**
+ * Batch 'finished' callback.
+ */
+function _lionbridge_translation_provider_batch_finished($success, $results, $operations) {
+  if ($success) {
+    // Here we could do something meaningful with the results.
+    // We just display the number of nodes we processed...
+    drupal_set_message(t('@count results processed.', ['@count' => count($results)]));
+  }
+  else {
+    // An error occurred.
+    // $operations contains the operations that remained unprocessed.
+    $error_operation = reset($operations);
+    drupal_set_message(
+      t('An error occurred while processing @operation with arguments : @args',
+        [
+          '@operation' => $error_operation[0],
+          '@args' => print_r($error_operation[0], TRUE),
+        ]
+      ),
+      'error'
+    );
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function lionbridge_translation_provider_form_tmgmt_job_edit_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // Load the job, get the translator and check the job type.
+  $job = \Drupal::routeMatch()->getParameter('tmgmt_job');
+  if ($job instanceof Drupal\tmgmt\Entity\Job) {
+    $translator = $job->getTranslator();
+    $service_type = $translator->getSetting('service_type');
+    if ($service_type == 'tm_update') {
+      $form['translator_wrapper']['checkout_info']['actions']['poll']['#value'] = t('Poll status');
+      $form['job_items_wrapper']['#access'] = FALSE;
+    }
+  }
+}
+
+/**
+ * Returns an array of Data item keys for the Job item.
+ *
+ * @param array $data
+ *   The Job Item Data array.
+ *
+ * @return array
+ *   The array of data item keys.
+ */
+function _lionbridge_translation_provider_get_data_keys($data) {
+  $keys = [];
+  foreach ($data as $field_name => $field_values) {
+    if (!empty($field_values['#translation'])) {
+      // Single value Data component key.
+      if (array_key_exists('#text_revisions', $field_values['#translation'])) {
+        $keys[$field_name] = $field_values['#translation']['#text_revisions'];
+      }
+      else {
+        $keys[$field_name] = $field_values['#translation'];
+      }
+    }
+    else {
+      // Multi-value Data component keys.
+      foreach ($field_values as $array_key => $value) {
+        if (is_array($value)) {
+          foreach ($value as $item_key => $item_value) {
+            if (is_array($item_value) && !empty($item_value['#translation'])) {
+              if (array_key_exists('#text_revisions', $item_value['#translation'])) {
+                $keys[$field_name . '][' . $array_key . '][' . $item_key] = $item_value['#translation']['#text_revisions'];
+              }
+              else {
+                $keys[$field_name . '][' . $array_key . '][' . $item_key] = $item_value['#translation'];
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return $keys;
+}
