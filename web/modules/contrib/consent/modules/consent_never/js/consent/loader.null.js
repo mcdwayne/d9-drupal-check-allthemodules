@@ -1,0 +1,4 @@
+/**
+ * @file
+ * Consent: Null loader.
+ */
