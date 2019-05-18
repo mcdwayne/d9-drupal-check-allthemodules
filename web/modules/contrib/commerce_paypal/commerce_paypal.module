@@ -1,0 +1,85 @@
+<?php
+
+/**
+ * @file
+ * Implements PayPal payment services for use with Drupal Commerce.
+ */
+
+use Drupal\commerce_paypal\Plugin\Commerce\PaymentGateway\CheckoutInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Render\Markup;
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function commerce_paypal_form_views_form_commerce_cart_form_default_alter(&$form, FormStateInterface $form_state, $form_id) {
+  /** @var \Drupal\views\ViewExecutable $view */
+  $view = reset($form_state->getBuildInfo()['args']);
+  // Only add the smart payment buttons if the cart form view has order items.
+  if (empty($view->result)) {
+    return;
+  }
+  $order_id = $view->args[0];
+  $entity_type_manager = \Drupal::entityTypeManager();
+  /** @var \Drupal\commerce_payment\PaymentGatewayStorageInterface $payment_gateway_storage */
+  $payment_gateway_storage = $entity_type_manager->getStorage('commerce_payment_gateway');
+  $order = $entity_type_manager->getStorage('commerce_order')->load($order_id);
+  // Load the payment gateways. This fires an event for filtering the
+  // available gateways, and then evaluates conditions on all remaining ones.
+  $payment_gateways = $payment_gateway_storage->loadMultipleForOrder($order);
+  // Can't proceed without any payment gateways.
+  if (empty($payment_gateways)) {
+    return;
+  }
+  foreach ($payment_gateways as $payment_gateway) {
+    if (!$payment_gateway->getPlugin() instanceof CheckoutInterface) {
+      continue;
+    }
+    $config = $payment_gateway->getPlugin()->getConfiguration();
+    if (!$config['enable_on_cart']) {
+      continue;
+    }
+    $builder = \Drupal::service('commerce_paypal.smart_payment_buttons_builder');
+    $form['paypal_smart_payment_buttons'] = $builder->build($order, $payment_gateway, FALSE);
+    break;
+  }
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter(). for commerce_checkout_flow.
+ */
+function commerce_paypal_form_commerce_checkout_flow_alter(&$form, FormStateInterface $form_state) {
+  if (isset($form['payment_information'])) {
+    /** @var \Drupal\commerce_payment\PaymentOption $payment_option */
+    foreach ($form['payment_information']['#payment_options'] as $id => $payment_option) {
+      if ($payment_option->getPaymentGatewayId() != 'paypal_checkout') {
+        continue;
+      }
+      $form['payment_information']['payment_method']['#options'][$id] = Markup::create('<img src="https://www.paypalobjects.com/webstatic/en_US/i/buttons/pp-acceptance-small.png" alt="PayPal Acceptance" style="vertical-align: middle">');
+    }
+  }
+  // Inject the Smart payment buttons on the review page.
+  if ($form['#step_id'] !== 'review') {
+    return;
+  }
+  /** @var \Drupal\commerce_order\Entity\OrderInterface $order */
+  $order = \Drupal::routeMatch()->getParameter('commerce_order');
+  if ($order->get('payment_gateway')->isEmpty() ||
+    $order->get('checkout_flow')->target_id == 'paypal_checkout') {
+    return;
+  }
+  /** @var \Drupal\commerce_payment\Entity\PaymentGatewayInterface $payment_gateway */
+  $payment_gateway = $order->payment_gateway->entity;
+  $payment_gateway_plugin = $payment_gateway->getPlugin();
+  if (!$payment_gateway_plugin instanceof CheckoutInterface) {
+    return;
+  }
+  /** @var \Drupal\commerce_paypal\SmartPaymentButtonsBuilderInterface $builder */
+  $builder = \Drupal::service('commerce_paypal.smart_payment_buttons_builder');
+  $form['paypal_smart_payment_buttons'] = $builder->build($order, $payment_gateway, TRUE);
+  $form['actions']['#access'] = FALSE;
+  // The payment_information pane on the review page is useless in our case.
+  if (isset($form['review']['payment_information'])) {
+    $form['review']['payment_information']['#access'] = FALSE;
+  }
+}
