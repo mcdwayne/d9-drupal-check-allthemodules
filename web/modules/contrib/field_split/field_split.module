@@ -1,0 +1,183 @@
+<?php
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Render\Element;
+use Drupal\Field\Entity\FieldConfig;
+
+/**
+ * @file
+ * Main file of Field Split module.
+ */
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function field_split_form_entity_view_display_edit_form_alter(&$form, FormStateInterface $form_state) {
+  $form_object = $form_state->getFormObject();
+  /** @var $view_display \Drupal\Core\Entity\Entity\EntityViewDisplay **/
+  $view_display = $form_object->getEntity();
+
+  // Only display form at default view display.
+  if ($view_display->getMode() !== 'default') {
+    return;
+  }
+
+  // Add custom submit callback to store the field split values.
+  $form['actions']['submit']['#submit'][] = 'field_split_config_form_submit';
+
+  $form['field_split'] = array(
+    '#type' => 'details',
+    '#title' => 'Split Fields',
+    '#group' => 'additional_settings',
+    '#tree' => TRUE,
+  );
+
+  $fields = \Drupal::entityManager()->getFieldDefinitions($view_display->getTargetEntityTypeId(), $view_display->getTargetBundle());
+  foreach ($fields as $field) {
+    // We can only support the splitting of bundle fields.
+    if (!$field instanceof FieldConfig){
+      continue;
+    }
+
+    $field_storage = $field->getFieldStorageDefinition();
+
+    // Field split can be only available for fields w/ more than one value.
+    if ($field_storage->getCardinality() === 1) {
+      continue;
+    }
+
+    $total_fields = $field_storage->getCardinality() != -1 ? $field_storage->getCardinality() : 50;
+    $label = $field->getLabel();
+    $field_name = $field->get('field_name');
+    $settings = $field->getThirdPartySettings('field_split');
+
+    // Build a list with available values.
+    $options = array();
+    foreach (range(2, $total_fields) as $number) {
+      $options[$number] = $number;
+    }
+
+    $form['field_split'][$field_name]['enable'] = array(
+      '#title' => t('Split %field (@machine-name)', array('%field' => $label, '@machine-name' => $field_name)),
+      '#type' => 'checkbox',
+      '#id' => 'field-split-enable-' . $field_name,
+      '#default_value' => isset($settings['enable']) ? TRUE : FALSE,
+    );
+
+    $form['field_split'][$field_name]['values'] = array(
+      '#title' => t('Amount of total fields'),
+      '#type' => 'select',
+      '#options' => $options,
+      '#default_value' => isset($settings['values']) ? $settings['values'] : NULL,
+      '#states' => array(
+        'visible' => array(
+          'input#field-split-enable-' . $field_name => array('checked' => TRUE),
+        ),
+      ),
+    );
+  }
+}
+
+/**
+ * Implements hook_form_submit().
+ */
+function field_split_config_form_submit(&$form, FormStateInterface $form_state) {
+  $form_object = $form_state->getFormObject();
+  $values = $form_state->getValue('field_split');
+
+  if (empty($values)) {
+    return;
+  }
+
+  /** @var $view_display \Drupal\Core\Entity\Entity\EntityViewDisplay **/
+  $view_display = $form_object->getEntity();
+
+  foreach($values as $field_name => $field) {
+    if ($field['enable']) {
+      // Save settings to the field configuration.
+      $field_config = FieldConfig::loadByName($view_display->getTargetEntityTypeId(), $view_display->getTargetBundle(), $field_name);
+      $field_config->setThirdPartySetting('field_split', 'enable', 1);
+      $field_config->setThirdPartySetting('field_split', 'values', $field['values']);
+      $field_config->save();
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function field_split_entity_extra_field_info() {
+  $extra = array();
+
+  // Load all fields with field_split enabled.
+  $storage = \Drupal::entityManager()->getStorage('field_config');
+  $field_ids = Drupal::entityQuery('field_config')
+    ->condition('third_party_settings.field_split.enable', 1)
+    ->execute();
+
+  $fields = $storage->loadMultiple($field_ids);
+
+  // Create the extra fields which represent the field deltas.
+  /** @var \Drupal\field\Entity\FieldConfig $field */
+  foreach ($fields as $field) {
+    $entity_type = $field->getTargetEntityTypeId();
+    $bundle = $field->getTargetBundle();
+    $field_name = $field->get('field_name');
+    $field_label = $field->get('label');
+    $settings = $field->getThirdPartySettings('field_split');
+
+    for ($i = 1; $i < $settings['values']; $i++) {
+      $extra[$entity_type][$bundle]['display'][$field_name . '_' . $i] = array(
+        'label' => $field_label . ' #' . ($i + 1),
+        'weight' => $i + 20,
+        'visible' => FALSE,
+      );
+    }
+  }
+
+  return $extra;
+}
+
+
+/**
+ * Implements hook_entity_view().
+ */
+function field_split_entity_view(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display, $view_mode, $langcode) {
+  // Load all fields assigned to the entity with field_split enabled.
+  $storage = \Drupal::entityManager()->getStorage('field_config');
+  $field_ids = Drupal::entityQuery('field_config')
+    ->condition('entity_type', $display->getTargetEntityTypeId())
+    ->condition('bundle', $display->getTargetBundle())
+    ->condition('third_party_settings.field_split.enable', 1)
+    ->execute();
+
+  $fields = $storage->loadMultiple($field_ids);
+
+  /** @var \Drupal\field\Entity\FieldConfig $field */
+  foreach ($fields as $field) {
+    $field_name = $field->get('field_name');
+    $settings = $field->getThirdPartySettings('field_split');
+
+    // Get values and limit them by the maximum configured values.
+    $value_keys = Element::children($build[$field_name]);
+    $value_keys = array_slice($value_keys, 0, $settings['values']);
+
+    // Gather all values and remove them from the original field.
+    $values = array();
+    foreach ($value_keys as $index) {
+      if ($index > 0) {
+        $values[$index] = $build[$field_name][$index];
+        unset($build[$field_name][$index]);
+      }
+    }
+
+    // Add extra fields to the build array.
+    foreach ($values as $index => $value) {
+      $extra_field_name = $field_name . '_' . $index;
+      $build[$extra_field_name] = $build[$field_name];
+      $build[$extra_field_name][0] = $value;
+    }
+  }
+}
