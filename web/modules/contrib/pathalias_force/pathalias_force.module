@@ -1,0 +1,358 @@
+<?php
+
+/**
+ * @file
+ * Module file for pathalias_force.
+ */
+
+use Drupal\Core\Entity\ContentEntityBase;
+use Drupal\Core\Entity\ContentEntityForm;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\language\Entity\ConfigurableLanguage;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\user\Entity\User;
+use Drupal\views\ViewExecutable;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_help().
+ */
+function pathalias_force_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.pathalias_force':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Path Alias Force provides functionality to create forced aliases for entities in a multilingual environment while using the language hierarchy system. This means that whenever you create a node in a specific language and you have other languages which fallback to it, this module will automatically generate aliases for every other language besides the source one.') . '</p>';
+      $output .= '<p>' . t('Forced aliases can be generated via the <a href="@link">Generate fallback URL aliases</a>.', ['@link' => Url::fromRoute('pathalias_force.form')->toString()]) . '</br>';
+      return $output;
+  }
+  return NULL;
+}
+
+/**
+ * Implements hook_path_insert().
+ */
+function pathalias_force_path_insert($path) {
+  if (!$path['forced']) {
+    pathalias_force_inserted($path);
+  }
+}
+
+/**
+ * Implements hook_entity_insert().
+ */
+function pathalias_force_entity_insert(EntityInterface $entity) {
+  $langcode = $entity->language()->getId();
+  pathalias_force_entity_changed($langcode, 'insert');
+}
+
+/**
+ * Custom function which creates fallback url aliases if needed.
+ *
+ * @param array $path
+ *   An array of path fields.
+ */
+function pathalias_force_inserted($path) {
+  static $self_call = FALSE;
+  if ($self_call) {
+    return;
+  }
+  $disabled_sources = drupal_static('path_alias_force_disabled_sources', []);
+  if (isset($disabled_sources[$path['source']])) {
+    return;
+  }
+
+  $connection = \Drupal::database();
+  $query = $connection->update('url_alias')
+    ->condition('pid', $path['pid'])
+    ->fields(['forced' => 0]);
+  $query->execute();
+
+  $fallback_languages = pathalias_force_fallback_languages_path($path['langcode']);
+  $path_alias_storage = \Drupal::service('path.alias_storage');
+  foreach ($fallback_languages as $fallback_language) {
+    $alias = $path['alias'];
+
+    $forced_path = [
+      'langcode' => $fallback_language,
+      'source' => $path['source'],
+      'forced' => 1,
+    ];
+
+    $forced_path = $path_alias_storage->load($forced_path) ?: $forced_path;
+    if (!isset($forced_path['alias']) || $forced_path['alias'] !== $alias) {
+      if (pathalias_force_ensure_unique_alias($forced_path['alias'], $forced_path['langcode'])) {
+        $self_call = TRUE;
+        $path_alias_storage->save($forced_path['source'], $alias, $fallback_language, NULL, 1);
+        $self_call = FALSE;
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_path_update().
+ */
+function pathalias_force_path_update($path) {
+  // We skip updating the forced aliases here.
+  if (!$path['forced']) {
+    pathalias_force_updated($path);
+  }
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function pathalias_force_entity_update(EntityInterface $entity) {
+  $langcode = $entity->language()->getId();
+  pathalias_force_entity_changed($langcode, 'update');
+}
+
+/**
+ * Helper function which triggers when entity is updated or inserted.
+ *
+ * Creates forced aliases which where removed in entity_presave().
+ *
+ * @param string $langcode
+ *   Entity current language.
+ *
+ * @throws \Drupal\Component\Plugin\Exception\InvalidPluginDefinitionException
+ */
+function pathalias_force_entity_changed($langcode = NULL, $operation) {
+  $path_alias_storage = \Drupal::service('path.alias_storage');
+  $disabled_sources =& drupal_static('pathalias_force_disabled_sources', []);
+  foreach ($disabled_sources as $source => $value) {
+    unset($disabled_sources[$source]);
+    $conditions = ['source' => $source, 'forced' => 0];
+
+    if ($langcode !== NULL) {
+      $conditions += ['langcode' => $langcode];
+    }
+
+    // First check if any alias for this source was created.
+    if ($path = $path_alias_storage->load($conditions)) {
+      if ($operation === 'insert') {
+        pathalias_force_inserted($path);
+      }
+      else {
+        // Now create forced aliases.
+        pathalias_force_updated($path);
+      }
+    }
+  }
+}
+
+/**
+ * Custom function which creates fallback url aliases if needed.
+ *
+ * @param array $path
+ *   An array of path fields.
+ *
+ * @throws \Drupal\Component\Plugin\Exception\InvalidPluginDefinitionException
+ */
+function pathalias_force_updated($path) {
+  static $self_call = FALSE;
+  if ($self_call) {
+    return;
+  }
+  $disabled_sources = drupal_static('path_alias_force_disabled_sources', []);
+  if (isset($disabled_sources[$path['source']])) {
+    return;
+  }
+
+  $fallback_languages = pathalias_force_fallback_languages_path($path['langcode']);
+
+  $path_alias_storage = \Drupal::service('path.alias_storage');
+  foreach ($fallback_languages as $fallback_language) {
+
+    $existing_path = $path_alias_storage->load([
+      'langcode' => $fallback_language,
+      'source' => $path['source'],
+    ]);
+
+    if (strpos($path['source'], 'taxonomy/term')) {
+      list($taxonomy, $term, $id) = explode('/', ltrim($path['source'], '/'));
+      $entity_type = $taxonomy . '_' . $term;
+    }
+    else {
+      list($entity_type, $id) = explode('/', ltrim($path['source'], '/'));
+    }
+
+    $entity_type = $entity_type === 'taxonomy' ? 'taxonomy_term' : $entity_type;
+
+    /* @var \Drupal\Core\Entity\EntityStorageInterface $entity_storage */
+    $entity_storage = \Drupal::entityTypeManager()->getStorage($entity_type);
+    /* @var \Drupal\Core\Entity\EntityInterface $entity */
+    $entity = $entity_storage->load($id);
+
+    $forced = 1;
+
+    if ($entity instanceof ContentEntityBase) {
+      if ($entity->hasTranslation($fallback_language)) {
+        $forced = 0;
+      }
+    }
+
+    $alias = $path['alias'];
+
+    $language_path = [
+      'langcode' => $fallback_language,
+      'source' => $path['source'],
+      'forced' => $forced,
+    ];
+
+    $language_path = $path_alias_storage->load($language_path) ?: $language_path;
+    if (pathalias_force_ensure_unique_alias($language_path['alias'], $language_path['langcode'])) {
+      $self_call = TRUE;
+      $path_alias_storage->save($language_path['source'], $alias, $fallback_language, $existing_path['pid'], $forced);
+      $self_call = FALSE;
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_presave().
+ */
+function pathalias_force_entity_presave(EntityInterface $entity) {
+  $entity_type = $entity->getEntityTypeId();
+  $source_base = $entity_type === 'taxonomy_term' ? '/taxonomy/term' : '/' . $entity_type;
+  $source = $source_base . '/' . $entity->id();
+  $disabled_sources =& drupal_static('pathalias_force_disabled_sources', []);
+  $disabled_sources[$source] = $source;
+}
+
+/**
+ * Helper function which deletes all the forced aliases.
+ */
+function pathalias_force_remove_forced_aliases() {
+  $path_alias_storage = \Drupal::service('path.alias_storage');
+  $conditions = [
+    'forced' => 1,
+  ];
+
+  $path_alias_storage->removeForcedAliases($conditions);
+}
+
+/**
+ * Ensures unique alias. Adds numeric suffix to it if it is not unique.
+ *
+ * @param string $alias
+ *   Path alias.
+ * @param string $langcode
+ *   Language code.
+ *
+ * @return bool
+ *   Returns TRUE if alias is unique, or if it has been made unique. FALSE
+ *   otherwise.
+ */
+function pathalias_force_ensure_unique_alias(&$alias, $langcode) {
+  $alias_original = $alias;
+  $i = 0;
+  $limit = 1000;
+  do {
+    if ($i) {
+      $alias = $alias_original . '-' . $i;
+    }
+    $connection = \Drupal::database();
+    $query = $connection->select('url_alias', 'ul')
+      ->condition('ul.alias', $alias)
+      ->condition('ul.langcode', $langcode);
+    $existing = $query->countQuery()->execute()->fetchField();
+
+    $i++;
+  }
+  while ($existing && $i < $limit);
+  return !$existing;
+}
+
+/**
+ * Helper function to identify the languages which fallback to path language.
+ *
+ * @param string $langcode
+ *   Langcode of the path.
+ *
+ * @return array
+ *   Array of languages which fallback to the langcode of the path.
+ */
+function pathalias_force_fallback_languages_path($langcode) {
+  $languages = \Drupal::languageManager()->getLanguages();
+  $fallback_languages = [];
+  foreach ($languages as $language) {
+    if ($language->getId() !== $langcode) {
+      $conf_language = ConfigurableLanguage::load($language->getId());
+      if ($conf_language->getThirdPartySetting('language_hierarchy', 'fallback_langcode', '') === $langcode) {
+        $fallback_languages[] = $language->getId();
+      }
+    }
+  }
+
+  return $fallback_languages;
+}
+
+/**
+ * Implements hook_preprocess().
+ *
+ */
+function pathalias_force_preprocess(&$variables) {
+  // Get the current content language-region.
+  $current_site_language = \Drupal::languageManager()->getCurrentLanguage();
+  if (isset($variables['elements'])) {
+    $elements = $variables['elements'];
+    if (isset($elements['#entity_type'])) {
+      if (isset($variables[$elements['#entity_type']])) {
+        /* @var \Drupal\Core\Entity\Entity $entity */
+        $entity = $variables[$elements['#entity_type']];
+        $manager = \Drupal::service('plugin.manager.alias_type');
+        $definitions = $manager->getVisibleDefinitions();
+        foreach ($definitions as $id => $definition) {
+          $definition_entity_type = str_replace('canonical_entities:', '', $id);
+          if ($definition_entity_type === $elements['#entity_type']) {
+            $url = $entity->toUrl()
+              ->setOption('language', $current_site_language);
+            $variables['url'] = $url->toString();
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function pathalias_force_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // We don't have base entity form alter, use generic.
+  if (isset($form_state->getBuildInfo()['callback_object'])) {
+    /* @var \Drupal\Core\Entity\ContentEntityForm $form_object */
+    if ($form_state->getFormObject() instanceof ContentEntityForm) {
+      $form_object = $form_state->getFormObject();
+      // Get current node language.
+      /* @var \Drupal\core\Entity\ContentEntityBase $entity */
+      $entity = $form_object->getEntity();
+      $entity_langcode = $entity->language()->getId();
+      // Get source node language.
+      /* @var  \Drupal\core\Entity\ContentEntityBase $source_entity */
+      $source_entity = $entity->getUntranslated();
+      $source_langcode = $source_entity->language()->getId();
+      if (isset($form['path'])) {
+        // Check if current node language is not same as source node language.
+        if ($entity_langcode !== $source_langcode) {
+          // Check if current entity language has fallback to source language.
+          $conf_language = ConfigurableLanguage::load($entity_langcode);
+          if ($conf_language->getThirdPartySetting('language_hierarchy', 'fallback_langcode', '') === $source_langcode) {
+            $form['path']['widget'][0]['pathauto']['#value'] = 0;
+            if (!User::load(\Drupal::currentUser()->id())
+              ->hasRole('administrator')) {
+              $form['path']['#access'] = FALSE;
+            }
+
+          }
+        }
+        else {
+          $form['path']['widget'][0]['pathauto']['#value'] = 1;
+        }
+      }
+    }
+  }
+}
