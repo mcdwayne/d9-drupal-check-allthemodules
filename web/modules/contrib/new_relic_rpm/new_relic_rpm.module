@@ -1,0 +1,163 @@
+<?php
+
+/**
+ * @file
+ * Drupal module implementing New Relic.
+ */
+
+use Drupal\new_relic_rpm\Timer;
+use Drupal\views\ViewExecutable;
+use Drupal\Core\Routing\RouteMatchInterface;
+
+/**
+ * Implements hook_cron().
+ *
+ * This is used to set cron tasks to be not tracked by RPM if so desired.
+ */
+function new_relic_rpm_cron() {
+  $cron_tracking = \Drupal::config('new_relic_rpm.settings')->get('track_cron');
+  \Drupal::service('new_relic_rpm.adapter')->setTransactionState($cron_tracking);
+}
+
+/**
+ * Implements hook_modules_installed().
+ */
+function new_relic_rpm_modules_installed($modules) {
+  // Make the Deploy call to New Relic.
+  if (!empty($modules)) {
+    new_relic_rpm_module_deploy($modules, 'install');
+  }
+}
+
+/**
+ * Implements hook_modules_uninstalled().
+ */
+function new_relic_rpm_modules_uninstalled($modules) {
+  // Make the Deploy call to New Relic.
+  if (!empty($modules)) {
+    new_relic_rpm_module_deploy($modules, 'uninstall');
+  }
+}
+
+/**
+ * Log module install/uninstall actions as a deploy call to New Relic RPM.
+ */
+function new_relic_rpm_module_deploy($modules, $action) {
+  // If the API Key and/or App name is/are not set, there is no sense in
+  // attempting to create deployments.
+  if (\Drupal::config('new_relic_rpm.settings')->get('module_deployment') &&
+      ini_get('newrelic.appname') &&
+      \Drupal::config('new_relic_rpm.settings')->get('api_key')) {
+
+    $description = t(
+      ':action: :modules',
+      [
+        ':action' => ($action == 'install') ? t('Installed')->render() : t('Uninstalled')->render(),
+        ':modules' => implode(', ', $modules),
+      ]
+    );
+
+    _new_relic_rpm_deploy('Drupal Module Install/Uninstall', $description->render(), $description->render());
+  }
+}
+
+/**
+ * Send deployments to New Relic's web API.
+ *
+ * @param string $user
+ *   (optional) User deploying changes.
+ * @param string $description
+ *   (optional) Description of the deployment.
+ * @param string $changelog
+ *   (optional) A list of changes for this deployment.
+ * @param string $revision
+ *   (optional) Revision id of the deployment.
+ */
+function _new_relic_rpm_deploy($user = NULL, $description = NULL, $changelog = NULL, $revision = NULL) {
+
+  $post_vars['deployment[application_id]'] = ini_get('newrelic.appname');
+  if (isset($user)) {
+    $post_vars['deployment[user]'] = $user;
+  }
+  if (isset($description)) {
+    $post_vars['deployment[description]'] = $description;
+  }
+  if (isset($changelog)) {
+    $post_vars['deployment[changelog]'] = $changelog;
+  }
+  if (isset($revision)) {
+    $post_vars['deployment[revision]'] = $revision;
+  }
+  $deployments = new_relic_rpm_curl('https://rpm.newrelic.com/deployments.xml', $post_vars);
+
+  \Drupal::logger('new_relic_rpm')->notice('Module install/uninstall action logged as deployment. Log data: %details', ['%details' => $deployments]);
+}
+
+/**
+ * Implements hook_views_pre_build().
+ */
+function new_relic_rpm_views_pre_build(ViewExecutable $view) {
+  if (\Drupal::config('new_relic_rpm.settings')->get('views_log_slow')) {
+    Timer::start('new_relic_rpm:' . $view->id() . ':' . $view->current_display);
+  }
+}
+
+/**
+ * Implements hook_views_post_render().
+ */
+function new_relic_rpm_views_post_render(ViewExecutable $view) {
+  if (\Drupal::config('new_relic_rpm.settings')->get('views_log_slow')) {
+    $execution_time = Timer::stop('new_relic_rpm:' . $view->id() . ':' . $view->current_display);
+    if ($execution_time > \Drupal::config('new_relic_rpm.settings')->get('views_log_threshold')) {
+      \Drupal::service('new_relic_rpm.adapter')->recordCustomEvent('SlowView', [
+        'views_id' => $view->id(),
+        'display_id' => $view->current_display,
+        'execution_time' => $execution_time,
+      ]);
+    }
+  }
+}
+
+/**
+ * This is the generic cURL function all New Relic Web API calls go through.
+ */
+function new_relic_rpm_curl($url, $post = []) {
+
+  $api_key = \Drupal::config('new_relic_rpm.settings')->get('api_key');
+
+  // Set the header with the API key.
+  $headers[] = "x-api-key: {$api_key}";
+
+  // Set up the cURL request.
+  $ch = curl_init();
+  curl_setopt($ch, CURLOPT_URL, $url);
+  curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, TRUE);
+  curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, FALSE);
+  if (!empty($post)) {
+    curl_setopt($ch, CURLOPT_POST, TRUE);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $post);
+  }
+  curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+  $return_data = curl_exec($ch);
+
+  if (stristr($return_data, 'Access denied')) {
+    return FALSE;
+  }
+
+  return $return_data;
+}
+
+/**
+ * Implements hook_help().
+ */
+function new_relic_rpm_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.new_relic_rpm':
+      return t("<p>This module's purpose is to enhance New Relic RPM's integration with Drupal and bring visibility of your website's performance into Drupal. It also allows you to perform some tasks pertaining to New Relic's monitoring of your site from within the Drupal website.</p>
+      <p>See the <a href=\":project_page\">project page on Drupal.org</a> for more details.</p>",
+        [
+          ':project_page' => 'https://www.drupal.org/project/new_relic_rpm',
+        ]);
+  }
+}
