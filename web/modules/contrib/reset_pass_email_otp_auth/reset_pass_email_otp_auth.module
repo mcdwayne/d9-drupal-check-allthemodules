@@ -1,0 +1,229 @@
+<?php
+
+/**
+ * @file
+ * Reset Email OTP integration.
+ */
+
+/**
+ * @file
+ * Use for common customization.
+ */
+
+use Drupal\Component\Utility\Html;
+use Drupal\Core\Database\Database;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\user\Entity\User;
+use Symfony\Component\HttpFoundation\RedirectResponse;
+
+/**
+ * Implements hook_field_widget_WIDGET_TYPE_form_alter().
+ */
+function reset_pass_email_otp_auth_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  switch ($form_id) {
+    case 'user_pass':
+      // Reorder the validation.
+      $user_pass_form_validate = 'reset_pass_email_otp_auth_form_user_pass_validate';
+      array_splice($form['#validate'], 3, 0, $user_pass_form_validate);
+      break;
+
+    case 'user_pass_reset':
+      $current_path = \Drupal::service('path.current')->getPath();
+      $uid = explode('/', $current_path);
+      $uid = end($uid);
+      $account = User::load($uid);
+      if (!is_null($account) && isset($account) && !empty($account->get('login')->value)) {
+        $form['message'] = ['#markup' => t('<p>This is a one-time login for user and will expire after 24 hours.</p><p>Click on verify OTP to reset your password.</p>')];
+        if (!empty($account->get('login')->value)) {
+          unset($form['actions']['submit']);
+        }
+      }
+      break;
+
+    case 'user_form':
+      // Redirect after cross wrong attempt.
+      $uid = \Drupal::currentUser()->id();
+      // Get database connection to get has detail.
+      if (Database::getConnection()
+        ->schema()
+        ->tableExists('reset_pass_email_otp_auth_track')) {
+        $query = Database::getConnection()
+          ->delete('reset_pass_email_otp_auth_track');
+        $query->condition('uid', $uid);
+        $query->execute();
+      }
+      break;
+
+    default;
+  }
+}
+
+/**
+ * Check if current password failed.
+ *
+ * @param mixed $form
+ *   Form definition for the user profile form.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   Form state of the user profile form.
+ */
+function reset_pass_email_otp_auth_form_user_pass_validate(&$form, FormStateInterface &$form_state) {
+  $account = $form_state->getValue('account');
+  if (!is_null($account) && $account->get('status')->value == '1') {
+    // Get OTP length config.
+    $otp = get_otp_for_reset(\Drupal::config('reset_pass_email_otp_auth.settings')
+      ->get('reset_pass_email_otp_auth_length'));
+    // Generate OTP and save in DB for every reset override old one.
+    send_user_reset_otp_with_email($account->id(), $otp, 'reset-auth');
+    // Send mail with OTP.
+    reset_email_otp_email_send($account->get('mail')->value, $otp, 'reset-otp-email');
+  }
+}
+
+/**
+ * Save sent OTP on db.
+ *
+ * @param int $uid
+ *   User uid.
+ * @param int $otp
+ *   Random OTP.
+ * @param string $status
+ *   User status.
+ *
+ * @return array
+ *   Form element return
+ */
+function send_user_reset_otp_with_email($uid, $otp, $status) {
+  $con = Database::getConnection();
+  $query = $con->merge('reset_pass_email_otp_auth_track')
+    ->key(['uid' => $uid])
+    ->insertFields([
+      'uid' => $uid,
+      'OTP' => $otp,
+      'count' => 0,
+      'hash' => '##',
+      'status' => $status,
+      'time' => time(),
+    ])
+    ->updateFields([
+      'time' => time(),
+      'OTP' => $otp,
+      'uid' => $uid,
+      'count' => 0,
+      'time' => time(),
+      'status' => $status,
+    ]);
+  $return_value = $query->execute();
+
+  return $return_value;
+}
+
+/**
+ * Get reset OTP.
+ *
+ * @param string $length
+ *   String limit OTP.
+ *
+ * @return string
+ *   OTP return.
+ */
+function get_otp_for_reset($length) {
+  $token = "";
+  $codeAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  $codeAlphabet .= "abcdefghijklmnopqrstuvwxyz";
+  $codeAlphabet .= "0123456789";
+  $codeAlphabet .= "!@#$%^&";
+  $max = strlen($codeAlphabet);
+
+  for ($i = 0; $i < $length; $i++) {
+    $token .= $codeAlphabet[random_int(0, $max - 1)];
+  }
+
+  return $token;
+}
+
+/**
+ * Send mail after account block.
+ *
+ * @param int $key
+ *   Message key.
+ * @param string $message
+ *   Message.
+ * @param array $params
+ *   List of parameters.
+ */
+function reset_pass_email_otp_auth_mail($key, &$message, array $params) {
+  switch ($key) {
+    case 'reset-otp-email':
+      $message['headers']['Content-Type'] = 'text/html; charset=UTF-8; format=flowed; delsp=yes';
+      $message['from'] = \Drupal::config('system.site')->get('mail');
+      $message['subject'] = \Drupal::config('reset_pass_email_otp_auth.settings')
+        ->get('reset_pass_email_otp_auth_mail_subject');
+      $message['body'][] = Html::escape($params['message']);
+      break;
+  }
+}
+
+/**
+ * Send mail callback.
+ */
+function reset_email_otp_email_send($mail, $otp, $key_mail) {
+  $mailManager = \Drupal::service('plugin.manager.mail');
+  $module = 'reset_pass_email_otp_auth';
+  switch ($key_mail) {
+    case 'reset-otp-email':
+      // Get Admin email id.
+      $params['message'] = str_replace('[OTP]', $otp, \Drupal::config('reset_pass_email_otp_auth.settings')
+        ->get('reset_pass_email_otp_auth_mail_body'));
+      $langcode = \Drupal::currentUser()->getPreferredLangcode();
+      $send = TRUE;
+      // Send mail to all user.
+      $to = $mail;
+      if (!empty($to)) {
+        $result = $mailManager->mail($module, $key_mail, $to, $langcode, $params, NULL, $send);
+      }
+      if ($result['result'] != TRUE) {
+        $message = t('There was a problem sending your email notification to @email.', ['@email' => 'users']);
+        drupal_set_message($message, 'error');
+        \Drupal::logger('mail-log')->error($message);
+
+        return;
+      }
+      break;
+
+    default;
+  }
+  $message = t('An email notification has been sent to @email', ['@email' => 'users']);
+  \Drupal::logger('mail-log')->notice($message);
+}
+
+/**
+ * Implements mail alter .
+ *
+ * @method hook_mail_alter
+ *
+ * @$params
+ * @$message all information of mail
+ */
+function reset_pass_email_otp_auth_mail_alter(&$message) {
+  if ($message['id'] == 'user_password_reset' || $message['id'] == 'reset_temp_password_email') {
+    if (!is_null($message['params']['account']->get('uid')->getValue())) {
+      preg_match_all('#\bhttps?://[^,\s()<>]+(?:\([\w\d]+\)|([^,[:punct:]\s]|/))#', $message['body'][0], $match);
+      $all_matches = $match[0];
+      $reset_token = explode('/', $all_matches[0]);
+      $hash = end($reset_token);
+      $timestamp = REQUEST_TIME;
+      $uid = $message['params']['account']->get('uid')
+        ->getValue()[0]['value'];
+      $con = Database::getConnection();
+      $query = $con->merge('reset_pass_email_otp_auth_track')
+        ->key(['uid' => $uid])
+        ->updateFields([
+          'uid' => $uid,
+          'count' => 0,
+          'hash' => $hash,
+          'time' => $timestamp,
+        ]);
+      $query->execute();
+    }
+  }
+}
