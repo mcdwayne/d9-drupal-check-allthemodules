@@ -1,0 +1,356 @@
+<?php
+
+/**
+ * @file
+ * Contains erf_commerce.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\field\Entity\FieldConfig;
+use Drupal\field\Entity\FieldStorageConfig;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\commerce_product\Entity\ProductInterface;
+use Drupal\views\Form\ViewsForm;
+use Drupal\Core\Url;
+use Drupal\erf\Entity\RegistrationType;
+
+/**
+ * Implements hook_help().
+ */
+function erf_commerce_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the erf_commerce module.
+    case 'help.page.erf_commerce':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Integrates Commerce products with Entity Registration Form.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_entity_base_field_info().
+ */
+function erf_commerce_entity_base_field_info(EntityTypeInterface $entity_type) {
+  // Add a new base field to the registration entity for connecting
+  // registrations to commerce order items (i.e. product variations in a cart).
+  if ($entity_type->id() === 'registration') {
+    $fields['commerce_order_item_id'] = BaseFieldDefinition::create('entity_reference')
+      ->setLabel(t('Commerce Order Item ID'))
+      ->setSetting('target_type', 'commerce_order_item')
+      ->setSetting('handler', 'default')
+      ->setDefaultValue(NULL);
+    return $fields;
+  }
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ *
+ * Adds settings to registration type add and edit forms for:
+ * - Redirecting new and updated registrations to the cart.
+ * - Attaching the `product_variations` field for commerce integration.
+ */
+function erf_commerce_form_registration_type_form_alter(&$form, FormStateInterface $form_state) {
+  /** @var \Drupal\Core\Config\Entity\ConfigEntityBundleBase $registration_type */
+  $registration_type = $form_state->getFormObject()->getEntity();
+
+  $form['erf_commerce']['cart_redirect'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Redirect to cart after saving'),
+    '#weight' => 1,
+  ];
+
+  if ($form_state->getBuildInfo()['form_id'] === 'registration_type_add_form') {
+    // Add a non-stored field to see if the product_variations field should be
+    // attached to this registration type.
+    $form['erf_commerce']['attach_product_variation_field'] = [
+      '#type' => 'checkbox',
+      '#title' => t('Attach Product Variation Field'),
+      '#description' => t('This allows integration with Commerce by linking a product variation to a registration.'),
+    ];
+
+    $form['actions']['submit']['#submit'][] = 'erf_commerce_form_registration_type_add_submit';
+
+    // For new registration types, the redirect setting field should only be
+    // available when commerce integration is enabled, which is defined by
+    // having the `product_variation` field added to the registration type.
+    $form['erf_commerce']['cart_redirect']['#states'] = [
+      'visible' => [
+        ':input[name="attach_product_variation_field"]' => ['checked' => TRUE]
+      ],
+    ];
+  }
+  // For existing registration types, this field should only be available if the
+  // registration type has the `product_variation` field.
+  elseif ($form_state->getBuildInfo()['form_id'] === 'registration_type_edit_form') {
+    $entity_field_manager = \Drupal::service('entity_field.manager');
+    $registration_type_fields = $entity_field_manager->getFieldDefinitions($registration_type->getEntityType()->get('bundle_of'), $registration_type->id());
+
+    $third_party_settings = $registration_type->getThirdPartySettings('erf_commerce');
+
+    $form['erf_commerce']['cart_redirect']['#default_value'] = isset($third_party_settings['cart_redirect']) ? $third_party_settings['cart_redirect'] : FALSE;
+
+    if (array_key_exists('product_variation', $registration_type_fields) === FALSE) {
+      $form['erf_commerce']['cart_redirect']['#disabled'] = TRUE;
+    }
+  }
+
+  $form['#entity_builders'][] = 'erf_commerce_redirect_add_form_builder';
+}
+
+/**
+ * Additional submit handler for the `registration_type_add_form` form.
+ *
+ * @see node_add_body_field() and commerce_product_add_variations_field().
+ */
+function erf_commerce_form_registration_type_add_submit(array &$form, FormStateInterface $form_state) {
+  if (!$form_state->getValue('attach_product_variation_field')) {
+    return;
+  }
+
+  $registration_type = $form_state->getFormObject()->getEntity();
+  $field_storage = FieldStorageConfig::loadByName('registration', 'product_variation');
+  $field = FieldConfig::loadByName('registration', $registration_type->id(), 'product_variation');
+
+  if (empty($field)) {
+    $field = FieldConfig::create([
+      'field_storage' => $field_storage,
+      'bundle' => $registration_type->id(),
+      'label' => 'Variation',
+      'required' => TRUE,
+      'settings' => [
+        'handler' => 'erf_commerce_variation',
+        'handler_settings' => []
+      ],
+    ]);
+    $field->save();
+
+    // Assign widget settings for the 'default' form mode.
+    // @todo Replace with \Drupal::service('entity_display.repository')->getFormDisplay() when it's ready.
+    entity_get_form_display('registration', $registration_type->id(), 'default')
+      ->setComponent('product_variation', [
+        'type' => 'rendered_variations',
+        'weight' => 0,
+      ])
+      ->save();
+
+    // Assign widget settings for the 'embedded' form mode. This form mode will
+    // have been created in erf_entity_bundle_create or
+    // RegistrationTypeForm::addParticipantsField().
+    $form_mode_embedded = entity_get_form_display('registration', $registration_type->id(), 'embedded');
+
+    if ($form_mode_embedded) {
+      $form_mode_embedded
+      ->setComponent('product_variation', [
+        'type' => 'rendered_variations',
+        'weight' => 0,
+      ])
+      ->save();
+    }
+
+  }
+
+  return $field;
+}
+
+/**
+ * Get a new or existing cart for the user associated with a registration.
+ */
+function erf_commerce_get_cart_for_registration(EntityInterface $registration) {
+  // Load services.
+  $commerce_cart_provider = \Drupal::service('commerce_cart.cart_provider');
+  $store = \Drupal::service('commerce_store.current_store')->getStore();
+  $entity_type_manager = \Drupal::service('entity_type.manager');
+
+  // Get the order type for the product variation that is part of this
+  // registration.
+  $order_item_type = $registration->product_variation->entity->getOrderItemTypeId();
+  $order_type = $entity_type_manager->getStorage('commerce_order_item_type')->load($order_item_type)->get('orderType');
+
+  // Get or create a cart for the registration user.
+  $cart = $commerce_cart_provider->getCart($order_type, $store, $registration->user_id->entity);
+  if (empty($cart)) {
+    $cart = $commerce_cart_provider->createCart($order_type, $store, $registration->user_id->entity);
+  }
+
+  return $cart;
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ *
+ * Add an item to a cart when a registration is created, as long as that
+ * registration:
+ *
+ * - has a `product_variation` field
+ * - is attached to a commerce product
+ */
+function erf_commerce_registration_insert(EntityInterface $registration) {
+  if (!$registration->hasField('product_variation')) {
+    return;
+  }
+
+  if (!$registration->getSourceEntity() instanceof ProductInterface) {
+    return;
+  }
+
+  $entity_type_manager = \Drupal::service('entity_type.manager');
+  $cart = erf_commerce_get_cart_for_registration($registration);
+  $commerce_cart_manager = \Drupal::service('commerce_cart.cart_manager');
+
+  // Get a count of the participants being registered, which will determine
+  // the count of items in the cart.
+  $quantity = $registration->participants->count();
+
+  // Add the selected variation to the cart. The cart manager will create a user
+  // notification.
+  $variation = $registration->product_variation->entity;
+  $order_item = $commerce_cart_manager->addEntity($cart, $variation, $quantity);
+
+  // Link the order item as a reference on the newly created registration.
+  $registration->commerce_order_item_id = $order_item->id();
+  $registration->save();
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update().
+ *
+ * Update order items if there are changes to a registration in a cart.
+ */
+function erf_commerce_registration_update(EntityInterface $registration) {
+  if ($registration->commerce_order_item_id->isEmpty()) {
+    return;
+  }
+  $order_item = $registration->commerce_order_item_id->entity;
+  $order_item_changed = FALSE;
+
+  // Check to see if the variation has changed.
+  if ($registration->hasField('product_variation')) {
+    if ($registration->product_variation->entity->id() !== $registration->original->product_variation->entity->id()) {
+      // The variation selection has changed. Adjust the order item. Note that
+      // the call to `updateOrderItem()` below will automatically trigger a
+      // change the order_item title.
+      $order_item->set('purchased_entity', $registration->product_variation->entity->id());
+      $order_item_changed = TRUE;
+    }
+  }
+
+  // Check to see if the number of participants has changed.
+  if ($registration->participants->count() !== $registration->original->participants->count()) {
+    // Change the order item quantity. Note that the call to `updateOrderItem()`
+    // below will automatically trigger a recalculation of the total price.
+    $order_item->set('quantity', $registration->participants->count());
+    $order_item_changed = TRUE;
+  }
+
+  // Only save the order item if there are modifications.
+  if ($order_item_changed) {
+    $cart = erf_commerce_get_cart_for_registration($registration);
+    $commerce_cart_manager = \Drupal::service('commerce_cart.cart_manager');
+    $commerce_cart_manager->updateOrderItem($cart, $order_item);
+
+    drupal_set_message(t('<a href=":url">Your cart</a> has been updated.', [
+      ':url' => Url::fromRoute('commerce_cart.page')->toString(),
+    ]));
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ *
+ * Remove any registrations linked to deleted order items.
+ */
+function erf_commerce_commerce_order_item_delete(EntityInterface $order_item) {
+  $registration = \Drupal::entityTypeManager()->getStorage('registration')->loadByProperties([
+    'commerce_order_item_id' => $order_item->id(),
+  ]);
+
+  if ($registration) {
+    $registration = reset($registration);
+    $registration->delete();
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * - Alter the cart form to make the quantity field read-only for order items
+ *   that are attached to a registration.
+ */
+function erf_commerce_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  if ($form_state->getFormObject() instanceof ViewsForm) {
+    $view = reset($form_state->getBuildInfo()['args']);
+
+    if ($view->storage->get('tag') === 'commerce_cart_form' && isset($form['edit_quantity'])) {
+      foreach ($view->result as $row_index => $row) {
+        // See https://api.drupal.org/api/drupal/core%21modules%21views%21src%21ResultRow.php/class/ResultRow/8.6.x
+        $order_item = $row->_relationship_entities['order_items'];
+
+        // See if this order item is attached to a registration.
+        $registration = \Drupal::entityTypeManager()->getStorage('registration')->loadByProperties([
+          'commerce_order_item_id' => $order_item->id(),
+        ]);
+
+        // If so, disable the quantity field.
+        if ($registration) {
+          // Transform this form element, which is normally a 'number' element,
+          // into an un-editable value.
+          // @todo The form element name might have a number appended, or be
+          //   absent, depending on the configuration of the commerce cart form
+          //   view.
+          // @see \Drupal\commerce_cart\Plugin\views\field\EditQuantity::viewsForm()
+          $form['edit_quantity'][$row_index]['#type'] = 'value';
+          $form['edit_quantity'][$row_index]['#markup'] = round($order_item->getQuantity(), 0);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Saves the third party setting for the cart redirect for registration types.
+ */
+function erf_commerce_redirect_add_form_builder($entity_type, RegistrationType $type, &$form, FormStateInterface $form_state) {
+  if ($form_state->hasValue('cart_redirect')) {
+    $type->setThirdPartySetting('erf_commerce', 'cart_redirect', $form_state->getValue('cart_redirect'));
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Check for third party settings on the registration type and set redirect if appropriate.
+ */
+function erf_commerce_form_entity_registration_form_alter(&$form, FormStateInterface $form_state) {
+  $form_object = $form_state->getFormObject();
+  $form_display = $form_state->get('form_display');
+
+  if (!$form_display) {
+    return;
+  }
+
+  $bundle = $form_state->get('form_display')->get('bundle');
+  $entity_type_manager = \Drupal::service('entity_type.manager');
+
+  // Load the registration_type and check the redirect setting.
+  $registration_type = \Drupal::service('entity_type.manager')->getStorage('registration_type')->load($bundle);
+
+  if ($registration_type->getThirdPartySetting('erf_commerce', 'cart_redirect')) {
+    $form['#submit'][] = 'erf_commerce_cart_redirect';
+  }
+}
+
+/**
+ * Submit function to handle the redirection to the commerce cart.
+ */
+function erf_commerce_cart_redirect($form, FormStateInterface $form_state) {
+  $route_provider = \Drupal::service('router.route_provider');
+  $cart_route = $route_provider->getRouteByName('commerce_cart.page');
+  $form_state->setRedirect($cart_route);
+}
