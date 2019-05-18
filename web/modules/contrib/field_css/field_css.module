@@ -1,0 +1,475 @@
+<?php
+/**
+ * @file
+ * This file implements the field_css field
+ */
+
+/**
+ * Implements hook_field_info().
+ *
+ */
+function field_css_field_info() {
+  return array(
+    // We name our field as the associative name of the array.
+    'field_css_field' => array(
+      'label' => t('CSS'),
+      'description' => t('Allow limited css markup'),
+      'default_widget' => 'field_css_structured_widget',
+      'default_formatter' => 'field_css_style_tag_formatter',
+    ),
+  );
+}
+
+/**
+ * Helper function to post process data and remove of white spaces, { and }.
+ *
+ * It also post converts feeform widgets fields into the structured data fields.
+ */
+function field_css_post_process($widget_type, $items) {
+  switch ($widget_type) {
+    case "field_css_freeform_widget":
+      $new_items = array();
+      foreach ($items as &$item) {
+        // do not prcess if we already have processed and have a selector
+        if(empty($item['selector'])) {
+          $new_items = array_merge($new_items, field_css_parse_freeform($item['style']));
+        }
+      }
+      //If we have new items lets replace the old ones
+      if(!empty($new_items)) {
+        $items = $new_items;
+      }
+      break;
+
+    case 'field_css_structured_widget':
+      break;
+  }
+  foreach ($items as &$item) {
+    $item['style'] = (isset($item['style']) ? trim($item['style'], "{} \t\n\r\0\x0B") : '');
+    $item['selector'] = (isset($item['selector']) ? trim($item['selector']) : '');
+  }
+  return $items;
+}
+
+/**
+ * Helper function to turn normal css in to our structured format.
+ *
+ * @TODO: Maybe we should be using something like https://github.com/sabberworm/PHP-CSS-Parser
+ */
+function field_css_parse_freeform($css) {
+  $items = array();
+  $decls = explode("}", $css);
+  foreach ($decls as $decl) {
+    if (strpos($decl, "{") !== FALSE) {
+      list($selector, $style) = explode("{", $decl);
+      if (!empty($style)) {
+        $items[] = array(
+          "selector" => trim($selector),
+          "style" => trim($style),
+        );
+      }
+    }
+  }
+  return $items;
+}
+
+/**
+ * Implements hook_field_presave().
+ */
+function field_css_field_presave($entity_type, $entity, $field, $instance, $langcode, &$items) {
+  $items = field_css_post_process($instance['widget']['type'], $items);
+  // Condense rules for storage.
+  _field_css_condense_items($items);
+}
+
+/**
+ * Implements hook_field_validate().
+ *
+ * @see field_css_field_widget_error()
+ */
+function field_css_field_validate($entity_type, $entity, $field, $instance, $langcode, $items, &$errors) {
+  // Lets test items as if they were going to be saved.
+  $w_type = $instance['widget']['type'];
+  $items = field_css_post_process($w_type, $items);
+  foreach ($items as $delta => $item) {
+    if (!empty($item['selector'])) {
+      $forbid_selector_regexs = "/(:root|\{|\})/";
+      $forbid_selector_text = t("':root', '{' and '}'");
+      if (preg_match($forbid_selector_regexs, $item['selector'])) {
+        // Always error on delta 0 if using field_css_freeform_widget.
+        if ($w_type == "field_css_freeform_widget") {
+          $delta = 0;
+        }
+        $errors[$field['field_name']][$langcode][$delta][] = array(
+          'error' => 'Selector not valid',
+          'message' => t('Selector contains a forbidden entry. Forbidden entries are @entries.', array(
+            "@entries" => $forbid_selector_text,
+          )),
+        );
+      }
+    }
+    if (!empty($item['style'])) {
+      $forbid_style_regexs = "/(\{|\})/";
+      $forbid_style_text = t("'{' and '}'");
+      if (preg_match($forbid_style_regexs, $item['style'])) {
+        $errors[$field['field_name']][$langcode][$delta][] = array(
+          'error' => 'Style not valid',
+          'message' => t('Style contains a forbidden entry. Forbidden entries are @entries.', array(
+            "@entries" => $forbid_style_text,
+          )),
+        );
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_field_is_empty().
+ *
+ */
+function field_css_field_is_empty($item, $field) {
+  $style = trim($item['style'], "{} \t\n\r\0\x0B");
+  return empty($style);
+}
+
+/**
+ * Implements hook_field_formatter_info().
+ *
+ * @see field_css_field_formatter_view()
+ */
+function field_css_field_formatter_info() {
+  return array(
+    // This formatter just displays the hex value in the color indicated.
+    'field_css_style_tag_formatter' => array(
+      'label' => t('Style Tag'),
+      'field types' => array('field_css_field'),
+    ),
+    'field_css_add_css_formatter' => array(
+      'label' => t('Add CSS function'),
+      'field types' => array('field_css_field'),
+    ),
+  );
+}
+
+/**
+ * Helper function to add prefixes to all of the selectors.
+ *
+ * @param string $selector
+ *   String of CSS selectors.
+ * @param string $prefix
+ *   Optional prefix to append to selectors.
+ *
+ * @return string
+ *   CSS Selectors with prefix added.
+ */
+function field_css_add_prefix($selector, $prefix = "") {
+  $selectors = explode(",", $selector);
+  $selectors = array_map(function($item) use($prefix) {
+    return $prefix . " " . trim($item);
+  }, $selectors);
+  return implode(",\n", $selectors);
+}
+
+/**
+ * Helper function to parse a set of field_css fields to usable css.
+ *
+ * @param array $items
+ *   An array of arrays taken from field_css field entry,
+ *   it has two items keyed by "selector" and "style".
+ * @param string $prefix
+ *   A string to add to the front of all selectors.
+ *
+ * @return array
+ *   CSS ready for inserting.
+ */
+function field_css_parse_fields(array $items, $prefix = "") {
+  return array_reduce($items, function($c, $i) use($prefix) {
+    return $c . field_css_parse_field($i, $prefix);
+  }, "");
+}
+
+/**
+ * Helper function to parse afield_css field to usable css.
+ *
+ * @param array $item
+ *    An array taken from field_css field entry,
+ *    it has two items keyed by "selector" and "style".
+ * @param string $prefix
+ *   A string to add to the front of all selectors.
+ *
+ * @return array
+ *   CSS ready for inserting.
+ */
+function field_css_parse_field(array $item, $prefix = "") {
+  $selector = field_css_add_prefix($item['selector'], $prefix);
+  return t("@selector { \n @style \n}\n", array(
+    "@selector" => $selector,
+    "@style" => $item['style'],
+  ));
+}
+
+/**
+ * Implements hook_field_formatter_view().
+ *
+ * @see field_css_field_formatter_info()
+ */
+function field_css_field_formatter_view($entity_type, $entity, $field, $instance, $langcode, $items, $display) {
+  // Expand stored values.
+  _field_css_expand_items($items);
+  $prefix = field_css_get_prefix($field, $entity_type, $entity);
+  $element = array();
+  $css = field_css_parse_fields($items, $prefix);
+
+  switch ($display['type']) {
+    case 'field_css_style_tag_formatter':
+      $element[0] = array(
+        '#type' => 'html_tag',
+        '#tag' => 'style',
+        '#value' => $css,
+      );
+      break;
+
+    case 'field_css_add_css_formatter':
+      drupal_add_css($css, array("type" => "inline"));
+  }
+  return $element;
+}
+
+/**
+ * Implements hook_field_widget_info().
+ *
+ * @see field_css_field_widget_form()
+ */
+function field_css_field_widget_info() {
+  return array(
+    'field_css_structured_widget' => array(
+      'label' => t('Structured'),
+      'field types' => array('field_css_field'),
+    ),
+    'field_css_freeform_widget' => array(
+      'label' => t('Free form'),
+      'field types' => array('field_css_field'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_field_widget_settings_form().
+ */
+function field_css_field_settings_form($field, $instance, $has_data) {
+  $settings = $field['settings'];
+  $form = array(
+    'prefix' => array(
+      '#type' => 'select',
+      '#title' => t('Selector Prefix'),
+      '#default_value' => isset($settings['prefix']) ? $settings['prefix'] : '',
+      '#options' => array(
+        "none" => "None",
+        "entity-item" => "EntityType-Id (e.g. node-4938)",
+        "fixed-value" => "Fixed Value",
+      ),
+      '#required' => FALSE,
+      '#description' => t('What selector should prefix all css rules.'),
+    ),
+    'prefix_value' => array(
+      '#type' => 'textfield',
+      '#title' => t('Prefix Value'),
+      '#default_value' => isset($settings['prefix_value']) ? $settings['prefix_value'] : '',
+      '#required' => FALSE,
+      '#description' => t('Proved the fixed value declaration that shall prefix all custom declarations.(Only used with Fix Value above).'),
+    ));
+  return $form;
+}
+
+/**
+ * Helper function to parse setting and generate the wiget.
+ */
+function field_css_get_prefix($field, $entity_type, $entity) {
+  $prefix = "";
+  $prefix_type = $field['settings']['prefix'];
+  switch ($prefix_type) {
+    case 'entity-item':
+      $entity_info = entity_get_info($entity_type);
+      $id = isset($entity->{$entity_info['entity keys']['id']}) ? $entity->{$entity_info['entity keys']['id']} : "###";
+      $prefix = "." . $entity_type . "-" . $id;
+      break;
+
+    case 'fixed-value';
+      $prefix = $field['settings']['prefix_value'];
+      break;
+  }
+  return $prefix;
+
+}
+
+/**
+ * Implements hook_field_widget_form().
+ */
+function field_css_field_widget_form(&$form, &$form_state, $field, $instance, $langcode, $items, $delta, $element) {
+  // Expand stored values.
+  _field_css_expand_items($items);
+
+  $value = isset($items[$delta]) ? $items[$delta] : array("selector" => "", "style" => "");
+  switch ($instance['widget']['type']) {
+
+    case 'field_css_structured_widget':
+      $element['selector'] = array(
+        '#type' => 'textfield',
+        '#title' => '',
+        '#prefix' => field_css_get_prefix($field, $element['#entity_type'], $element['#entity']),
+        '#default_value' => $value['selector'],
+        '#attributes' => array('class' => array("field-css-selector", "field-css-wrapped")),
+      );
+      $element['style'] = array(
+        '#type' => 'textarea',
+        '#title' => '',
+        '#desciption' => "",
+        '#default_value' => "{\n" . $value['style'] . "\n}",
+        '#attributes' => array('class' => array("field-css-style", "field-css-wrapped")),
+      );
+      $element['#attached']['css'] = array(
+        drupal_get_path('module', 'field_css') . '/field_css.admin.css',
+      );
+      $element['#attributes']['class'][] = "field-css-stff";
+      break;
+
+    case 'field_css_freeform_widget':
+
+      //if ($delta === 0) {
+        $element['style'] = array(
+          '#type' => 'textarea',
+          '#title' => '',
+          '#prefix' => t("All declorations will be prefixed by '@prefix'.", array(
+            "@prefix" => field_css_get_prefix($field, $element['#entity_type'], $element['#entity']),
+          )),
+          '#default_value' => field_css_parse_fields($items),
+          '#attributes' => array('class' => array("field-css-style", "field-css-wrapped")),
+        );
+     /* }
+      else {
+        $element = NULL;
+      }*/
+      break;
+  }
+  if (isset($element['style'])) {
+    field_css_attach_syntax_highlighting($form);
+  }
+
+  return $element;
+}
+
+/**
+ * Implements hook_field_widget_error().
+ *
+ * Hook_field_widget_error() lets us figure out what to do with errors
+ * we might have generated in hook_field_validate(). Generally, we'll just
+ * call form_error().
+ *
+ * @see field_css_field_validate()
+ * @see form_error()
+ */
+function field_css_field_widget_error($element, $error, $form, &$form_state) {
+  form_error($element, $error['message']);
+}
+
+/**
+ * Returns path to CodeMirror, or FALSE if not found.
+ *
+ * Thank you to http://www.drupal.org/projects/cpn.
+ */
+function field_css_codemirror() {
+  static $path;
+
+  // Only process this once per page load.
+  if (is_null($path)) {
+    if (module_exists('libraries')) {
+      $path = libraries_get_path('codemirror');
+    }
+    else {
+      $path = 'sites/all/libraries/codemirror';
+    }
+    $path = file_exists($path) && is_dir($path) ? $path : FALSE;
+  }
+
+  return $path;
+}
+
+/**
+ * Attaches syntax highlighting to a form element.
+ *
+ * Thank you to http://www.drupal.org/projects/cpn.
+ */
+function field_css_attach_syntax_highlighting(&$form) {
+  $path = field_css_codemirror();
+  if (!empty($path)) {
+    $form['#attached']['js'][$path . '/lib/codemirror.js'] = array(
+      'type' => 'file',
+      'group' => JS_LIBRARY,
+    );
+    $form['#attached']['css'][] = $path . '/lib/codemirror.css';
+    $form['#attached']['js'][] = $path . '/mode/css/css.js';
+    $form['#attached']['js'][] = drupal_get_path('module', 'field_css') . '/field_css.js';
+  }
+}
+
+/**
+ * Helper function to condense multiple CSS rules for storage.
+ *
+ * @param array &$items
+ *    Array of css items.
+ * @return array
+ *   condensed array of combined and json_encoded css rules.
+ */
+function _field_css_condense_items(&$items) {
+  // Only encode multiple rules.
+  if (!empty($items) && (count($items) > 1)) {
+    $condensed = array();
+    foreach ($items as $item) {
+      $condensed['selector'][] = $item['selector'];
+      $condensed['style'][] = $item['style'];
+    }
+    $condensed['selector'] = json_encode($condensed['selector']);
+    $condensed['style'] = json_encode($condensed['style']);
+    $items = array($condensed);
+  }
+}
+
+/**
+ * Helper function to expand CSS rules from storage.
+ *
+ * @param &$items
+ *   Condensed array of combined json_encoded css rules.
+ * @return array
+ *   Expanded array of css rules.
+ */
+function _field_css_expand_items(&$items) {
+
+  if(!empty($items)) {
+    $expanded = array();
+    foreach ($items as $item) {
+      // Check if item is json encoded.
+      if (json_decode($item['selector'])) {
+        $item['selector'] = json_decode($item['selector']);
+      }
+      else {
+        $item['selector'] = array($item['selector']);
+      }
+      // Check if item is json_encoded.
+      if (json_decode($item['style'])) {
+        $item['style'] = json_decode($item['style']);
+      }
+      else {
+        $item['style'] = array($item['style']);
+      }
+
+      foreach ($item['selector'] as $s => $selector) {
+        $expanded[] = array(
+          'selector' => $selector,
+          'style' => $item['style'][$s],
+        );
+      }
+    }
+
+    $items = $expanded;
+  }
+}
