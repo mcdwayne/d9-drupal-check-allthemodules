@@ -1,0 +1,151 @@
+<?php
+/**
+ * @file
+ * Mother May I module
+ * 
+ * Allows site administer to specify a password that must be
+ * entered before a new account can be created.
+ */
+
+use Drupal\Core\Cache\Cache;
+use Drupal\Core\Form\FormStateInterface;
+use \Drupal\Component\Utility\Xss;
+
+define('MOTHERMAYI_PATH', 'admin/config/custom/mothermayi');
+define('MOTHERMAYI_ADMINISTER_PASSWORD', 'Administer mothermayi password');
+
+
+/**
+ * Implements hook_form_user_register_form_alter().
+ */
+function mothermayi_form_user_register_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+  $myconfig = \Drupal::config('mothermayi.settings');
+    // Set cache tags so the form is updated when settings are updated.
+  $form['#cache']['tags'] = Cache::mergeTags($form['#cache']['tags'], $myconfig->getCacheTags());
+
+  $user = \Drupal::currentUser();
+
+  if (isset($user) && ($user->id() > 0)) {
+    // The point of MotherMayI is to prevent spam account creations.
+    // If this user is already logged in, the protection is kind of pointless.
+    return;
+  }
+
+
+  $fs = array();
+  $pw = $myconfig->get('mothermayi_secret_word');
+  if (!empty($pw)) {
+    // Add the "secret word" field.
+    $fs['mothermayi_password'] = array(
+      '#type' => 'textfield',
+      '#required' => TRUE,
+      '#size' => 30,
+      '#description' => t('Enter the secret word.'),
+      '#weight' => 1,
+    );
+
+    $hint = $myconfig->get('mothermayi_secret_hint');
+    if ($hint['value'] != '') {
+      $hint = check_markup($hint['value'], $hint['format'], FALSE);
+      $fs['hint'] = array(
+        '#type' => 'item',
+        '#description' => $hint,
+        '#weight' => 0,
+      );
+    }
+  }
+  $ef = $myconfig->get('mothermayi_empty');
+  if ($ef) {
+    // Add a "must be empty" field.
+    $desc = $myconfig->get('mothermayi_empty_description', '');
+    $fs['mothermayi_mty'] = array(
+      '#type' => 'textfield',
+      '#size' => 20,
+      '#description' => Xss::filterAdmin($desc),
+      '#default' => '',
+      '#weight' => 1,
+    );
+  }
+  if (!empty($fs)) {
+    $fs['#type'] = 'fieldset';
+    $fs['#title'] = t('Secret word');
+    $fs['#weight'] = $myconfig->get('mothermayi_weight', 4);
+    $form['mothermayi'] = $fs;
+    $form['#validate'][] = '_mothermayi_user_register_validate';
+  }
+}
+
+/**
+ * Validate secret word on user account request.
+ *
+ * Note that this will only be called if a secret word has been configured.
+ *
+ * @param array $form
+ *   The registration form.
+ * @param array $form_state
+ *   State of the form. In particular, values entered.
+ */
+function _mothermayi_user_register_validate(array &$form, FormStateInterface $form_state) {
+
+  $pwd = $form_state->getValue('mothermayi_password');
+  $mty = $form_state->getValue('mothermayi_mty');
+
+  if (isset($pwd) || isset($mty)) {
+    $user = $form_state->getValue('name');
+    $doreport = !$form_state->hasAnyErrors();
+    // Check the secret word.
+    if (isset($pwd) && !_mothermayi_check_secret($pwd)) {
+      if ($doreport) {
+        $form_state->setErrorByName('mothermayi_password',
+          t('The secret word is not correct.'));
+      }
+      \Drupal::logger('mothermayi')->notice('Secret word failure, user \'@user\', attempt \'@sw\'', array('@user' => $user, '@sw' => $pwd));
+    }
+    if (!empty($mty)) {
+      if ($doreport) {
+        $form_state->setErrorByName('error', t('Please read the directions!'));
+      }
+      \Drupal::logger('mothermayi')->notice('Empty field failure: user \'@user\', field \'@field\'', array('@field' => $mty, '@user' => $user));
+    }
+
+    // Don't save the secret word in the user block.
+    $form_state->addCleanValueKey('mothermayi_password');
+    $form_state->addCleanValueKey('mothermayi_mty');
+  }
+}
+
+/**
+ * Check if a user-entered secret word is correct.
+ *
+ * @param string $upw
+ *   The entered password.
+ * @param string $sw
+ *   If set, the secret word.
+ * @param int $up
+ *   If set, use this as "use preg" indication.
+ *
+ * @returns boolean
+ *   TRUE if the password is correct.
+ */
+function _mothermayi_check_secret($upw, $sw = NULL, $up = -1) {
+  $myconfig = \Drupal::config('mothermayi.settings');
+  if ($sw == NULL) {
+    $sw = $myconfig->get('mothermayi_secret_word');
+  }
+  if ($sw == '') {
+    // No secret word, so we're OK.
+    return TRUE;
+  }
+
+  // There is a secret word, so we need to check it.
+  if ($up < 0) {
+    $up = $myconfig->get('mothermayi_use_preg');
+  }
+  if ($up == 0) {
+    // Not already a preg, so turn it into one that exactly matches the word.
+    $sw = "/^$sw\$/";
+  }
+
+  // OK the user if the secret word matches the pattern.
+  return (preg_match($sw, $upw) > 0);
+}
