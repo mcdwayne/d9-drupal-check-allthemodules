@@ -1,0 +1,340 @@
+<?php
+
+/**
+ * @file
+ * Contains kalastatic.module.
+ */
+
+use Symfony\Component\Finder\Finder;
+use Symfony\Component\Yaml\Parser;
+
+/**
+ * Implements hook_library_info_build().
+ */
+function kalastatic_library_info_build() {
+  global $base_path;
+  $settings = kalastatic_get_settings('yaml');
+  $config = kalastatic_get_settings('config');
+  $build_path = $base_path . $settings['destination'];
+
+  // Some library metadata.
+  $libraries = [];
+  $libraries['css-js'] = [
+    'dependencies' => [
+      'core/jquery',
+    ],
+    'license' => [
+      'name' => 'MIT',
+      'url' => 'https://opensource.org/licenses/MIT',
+      'gpl-compatible' => TRUE,
+    ],
+  ];
+
+  // Build and array of css file paths.
+  $css = [];
+  foreach ($config['stylesheets'] as $css_path) {
+    $css[$build_path . '/' . $css_path] = [];
+  }
+
+  // Build and array of js file paths.
+  $js = [];
+  foreach ($config['scripts']['footer'] as $js_path) {
+    // Don't pull in the special files we built to handle Drupal compatibility
+    // on the Kalastatic side.
+    $disallowed = strpos($js_path, 'drupal_pre') || strpos($js_path, 'drupal_post');
+    if (!$disallowed) {
+      $js[$build_path . '/' . $js_path] = [];
+    }
+  }
+
+  // Add the css and js to the library.
+  $libraries['css-js'] += [
+    'css' => [
+      'theme' => $css,
+    ],
+    'js' => $js,
+  ];
+  return $libraries;
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function kalastatic_page_attachments(array &$attachments) {
+  // Attach library to page.
+  $attachments['#attached']['library'][] = 'kalastatic/css-js';
+
+  // Add favicon tags to head.
+  _kalastatic_favicons($attachments);
+}
+
+/**
+ * Implements hook_rebuild().
+ */
+function kalastatic_rebuild() {
+  // Warm the settings cache.
+  kalastatic_get_settings();
+}
+
+/**
+ * Return the default path to Kalastatic.
+ *
+ * The assumption is that it is inside a folder called 'kalastatic' in the
+ * current default theme. This assumption is based on convention.
+ */
+function kalastatic_path_to_src_default() {
+  $default_theme = \Drupal::config('system.theme')->get('default');
+  return drupal_get_path('theme', $default_theme) . '/kalastatic';
+}
+
+/**
+ * Return the path to the default build folder.
+ *
+ * This assumption is based on what Kalastatic does if no build path is set in
+ * kalastatic.yaml file.
+ */
+function kalastatic_path_to_build_default() {
+  return kalastatic_path_to_src_default() . '/build';
+}
+
+/**
+ * Get Kalastatic settings from cache.
+ *
+ * Alternatively, if it doesn't exist then hit kalastatic.yaml file.
+ *
+ * @param string $type
+ *   Which cache file to get.
+ *
+ * @return array
+ *   An array of info from Kalastatic from the file requested.
+ */
+function kalastatic_get_settings(string $type = '') {
+  $cid = 'kalastatic_yaml';
+  $data = NULL;
+  if ($cache = \Drupal::cache('discovery')->get($cid)) {
+    // We have cache, so use it.
+    $data = $cache->data;
+  }
+  else {
+    // We have no cache so hit the file system.
+    $yaml = kalastatic_get_kalastatic_yaml();
+    $data['yaml'] = kalastatic_adjust_path_root($yaml);
+    $data['config'] = kalastatic_get_kalastatic_config($data['yaml']);
+    \Drupal::cache('discovery')->set($cid, $data);
+  }
+  return $type ? $data[$type] : $data;
+}
+
+/**
+ * Get Kalastatic settings from kalastatic.yaml file.
+ */
+function kalastatic_get_kalastatic_config($settings = []) {
+  // Find Kalastatic's config.metadata file.
+  $settings = empty($settings) ? kalastatic_get_settings() : $settings;
+  $finder = new Finder();
+  $iterator = $finder
+    ->name('config.metadata')
+    ->in($settings['source']);
+
+  // This file is markdown with yaml front matter so we need to massage it a bit
+  // to parse the yaml.
+  $config = [];
+  foreach ($iterator as $file_path => $file) {
+    $yaml = new Parser();
+    $file_contents = file_get_contents($file_path);
+    $yaml_only = str_replace('---', '', $file_contents);
+    $config = $yaml->parse($yaml_only);
+  }
+  return $config;
+}
+
+/**
+ * Get Kalastatic settings from kalastatic.yaml file.
+ */
+function kalastatic_get_kalastatic_yaml() {
+  // Find a kalastatic.yaml file. We start by looking 1 level higher than Drupal
+  // root to handle Composer builds.
+  $finder = new Finder();
+  $iterator = $finder
+    ->name('kalastatic.yaml')
+    ->in('..');
+
+  // Hopefully there's only one.
+  $settings = [];
+  foreach ($iterator as $file_path => $file) {
+    $yaml = new Parser();
+    $settings = $yaml->parse(file_get_contents($file_path));
+  }
+
+  // Set default paths if kalastatic.yaml doesn't have them set.
+  foreach ($settings as $setting => $path) {
+    if (!isset($settings['source'])) {
+      $settings[$setting] = kalastatic_path_to_src_default();
+    }
+    if (!isset($settings['destination'])) {
+      $settings[$setting] = kalastatic_path_to_build_default();
+    }
+  }
+  return $settings;
+}
+
+/**
+ * Mangle kalastatic.yaml paths for Drupal.
+ *
+ * If we are dealing with a composer project where Drupal is nested one
+ * folder deep in the project the paths defined in kalastatic.yaml will have 1
+ * more arg than Drupal knows about so we need to remove it.
+ */
+function kalastatic_adjust_path_root($settings) {
+  // Deal with the source and destination.
+  $settings['source'] = kalastatic_drupal_root_path($settings['source']);
+  $settings['destination'] = kalastatic_drupal_root_path($settings['destination']);
+
+  // All the Twig namespaces need their paths mangled too.
+  $namespaces = &$settings['pluginOpts']['metalsmith-jstransformer']['engineOptions']['twig']['namespaces'];
+  foreach ($namespaces as &$path) {
+    $path = kalastatic_drupal_root_path($path);
+  }
+  return $settings;
+}
+
+/**
+ * Mangle a path for Drupal.
+ *
+ * If we are dealing with a composer project where Drupal is nested one
+ * folder deep in the project the paths defined in kalastatic.yaml will have 1
+ * more arg than Drupal knows about so we need to remove it.
+ */
+function kalastatic_drupal_root_path($path) {
+  $root_args = explode('/', DRUPAL_ROOT);
+  $drupal_parent = end($root_args);
+  $path_args = explode('/', $path);
+  $prefix = reset($path_args);
+  if ($prefix == $drupal_parent) {
+    // We add 1 to get rid of a preceding slash.
+    $length = strlen($prefix) + 1;
+    $new_path = substr($path, $length);
+  }
+  return $new_path;
+}
+
+/**
+ * Pull the Twig name spaces from kalastatic.yaml file.
+ */
+function kalastatic_get_namespaces() {
+  $settings = kalastatic_get_settings('yaml');
+  return $settings['pluginOpts']['metalsmith-jstransformer']['engineOptions']['twig']['namespaces'];
+}
+
+/**
+ * Implements hook_page_attachments_alter().
+ */
+function kalastatic_page_attachments_alter(array &$page) {
+  // Unset Drupals default favicon.
+  $links = $page['#attached']['html_head_link'];
+  foreach ($links as $key => $link) {
+    if ($link[0]['href'] == '/core/misc/favicon.ico') {
+      unset($page['#attached']['html_head_link'][$key]);
+    }
+  }
+}
+
+/**
+ * Add favicon tags to the head.
+ */
+function _kalastatic_favicons(array &$attachments) {
+  // Pull the brand color from saved settings.
+  $config = \Drupal::config('kalastatic.settings');
+  $brand_color = $config->get('kalastatic_brand_color');
+
+  // Get kalastatic.yaml settings so we can find the images.
+  $settings = kalastatic_get_settings();
+  $dest = '/' . $settings['destination'];
+
+  // Set up tags for the favicons.
+  $apple_touch_icon = [
+    '#type' => 'html_tag',
+    '#tag' => 'link',
+    '#attributes' => [
+      'href' => $dest . '/images/favicon/apple-touch-icon.png',
+      'rel' => 'apple-touch-icon',
+      'sizes' => '180x180',
+    ],
+  ];
+  $attachments['#attached']['html_head'][] = [$apple_touch_icon, 'apple_touch_icon'];
+
+  $favicon_32x32 = [
+    '#type' => 'html_tag',
+    '#tag' => 'link',
+    '#attributes' => [
+      'href' => $dest . '/images/favicon/favicon-32x32.png',
+      'rel' => 'icon',
+      'sizes' => '32x32',
+      'type' => 'image/png',
+    ],
+  ];
+  $attachments['#attached']['html_head'][] = [$favicon_32x32, 'favicon_32x32'];
+
+  $favicon_16x16 = [
+    '#type' => 'html_tag',
+    '#tag' => 'link',
+    '#attributes' => [
+      'href' => $dest . '/images/favicon/favicon-16x16.png',
+      'rel' => 'icon',
+      'sizes' => '16x16',
+      'type' => 'image/png',
+    ],
+  ];
+  $attachments['#attached']['html_head'][] = [$favicon_16x16, 'favicon_16x16'];
+
+  $manifest = [
+    '#type' => 'html_tag',
+    '#tag' => 'link',
+    '#attributes' => [
+      'href' => $dest . '/images/favicon/manifest.json',
+      'rel' => 'manifest',
+    ],
+  ];
+  $attachments['#attached']['html_head'][] = [$manifest, 'manifest'];
+
+  $mask_icon = [
+    '#type' => 'html_tag',
+    '#tag' => 'link',
+    '#attributes' => [
+      'href' => $dest . '/images/favicon/safari-pinned-tab.svg',
+      'rel' => 'mask-icon',
+      'color' => $brand_color,
+    ],
+  ];
+  $attachments['#attached']['html_head'][] = [$mask_icon, 'mask-icon'];
+
+  $shortcut_icon = [
+    '#type' => 'html_tag',
+    '#tag' => 'link',
+    '#attributes' => [
+      'href' => $dest . '/images/favicon/favicon.ico',
+      'rel' => 'shortcut icon',
+    ],
+  ];
+  $attachments['#attached']['html_head'][] = [$shortcut_icon, 'shortcut icon'];
+
+  $msapplication_config = [
+    '#type' => 'html_tag',
+    '#tag' => 'meta',
+    '#attributes' => [
+      'href' => $dest . '/images/favicon/browserconfig.xml',
+      'name' => 'msapplication-config',
+    ],
+  ];
+  $attachments['#attached']['html_head'][] = [$msapplication_config, 'msapplication_config'];
+
+  $theme_color = [
+    '#type' => 'html_tag',
+    '#tag' => 'meta',
+    '#attributes' => [
+      'content' => $brand_color,
+      'name' => 'theme-color',
+    ],
+  ];
+  $attachments['#attached']['html_head'][] = [$theme_color, 'theme_color'];
+}
