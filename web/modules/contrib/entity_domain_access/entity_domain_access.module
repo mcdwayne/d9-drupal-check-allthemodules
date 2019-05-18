@@ -1,0 +1,252 @@
+<?php
+
+/**
+ * @file
+ * Contains entity_domain_access.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\Entity\Query\QueryInterface;
+use Drupal\entity_domain_access\EntityDomainAccessPermissions;
+
+/**
+ * Implements hook_help().
+ */
+function entity_domain_access_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the entity_domain_access module.
+    case 'help.page.entity_domain_access':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Domain Access') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_domain_references_alter().
+ */
+function entity_domain_access_domain_references_alter(QueryInterface $query, AccountInterface $account, $context) {
+  if (\Drupal::service('entity_domain_access.mapper')->isDomainAccessEntityType($context['entity_type'])) {
+    return;
+  }
+
+  // Restrict domains by editorial assignment.
+  if ($context['field_type'] != 'editor') {
+    return;
+  }
+
+  if ($account->hasPermission(EntityDomainAccessPermissions::getPermissionId('update', $context['entity_type']))) {
+    return;
+  }
+  elseif ($account->hasPermission(EntityDomainAccessPermissions::getPermissionId('update', $context['entity_type'], NULL, 'assigned'))) {
+    if (!empty($account->get(DOMAIN_ACCESS_ALL_FIELD)->value)) {
+      return;
+    }
+    $allowed = \Drupal::service('domain_access.manager')->getAccessValues($account);
+    $query->condition('id', array_keys($allowed), 'IN');
+  }
+  else {
+    // Remove all options.
+    $query->condition('id', '-no-possible-match-');
+  }
+
+}
+
+/**
+ * Implements hook_entity_access().
+ */
+function entity_domain_access_entity_access(EntityInterface $entity, $operation, AccountInterface $account) {
+
+  if (!\Drupal::service('entity_domain_access.mapper')->isDomainAccessEntity($entity)) {
+    return AccessResult::neutral();
+  }
+
+  $options = [
+    'entity' => $entity,
+    'account' => $account,
+  ];
+
+  $access_result = entity_domain_access_check_allow_do_operation($operation, $options);
+  if (is_bool($access_result) && $access_result) {
+    return AccessResult::allowed()
+      ->cachePerPermissions()
+      ->cachePerUser()
+      ->addCacheableDependency($entity);
+  }
+
+  // No opinion.
+  return AccessResult::neutral();
+}
+
+/**
+ * Implements hook_entity_create_access().
+ */
+function entity_domain_access_entity_create_access(AccountInterface $account, array $context, $entity_bundle) {
+
+  if (!$entity_bundle) {
+    $entity_bundle = $context['entity_type_id'];
+  }
+
+  if (!\Drupal::service('entity_domain_access.mapper')->isDomainAccessEntityBundle($context['entity_type_id'], $entity_bundle)) {
+    return AccessResult::neutral();
+  }
+
+  $options = [
+    'entity_type_id' => $context['entity_type_id'],
+    'entity_bundle' => $entity_bundle,
+    'account' => $account,
+  ];
+
+  $access_result = entity_domain_access_check_allow_do_operation('create', $options);
+  if (is_bool($access_result) && $access_result) {
+    // Note the cache context here!
+    return AccessResult::allowed()->addCacheContexts(['user.permissions', 'url.site']);
+  }
+
+  // No opinion.
+  return AccessResult::neutral();
+}
+
+/**
+ * Check access to operation.
+ *
+ * @param string $operation
+ *   Operation.
+ * @param array $options
+ *   Associative array of options, where:
+ *     - entity_type_id - required, if 'entity_bundle' presents,
+ *     - entity_bundle - required, if 'entity_type_id' presents,
+ *     - account - user object to check (optional),
+ *     - entity - entity instance, will be used to override 'entity_type_id'
+ *                and 'entity_bundle'.
+ *
+ * @return null|bool
+ *   NULL if can't check permissions, otherwise bool.
+ */
+function entity_domain_access_check_allow_do_operation($operation, array $options) {
+
+  if ((empty($options['entity_type_id']) || empty($options['entity_bundle'])) && empty($options['entity'])) {
+    return NULL;
+  }
+
+  $active_domain = &drupal_static(__FUNCTION__, NULL);
+  if (empty($active_domain)) {
+    $domain_negotiator = \Drupal::service('domain.negotiator');
+
+    // Ensure that the loader has run. In some tests, the kernel event has not.
+    $active = $domain_negotiator->getActiveDomain();
+    if (empty($active)) {
+      $active = $domain_negotiator->getActiveDomain(TRUE);
+    }
+    /** @var \Drupal\domain\Entity\Domain $active_domain */
+    $active_domain = $active;
+  }
+
+  // Check to see that we have a valid active domain.
+  // Without one, we cannot assert an opinion about access.
+  if (empty($active_domain->getDomainId())) {
+    return NULL;
+  }
+
+  /** @var \Drupal\entity_domain_access\EntityDomainAccessManager $manager */
+  $manager = \Drupal::service('entity_domain_access.manager');
+
+  if (empty($options['account'])) {
+    $options['account'] = Drupal::currentUser();
+  }
+  $account = $options['account'];
+
+  if (!empty($options['entity'])) {
+    // Check access by entity.
+    $entity = $options['entity'];
+    $options['entity_bundle'] = $entity->bundle();
+    $options['entity_type_id'] = $entity->getEntityType()->id();
+    $has_access_by_domain = $manager->checkEntityAccess($entity, $account);
+  }
+  else {
+    // Check access by account.
+    // Load the full user record.
+    $user = \Drupal::entityTypeManager()->getStorage('user')->load($account->id());
+    $user_domains = \Drupal::service('domain_access.manager')->getAccessValues($user);
+    $has_access_by_domain = in_array($active_domain->getDomainId(), $user_domains);
+  }
+
+  $entity_bundle = $options['entity_bundle'];
+  $entity_type_id = $options['entity_type_id'];
+
+  $can_do_it_on_all = $account->hasPermission(EntityDomainAccessPermissions::getPermissionId($operation, $entity_type_id));
+  $can_do_it_on_entity = $account->hasPermission(EntityDomainAccessPermissions::getPermissionId($operation, $entity_type_id, NULL, 'assigned'));
+  $can_do_it_on_bundle = $account->hasPermission(EntityDomainAccessPermissions::getPermissionId($operation, $entity_type_id, $entity_bundle, 'assigned'));
+
+  return $can_do_it_on_all || (($can_do_it_on_entity || $can_do_it_on_bundle) && $has_access_by_domain);
+}
+
+/**
+ * Implements hook_entity_field_access_alter().
+ */
+function entity_domain_access_entity_field_access_alter(array &$grants, array $context) {
+  $access = AccessResult::neutral();
+  /** @var \Drupal\Core\Field\FieldDefinitionInterface $field_definition */
+  $field_definition = $context['field_definition'];
+  $target_entity_type = $field_definition->getTargetEntityTypeId();
+  if (\Drupal::service('entity_domain_access.mapper')->isDomainAccessEntityType($target_entity_type)
+    && ($field_definition->getName() == DOMAIN_ACCESS_ALL_FIELD
+      || $field_definition->getName() == DOMAIN_ACCESS_FIELD)) {
+
+    $operation = 'update';
+    switch ($field_definition->getName()) {
+      case DOMAIN_ACCESS_ALL_FIELD:
+        $access = AccessResult::forbiddenIf(!$context['account']->hasPermission(EntityDomainAccessPermissions::getPermissionId($operation, $target_entity_type)));
+        break;
+
+      case DOMAIN_ACCESS_FIELD:
+        $access = AccessResult::allowedIfHasPermissions($context['account'], [
+          EntityDomainAccessPermissions::getPermissionId($operation, $target_entity_type),
+          EntityDomainAccessPermissions::getPermissionId($operation, $target_entity_type, NULL, 'assigned'),
+        ], 'OR');
+
+        if (!$access->isAllowed()) {
+          $access = AccessResult::forbidden();
+        }
+
+        break;
+
+      default:
+    }
+    $grants['domain_access'] = $access;
+  }
+}
+
+/**
+ * Implements hook_views_data_alter().
+ */
+function entity_domain_access_views_data_alter(array &$data) {
+  $enabled_entity_types = \Drupal::service('entity_domain_access.mapper')->getEnabledEntityTypes();
+
+  foreach ($enabled_entity_types as $entity_type_id => $entity_type) {
+    $table = $entity_type_id . '__' . DOMAIN_ACCESS_FIELD;
+    $data[$table][DOMAIN_ACCESS_FIELD]['field']['id'] = 'domain_access_field';
+    $data[$table][DOMAIN_ACCESS_FIELD . '_target_id']['filter']['id'] = 'domain_access_filter';
+    $data[$table][DOMAIN_ACCESS_FIELD . '_target_id']['argument']['id'] = 'domain_access_argument';
+
+    $label = $entity_type->getLabel();
+
+    // Current domain filter.
+    $data[$table]['current_all'] = [
+      'title' => t('Current domain'),
+      'group' => $label,
+      'filter' => [
+        'field' => DOMAIN_ACCESS_FIELD . '_target_id',
+        'id' => 'entity_domain_access_current_all_filter',
+        'title' => t('Available on current domain'),
+        'help' => t('Filters out %type_name not available on current domain (published to current domain or all affiliates).', ['%type_name' => $label]),
+      ],
+    ];
+  }
+}
