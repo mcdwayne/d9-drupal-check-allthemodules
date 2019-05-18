@@ -1,0 +1,195 @@
+<?php
+
+/**
+ * @file
+ * Contains domain_menu.module..
+ */
+
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+
+if (!defined('DOMAIN_ACCESS_FIELD')) {
+  define('DOMAIN_ACCESS_FIELD', 'field_domain_access');
+}
+
+/**
+ * Implements hook_help().
+ */
+function domain_menu_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the domain_menu module.
+    case 'help.page.domain_menu':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Allows Assigning Different Menus per-domain') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Inject domain access fields in menu add/edit forms.
+ */
+function domain_menu_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  if (in_array($form_id, array("menu_add_form", "menu_edit_form"))) {
+    /** @var \Drupal\system\MenuInterface $menu */
+    $menu = $form_state->getFormObject()->getEntity();
+    $options = domain_menu_access_options($menu);
+
+    $form[DOMAIN_ACCESS_FIELD] = array(
+      '#type' => 'checkboxes',
+      '#title' => t('Domain Access'),
+      '#description' => t('Select the affiliate domain(s) for this content'),
+      '#options' => $options,
+      '#default_value' => $menu->getThirdPartySetting('domain_menu', 'domains', []),
+      '#required' => TRUE,
+    );
+
+    $form['actions']['submit']['#submit'][] = "domain_menu_add_edit_form_submit";
+  }
+
+  if ($form_id == 'menu_add_form') {
+    $entity = $form_state->getFormObject()->getEntity();
+    $form[DOMAIN_ACCESS_FIELD]['#default_value'] = \Drupal::service('domain_access.manager')->getAccessValues($entity);
+
+  }
+}
+
+/**
+ * Build an options list of domain ids and domain labels for use with FAPI.
+ *
+ * Since menu entities are not fieldable, an entity_reference field can't be
+ * directly injected into the entity, which means we still have to alter the
+ * form directly. Still it makes a lot of sense to reuse the entity reference
+ * plugin directly, because this allows domain module to change the logic of
+ * domain assignment and permissions without having to touch this again.
+ *
+ * @param \Drupal\system\MenuInterface $menu
+ *    Menu entity for which the list of options is being built.
+ *
+ * @return array
+ *    Associative array of domain_id/domain_labels that can be referenced.
+ */
+function domain_menu_access_options($menu) {
+  $options = [];
+
+  /** @var \Drupal\Core\Entity\EntityReferenceSelection\SelectionPluginManagerInterface $entity_ref_selection_manager */
+  $entity_ref_selection_manager = \Drupal::service('plugin.manager.entity_reference_selection');
+  /** @var \Drupal\domain\Plugin\EntityReferenceSelection\DomainSelection $domain_selection */
+  $domain_selection = $entity_ref_selection_manager->createInstance('default:domain', [
+    'target_type' => 'domain',
+    'entity' => $menu,
+    // No handler_settings are needed, this is just to avoid PHP notice.
+    'handler_settings' => [],
+  ]);
+  $domain_ids = $domain_selection->buildEntityQuery()->execute();
+  /** @var \Drupal\domain\DomainLoaderInterface $domain_loader */
+  $domain_loader = \Drupal::service('domain.loader');
+  $domains = $domain_loader->loadMultipleSorted($domain_ids);
+  foreach ($domains as $domain_id => $domain) {
+    $options[$domain_id] = $domain->label();
+  }
+  return $options;
+}
+
+/**
+ *
+ */
+function domain_menu_domain_references_alter($query, $account, $context) {
+  switch ($context['entity_type']) {
+    case 'menu':
+      if ($account->hasPermission('administer menu')) {
+        break;
+      }
+      elseif ($account->hasPermission('administer domain menus')) {
+        if (!empty($account->get(DOMAIN_ACCESS_ALL_FIELD)->value)) {
+          break;
+        }
+        $allowed = \Drupal::service('domain_access.manager')->getAccessValues($account);
+        $query->condition('id', array_keys($allowed), 'IN');
+      }
+      else {
+        // Remove all options.
+        $query->condition('id', '-no-possible-match-');
+      }
+      break;
+  }
+}
+
+/**
+ * Saves the third-party settings for menu domains.
+ *
+ * @param $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+function domain_menu_add_edit_form_submit($form, FormStateInterface &$form_state) {
+  /** @var \Drupal\system\MenuInterface $menu */
+  $menu = $form_state->getFormObject()->getEntity();
+  $menu->setThirdPartySetting('domain_menu', 'domains', $form_state->getValue(DOMAIN_ACCESS_FIELD));
+  $menu->save();
+}
+
+/**
+ * Implements hook_entity_type_alter().
+ *
+ * @param \Drupal\Core\Entity\EntityTypeInterface[] $entity_types
+ */
+function domain_menu_entity_type_alter(array &$entity_types) {
+  $entity_types['menu']->setHandlerClass('access', 'Drupal\domain_menu\DomainMenuAccessControlHandler');
+}
+
+/**
+ * Implements hook_entity_access().
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ * @param string $operation
+ * @param \Drupal\Core\Session\AccountInterface $account
+ */
+function domain_menu_entity_access(EntityInterface $entity, $operation, AccountInterface $account) {
+  if ($entity->getEntityTypeId() == 'menu_link_content') {
+    /** @var $entity \Drupal\menu_link_content\MenuLinkContentInterface */
+    $parent_menu_id = $entity->getMenuName();
+    $parent_menu = \Drupal::entityTypeManager()->getStorage('menu')->load($parent_menu_id);
+    $parent_accessible = $parent_menu->access('update', $account);
+    return AccessResult::allowedIf($parent_accessible);
+  }
+}
+
+/**
+ * Implements hook_entity_create_access().
+ */
+function domain_menu_entity_create_access(AccountInterface $account, array $context, $entity_bundle) {
+  // Allow users with the "administer domain menus" permission to create menu items.
+  // @see DomainMenuAdminAccessCheck::menuLinkCreateAccessCheck as well.
+  if ($context['entity_type_id'] == 'menu_link_content') {
+    return AccessResult::allowedIfHasPermission($account, 'administer domain menus');
+  }
+}
+
+/**
+ *
+ */
+function domain_menu_form_node_form_alter(&$form, FormStateInterface $form_state) {
+  if (isset($form['menu'])) {
+    $form['menu']['#access'] = $form['menu']['#access'] || \Drupal::currentUser()->hasPermission('administer domain menus');
+  }
+}
+
+/**
+ * Make sure that we run only after the Menu UI module has injected it's form alternations
+ * (the menu Form Selector items).
+ * Implements hook_module_implements_alter().
+ */
+function domain_menu_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'form_alter') {
+    $original_definition = $implementations['domain_menu'];
+    unset($implementations['domain_menu']);
+    $implementations['domain_menu'] = $original_definition;
+  }
+}
