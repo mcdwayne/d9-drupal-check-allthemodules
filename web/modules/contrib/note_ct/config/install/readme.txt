@@ -1,0 +1,3 @@
+There is install files what create and configure content type.
+On that page (yoursite/admin/config/development/configuration/single/export) you can see any configuration files. For example if you need to create custom content type programatically create in drupal content type you need and go to configurations page, choose
+"single item". And in configuration type you can find configuration files you need. "Field" , "Field storage", "Content type", "Entity form display", "Entity view display" contains all about content type you create.
