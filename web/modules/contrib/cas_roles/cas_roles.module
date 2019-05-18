@@ -1,0 +1,180 @@
+<?php
+
+/**
+ * @file
+ * Allows user account and profile attributes to be automatically populated
+ * using tokens. Provides basic tokens for attributes returned by the CAS
+ * server.
+ */
+
+/**
+ * Only assign roles which are present in drupal and match,
+ * remove user roles not present in CAS.
+ */
+define('CAS_ROLES_DRUPAL_ROLES_ONLY', 0);
+
+/**
+ * Create roles which don't exits in Drupal,
+ * remove user roles not present in CAS.
+ */
+define('CAS_ROLES_CREATE_NEW_ROLES', 1);
+
+/**
+ * Match roles with regular expressions.
+ */
+define('CAS_ROLES_MATCH_REGEX', 2);
+
+
+/**
+ * Implements hook_menu().
+ */
+function cas_roles_menu() {
+  $items = array();
+
+  $items['admin/config/people/cas/roles'] = array(
+    'title' => 'Roles',
+    'description' => 'Settings for CAS roles.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cas_roles_admin_settings'),
+    'access arguments' => array('administer cas'),
+    'file' => 'cas_roles.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => -7,
+  );
+
+  return $items;
+}
+
+
+/**
+ * Implements hook_cas_user_presave().
+ */
+function cas_roles_cas_user_presave(&$edit, $account) {
+  $sync_every_login = variable_get('cas_roles_sync_every_login');
+  $behavior = variable_get('cas_roles_behavior');
+  $roles = variable_get('cas_roles_roles');
+  $relations = variable_get('cas_roles_relations', array('2' => NULL));
+
+  // We synchronize on the first login (always) & on future logins (if chosen).
+  if ($account->login && !$sync_every_login) {
+    // The user has logged in before and we are not set to always synchronize.
+    return;
+  }
+
+  // The users CAS attributes from the CAS module.
+  $cas_attributes = $edit['cas_user']['attributes'];
+
+  // Get the name of the attributes.
+  $tokens = token_scan($roles);
+  
+  // There is no cas token, hence no matching.
+  if (!is_array($tokens) || !array_key_exists('cas', $tokens )) {
+    return;
+  }
+
+  $tokens = token_find_with_prefix($tokens['cas'], 'attribute');
+
+  // An Array with the relevant CAS attribute arrays.
+  $arr = array();
+  foreach ($tokens as $name => $original) {
+    $chain = explode(':', $name);
+    $branch = $cas_attributes;
+    $found = TRUE;
+    foreach ($chain as $link) {
+      if (isset($branch[$link])) {
+        $branch = $branch[$link];
+      }
+      else {
+        $found = FALSE;
+      }
+    }
+    if ($found) {
+      $arr[$original] = $branch;
+    }
+  }
+
+  // Assemble the patterns.
+  $role_patterns = array($roles);
+  foreach ($arr as $token => $elements) {
+    foreach ($role_patterns as $key => $pattern) {
+      $new_pattern = array();
+      _cas_roles_recursive_str_replace($new_pattern, $token, $elements, $pattern);
+      unset($role_patterns[$key]);
+      $role_patterns = array_merge($role_patterns, $new_pattern);
+    }
+  }
+
+  // Replace all the tokens including the cas tokens if cas_attributes exists
+  if (module_exists('cas_attributes')) {
+    $data = array('cas' => $edit['cas_user']['name']);
+  }
+  else {
+    $data = array();
+  }
+  foreach ($role_patterns as $key => $pattern) {
+    $pattern = trim(token_replace($pattern, $data, array('clear' => TRUE)));
+    $role_patterns[$key] = html_entity_decode($pattern);
+  }
+  $role_patterns = array_unique($role_patterns);
+
+  if ($behavior == CAS_ROLES_CREATE_NEW_ROLES) {
+    $new_roles = array_diff($role_patterns, user_roles());
+    // Create new roles.
+    foreach ($new_roles as $new) {
+      $role = (object) array('name' => $new);
+      user_role_save($role);
+    }
+  }
+
+  if ($behavior == CAS_ROLES_MATCH_REGEX) {
+    // Do regexp matching!
+    $custom_roles = cas_roles_cutsom_user_roles();
+    $new_user_roles = $edit['roles'];
+    foreach ($custom_roles as $rid => $role) {
+      if (array_key_exists($rid, $relations) && $relations[$rid]) {
+        $matches = preg_grep($relations[$rid], $role_patterns);
+        if (!empty($matches)) {
+          $new_user_roles[$rid] = $role;
+        }
+        else {
+          unset($new_user_roles[$rid]);
+        }
+      }
+    }
+  }
+  else {
+    // Just assign the roles!
+    // Add the authenticated user role.
+    $new_user_roles = array_intersect(cas_roles_cutsom_user_roles(), $role_patterns);
+    $new_user_roles[DRUPAL_AUTHENTICATED_RID] = 'authenticated user';
+  }
+
+  // Set the (new) roles.
+  $edit['roles'] = $new_user_roles;
+}
+
+
+/**
+ * Function to remove the authenticated user role.
+ */
+function cas_roles_cutsom_user_roles($permission = NULL) {
+  return array_diff_key(
+    user_roles(TRUE, $permission),
+    array(DRUPAL_AUTHENTICATED_RID => 'authenticated user')
+  );
+}
+
+
+/**
+ * Recursive function to cater for nested arrays.
+ */
+function _cas_roles_recursive_str_replace(&$pattern_array, $token, $elements, $pattern) {
+  if (!is_array($elements)) {
+    $pattern_array[] = str_replace($token, $elements, $pattern);
+  }
+  else {
+    foreach ($elements as $element) {
+      _cas_roles_recursive_str_replace($pattern_array, $token, $element, $pattern);
+    }
+  }
+}
