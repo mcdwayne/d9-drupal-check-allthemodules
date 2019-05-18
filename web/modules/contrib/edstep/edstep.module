@@ -1,0 +1,318 @@
+<?php
+
+use Drupal\Core\Database\Query\AlterableInterface;
+use Drupal\Core\Database\Query\SelectInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Url;
+use Drupal\Core\Utility\LinkGenerator;
+use Drupal\edstep\Entity\EdstepCourse;
+use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
+
+/**
+ * Implements hook_help().
+ *
+ * @inheritdoc
+ */
+function edstep_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.edstep':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('This module brings <a href="@edstep">EdStep</a> to your Drupal site. It allows you to promote your EdStep courses and users can take them without leaving your website. This way you are in full control over the EdStep course experience.', ['@edstep' => 'https://edstep.com/']) . '</p>';
+      $output .= '<h3>' . t('Getting started') . '</h3>';
+      $output .= '<ol>';
+      $output .= '<li>' . t('Go to <a href="@config">the EdStep settings page</a> and enter your client ID and client secret. You can apply for one at <a href="@edstep">edstep.com</a>.', ['@config' => Url::fromRoute('edstep.settings')->toString(), '@edstep' => 'https://edstep.com/']) . '</li>';
+      $output .= '<li>' . t('Go to <a href="@config">the permissions page</a> and decide which roles may add, view and remove EdStep courses.', ['@config' => Url::fromRoute('user.admin_permissions', [], ['fragment' => 'module-edstep'])->toString()]) . '</li>';
+      $output .= '</ol>';
+      return $output;
+  }
+  return NULL;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function edstep_theme() {
+  return [
+    'edstep_course' => [
+      'render element' => 'elements',
+    ],
+    'edstep_course_activity' => [
+      'render element' => 'elements',
+    ],
+    'edstep_course_menu' => [
+      'render element' => 'elements',
+    ],
+    'edstep_activity_pager' => [
+      'render element' => 'elements',
+    ],
+  ];
+}
+
+function edstep_edstep_course_view_alter(array &$build, EdstepCourse $edstep_course, EntityViewDisplayInterface $display) {
+  if($edstep_course->getRemoteValue('title') === NULL) {
+    \Drupal::logger('edstep')->notice('Could not fetch data for EdStep course with ID @id', [
+      '@id' => $edstep_course->id(),
+    ]);
+    if(edstep_course_is_page($edstep_course)) {
+      throw new NotFoundHttpException();
+    }
+    $build = NULL;
+  }
+}
+
+/**
+ * Prepares variables for edspte_course templates.
+ *
+ * Default template: edspte_course.html.twig.
+ *
+ * Most themes use their own copy of edspte_course.html.twig. The default is located
+ * inside "/core/modules/edspte_course/templates/edspte_course.html.twig". Look in there for the
+ * full list of variables.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - elements: An array of elements to display in view mode.
+ *   - edspte_course: The edspte_course object.
+ *   - view_mode: View mode; e.g., 'full', 'teaser', etc.
+ */
+function template_preprocess_edstep_course(&$variables) {
+  $variables['view_mode'] = $variables['elements']['#view_mode'];
+  // Provide a distinct $teaser boolean.
+  $variables['teaser'] = $variables['view_mode'] == 'teaser';
+  $variables['edstep_course'] = $variables['elements']['#edstep_course'];
+  /** @var \Drupal\edstep_course\NodeInterface $edstep_course */
+  $edstep_course = $variables['edstep_course'];
+  $variables['date'] = drupal_render($variables['elements']['created']);
+  unset($variables['elements']['created']);
+  $variables['author_name'] = drupal_render($variables['elements']['uid']);
+  unset($variables['elements']['uid']);
+
+  $variables['url'] = $edstep_course->url('canonical', [
+    'language' => $edstep_course->language(),
+  ]);
+  $variables['label'] = $variables['elements']['title'];
+  unset($variables['elements']['title']);
+  // The 'page' variable is set to TRUE when the view mode is 'full' and we are on the 'edstep_course.view' route.
+  $variables['page'] = ($variables['view_mode'] == 'full' && edstep_course_is_page($edstep_course));
+
+  // Add buttons
+  $variables['content']['buttons']['#weight'] = 999;
+
+  // "Enroll" button
+  $variables['content']['buttons']['enroll'] = \Drupal::formBuilder()->getForm(Drupal\edstep\Form\EdstepCourseEnrollForm::class, $edstep_course);
+  if ($variables['view_mode'] != 'full') {
+    hide($variables['content']['buttons']['enroll']);
+  }
+
+  // "Remove" button
+  $variables['content']['buttons']['remove'] = \Drupal::service('entity.form_builder')->getForm($edstep_course, 'remove_button');
+  if ($variables['view_mode'] != 'manage') {
+    hide($variables['content']['buttons']['remove']);
+  }
+
+  // "Add" button
+  $variables['content']['buttons']['add'] = \Drupal::service('entity.form_builder')->getForm($edstep_course, 'add_button');
+  if ($variables['view_mode'] != 'manage') {
+    hide($variables['content']['buttons']['add']);
+  }
+
+  // Helpful $content variable for templates.
+  $variables += ['content' => []];
+  foreach (Element::children($variables['elements']) as $key) {
+    $variables['content'][$key] = $variables['elements'][$key];
+  }
+
+  // Gather edstep_course classes.
+  $variables['attributes']['class'][] = 'edstep-course';
+  if ($variables['teaser']) {
+    $variables['attributes']['class'][] = 'edstep-course--view-mode-teaser';
+  }
+
+  // Add article ARIA role.
+  $variables['attributes']['role'] = 'article';
+}
+
+/**
+ * Implements hook_preprocess_HOOK() for `edstep_course_activity` templates.
+ */
+function template_preprocess_edstep_course_activity(&$variables) {
+  $edstep_course = $variables['elements']['#edstep_course'];
+  $section_id = $variables['elements']['#section_id'];
+  $activity_id = $variables['elements']['#activity_id'];
+  $variables['activity'] = $edstep_course->getRemote()->section($section_id)->activity($activity_id)->fetch()->toArray();
+  $variables['resourceUrl'] = $edstep_course->getActivityResourceUrl($section_id, $activity_id);
+  $variables['#attached']['library'][] = 'edstep/edstep-course-activity';
+  unset($variables['elements']);
+}
+
+/**
+ * Implements hook_preprocess_HOOK() for `edstep_course_menu` templates.
+ */
+function template_preprocess_edstep_course_menu(&$variables) {
+  $edstep_course = $variables['elements']['#edstep_course'];
+  $sections = $edstep_course->getRemoteValue('sections');
+  $variables['sections'] = array_map(function($section) use($edstep_course) {
+    return [
+      'title' => html_entity_decode(strip_tags($section->title)),
+      'activities' => array_map(function($activity) use($section, $edstep_course) {
+        $title = html_entity_decode(strip_tags($activity->title));
+        $url = $edstep_course->getActivityUrl($section->id, $activity->id);
+        $url->setOption('set_active_class', TRUE);
+        return [
+          'link' => \Drupal::service('link_generator')->generate($title, $url),
+        ];
+      }, $section->activities->toArray())
+    ];
+  }, $sections->toArray());
+  $url = Url::fromRoute('entity.edstep_course.view_result', ['edstep_course' => $edstep_course->get('course_id')->value]);
+  $variables['sections'][count($variables['sections']) - 1]['activities'][] = [
+    'link' => \Drupal::service('link_generator')->generate(t('Result'), $url),
+  ];
+  unset($variables['elements']);
+}
+
+/**
+ * Implements hook_preprocess_HOOK() for `edstep_course_menu` templates.
+ */
+function template_preprocess_edstep_activity_pager(&$variables) {
+  $edstep_course = $variables['elements']['#course'];
+  $client = \Drupal::service('edstep.edstep')->getClient();
+  $paths = array();
+  try {
+    $course = $client->course($edstep_course->get('course_id')->value);
+    foreach($course->sections as $section) {
+      foreach($section->activities as $activity) {
+        if($section->progress['locked']) {
+          $paths[] = '';
+        } else {
+          $paths[$course->id . ':' . $section->id . ':' . $activity->id] = $edstep_course->getActivityUrl($section->id, $activity->id);
+        }
+      }
+    }
+  } catch(Exception $e) {
+  }
+
+  $paths[] = Url::fromRoute('entity.edstep_course.view_result', ['edstep_course' => $edstep_course->get('course_id')->value]);
+
+  $current = array_search($course->id . ':' . $variables['elements']['#section_id'] . ':' . $variables['elements']['#activity_id'], array_keys($paths));
+
+  if($current === FALSE) {
+    $current = array_search(\Drupal::service('path.current')->getPath(), array_keys($paths));
+  }
+  $paths = array_values($paths);
+
+  $total = sizeof($paths);
+  $previous = '';
+  if($current > 0) {
+    $previous = $paths[$current - 1];
+  }
+  $next = '';
+  if($current < sizeof($paths) - 1) {
+    $next = $paths[$current + 1];
+  }
+  $current++;
+  $variables['pager'] = array(
+    'current' => $current,
+    'total' => $total,
+    'next' => $next,
+    'previous' => $previous,
+  );
+
+  unset($variables['elements']);
+}
+
+/**
+ * Implements hook_entity_base_field_info().
+ * @param \Drupal\Core\Entity\EntityTypeInterface $entity_type
+ * @return array $fields
+ */
+function edstep_entity_base_field_info(EntityTypeInterface $entity_type) {
+  if ($entity_type->id() === 'edstep_course') {
+    $fields = [];
+
+    $fields['title'] = BaseFieldDefinition::create('string')
+      ->setLabel(t('Title'))
+      ->setDescription(t('The title of the course in EdStep.'))
+      ->setComputed(TRUE)
+      ->setClass('\Drupal\edstep\EdstepRemoteFieldItemList')
+      ->setDisplayConfigurable('view', TRUE)
+      ->setDisplayOptions('view', [
+        'label' => 'hidden',
+        'weight' => -5,
+      ]);
+
+    $fields['description'] = BaseFieldDefinition::create('text_long')
+      ->setLabel(t('Description'))
+      ->setDescription(t('The description of the course in EdStep.'))
+      ->setComputed(TRUE)
+      ->setClass('\Drupal\edstep\EdstepRemoteFieldItemList')
+      ->setDisplayConfigurable('view', TRUE)
+      ->setDisplayOptions('view', [
+        'label' => 'hidden',
+        'weight' => 0,
+      ]);
+
+    return $fields;
+  }
+}
+
+/**
+ * Checks whether the current page is the full page view of the passed-in edstep_course.
+ *
+ * @param \Drupal\edstep\Entity\EdstepCourse $edstep_course
+ *   A edstep_course entity.
+ *
+ * @return int|false
+ *   The ID of the edstep_course if this is a full page view, otherwise FALSE.
+ */
+function edstep_course_is_page(EdstepCourse $edstep_course) {
+  $route_match = \Drupal::routeMatch();
+  if ($route_match->getRouteName() == 'entity.edstep_course.canonical') {
+    $page_edstep_course = $route_match->getParameter('edstep_course');
+  }
+  return (!empty($page_edstep_course) ? $page_edstep_course->id() == $edstep_course->id() : FALSE);
+}
+
+function edstep_query_alter(AlterableInterface $query) {
+  if($query instanceof SelectInterface) {
+    // If this select query involves user field tables that have field mappings, sync the current user data
+    $queried_fields = array();
+    foreach($query->getTables() as $table_name => $table) {
+      if(preg_match('/^user__(.+)/', $table_name, $matches)) {
+        $queried_fields[] = $matches[1];
+      }
+    }
+
+    if(!empty($queried_fields)) {
+      $edstep_service = \Drupal::service('edstep.edstep');
+      $field_mappings = $edstep_service->getFieldMappings('user');
+      $mapped_fields = array_keys($field_mappings);
+
+      $common = array_intersect($mapped_fields, $queried_fields);
+      if(!empty($common)) {
+        try {
+          $edstep_service->syncCurrentUserData();
+        } catch(Exception $e) {
+          \Drupal::logger('edstep')->error('Could not sync current user data for user id %uid', [
+            '%uid' => \Drupal::currentUser()->id(),
+          ]);
+        }
+      }
+    }
+  }
+
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK_alter().
+ */
+function edstep_theme_suggestions_edstep_course_alter(array &$suggestions, array $variables) {
+  if(!empty($variables['elements']['#view_mode'])) {
+    $suggestions[] = 'edstep_course__' . $variables['elements']['#view_mode'];
+  }
+}
