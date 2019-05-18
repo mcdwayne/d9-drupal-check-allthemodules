@@ -1,0 +1,327 @@
+<?php
+
+/**
+ * @file
+ * Contains hook implementations and global functions.
+ */
+
+declare(strict_types = 1);
+
+use BartFeenstra\Functional\Iterable\Iterator;
+use BartFeenstra\Functional\Some;
+use Drupal\Core\Entity\ContentEntityTypeInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\EntityStorageException;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Entity\FieldableEntityInterface;
+use Drupal\Core\Field\FieldDefinitionInterface;
+use Drupal\Core\Field\Plugin\Field\FieldType\EntityReferenceItem;
+use Drupal\erg\EntityReference;
+use Drupal\erg\Event;
+use Drupal\erg\Field\FieldSettings;
+use Drupal\erg\Guard\GuardInterface;
+use Drupal\erg\Guard\GuardExceptionInterface;
+use function BartFeenstra\Functional\Iterable\iter;
+use function BartFeenstra\Functional\Predicate\instance_of;
+
+/**
+ * Implements hook_entity_predelete().
+ */
+function erg_entity_predelete(EntityInterface $entity) {
+  try {
+    erg_dispatch_for_referent($entity, Event::PRE_REFERENT_DELETE);
+  }
+  catch (GuardExceptionInterface $e) {
+    throw new EntityStorageException(erg_format_message($e->getEntityReference(),
+      'Cannot delete @referentTypeLabel @referentId ("@referentLabel"), because of an entity reference guard on @fieldLabel on @refereeTypeLabel @refereeId ("@refereeLabel").'),
+      0, $e);
+  }
+}
+
+/**
+ * Checks if a field definition has entity reference guards.
+ *
+ * @param \Drupal\Core\Field\FieldDefinitionInterface $fieldDefinition
+ *   A field definition.
+ *
+ * @return bool
+ *   Wether or not the definition has guards.
+ */
+function erg_field_definition_is_erg(
+  FieldDefinitionInterface $fieldDefinition
+): bool {
+  /** @var \Drupal\Core\Field\FieldTypePluginManagerInterface $fieldTypeManager */
+  $fieldTypeManager = \Drupal::service('plugin.manager.field.field_type');
+  $itemClass = $fieldTypeManager->getDefinition($fieldDefinition->getType())['class'];
+  if (!instance_of(EntityReferenceItem::class)($itemClass)) {
+    return FALSE;
+  }
+  if (!$fieldDefinition->getSetting('erg')) {
+    return FALSE;
+  }
+  $settings = $fieldDefinition->getSetting('erg');
+  assert($settings instanceof FieldSettings);
+  return TRUE;
+}
+
+/**
+ * Alters a field definition, if needed.
+ *
+ * @param \Drupal\Core\Field\FieldDefinitionInterface $fieldDefinition
+ *   The field definition.
+ */
+function erg_field_definition_alter(
+  FieldDefinitionInterface $fieldDefinition
+) {
+  if (!erg_field_definition_is_erg($fieldDefinition)) {
+    return;
+  }
+
+  /** @var \Drupal\erg\Field\FieldSettings $settings */
+  $settings = $fieldDefinition->getSetting('erg');
+
+  // Add validation constraints for the "reference" event.
+  $find = iter($settings->getGuards())->find(function (GuardInterface $guard) {
+    return Event::REFEREE_VALIDATE === $guard->getEvent();
+  });
+
+  if ($find instanceof Some) {
+    $fieldDefinition->addConstraint('ErgOnValidateRefereeGuardConstraint');
+  }
+}
+
+/**
+ * Implements hook_entity_base_field_info_alter().
+ */
+function erg_entity_base_field_info_alter(
+  array &$fields,
+  EntityTypeInterface $entity_type
+) {
+  foreach ($fields as $fieldDefinition) {
+    erg_field_definition_alter($fieldDefinition);
+  }
+}
+
+/**
+ * Implements hook_entity_bundle_field_info_alter().
+ */
+function erg_entity_bundle_field_info_alter(
+  array &$fields,
+  EntityTypeInterface $entity_type,
+  string $bundle
+) {
+  foreach ($fields as $fieldDefinition) {
+    erg_field_definition_alter($fieldDefinition);
+  }
+}
+
+/**
+ * Dispatches an entity event for a referee.
+ *
+ * @param \Drupal\Core\Entity\FieldableEntityInterface $referee
+ *   The entity.
+ * @param string $event
+ *   An Event::* event (operation) name.
+ *
+ * @throws \Drupal\erg\Guard\GuardExceptionInterface
+ *   Thrown if a guard wants to prevent the dispatched event from completing.
+ *   It is the calling code's responsibility to correctly handle this
+ *   interruption.
+ *
+ * @see \Drupal\erg\Event
+ */
+function erg_dispatch_for_referee(FieldableEntityInterface $referee, string $event) {
+  foreach ($referee->getFieldDefinitions() as $field_name => $_) {
+    erg_dispatch_for_referee_field($referee, $event, $field_name);
+  }
+}
+
+/**
+ * Dispatches an entity event for an entity reference field on a referee.
+ *
+ * @param \Drupal\Core\Entity\FieldableEntityInterface $referee
+ *   The entity.
+ * @param string $event
+ *   An Event::* event (operation) name.
+ * @param string $field_name
+ *  The name of the entity reference field.
+ *
+ * @throws \Drupal\erg\Guard\GuardExceptionInterface
+ *   Thrown if a guard wants to prevent the dispatched event from completing.
+ *   It is the calling code's responsibility to correctly handle this
+ *   interruption.
+ *
+ * @see \Drupal\erg\Event
+ */
+function erg_dispatch_for_referee_field(FieldableEntityInterface $referee, string $event, string $field_name) {
+  // Ensure the field definition contains the required settings.
+  $field_definition = $referee->getFieldDefinition($field_name);
+  if (!erg_field_definition_is_erg($field_definition)) {
+    return;
+  }
+
+  $field_name = $field_definition->getName();
+  /** @var \Drupal\erg\Field\FieldSettings $settings */
+  $settings = $field_definition->getSetting('erg');
+  iter($referee->get($field_name))
+    ->map(function ($item) use ($referee, $field_name, $settings) {
+      return new EntityReference($referee, $field_name, $item->entity, $settings->getGuards());
+    })
+    ->each(function (EntityReference $entityReference) use ($event) {
+    $entityReference->guard($event);
+  });
+}
+
+/**
+ * Dispatches an entity event for a referent.
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $referent
+ *   The entity.
+ * @param string $event
+ *   An Event::* event (operation) name.
+ *
+ * @throws \Drupal\erg\Guard\GuardExceptionInterface
+ *   Thrown if a guard wants to prevent the dispatched event from completing.
+ *   It is the calling code's responsibility to correctly handle this
+ *   interruption.
+ *
+ * @see \Drupal\erg\Event
+ */
+function erg_dispatch_for_referent(EntityInterface $referent, string $event) {
+  erg_get_references_to_referent($referent)
+    ->each(function (EntityReference $entityReference) use ($event) {
+      $entityReference->guard($event);
+    });
+}
+
+/**
+ * Gets all guarded entity reference field definitions.
+ *
+ * @return \Drupal\Core\Field\FieldDefinitionInterface[]|BartFeenstra\Functional\Iterable\Iterator
+ *   The field definitions.
+ */
+function erg_get_field_definitions(): Iterator {
+  $entity_type_manager = \Drupal::entityTypeManager();
+  /** @var \Drupal\Core\Entity\EntityTypeBundleInfoInterface $entity_type_bundle_info */
+  $entity_type_bundle_info = \Drupal::service('entity_type.bundle.info');
+  /** @var \Drupal\Core\Entity\EntityFieldManagerInterface $entity_field_manager */
+  $entity_field_manager = \Drupal::service('entity_field.manager');
+
+  // Get all entity types.
+  return iter($entity_type_manager->getDefinitions())
+    // Keep content entity types only.
+    ->filter(function (EntityTypeInterface $type) {
+      return $type instanceof ContentEntityTypeInterface;
+    })
+    // For each entity type, load its definitions.
+    ->map(function ($_, $entity_type_id) use (
+      $entity_type_bundle_info,
+      $entity_field_manager
+    ) {
+      $bundle_info = $entity_type_bundle_info->getBundleInfo($entity_type_id);
+      $bundles = iter($bundle_info)->listKeys();
+      return iter($bundles)
+        ->map(function (string $bundle) use (
+          $entity_type_id,
+          $entity_field_manager
+        ) {
+          return $entity_field_manager->getFieldDefinitions($entity_type_id,
+            $bundle);
+        });
+    })
+    // Create one large definition iterator by flattening the top three levels.
+    ->flatten(2)
+    // Ignore duplicates.
+    ->unique()
+    // Keep entity reference items with ERG settings.
+    ->filter('erg_field_definition_is_erg')
+    // Sort the fields based on erg weights assigned to them.
+    // (Note that the sort is not stable.)
+    ->sort(function (FieldDefinitionInterface $settings_a, FieldDefinitionInterface $settings_b) {
+      /** @var \Drupal\erg\Field\FieldSettings $settings_a */
+      $settings_a = $settings_a->getSetting('erg');
+      /** @var \Drupal\erg\Field\FieldSettings $settings_b */
+      $settings_b = $settings_b->getSetting('erg');
+      return $settings_b->getWeight() <=> $settings_a->getWeight();
+    });
+}
+
+/**
+ * Gets all references to an entity with at least one guard for the given event.
+ *
+ * The references are limited to those that have been stored persistently.
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $referent
+ *   The entity.
+ *
+ * @return \Drupal\erg\EntityReference[]|BartFeenstra\Functional\Iterable\Iterator
+ *   The references.
+ */
+function erg_get_references_to_referent(EntityInterface $referent): Iterator {
+  return erg_get_field_definitions()
+    // Confirm the reference targets the correct entity type and bundle.
+    ->filter(function (FieldDefinitionInterface $definition) use ($referent) {
+      return $referent->getEntityTypeId() === $definition->getSetting('target_type')
+        and ($referent->bundle() === $definition->getSetting('target_bundle') or !$definition->getSetting('target_bundle'));
+    })
+    // Find all references.
+    ->map(function (FieldDefinitionInterface $definition) use ($referent) {
+      $query = \Drupal::entityTypeManager()
+        ->getStorage($definition->getTargetEntityTypeId())
+        ->getQuery();
+      $query->condition($definition->getName(), $referent->id());
+      /** @var \Drupal\erg\Field\FieldSettings $settings */
+      $settings = $definition->getSetting('erg');
+      return iter($query->execute())->map(function (string $source_entity_id
+      ) use (
+        $definition,
+        $referent,
+        $settings
+      ) {
+        return new EntityReference($definition->getTargetEntityTypeId() . ':' . $source_entity_id,
+          $definition->getName(),
+          $referent->getEntityTypeId() . ':' . $referent->id(), $settings->getGuards(), $settings->getResponse());
+      });
+    })
+    ->flatten();
+}
+
+/**
+ * Formats an entity reference message.
+ *
+ * @param string $message
+ *   The unformatted message.
+ * @param mixed[] $arguments
+ *   Keys are placeholder names, prefixed with '@', and values are
+ *   replacements. The following default values exist:
+ *   - @refereeId: The referee's entity ID.
+ *   - @refereeLabel: The referee's entity label.
+ *   - @refereeTypeLabel: The referee's entity type label.
+ *   - @referentId: The referent's entity ID.
+ *   - @referentLabel: The referent's entity label.
+ *   - @referentTypeLabel: The referent's entity type label.
+ *   - @fieldLabel: The entity reference field's label.
+ *
+ * @return string
+ *   The formatted message.
+ */
+function erg_format_message(
+  EntityReference $entityReference,
+  string $message,
+  array $arguments = []
+): string {
+  $referee = $entityReference->getReferee();
+  $referent = $entityReference->getReferent();
+  $field_name = $entityReference->getFieldName();
+  $arguments = [
+    '@refereeId' => $referee->id() ?: '*unsaved*',
+    '@refereeTypeLabel' => (string) $referee->getEntityType()->getLabel(),
+    '@refereeLabel' => (string) $referee->label(),
+    '@referentId' => $referent->id() ?: '*unsaved*',
+    '@referentTypeLabel' => (string) $referent->getEntityType()->getLabel(),
+    '@referentLabel' => (string) $referent->label(),
+    '@fieldLabel' => (string) $referee->$field_name->getFieldDefinition()
+      ->getLabel(),
+  ] + $arguments;
+  return strtr($message, $arguments);
+}
