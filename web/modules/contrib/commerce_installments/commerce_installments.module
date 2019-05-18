@@ -1,0 +1,203 @@
+<?php
+
+/**
+ * @file
+ * Contains commerce_installments.module.
+ */
+
+use Drupal\commerce\BundleFieldDefinition;
+use Drupal\commerce_installments\Entity\InstallmentPlanTypeInterface;
+use Drupal\commerce_order\Entity\OrderInterface;
+use Drupal\commerce_payment\Exception\DeclineException;
+use Drupal\commerce_payment\Exception\PaymentGatewayException;
+use Drupal\commerce_payment\Plugin\Commerce\PaymentGateway\OnsitePaymentGatewayInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+
+/**
+ * Implements hook_help().
+ */
+function commerce_installments_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the commerce_installments module.
+    case 'help.page.commerce_installments':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Commerce Installments') . '</p>';
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function commerce_installments_theme() {
+  $theme = [];
+  $theme['commerce_installment_plan'] = [
+    'render element' => 'elements',
+    'file' => 'installment_plan.page.inc',
+    'template' => 'installment_plan',
+  ];
+  $theme['commerce_installment_plan_content_add_list'] = [
+    'render element' => 'content',
+    'variables' => ['content' => NULL],
+    'file' => 'installment_plan.page.inc',
+  ];
+  $theme['commerce_installment'] = [
+    'render element' => 'elements',
+    'file' => 'installment.page.inc',
+    'template' => 'installment',
+  ];
+  $theme['commerce_installment_content_add_list'] = [
+    'render element' => 'content',
+    'variables' => ['content' => NULL],
+    'file' => 'installment.page.inc',
+  ];
+  return $theme;
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK().
+ */
+function commerce_installments_theme_suggestions_installment_plan(array $variables) {
+  $suggestions = [];
+  $entity = $variables['elements']['#installment_plan'];
+  $sanitized_view_mode = strtr($variables['elements']['#view_mode'], '.', '_');
+
+  $suggestions[] = 'installment_plan__' . $sanitized_view_mode;
+  $suggestions[] = 'installment_plan__' . $entity->bundle();
+  $suggestions[] = 'installment_plan__' . $entity->bundle() . '__' . $sanitized_view_mode;
+  $suggestions[] = 'installment_plan__' . $entity->id();
+  $suggestions[] = 'installment_plan__' . $entity->id() . '__' . $sanitized_view_mode;
+  return $suggestions;
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK().
+ */
+function commerce_installments_theme_suggestions_installment(array $variables) {
+  $suggestions = [];
+  $entity = $variables['elements']['#installment'];
+  $sanitized_view_mode = strtr($variables['elements']['#view_mode'], '.', '_');
+
+  $suggestions[] = 'installment__' . $sanitized_view_mode;
+  $suggestions[] = 'installment__' . $entity->bundle();
+  $suggestions[] = 'installment__' . $entity->bundle() . '__' . $sanitized_view_mode;
+  $suggestions[] = 'installment__' . $entity->id();
+  $suggestions[] = 'installment__' . $entity->id() . '__' . $sanitized_view_mode;
+  return $suggestions;
+}
+/**
+ * Adds the default installments field to an installment plan type.
+ *
+ * @param \Drupal\commerce_installments\Entity\InstallmentPlanTypeInterface $installmentPlanType
+ *   The installment plan type.
+ */
+function commerce_installments_add_installments_field(InstallmentPlanTypeInterface $installmentPlanType = NULL) {
+  $field_definition = BundleFieldDefinition::create('entity_reference')
+    ->setTargetEntityTypeId('installment_plan')
+    //->setTargetBundle($installmentPlanType->id())
+    ->setTargetBundle('installment_plan')
+    ->setName('installments')
+    ->setRevisionable(TRUE)
+    ->setCardinality(BundleFieldDefinition::CARDINALITY_UNLIMITED)
+    ->setRequired(TRUE)
+    ->setSetting('target_type', 'installment')
+    ->setSetting('handler', 'default')
+    ->setDisplayOptions('form', [
+      'label' => 'hidden',
+      'type' => 'inline_entity_form_complex',
+      'weight' => 3,
+      'settings' => [
+        'override_labels' => TRUE,
+        'label_singular' => 'installment',
+        'label_plural' => 'installments',
+      ],
+    ])
+    ->setDisplayOptions('view', [
+      'label' => 'hidden',
+      'type' => 'entity_reference_label',
+      'weight' => 3,
+      'settings' => [
+        'link' => FALSE,
+      ]
+    ]);
+
+  $configurable_field_manager = \Drupal::service('commerce.configurable_field_manager');
+  $configurable_field_manager->createField($field_definition);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete() for 'commerce_order'.
+ *
+ * Delete the installment plans of a delete order.
+ */
+function commerce_installments_commerce_order_delete(OrderInterface $order) {
+  /** @var \Drupal\commerce_installments\Entity\InstallmentPlanInterface[] $plans */
+  $plans = \Drupal::entityTypeManager()->getStorage('installment_plan')->loadByProperties(['order_id' => $order->id()]);
+  foreach ($plans as $plan) {
+    $plan->delete();
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function commerce_installments_cron() {
+  /** @var \Drupal\Core\Entity\ContentEntityStorageInterface $installmentStorage */
+  $installmentStorage = \Drupal::service('entity_type.manager')->getStorage('installment');
+  $query = $installmentStorage->getQuery()
+    ->condition('payment_date', \Drupal::time()->getRequestTime(), '<')
+    ->condition('state', 'pending');
+
+  $results = $query->execute();
+  /** @var \Drupal\commerce_installments\Entity\InstallmentInterface[] $installments */
+  $installments = $installmentStorage->loadMultiple($results);
+
+  foreach ($installments as $installment) {
+    $plan = $installment->getInstallmentPlan();
+    if (!$plan->getPaymentGateway()) {
+      \Drupal::logger('commerce_installments')->error('No payment gateway selected for plan: %pid and installment %iid for order: %oid', ['%pid' => $plan->id(), '%iid' => $installment->id(), '%oid' => $plan->getOrderId()]);
+      // Move to next installment because it will likely fail if the gateway is
+      // missing.
+      continue;
+    }
+
+    /** @var \Drupal\commerce_payment\Entity\PaymentGatewayInterface $payment_gateway */
+    $payment_gateway = $plan->getPaymentGateway();
+    $payment_gateway_plugin = $payment_gateway->getPlugin();
+
+    if ($payment_gateway_plugin instanceof OnsitePaymentGatewayInterface) {
+      /** @var \Drupal\Core\Entity\EntityStorageInterface $payment_storage */
+      $payment_storage = \Drupal::service('entity_type.manager')->getStorage('commerce_payment');
+      /** @var \Drupal\commerce_payment\Entity\PaymentInterface $payment */
+      $payment = $payment_storage->create([
+        'state' => 'new',
+        'amount' => $installment->getAmount(),
+        'payment_gateway' => $payment_gateway->id(),
+        'order_id' => $plan->getOrderId(),
+      ]);
+
+      try {
+        $payment->payment_method = $plan->getPaymentMethod();
+        $payment_gateway_plugin->createPayment($payment);
+        $installment->setState('paid');
+        $installment->save();
+      }
+      catch (DeclineException $e) {
+        \Drupal::logger('commerce_installments')->error($e->getMessage());
+        \Drupal::logger('commerce_installments')->error('DeclineException for plan: %pid and installment %iid', ['%pid' => $plan->id(), '%iid' => $installment->id()]);
+      }
+      catch (PaymentGatewayException $e) {
+        \Drupal::logger('commerce_installments')->error($e->getMessage());
+        \Drupal::logger('commerce_installments')->error('PaymentGatewayException for plan: %pid and installment %iid', ['%pid' => $plan->id(), '%iid' => $installment->id()]);
+      }
+      catch (Exception $e) {
+        \Drupal::logger('commerce_installments')->error($e->getMessage());
+        \Drupal::logger('commerce_installments')->error('Unexpected exception for plan: %pid and installment %iid', ['%pid' => $plan->id(), '%iid' => $installment->id()]);
+      }
+    }
+    else {
+      \Drupal::logger('commerce_installments')->error('Payment gateway type is invalid for plan: %pid and installment %iid', ['%pid' => $plan->id(), '%iid' => $installment->id()]);
+    }
+  }
+}
