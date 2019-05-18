@@ -1,0 +1,241 @@
+<?php
+
+/**
+ * @file
+ * Contains micon_menu.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\node\NodeInterface;
+use Drupal\menu_link_content\Entity\MenuLinkContent;
+use Drupal\micon\MiconIconize;
+
+/**
+ * Implements hook_help().
+ */
+function micon_menu_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the micon_menu module.
+    case 'help.page.micon_menu':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('The Micon menu module overtakes the core default widget for menu link content entities, allowing you to set icons on menu links.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_entity_base_field_info_alter().
+ */
+function micon_menu_entity_base_field_info_alter(&$fields, EntityTypeInterface $entity_type) {
+  if ($entity_type->id() === 'menu_link_content') {
+    $fields['link']->setDisplayOptions('form', [
+      'type' => 'micon_menu',
+      'weight' => -2,
+      'settings' => [
+        'target' => TRUE,
+        'position' => TRUE,
+      ],
+    ]);
+  }
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function micon_menu_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'form_node_form_alter') {
+    unset($implementations['menu_ui']);
+    // Move micon_menu_form_node_form_alter() to the end of the list.
+    $group = $implementations['micon_menu'];
+    unset($implementations['micon_menu']);
+    $implementations['micon_menu'] = $group;
+  }
+}
+
+/**
+ * Implements hook_menu_links_discovered_alter().
+ */
+function micon_menu_menu_links_discovered_alter(&$links) {
+  $links['user.logout']['class'] = 'Drupal\micon_menu\MiconLoginLogoutMenuLink';
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function micon_menu_form_node_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+  if (function_exists('menu_ui_form_node_form_alter')) {
+    menu_ui_form_node_form_alter($form, $form_state, $form_id);
+    if (isset($form['menu'])) {
+      $node = $form_state->getFormObject()->getEntity();
+      $defaults = menu_ui_get_menu_link_defaults($node);
+      $options = [];
+      if ($defaults['entity_id']) {
+        $menu = MenuLinkContent::load($defaults['entity_id']);
+        $options = $menu->get('link')->first()->get('options')->getValue();
+      }
+      $config = \Drupal::config('micon_menu.config');
+      $form['menu']['link']['title']['#weight'] = -2;
+      $form['menu']['link']['options']['#tree'] = TRUE;
+      $form['menu']['link']['options']['#weight'] = -1;
+      $form['menu']['link']['options']['attributes']['#tree'] = TRUE;
+      $form['menu']['link']['options']['attributes']['data-icon'] = [
+        '#type' => 'micon',
+        '#title' => t('Icon'),
+        '#default_value' => isset($options['attributes']['data-icon']) ? $options['attributes']['data-icon'] : NULL,
+        '#packages' => $config->get('packages'),
+        '#access' => \Drupal::currentUser()->hasPermission('use micon link'),
+      ];
+      foreach (array_keys($form['actions']) as $action) {
+        if ($action != 'preview' && isset($form['actions'][$action]['#type']) && $form['actions'][$action]['#type'] === 'submit') {
+          if (($key = array_search('menu_ui_form_node_form_submit', $form['actions'][$action]['#submit'])) !== FALSE) {
+            $form['actions'][$action]['#submit'][$key] = 'micon_menu_menu_ui_form_node_form_submit';
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Form submission handler for menu item field on the node form.
+ *
+ * @param array $form
+ *   An associative array containing the structure of the form.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   The current state of the form.
+ *
+ * @see menu_ui_form_node_form_submit()
+ */
+function micon_menu_menu_ui_form_node_form_submit(array $form, FormStateInterface $form_state) {
+  $node = $form_state->getFormObject()->getEntity();
+  if (!$form_state->isValueEmpty('menu')) {
+    $values = $form_state->getValue('menu');
+    if (empty($values['enabled'])) {
+      if ($values['entity_id']) {
+        $entity = MenuLinkContent::load($values['entity_id']);
+        $entity->delete();
+      }
+    }
+    elseif (trim($values['title'])) {
+      // Decompose the selected menu parent option into 'menu_name' and
+      // 'parent', if the form used the default parent selection widget.
+      if (!empty($values['menu_parent'])) {
+        list($menu_name, $parent) = explode(':', $values['menu_parent'], 2);
+        $values['menu_name'] = $menu_name;
+        $values['parent'] = $parent;
+      }
+      _micon_menu_menu_ui_node_save($node, $values);
+    }
+  }
+}
+
+/**
+ * Helper function to create or update a menu link for a node.
+ *
+ * @param \Drupal\node\NodeInterface $node
+ *   Node entity.
+ * @param array $values
+ *   Values for the menu link.
+ *
+ * @see _menu_ui_node_save()
+ */
+function _micon_menu_menu_ui_node_save(NodeInterface $node, array $values) {
+  /** @var \Drupal\menu_link_content\MenuLinkContentInterface $entity */
+  if (!empty($values['entity_id'])) {
+    $entity = MenuLinkContent::load($values['entity_id']);
+    if ($entity->isTranslatable()) {
+      if (!$entity->hasTranslation($node->language()->getId())) {
+        $entity = $entity->addTranslation($node->language()->getId(), $entity->toArray());
+      }
+      else {
+        $entity = $entity->getTranslation($node->language()->getId());
+      }
+    }
+  }
+  else {
+    // Create a new menu_link_content entity.
+    $entity = MenuLinkContent::create([
+      'link' => ['uri' => 'entity:node/' . $node->id()],
+      'langcode' => $node->language()->getId(),
+    ]);
+    $entity->enabled->value = 1;
+  }
+  // Clean up options.
+  $values['options'] = array_filter($values['options']['attributes']);
+
+  $entity->title->value = trim($values['title']);
+  $entity->description->value = trim($values['description']);
+  $entity->link->options = $values['options'];
+  $entity->menu_name->value = $values['menu_name'];
+  $entity->parent->value = $values['parent'];
+  $entity->weight->value = isset($values['weight']) ? $values['weight'] : 0;
+  $entity->save();
+}
+
+/**
+ * Implements hook_preprocess_menu().
+ */
+function micon_menu_preprocess_menu(&$variables) {
+  $variables['items'] = _micon_menu_preprocess_menu_items($variables['items']);
+}
+
+/**
+ * Helper function to iterate over each menu item and utilize icon.
+ */
+function _micon_menu_preprocess_menu_items($items) {
+  foreach ($items as &$item) {
+    $options = $item['url']->getOptions();
+    if (!empty($options['attributes']['data-icon'])) {
+      $icon = MiconIconize::iconize($item['title'])->setIcon($options['attributes']['data-icon']);
+      if (!empty($options['attributes']['data-icon-position']) && $options['attributes']['data-icon-position'] === 'after') {
+        $icon->setIconAfter();
+      }
+      $item['title'] = $icon->render();
+      unset($options['attributes']['data-icon']);
+      $item['url']->setOptions($options);
+    }
+    if (!empty($item['below'])) {
+      $item['below'] = _micon_menu_preprocess_menu_items($item['below']);
+    }
+  }
+  return $items;
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function micon_menu_form_menu_link_edit_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $options = $form_state->getBuildInfo()['args'][0]->getOptions();
+  $config = \Drupal::config('micon_menu.config');
+  $form['path']['link']['data-icon'] = [
+    '#type' => 'micon',
+    '#title' => t('Icon'),
+    '#default_value' => isset($options['attributes']['data-icon']) ? $options['attributes']['data-icon'] : NULL,
+    '#packages' => $config->get('packages'),
+    '#access' => \Drupal::currentUser()->hasPermission('use micon link'),
+  ];
+  $form['#submit'][] = '_micon_menu_form_menu_link_edit_alter_submit';
+}
+
+/**
+ * Process the submitted form.
+ *
+ * @param array $form
+ *   An associative array containing the structure of the form.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   The current state of the form.
+ */
+function _micon_menu_form_menu_link_edit_alter_submit(array $form, FormStateInterface $form_state) {
+  $options = $form_state->getBuildInfo()['args'][0]->getOptions();
+  $menu_link_id = $form_state->getValue('menu_link_id');
+  if (!empty($menu_link_id)) {
+    $menu_link_manager = \Drupal::service('plugin.manager.menu.link');
+    $icon = $form_state->getValue('data-icon');
+    $menu_link_manager->updateDefinition($menu_link_id, ['options' => ['attributes' => ['data-icon' => $icon]]]);
+  }
+}
