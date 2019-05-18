@@ -1,0 +1,140 @@
+<?php
+
+/**
+ * @file
+ * Contains main module logic.
+ */
+
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\entity_pilot\Data\FlightManifest;
+use Drupal\entity_pilot_map_config\Form\ArrivalMappingForm;
+use Drupal\field_ui\FieldUI;
+
+/**
+ * Implements hook_entity_base_field_info().
+ */
+function entity_pilot_map_config_entity_base_field_info(EntityTypeInterface $entity_type) {
+  if ($entity_type->id() === 'ep_arrival') {
+    $fields['mapping_fields'] = BaseFieldDefinition::create('entity_reference')
+      ->setLabel(t('Field mapping'))
+      ->setDescription(t('Maps missing fields in the remote flight to local fields.'))
+      ->setSetting('target_type', 'ep_field_mapping')
+      ->setTargetEntityTypeId($entity_type->id())
+      ->setRevisionable(TRUE)
+      // @todo write a test for this.
+      ->setDisplayOptions('view', [
+        'label' => 'hidden',
+        'type' => 'string',
+        'weight' => -5,
+      ])
+      // @todo write a custom widget/selection handler plugin.
+      ->setDisplayOptions('form', [
+        'type' => 'options_select',
+        'weight' => 5,
+        'settings' => [],
+      ])
+      ->setDisplayConfigurable('form', FALSE)
+      ->setDisplayConfigurable('view', FALSE);
+
+    $fields['mapping_bundles'] = BaseFieldDefinition::create('entity_reference')
+      ->setLabel(t('Bundle mapping'))
+      ->setDescription(t('Maps missing bundles in the remote flight to local bundles.'))
+      ->setSetting('target_type', 'ep_bundle_mapping')
+      ->setTargetEntityTypeId($entity_type->id())
+      ->setRevisionable(TRUE)
+      // @todo write a test for this.
+      ->setDisplayOptions('view', [
+        'label' => 'hidden',
+        'type' => 'string',
+        'weight' => -5,
+      ])
+      // @todo write a custom widget/selection handler plugin.
+      ->setDisplayOptions('form', [
+        'type' => 'options_select',
+        'weight' => 5,
+        'settings' => [],
+      ])
+      ->setDisplayConfigurable('form', FALSE)
+      ->setDisplayConfigurable('view', FALSE);
+    return $fields;
+  }
+  return [];
+}
+
+/**
+ * Implements hook_entity_type_build().
+ */
+function entity_pilot_map_config_entity_type_alter(array &$entity_types) {
+  /** @var \Drupal\Core\Entity\EntityTypeInterface $arrival */
+  $arrival = &$entity_types['ep_arrival'];
+  $arrival->setFormClass('mapping', ArrivalMappingForm::class);
+  $arrival->setLinkTemplate('mapping-form', '/admin/structure/entity-pilot/arrivals/{ep_arrival}/mapping');
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for ep_arrival_main_account_add_form().
+ */
+function entity_pilot_map_config_form_ep_arrival_form_alter(&$form, FormStateInterface &$form_state, $form_id) {
+  /** @var \Drupal\Core\Entity\ContentEntityForm $form_object */
+  $form_object = $form_state->getFormObject();
+  // @todo - add a test for this.
+  if ($form_object->getOperation() !== 'mapping') {
+    // Only show these fields on the mapping form mode.
+    $form['mapping_fields']['#access'] = FALSE;
+    $form['mapping_bundles']['#access'] = FALSE;
+  }
+  if ($form_object->getOperation() === 'mapping') {
+    $form['approved_passengers']['#access'] = FALSE;
+    /** @var \Drupal\entity_pilot\ArrivalInterface $arrival */
+    $arrival = $form_object->getEntity();
+    /** @var \Drupal\entity_pilot_map_config\ConfigurationDifferenceManagerInterface $config_difference_manager */
+    $config_difference_manager = \Drupal::service('entity_pilot_map_config.difference_manager');
+    $flight_manifest = FlightManifest::fromArrival($arrival);
+    $configuration_difference = $config_difference_manager->computeDifference($flight_manifest);
+    /** @var \Drupal\entity_pilot_map_config\MappingManagerInterface $mapping_manager */
+    $mapping_manager = \Drupal::service('entity_pilot_map_config.mapping_manager');
+    $valid_differences = $mapping_manager->loadForConfigurationDifference($configuration_difference);
+    $bundle_ids = array_keys($valid_differences->getBundleMappings());
+    foreach ($form['mapping_bundles']['widget']['#options'] as $key => $value) {
+      if (!in_array($key, $bundle_ids, TRUE) && $key !== '_none') {
+        unset($form['mapping_bundles']['widget']['#options'][$key]);
+      }
+    }
+    $field_ids = array_keys($valid_differences->getFieldMappings());
+    foreach ($form['mapping_fields']['widget']['#options'] as $key => $value) {
+      if (!in_array($key, $field_ids, TRUE) && $key !== '_none') {
+        unset($form['mapping_fields']['widget']['#options'][$key]);
+      }
+    }
+  }
+  if ($form_object->getOperation() === 'add') {
+    // In add mode, we need to append our submit handler.
+    $form['actions']['submit']['#submit'][] = 'entity_pilot_map_config_arrival_add_submit';
+  }
+}
+
+/**
+ * Submit handler for arrival add form.
+ */
+function entity_pilot_map_config_arrival_add_submit($form, FormStateInterface $form_state) {
+  /** @var \Drupal\entity_pilot\ArrivalStorageInterface $arrival_storage */
+  $arrival_storage = \Drupal::entityTypeManager()->getStorage('ep_arrival');
+  /** @var \Drupal\Core\Entity\EntityFormInterface $form_object */
+  $form_object = $form_state->getFormObject();
+  /** @var \Drupal\entity_pilot\ArrivalInterface $arrival */
+  $arrival = $arrival_storage->resetCacheAndLoad($form_object->getEntity()->id());
+  /** @var \Drupal\entity_pilot_map_config\ArrivalCreationResult $result */
+  $result = \Drupal::service('entity_pilot_map_config.arrival_creation_handler')->buildNewArrivalResult($arrival);
+  $arrival->mapping_fields = $result->getFieldMapping() ? $result->getFieldMapping()->id() : NULL;
+  $arrival->mapping_bundles = $result->getBundleMapping() ? $result->getBundleMapping()->id() : NULL;
+  $arrival->save();
+  $destinations = $result->getDestinations();
+  $final_destination = $form_state->getRedirect();
+  $destinations[] = [
+    'route_name' => $final_destination->getRouteName(),
+    'route_parameters' => $final_destination->getRouteParameters(),
+  ];
+  $form_state->setRedirectUrl(FieldUI::getNextDestination($destinations));
+}
