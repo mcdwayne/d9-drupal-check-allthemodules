@@ -1,0 +1,218 @@
+<?php
+
+/**
+ * @file
+ * Autocomplete Multiselect CC and BCC functionality for sitewide contact forms.
+ */
+
+use Drupal\contact\Entity\ContactForm;
+
+/**
+ * Implements hook_help().
+ */
+function autocomplete_multiselect_contact_help($path = NULL, $arg = NULL) {
+  $output = "";
+  switch ($path) {
+    case 'admin/help#autocomplete_multiselect_contact':
+      $output = t('Adds Autocomplete and Multiselect users using cc and bcc fields to site-wide contact form.');
+      break;
+  }
+  return $output;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function autocomplete_multiselect_contact_form_contact_form_edit_form_alter(&$form, &$form_state) {
+  $formid = $form['id']['#default_value'];
+  $autocomplete_multiselect_contact_data = [];
+  if (empty($formid)) {
+    $formid = 0;
+  }
+  if (!empty($form['actions']['submit']['#submit'])) {
+    array_unshift($form['actions']['submit']['#submit'], '_autocomplete_multiselect_contact_submit');
+  }
+  else {
+    array_unshift($form['#submit'], '_autocomplete_multiselect_contact_submit');
+  }
+  $autocomplete_multiselect_contact_data = autocomplete_multiselect_contact_get($formid);
+  $form['autocomplete_multiselect_contact_cc'] = [
+  '#type' => 'select',
+  '#title' => t('Select CC recipients'),
+  '#multiple' => TRUE,
+  '#description' => t('Select the desired CC user from the list.'),
+  '#attributes' => array('class' => array('multipleSelect'), 'multiple' => ""),
+  '#options' => autocomplete_multiselect_contact_userAutocomplete(),
+  '#default_value' => explode("-", $autocomplete_multiselect_contact_data['cc']),
+  '#element_validate' => ['autocomplete_multiselect_contact_validate'],
+ ];
+ $form['autocomplete_multiselect_contact_bcc'] = [
+   '#type' => 'select',
+   '#title' => t('Select BCC recipients'),
+   '#multiple' => TRUE,
+   '#description' => t('Select the desired BCC user from the list.'),
+   '#attributes' => ['class' => array('multipleSelect'), 'multiple' => ""],
+   '#options' => autocomplete_multiselect_contact_userAutocomplete(),
+   '#default_value' => explode("-", $autocomplete_multiselect_contact_data['bcc']),
+   '#element_validate' => ['autocomplete_multiselect_contact_validate'],
+ ];
+  $order = [
+     'category',
+     'recipients',
+     'autocomplete_multiselect_contact_cc',
+     'autocomplete_multiselect_contact_bcc',
+     'reply',
+     'weight',
+     'selected',
+     'submit',
+   ];
+  foreach ($order as $key => $value) {
+    $form[$value]['#weight'] = $key;
+  }
+}
+
+function autocomplete_multiselect_contact_page_attachments(array &$page) {
+ $page['#attached']['library'][] = 'autocomplete_multiselect_contact/autocomplete_multiselect_contact';
+}
+
+function autocomplete_multiselect_contact_entity_delete($entity) {
+  if (!($entity instanceof ContactForm)) {
+    return;
+  }
+  autocomplete_multiselect_contact_del($entity->id());
+}
+
+/**
+ * Custom submit functions.
+ */
+function _autocomplete_multiselect_contact_submit($form, &$form_state) {
+  $formid = $form_state->getValue('id');
+  $autocomplete_multiselect_contact_data = [
+    'cc' => implode("-", $form_state->getValue('autocomplete_multiselect_contact_cc')),
+    'bcc' => implode("-", $form_state->getValue('autocomplete_multiselect_contact_bcc')),
+  ];
+  autocomplete_multiselect_contact_set($formid, $autocomplete_multiselect_contact_data);
+}
+
+/**
+ * Implements hook_mail_alter().
+ */
+function autocomplete_multiselect_contact_mail_alter(&$message) {
+  if ($message['module'] != 'contact') {
+   return;
+  }
+  $formid = $message['params']['contact_form']->getOriginalId();
+  if (!$formid) {
+   return;
+  }
+  $autocomplete_multiselect_contact_data = autocomplete_multiselect_contact_get($formid);
+  $autocomplete_multiselect_cc=explode("-", $autocomplete_multiselect_contact_data['cc']);
+  $autocomplete_multiselect_bcc=explode("-", $autocomplete_multiselect_contact_data['bcc']);
+  if ($autocomplete_multiselect_contact_data['cc']) {
+    $message['headers']['Cc'] = implode(",", $autocomplete_multiselect_cc);
+  }
+  if ($autocomplete_multiselect_contact_data['bcc']) {
+    $message['headers']['Bcc'] = implode(",", $autocomplete_multiselect_bcc);
+  }
+}
+
+function autocomplete_multiselect_contact_validate($element, &$form_state) {
+  if ($element['#value']) {
+    $mailarr = explode(",", $element['#value']);
+    $invalidarr = [];
+    foreach ($mailarr as $email) {
+      if (!valid_email_address(trim($email))) {
+        $invalidarr[] = trim($email);
+      }
+    }
+    if (!empty($invalidarr)) {
+      $translation = \Drupal::service('string_translation');
+      $message = $translation->formatPlural(count($invalidarr), "The following email is invalid: %emails", "The following emails are invalid: %emails", ['%emails' => implode(', ', $invalidarr)]);
+      $form_state->setErrorByName($element['#name'], $message);
+    }
+  }
+}
+
+/**
+ * Custom db functions below.
+ */
+function autocomplete_multiselect_contact_set($cid, $data) {
+  $testresult = db_query("SELECT cid FROM {autocomplete_multiselect_contact} WHERE cid = :cid", [':cid' => $cid]);
+  $results = $testresult->fetchField();
+  if ($results) {
+    // Update record.
+    db_update('autocomplete_multiselect_contact')
+      ->fields(['autocomplete_multiselect_contact_data' => serialize($data)])
+      ->condition('cid', $cid)
+      ->execute();
+  }
+  else {
+    // New record.
+    db_insert('autocomplete_multiselect_contact')
+      ->fields([
+        'cid' => $cid,
+        'autocomplete_multiselect_contact_data' => serialize($data),
+      ])
+      ->execute();
+  }
+}
+
+/**
+ * {@inheritdoc}
+ */
+function autocomplete_multiselect_contact_get($cid) {
+  $result = db_query("SELECT autocomplete_multiselect_contact_data FROM {autocomplete_multiselect_contact} WHERE cid = :cid", [':cid' => $cid])->fetchField();
+  $output = ['cc' => '', 'bcc' => ''];
+  if ($result) {
+    $output = unserialize($result);
+  }
+  return $output;
+}
+
+/**
+ * {@inheritdoc}
+ */
+function autocomplete_multiselect_contact_del($cid) {
+  db_delete('autocomplete_multiselect_contact')
+    ->condition('cid', $cid)
+    ->execute();
+}
+
+
+
+function autocomplete_multiselect_contact_userAutocomplete($usertype) {
+    $users=array();
+    $query = \Drupal::service('entity_type.manager')->getStorage('user');
+    $userdata = $query->getQuery()
+    ->execute();
+    unset($userdata[0]);
+    foreach($userdata as $uid){
+        $user= autocomplete_multiselect_contact_usercontent($uid,$usertype);
+        $users[$user['email']]=$user['username'];
+    }
+    
+    return $users;
+  }
+  
+  
+function autocomplete_multiselect_contact_usercontent($uid,$usertype) {
+    $userdata=array();
+    $account = \Drupal\user\Entity\User::load($uid); // pass your uid
+    $roles = $account->getRoles();
+   if(in_array($usertype, $roles))
+   {
+      $email = $account->get('mail')->value;
+      $uid=    $account->get('uid')->value;
+      $userdata['email']=$email;
+      $userdata['username']= $account->get('name')->value."(".$uid.")";
+   }
+   else{
+      $email = $account->get('mail')->value;
+      $name =  $account->get('name')->value;
+      $uid=    $account->get('uid')->value;
+      $userdata['email']=$email;
+      $userdata['username']= $account->get('name')->value."(".$uid.")";
+   }
+      return $userdata;
+     
+ }
