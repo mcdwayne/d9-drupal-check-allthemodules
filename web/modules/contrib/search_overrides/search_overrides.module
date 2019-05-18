@@ -1,0 +1,115 @@
+<?php
+
+/**
+ * @file
+ * Contains hooks for Search Overrides Module.
+ */
+
+use Drupal\search_api\Query\QueryInterface;
+use Solarium\Core\Query\QueryInterface as SolariumQueryInterface;
+use Drupal;
+use Drupal\search_api_solr\Utility\Utility;
+use Drupal\Core\Url;
+
+/**
+ * Lets modules alter the Solarium select query before executing it.
+ *
+ * @param \Solarium\Core\Query\QueryInterface $solarium_query
+ *   The Solarium query object, as generated from the Search API query.
+ * @param \Drupal\search_api\Query\QueryInterface $query
+ *   The Search API query object representing the executed search query.
+ */
+function search_overrides_search_api_solr_query_alter(SolariumQueryInterface $solarium_query, QueryInterface $query) {
+  // Allow a method to review unmodified results.
+  $ignore = Drupal::request()->query->get('ignore_overrides');
+  if (!empty($ignore)) {
+    // Show unmodified results.
+    return;
+  }
+
+  // Exit if no query was performed.
+  if (!is_array($query->getKeys())) {
+    return;
+  }
+
+  // First retrieve the user-entered text.
+  $keys = array_shift($query->getKeys());
+  // Try to find an override for this query text.
+  $elQuery = Drupal::entityQuery('search_override');
+  $elevates = $elQuery->condition('query', $keys)->execute();
+  if (!$elevates) {
+    // No record for this search term, so nothing to do.
+    return;
+  }
+
+  $elStorage = Drupal::entityTypeManager()->getStorage('search_override');
+  // Only load one entity, to reduce complexity
+  // TODO: prevent duplicates from being stored.
+  $elevate = $elStorage->load(array_shift($elevates));
+
+  $hash = Utility::getSiteHash();
+  // TODO: sort out language handling, seems ambiguous/confusing now.
+  $languages = $query->getLanguages();
+  $elSolrIds = [];
+  $exSolrIds = [];
+  foreach ($languages as $language) {
+    // Handle items to elevate.
+    $elevateIds = $elevate->getElevatedIds();
+    foreach ($elevateIds as $id) {
+      // TODO: make this work with more entities than nodes.
+      $elSolrIds[] = $hash . '-base-entity:node/' . $id . ':' . $language;
+    }
+
+    // Handle exclusions.
+    $excludeIds = $elevate->getExcludedIds();
+    // $excludeIds = array(10);.
+    foreach ($excludeIds as $id) {
+      // TODO: make this work with more entities than nodes.
+      $exSolrIds[] = $hash . '-base-entity:node/' . $id . ':' . $language;
+    }
+  }
+  $solarium_query->addParam('elevateIds', implode(',', $elSolrIds));
+  $solarium_query->addParam('excludeIds', implode(',', $exSolrIds));
+}
+
+/**
+ * Provide additional operations on the Saerch overrides listing page.
+ */
+function search_overrides_entity_operation($entity) {
+  $operations = [];
+  $info = $entity->getEntityType();
+  if ($info->id() == 'search_override') {
+    $config = Drupal::config('searchoverride_settings.settings');
+    $path = $config->get('path');
+    $parameter = $config->get('parameter');
+    if (empty($config) || empty($path) || empty($parameter)) {
+      // The required configuration has not been provided, so throw a warning
+      // and skip adding operations.
+      $messenger = Drupal::messenger();
+      $messenger->addMessage('Settings for Search Overrides are incomplete. Configure them to add links here to test results.', $messenger::TYPE_WARNING, $repeat = TRUE);
+      return;
+    }
+
+    // Provide a link to view the modified results.
+    $operations['test-result'] = [
+      'title' => t('Test Override'),
+      'weight' => 5,
+      'url' => Url::fromUri('internal:' . $path, [
+        'query' => [$parameter => $entity->getQuery()],
+      ]),
+    ];
+    // Provide a link to view the unmodified results.
+    $operations['original-result'] = [
+      'title' => t('Original Results'),
+      'weight' => 6,
+      'url' => Url::fromUri('internal:' . $path, [
+        'query' => [
+          $parameter => $entity->getQuery(),
+          'ignore_overrides' => 1,
+        ],
+      ]),
+    ];
+  }
+
+  return $operations;
+}
