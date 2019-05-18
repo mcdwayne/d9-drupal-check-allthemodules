@@ -1,0 +1,202 @@
+<?php
+/**
+ * @file
+ * Hook implementations for the Collect module.
+ */
+
+use Drupal\collect\CollectContainerInterface;
+use Drupal\Core\Entity\ContentEntityInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\FieldableEntityInterface;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Url;
+use Drupal\search_api\Entity\Index;
+
+/**
+ * Implements hook_help().
+ */
+function collect_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'entity.collect_container.collection':
+      return '<p>' . t('This page shows all data containers created by the Collect module. The data can be interpreted and processed, once a <a href="@models_url">model</a> is set up to designate a model plugin. Some model plugins offer one-click setup from the data container view.', ['@models_url' => \Drupal::url('entity.collect_model.collection')]) . '</p>';
+
+    case 'entity.collect_model.collection':
+      return '<p>' . t('Your <em>models</em> define how to interpret the data of collected containers. Each model links a <em>model plugin</em> to a set of containers. The model also defines what <em>properties</em> are exposed, as well as a <em>processing</em> flow.') . '</p>';
+
+    case 'entity.collect_model.edit_form':
+    case 'entity.collect_model.add_form':
+    case 'entity.collect_model.add_suggested_form':
+      return '<p>' . t('These settings apply when processing containers that match the given URI pattern: If the <em>URI pattern</em> of this model matches the <em>Schema URI</em> of a container (and no other model has a more specific matching URI pattern) then this model will be used to handle the container and access its data.') . '</p>';
+
+    case 'entity.collect_model.processing_form':
+      return '<p>' . t('Collected containers are processed after they have been saved. The processing that you can modify here applies to all containers that this model applies to.') . '</p>';
+
+    case 'entity.collect_model.property_edit_form':
+    case 'entity.collect_model.property_add_form':
+      return '<p>' . t('A property declares that a single data value may be present in the data.') . '</p>';
+
+    case 'collect.capture_entities':
+      return '<p>' . t('Select an entity type and bundle, or a single entity, to capture it into a data container and start processing it. Config entities are not supported.') . '</p>'
+        . '<p>' . t('Automatic capturing can be set up in the <a href="@url">Collect settings</a>.', ['@url' => \Drupal::url('collect.settings')]) . '</p>';
+
+    case 'collect.fetch_url':
+      return '<p>' . t('Enter the URL of a web resource to capture it into a data container and start processing it.') . '</p>';
+  }
+
+  return NULL;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function collect_theme() {
+  return array(
+    'collect_container' => array(
+      'render element' => 'elements',
+      'template' => 'collect_container',
+    ),
+  );
+}
+
+/**
+ * Prepares variables for container templates.
+ *
+ * Default template: collect_container.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - collect_container: The collect container.
+ */
+function template_preprocess_collect_container(&$variables) {
+  $variables['container'] = $variables['elements']['#collect_container'];
+
+  foreach (Element::children($variables['elements']) as $key) {
+    $variables['content'][$key] = $variables['elements'][$key];
+  }
+
+  $variables['attributes']['class'][] = 'collect';
+  $variables['attributes']['class'][] = 'container';
+}
+
+/**
+ * Implements hook_field_formatter_info_alter().
+ */
+function collect_field_formatter_info_alter(&$info) {
+  // Make uuid and uri fields printable using the string formatter.
+  $info['string']['field_types'][] = 'uuid';
+  $info['string']['field_types'][] = 'uri';
+}
+
+/**
+ * Implements hook_entity_insert().
+ */
+function collect_entity_insert(EntityInterface $entity) {
+  if (collect_common_entity_capture_check($entity, collect_continuous_entity_capture_configuration())) {
+    \Drupal::service('collect.capture_entity')->capture($entity, 'insert');
+  }
+
+  // Track new entity with Search API index.
+  if ($entity instanceof CollectContainerInterface && \Drupal::moduleHandler()->moduleExists('search_api')) {
+    if ($model = collect_model_manager()->loadModelByUri($entity->getSchemaUri())) {
+      $datasource_id = 'collect:' . $model->id();
+      $index_ids = \Drupal::entityQuery('search_api_index')
+        ->condition('datasources.*', $datasource_id)
+        ->execute();
+      foreach (Index::loadMultiple($index_ids) as $index_id => $index) {
+        $index->trackItemsInserted($datasource_id, [$entity->id()]);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function collect_entity_update(EntityInterface $entity) {
+  if (collect_common_entity_capture_check($entity, collect_continuous_entity_capture_configuration())) {
+    \Drupal::service('collect.capture_entity')->capture($entity, 'update');
+  }
+}
+
+/**
+ * Captures the entity.
+ *
+ * Batch callback function.
+ */
+function collect_capture_entity_batch(ContentEntityInterface $entity) {
+  return \Drupal::service('collect.capture_entity')->capture($entity);
+}
+
+/**
+ * Returns configuration for continuous entity capturing.
+ */
+function collect_continuous_entity_capture_configuration() {
+  return \Drupal::configFactory()->get('collect.settings')->get('entity_capture');
+}
+
+/**
+ * Gets the model manager.
+ *
+ * Use this in cases where the plugin manager cannot be obtained by injection.
+ *
+ * @return \Drupal\collect\Model\ModelManagerInterface
+ *   The Collect model plugin manager.
+ */
+function collect_model_manager() {
+  return \Drupal::service('plugin.manager.collect.model');
+}
+
+/**
+ * Gets the processor manager.
+ *
+ * Use this in cases where the plugin manager cannot be obtained by injection.
+ *
+ * @return \Drupal\collect\Processor\ProcessorManagerInterface
+ *   The Collect processor plugin manager.
+ */
+function collect_processor_manager() {
+  return \Drupal::service('plugin.manager.collect.processor');
+}
+
+/**
+ * Gets the web resource fetching service.
+ *
+ * Use this in cases where the service cannot be obtained by injection.
+ *
+ * @return \Drupal\collect\FetchWebResource
+ *   The Fetch Web Resource service.
+ */
+function collect_fetch_service() {
+  return \Drupal::service('collect.fetch_web_resource');
+}
+
+/**
+ * Gets the relation plugin manager.
+ *
+ * Use this in cases where the plugin manager cannot be obtained by injection.
+ *
+ * @return \Drupal\collect\Relation\RelationPluginManagerInterface
+ *   The Collect relation plugin manager.
+ */
+function collect_relation_manager() {
+  return \Drupal::service('plugin.manager.collect.relation');
+}
+
+/**
+ * Implements hook_entity_operation_alter().
+ */
+function collect_entity_operation_alter(array &$operations, EntityInterface $entity) {
+  // Display the "Capture (Collect)" operation only for content entities.
+  // Exclude possibility to capture collect container entities.
+  if ($entity instanceof FieldableEntityInterface && !$entity instanceof CollectContainerInterface && \Drupal::currentUser()->hasPermission('administer collect')) {
+    $operations['collect_capture'] = [
+      'title' => t('Capture (Collect)'),
+      'url' => Url::fromRoute('collect.capture_entity', [
+        'entity_type' => $entity->getEntityTypeId(),
+        'entity_id' => $entity->id()
+      ]),
+      'weight' => 50,
+    ];
+  }
+}

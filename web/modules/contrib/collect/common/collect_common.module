@@ -1,0 +1,148 @@
+<?php
+/**
+ * @file
+ * Hook implementations for the Collect common module.
+ */
+
+use Drupal\Component\Utility\SafeMarkup;
+use Drupal\Core\Entity\ContentEntityBase;
+use Drupal\Core\Entity\ContentEntityInterface;
+use Drupal\Core\Entity\Plugin\DataType\EntityReference;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\EntityManagerInterface;
+use Drupal\Core\Entity\FieldableEntityInterface;
+use Drupal\Core\TypedData\ListDataDefinition;
+use Symfony\Component\Serializer\Normalizer\NormalizerInterface;
+
+/**
+ * Checks whether entity is eligible for continuous capturing.
+ */
+function collect_common_entity_capture_check(EntityInterface $entity, $configuration) {
+  if ($entity instanceof FieldableEntityInterface && $configuration) {
+    if (isset($configuration[$entity->getEntityTypeId()])) {
+      $entity_type_config = $configuration[$entity->getEntityTypeId()];
+      if (!isset($entity_type_config['continuous'])) {
+        return FALSE;
+      }
+      $bundles = $entity_type_config['continuous']['bundles'];
+      // Capturing all entities except selected bundles.
+      if ($entity_type_config['continuous']['default'] == 'all' && in_array($entity->bundle(), $bundles)) {
+        return FALSE;
+      }
+      // Capturing entities from selected bundles.
+      if ($entity_type_config['continuous']['default'] == 'none' && !in_array($entity->bundle(), $bundles)) {
+        return FALSE;
+      }
+      // Capturing all entities of an entity type.
+      return TRUE;
+    }
+    return FALSE;
+  }
+  return FALSE;
+}
+
+/**
+ * Retrieves the available bundles of this entity type as an options list.
+ *
+ * @param \Drupal\Core\Entity\EntityManagerInterface $entity_manager
+ *   The entity manager.
+ * @param string $entity_type
+ *   The entity type id.
+ *
+ * @return array
+ *   An associative array of bundle labels, keyed by the bundle name.
+ */
+function collect_common_get_bundles(EntityManagerInterface $entity_manager, $entity_type) {
+  $options = array();
+  if ($entity_manager->getDefinition($entity_type)->hasKey('bundle')) {
+    foreach ($entity_manager->getBundleInfo($entity_type) as $bundle => $bundle_info) {
+      $options[$bundle] = SafeMarkup::checkPlain($bundle_info['label']);
+    }
+  }
+  return $options;
+}
+
+/**
+ * Expand field definitions with URI definitions for entity reference fields.
+ *
+ * @param \Drupal\Core\Entity\EntityManagerInterface $entity_manager
+ *   The entity manager.
+ * @param \Symfony\Component\Serializer\Normalizer\NormalizerInterface $serializer
+ *   SerializerInterface which is used for serialization.
+ * @param \Drupal\Core\Field\FieldDefinitionInterface[] $field_definitions
+ *   An array of field definitions, keyed by field name.
+ * @param array $fields
+ *   Normalized field definitions data.
+ */
+function collect_common_add_uri_definitions(EntityManagerInterface $entity_manager, NormalizerInterface $serializer, array $field_definitions, array $fields) {
+  // As we use HAL specification compatible structure to capture referenced
+  // entity URIs, field definitions of reference fields do not match the
+  // structure of values. Considering that, we need to create URI data
+  // definitions for those fields.
+  foreach ($field_definitions as $field_name => $field_definition) {
+    if (in_array($field_definition->getType(), ['entity_reference', 'file', 'image']) && $entity_manager->getDefinition($field_definition->getSetting('target_type'))->isSubclassOf('\Drupal\Core\Entity\FieldableEntityInterface')) {
+      $fields['_link_' . $field_name] = $serializer->normalize(ListDataDefinition::create('uri')
+        ->setLabel(t('@label (URI)', ['@label' => $field_definition->getLabel()]))
+        ->setDescription($field_definition->getDescription()));
+    }
+  }
+
+  return $fields;
+}
+
+/**
+ * Returns a collect cache key of the given entity.
+ *
+ * @param \Drupal\Core\Entity\ContentEntityInterface $entity
+ *   The given content entity.
+ *
+ * @return string
+ *   The cache key.
+ */
+function collect_common_cache_key(ContentEntityInterface $entity) {
+  $cache_key = implode('.', ['collect', $entity->getEntityTypeId(), $entity->id()]);
+  if ($revision_id = $entity->getRevisionId()) {
+    $cache_key .= '.' . $revision_id;
+  }
+
+  return $cache_key;
+}
+
+/**
+ * Returns a list of entities referenced by passed entity.
+ *
+ * @param array $entities
+ *   The recursively collected referenced entities.
+ * @param \Drupal\Core\Entity\ContentEntityInterface $entity
+ *   The original entity.
+ * @param array $config
+ *   The entity capture configuration.
+ * @param int $depth
+ *   The depth level of capturing entity references.
+ */
+function collect_common_get_referenced_entities(array &$entities, ContentEntityInterface $entity, array $config, $depth = 0) {
+  // Check for referenced entities only if there are reference fields set in
+  // the configuration.
+  if (isset($config[$entity->getEntityTypeId()]['reference_fields'])) {
+    // Gather a list of referenced entities.
+    foreach ($entity->getFields() as $field_items) {
+      foreach ($field_items as $field_item) {
+        if (in_array($field_item->getFieldDefinition()->getName(), $config[$entity->getEntityTypeId()]['reference_fields'])) {
+          // Loop over all properties of a field item.
+          foreach ($field_item->getProperties(TRUE) as $property) {
+            if ($property instanceof EntityReference && $referenced_entity = $property->getValue()) {
+              if ($referenced_entity instanceof ContentEntityBase) {
+                $id = $referenced_entity->getEntityTypeId() . ':' . $referenced_entity->id();
+                // Avoid recursion.
+                if (!isset($entities[$id])) {
+                  $entities[$id] = $referenced_entity;
+                  collect_common_get_referenced_entities($entities, $referenced_entity, $config, $depth++);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
