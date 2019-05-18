@@ -1,0 +1,128 @@
+<?php
+
+/**
+ * @file
+ * Contains suggestion.module.
+ */
+
+use Drupal\Component\Utility\Html;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\CurrentRouteMatch;
+use Drupal\node\NodeInterface;
+use Drupal\suggestion\SuggestionHelper;
+use Drupal\suggestion\SuggestionStorage;
+
+/**
+ * Implements hook_cron().
+ */
+function suggestion_cron() {
+  if (!SuggestionHelper::getConfig('synced')) {
+    SuggestionHelper::index();
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function suggestion_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $autocomplete = SuggestionHelper::getConfig('autocomplete');
+
+  if (empty($autocomplete[$form_id])) {
+    return;
+  }
+  return SuggestionHelper::alterElement($form, $autocomplete[$form_id]);
+}
+
+/**
+ * Implements hook_help().
+ */
+function suggestion_help($route_name, CurrentRouteMatch $route_match) {
+  $x = [
+    '```php' => '<code>',
+    '```'    => '</code>',
+    "\n"     => "\n<br />",
+  ];
+  switch ($route_name) {
+    case 'help.page.suggestion':
+      $txt = file_get_contents(drupal_get_path('module', 'suggestion') . '/README.md');
+      return str_replace(array_keys($x), array_values($x), Html::escape($txt));
+  }
+  return '';
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function suggestion_node_insert(NodeInterface $node) {
+  $types = SuggestionHelper::types();
+
+  if (!empty($node->status) && !empty($node->type) && in_array($node->type, $types)) {
+    SuggestionHelper::insert($node->label(), $node->language(), SuggestionStorage::CONTENT_BIT);
+  }
+}
+
+/**
+ * Implements hook_permission().
+ */
+function suggestion_permission() {
+  return [
+    'administer suggestion' => [
+      'title'       => t('Administer the Suggestion Module'),
+      'description' => t('Perform administration tasks for the suggestion module.'),
+    ],
+  ];
+}
+
+/**
+ * Custom submit function to add surfer suggestions.
+ */
+function suggestion_surfer_submit($form, FormStateInterface $form_state) {
+  $language = \Drupal::languageManager()->getCurrentLanguage();
+  $cfg = SuggestionHelper::getConfig();
+  $form_id = $form_state->getValue('form_id');
+
+  $field_name = !empty($cfg->autocomplete[$form_id]) ? $cfg->autocomplete[$form_id] : '';
+
+  if (!$field_name || !$form_state->getValue($field_name)) {
+    return;
+  }
+  $txt = SuggestionHelper::tokenize($form_state->getValue($field_name), $cfg->min);
+
+  if (!$txt) {
+    return;
+  }
+  $atoms = SuggestionHelper::atomize($txt);
+
+  $count = count($atoms);
+
+  if ($count < $cfg->atoms_min || $count > $cfg->atoms_max) {
+    return;
+  }
+  $ngram = implode(' ', $atoms);
+
+  $qty = SuggestionStorage::getNgramQty($ngram, $language->getId());
+
+  if ($qty) {
+    $count = str_word_count($ngram);
+    $src = SuggestionStorage::getBitmap($ngram, SuggestionStorage::SURFER_BIT, $language->getId());
+
+    $key = [
+      'langcode' => $language->getId(),
+      'ngram'    => $ngram,
+    ];
+    $fields = [
+      'atoms'   => $count,
+      'density' => SuggestionHelper::calculateDensity($src, $count, ($qty + 1)),
+      'qty'     => $qty + 1,
+      'src'     => $src,
+    ];
+    SuggestionStorage::mergeSuggestion($key, $fields);
+
+    return;
+  }
+  $score = SuggestionStorage::getScore($atoms, $language->getId());
+
+  if ($score >= SuggestionHelper::MIN_SCORE) {
+    SuggestionHelper::insert($ngram, $language->getId(), SuggestionStorage::SURFER_BIT, $score);
+  }
+}
