@@ -1,0 +1,153 @@
+<?php
+
+use Drupal\Core\Url;
+use Drupal\Component\Utility\NestedArray;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Form\FormState;
+use Symfony\Component\HttpFoundation\RedirectResponse;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Form\ConfigFormBase;
+use Symfony\Component\DependencyInjection\ContainerInterface;
+use Symfony\Component\HttpFoundation\Request;
+use Drupal\Core\Controller\ControllerBase;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\commerce_order\Entity\LineItem;
+use Drupal\commerce_order\Entity\Order;
+use Drupal\commerce_product\Entity\Product;
+use Drupal\commerce_product\Entity\ProductVariation;
+use Drupal\Core\Routing\AdminContext;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Component\Utility\Html;
+
+/**
+ * 
+ * @param type $form
+ * @param FormStateInterface $form_state
+ * @param type $form_id
+ * Implements hook_form_alter().
+ */
+function suretax_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  // Order Manual Edit page.
+  if ((strstr($form_id, "commerce_order_")) && (strstr($form_id, "_edit_form"))) {
+    unset($form['line_items']['widget']['actions']['bundle']['#options']['suretax_calculation']);
+    foreach (array_keys($form['actions']) as $action) {
+      if ($action != 'preview' && isset($form['actions'][$action]['#type']) && $form['actions'][$action]['#type'] === 'submit') {
+        $form['actions'][$action]['#submit'][] = 'suretax_manual_submit';
+      }
+    }
+    array_unshift($form['#validate'], 'suretax_manual_validate');
+  }
+  // Update Suretax lineitem in Checkout page.
+  if ($form_id == 'multistep_default') {
+    $path = HTML::escape(\Drupal::service('path.current')->getPath());
+    $path_args = explode('/', $path);
+    $order_id = $path_args[2];
+    $order_load = Order::load($order_id);
+    suretax_line_item($order_load);
+  }
+  //@TODO in Cart Page with Suretax as Subtotal.
+  //  if ((strstr($form_id, "views_form_commerce_cart_form_"))) {
+  //  $order_id = $form['actions']['checkout']['#order_id'];
+  // }
+}
+
+/**
+ * 
+ * @param type $form
+ * @param FormStateInterface $form_state
+ * Implements Manual Submit function in Order Edit page.
+ */
+function suretax_manual_submit(&$form, \Drupal\Core\Form\FormStateInterface &$form_state) {
+  $path = HTML::escape(\Drupal::service('path.current')->getPath());
+  $path_args = explode('/', $path);
+  $order_id = $path_args[4];
+  $values = $form_state->getValues();
+  $order_load = Order::load($order_id);
+  suretax_line_item($order_load);
+}
+
+/**
+ * 
+ * @global type $base_url
+ * @param type $form
+ * @param FormStateInterface $form_state
+ * @return RedirectResponse
+ * Implements validate function for suretax credentials in Order Page.
+ */
+function suretax_manual_validate(&$form, \Drupal\Core\Form\FormStateInterface &$form_state) {
+  global $base_url;
+  $values = $form_state->getValues();
+  $url = Url::fromUri($base_url . '/admin/commerce/config/suretax');
+  $suretax_config = \Drupal::config('suretax.settings');
+  $mode = $suretax_config->get('suretax_mode');
+  $ClientNumber = $suretax_config->get('suretax_client_id_' . $mode, '');
+  $ValidationKey = $suretax_config->get('suretax_validation_key_' . $mode, '');
+  if (!$ClientNumber || !$ValidationKey) {
+    drupal_set_message(t('SureTax not configured properly.'), 'error');
+    drupal_set_message(\Drupal::l(t('Click Here'), $url), 'error');
+    drupal_set_message(t(' to configure.'), 'error');
+    $current_path = \Drupal::request()->getRequestUri();
+    return new RedirectResponse($base_url . '/' . $current_path);
+  }
+}
+
+/**
+ * 
+ * @param type $order_load
+ * Implements function to add Product, Product Variation and Suretax lineitem.
+ */
+function suretax_line_item($order_load) {
+  // Check order has lineitems.
+  if ($order_load->hasLineItems()) {
+    $line_items = $order_load->getLineItems();
+    foreach ($line_items as $line_item) {
+      // Remove Suretax lineitem if already present.
+      if ($line_item->type->target_id == 'suretax_calculation') {
+        $suretax_line_item_id = $line_item->line_item_id->value;
+        $suretax_line_item_delete = LineItem::load($suretax_line_item_id);
+        $order_load->removeLineItem($suretax_line_item_delete);
+        $order_load->save();
+        $suretax_line_item_delete->delete();
+      }
+    }
+    module_load_include('inc', 'suretax', 'suretax_sales_calculate');
+    $tax_total = suretax_sales_request_tax($order_load, $order_uid);
+    $suretax_config = \Drupal::config('suretax.settings');
+    $checkout_name = $suretax_config->get('suretax_checkout_name');
+// Create new Product.
+    $product = Product::create([
+          'type' => 'default',
+          'title' => $checkout_name,
+          'status' => 1,
+    ]);
+    $product->save();
+// Create new Product variation type SureTax.
+    $productvariation = ProductVariation::create([
+          'type' => 'suretax',
+          'title' => $checkout_name,
+          'status' => 1,
+          'product_id' => $product->id(),
+          'sku' => 'suretax_' . $order_load->getOrderNumber() . '_' . $tax_total,
+          'price' => [
+            'amount' => $tax_total,
+            'currency_code' => 'USD'
+          ],
+    ]);
+    $productvariation->save();
+//Create new SureTax Lineitem.
+    $line_item = LineItem::create([
+          'type' => 'suretax_calculation',
+          'unit_price' => [
+            'amount' => $tax_total,
+            'currency_code' => 'USD',
+          ],
+          'title' => $checkout_name,
+          'order_id' => $order_load->getOrderNumber(),
+          'purchased_entity' => $productvariation->id(),
+    ]);
+    $line_item->save();
+// Add suretax lineitem to order.
+    $order_load->addLineItem($line_item);
+    $order_load->save();
+  }
+}
