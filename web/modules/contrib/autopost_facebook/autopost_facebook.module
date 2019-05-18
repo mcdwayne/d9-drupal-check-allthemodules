@@ -1,0 +1,162 @@
+<?php
+
+/**
+ * @file
+ * This is the primary module file.
+ */
+
+use Drupal\Core\Database\Database;
+use Drupal\Core\Entity\ContentEntityInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\user\Entity\User;
+use Facebook\Exceptions\FacebookResponseException;
+use Facebook\Exceptions\FacebookSDKException;
+use Facebook\Facebook;
+
+/**
+ * Implements hook_form_FORM_ID_alter() for 'field_storage_config_edit_form'.
+ *
+ * @todo Remove when module require 8.4 core https://www.drupal.org/node/2869873
+ */
+function autopost_facebook_form_field_storage_config_edit_form_alter(&$form, FormStateInterface $form_state) {
+  if ($form_state->getFormObject()->getEntity()->getType() == 'autopost_facebook') {
+    // Hide the cardinality field.
+    $form['cardinality_container']['#access'] = FALSE;
+    $form['cardinality_container']['#disabled'] = TRUE;
+  }
+}
+
+/**
+ * Implements hook_entity_insert().
+ */
+function autopost_facebook_entity_insert(EntityInterface $entity) {
+  if (autopost_facebook_validate($entity)) {
+    autopost_facebook_post_link($entity);
+  }
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function autopost_facebook_entity_update(EntityInterface $entity) {
+  if (autopost_facebook_validate($entity)) {
+    autopost_facebook_post_link($entity);
+  }
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function autopost_facebook_entity_delete(EntityInterface $entity) {
+  if ($entity instanceof ContentEntityInterface && is_numeric($entity->id())) {
+    Database::getConnection()
+      ->delete('autopost_facebook')
+      ->condition('entity_id', $entity->id(), '=')
+      ->condition('entity_type', $entity->getEntityTypeId(), '=')
+      ->execute();
+  }
+}
+
+/**
+ * Checks if the entity should be posted.
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ *   The entity to be posted on facebook.
+ *
+ * @return bool
+ *   Returns TRUE when entity allowed to be autoposted, FALSE otherwise.
+ *
+ * @see \Drupal\autopost_facebook\Plugin\Field\FieldWidget\AutopostFacebookDefaultWidget::formElement()
+ */
+function autopost_facebook_validate(EntityInterface $entity) {
+  if ($entity instanceof ContentEntityInterface
+    && is_numeric($entity->id())
+    && $entity->hasLinkTemplate('canonical')
+    && $entity->access('view', User::getAnonymousUser())) {
+    $fields = $entity->getFieldDefinitions();
+    foreach ($fields as $field_name => $definition) {
+      if ($definition->getType() === 'autopost_facebook') {
+        switch ($entity->{$field_name}->value) {
+          case 1:
+            $isPosted = Database::getConnection()
+              ->queryRange('SELECT 1 FROM {autopost_facebook} WHERE entity_id = :entity_id AND entity_type = :entity_type', 0, 1, [
+                'entity_id' => $entity->id(),
+                'entity_type' => $entity->getEntityTypeId(),
+              ])->fetchField();
+            return !$isPosted;
+
+          case 2:
+            return TRUE;
+        }
+        // Do not iterate other fields when posting disabled.
+        break;
+      }
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Posts entity path on facebook.
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ *   The entity to be posted on facebook.
+ *
+ * @return bool
+ *   Returns TRUE when post succeeded, FALSE otherwise.
+ */
+function autopost_facebook_post_link(EntityInterface $entity) {
+  $config = \Drupal::config('autopost_facebook.settings');
+
+  $app_id = $config->get('app_id');
+  $app_secret = $config->get('app_secret');
+  $access_token = $config->get('access_token');
+
+  if ($app_id and $app_secret and $access_token) {
+    // Documentation in https://github.com/facebook/php-graph-sdk/blob/5.5/docs/examples/post_links.md
+    $fb = new Facebook([
+      'app_id' => $config->get('app_id'),
+      'app_secret' => $config->get('app_secret'),
+      'default_graph_version' => 'v2.10',
+    ]);
+
+    try {
+      $linkData = [
+        'link' => $entity->toUrl()->setAbsolute()->toString(),
+        'message' => $entity->label(),
+      ];
+      $posts_accounts = \Drupal::config('autopost_facebook.accounts_settings')
+        ->get('posts');
+      foreach ($posts_accounts as $id => $access_token) {
+        $fb->post("/{$id}/feed", $linkData, $access_token);
+      }
+    }
+    catch (FacebookResponseException $e) {
+      $message = t('Graph returned an error: %message', ['%message' => $e->getMessage()]);
+    }
+    catch (FacebookSDKException $e) {
+      $message = t('Facebook SDK returned an error: %message', ['%message' => $e->getMessage()]);
+    }
+    catch (\Exception $e) {
+      $message = t('Posting to Facebook failed: %message', ['%message' => $e->getMessage()]);
+    }
+
+    if (isset($message)) {
+      drupal_set_message($message, 'warning');
+      return FALSE;
+    }
+    else {
+      Database::getConnection()
+        ->merge('autopost_facebook')
+        ->keys([
+          'entity_id' => $entity->id(),
+          'entity_type' => $entity->getEntityTypeId(),
+        ])
+        ->fields([
+          'timestamp' => \Drupal::time()->getRequestTime(),
+        ])->execute();
+      return TRUE;
+    }
+  }
+}
