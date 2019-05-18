@@ -1,0 +1,342 @@
+<?php
+
+/**
+ * @file
+ * Contains content_parser.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use GuzzleHttp\Exception\RequestException;
+use Drupal\Component\Utility\Unicode;
+use Drupal\Core\Entity\EntityInterface;
+use phpQuery as phpQuery;
+use phpUri as phpUri;
+use GuzzleHttp\Exception\ClientException;
+
+/**
+ * Implements hook_theme().
+ */
+function content_parser_theme($existing, $type, $theme, $path) {
+  return [
+    // Templates for default widget types.
+    'example_fields' => [
+      'variables' => [
+        'fields' => [],
+        'isMulti' => false,
+      ],
+      // 'template' => 'example-fields',
+    ],
+  ];
+}
+
+/**
+ * Implements hook_help().
+ */
+function content_parser_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the content_parser module.
+    case 'help.page.content_parser':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('ContentParser') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * {@inheritdoc}
+ */
+function content_parser_get_entity_by_remote_id($remote_id) {
+  $remotes = Drupal::entityManager()
+    ->getStorage('remote_parser')
+    ->loadByProperties([
+      'remote_id' => $remote_id
+    ]);
+
+  if ($remote = reset($remotes)) {
+    return $remote->getHost();
+  }
+
+  return null;
+}
+
+/**
+ * {@inheritdoc}
+ */
+function content_parser_insert_remote_id($entity_type, $entity_id, $remote_id, $original_link, $parser_id) {
+  $entity = Drupal::entityManager()
+    ->getStorage('remote_parser')
+    ->create([
+      'remote_id' => $remote_id,
+      'entity_type' => $entity_type,
+      'entity_id' => $entity_id,
+      'original_link' => $original_link,
+      'parser' => $parser_id
+    ])
+    ->save();
+}
+
+/**
+ * {@inheritdoc}
+ */
+function content_parser_entity_delete(EntityInterface $entity) {
+  $remotes = Drupal::entityManager()
+    ->getStorage('remote_parser')
+    ->loadByProperties([
+      'entity_type' => $entity->getEntityTypeId(),
+      'entity_id' => $entity->id()
+
+    ]);
+
+  if ($remote = reset($remotes)) {
+    $remote->delete();
+  }
+}
+
+/**
+ * {@inheritdoc}
+ */
+function _content_parser_match_path($path, $patterns) {
+  $patterns = _get_array_from_text_lines($patterns);
+
+  foreach ($patterns as $pattern) {
+    if (!trim($pattern)) {
+      continue;
+    }
+    if (Unicode::substr($pattern, 0, 1) == '#') {
+      if (preg_match($pattern, $path)) {
+        return TRUE;
+      }
+    }
+    else {
+      if (\Drupal::service('path.matcher')->matchPath($path, $pattern)) {
+        return TRUE;
+      }
+    }
+  }
+
+  return FALSE;
+}
+
+/**
+ * {@inheritdoc}
+ */
+function _entity_create($entity_type, $bundle) {
+  return Drupal::entityTypeManager()
+      ->getStorage($entity_type)
+      ->create([
+        'type' => $bundle
+      ]);
+}
+
+/**
+ * Exploded text by lines.
+ */
+function _get_array_from_text_lines($string) {
+  return preg_split("/\r\n|\n|\r/", trim($string));
+}
+
+/**
+ * Download remote url.
+ */ 
+function _get_page_by_url($uri, $headers = [], $cookieJar, $charset = 'auto') {
+  try {
+    $body = (string) \Drupal::httpClient()
+      ->get($uri, [
+        'headers' => $headers,
+        'cookies'  => $cookieJar
+      ])
+      ->getBody();
+  } catch (RequestException $e) {
+    return NULL;
+  }
+
+  // Find charset
+  if ($charset == 'auto') {
+    if (preg_match('# content="text/html; charset=(.+)"#isU', $body, $matches)) {
+      $charset = $matches[1];
+    }
+  }
+
+  // Convert charset
+  if (Unicode::strtolower($charset) != 'utf-8' && $charset != 'auto') {
+    $body = iconv($charset, 'UTF-8//IGNORE', $body);
+    $body = str_ireplace(
+      ' content="text/html; charset=' . $charset . '"',
+      ' content="text/html; charset=utf-8"',
+      $body
+    );
+  }
+
+  return $body;
+}
+
+/**
+ * Create phpQuery object.
+ */
+function _content_parser_create_phpquery($html, $charset_fix = FALSE) {
+  return PhpQuery::newDocument($html, $charset_fix ? 'utf8' : FALSE);
+}
+
+/**
+ * Return page links.
+ */
+function _parser_get_page_links($doc) {
+  $links = array();  
+  foreach ($doc->find('a') as $a) {
+    $href = pq($a)->attr('href');
+
+    // Continue if $href == '#content'
+    if (Unicode::substr($href, 0, 1) == '#') {
+      continue;
+    }
+    // Continue if $href == 'ftp://...'
+    if (preg_match('#^([a-z]+)://#', $href, $matches) && !in_array($matches[1], array('http', 'https'))) {
+      continue;
+    }
+    // Continue if $href == 'javascript:alert();'
+    if (strpos($href, 'javascript:') === 0 || strpos($href, 'mailto:') === 0) {
+      continue;
+    }
+
+    // Remove hash
+    $href = preg_replace('/#.*$/', '', $href);
+
+    $links[] = $href;
+  }
+
+  return array_unique($links);
+}
+
+/**
+ * Return absolute url by base and relative url.
+ */
+function parser_get_absolute_url($base_url, $relative_url) {
+  if (preg_match('#^[a-z]+://[^/]+$#', $base_url)) {
+    $base_url .= '/';
+  }
+
+  return phpUri::parse($base_url)->join($relative_url);
+}
+
+/**
+ * Return TRUE if URLs have same host.
+ */
+function _parser_check_urls_host($url1, $url2) {
+  $url1_host = preg_replace('#^www.#', '', parse_url($url1, PHP_URL_HOST));
+  $url2_host = preg_replace('#^www.#', '', parse_url($url2, PHP_URL_HOST));
+  if ($url1_host == $url2_host) {
+    return TRUE;
+  }
+}
+
+/**
+ * Send POST http request.
+ */
+function _parser_post_request($url, array $data, array $options = array()) {
+  try {
+    return  \Drupal::httpClient()
+      ->post($uri, $options + [
+        'headers' => ['Content-Type' => 'application/x-www-form-urlencoded'],
+        'body' => $data
+      ]);
+  }
+  catch (RequestException $e) {
+    return NULL;
+  }
+
+  return NULL;
+}
+
+/**
+ * Send POST http request.
+ */
+function _reference_create($type, $data) {
+  $entity = Drupal::entityManager()
+    ->getStorage($type)
+    ->create($data);
+
+  try {
+    $entity->save();
+  } catch (\Exception $e) {
+    return null;
+  }
+
+  return $entity->id();
+}
+
+
+/**
+ * Find img tag in html, download files and change src attribute.
+ */
+function parser_download_images($doc, $base_url, $path = 'public://images') {
+  return _parser_download_files($doc, 'img', 'src', $base_url, $path);
+}
+
+/**
+ * Find links in html, download files and change href attribute.
+ */
+function parser_download_links($doc, $extensions, $base_url, $path = 'public://') {
+  $selectors = array();
+  foreach ($extensions as $extension) {
+    $selectors[] = 'a[href$=".' . $extension . '"]';
+  }
+  return _parser_download_files($doc, implode(', ', $selectors), 'href', $base_url, $path);
+}
+
+/**
+ * Find files in html, download and change tag attribute.
+ */
+function _parser_download_files($doc, $selector, $attr, $base_url, $path = 'public://') { 
+  foreach ($doc->find($selector) as $element) {
+    $file_url = parser_get_absolute_url($base_url, pq($element)->attr($attr));
+    $file_url_info = parse_url($file_url);
+    $local_file_name = ltrim($file_url_info['path'], '/');
+    $local_file_name = str_replace('/', '-', $local_file_name);
+    $file_patch = $path . '/' . $local_file_name;
+
+    drupal_mkdir($path);
+
+    if (!file_exists($file_patch)) {
+      try {
+        $data = (string) \Drupal::httpClient()
+          ->get($file_url)
+          ->getBody();
+        
+        file_unmanaged_save_data($data, $file_patch, FILE_EXISTS_RENAME);
+      } catch (ClientException $e) {
+        continue;
+      }
+    }
+
+    $new_atr = file_create_url($path . '/' . $local_file_name);
+    pq($element)->attr($attr, $new_atr);
+  }
+  
+  return $doc;
+}
+
+/**
+ * {@inheritdoc}
+ */
+function _content_parser_retrieve_images($doc, $query) {
+  $elements = [];
+
+  foreach ($doc->find($query) as $element) {
+    try {
+      $file = system_retrieve_file(pq($element)->attr('src'), 'public://images/', true);
+
+      if($file) {
+        $elements[] = [
+         'target_id' => $file->id()
+       ];
+      }
+    } catch (ClientException $e) {
+
+    }
+  }
+
+  return $elements;
+}
