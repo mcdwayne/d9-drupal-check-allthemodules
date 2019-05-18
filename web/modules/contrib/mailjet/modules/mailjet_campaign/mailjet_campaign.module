@@ -1,0 +1,221 @@
+<?php
+
+use Drupal\mailjet_campaign\Entity\Campaign;
+use Mailjet\Resources;
+
+/*
+ * @file
+ * code for Mailjet Capmpaign module
+ */
+
+
+/**
+ * Loads a single Campaign by ID.
+ *
+ * @param int $campaign_id
+ *   The ID of the Campaign entity to load.
+ *
+ * @return Drupal\mailjet_signup_form_type\Entity\SignupForm;
+ *   The Campaign entity.
+ */
+function mailjet_campaign_load($campaign_id) {
+  return Campaign::load($campaign_id);
+}
+
+/**
+ * Loads multiple Mailjet Signup forms entities.
+ *
+ * @param array $campaign_ids
+ *   Array of Campaign entity IDs to load.
+ * @param bool $reset
+ *   TRUE to reset cache when loading Campaigns.
+ *
+ * @return Drupal\campaign\Entity\Campaign[]
+ *   Array of Campaigns.
+ */
+function mailjet_campaign_multiple($campaign_ids = [], $reset = FALSE) {
+  if (empty($campaign_ids)) {
+    $campaign_ids = NULL;
+  }
+
+  $controller = \Drupal::entityTypeManager()->getStorage('campaign');
+
+  if ($reset) {
+    $controller->resetCache($campaign_ids);
+  }
+
+  return $controller->loadMultiple($campaign_ids);
+}
+
+/**
+ * Does a replacement of a link in a email template, adds a tracking token to
+ * the link.
+ */
+function _mailjet_campaign_alter_callback() {
+
+  if ($_SERVER['REQUEST_METHOD'] != 'POST') {
+  }
+
+  $post = trim(file_get_contents('php://input'));
+
+  \Drupal::logger('mailjet')->notice(print_r($post, TRUE));
+    $postDecoded = json_decode($post);
+
+  $isCampaignDraft = false;
+  $html = '';
+  $mailjetApiClient = mailjet_new();
+
+  if (isset($postDecoded->data)) {
+    $data = (object) $postDecoded->data;
+  }
+  elseif (isset($postDecoded->mailjet)) {
+    $mailjet = json_decode($postDecoded->mailjet);
+    $data = $mailjet->data;
+  }
+
+  // Get request response.
+  if (isset($postDecoded->response)) {
+    $response = (object) $postDecoded->response;
+  }
+
+  if ($response->message == 'html saved successfully') {
+
+    // Get the HTML for the email template.
+    $result = $mailjetApiClient->get(Resources::$NewsletterDetailcontent, ['id' => $data->campaign_id]);
+    if ($result->success() && $result->getCount() > 0) {
+      $campaignContent = $result->getData();
+    } else {
+        $result = $mailjetApiClient->get(Resources::$CampaigndraftDetailcontent, ['id' => $data->campaign_id]);
+        if ($result->success() && $result->getCount() > 0) {
+            $campaignContent = $result->getData();
+        }
+        $isCampaignDraft = true;
+    }
+
+    $html = $campaignContent[0]['Html-part'];
+
+    // Find the body for the email template.
+    $get_body_part_html = strstr($html, '<body>');
+
+    // Get all links in the body.
+    $links = explode('<a', $get_body_part_html);
+    if (!empty($links)) {
+      foreach ($links as $key => $value) {
+        if ($key != 0) {
+          $link_beginning = explode('href="', $value);
+          $link = strstr($link_beginning[1], '"', TRUE);
+          $array_links[] = $link;
+        }
+      }
+
+      // To avoid duplication use only the unique values.
+      $array_links = array_unique($array_links);
+      foreach ($array_links as $k => $v) {
+        $replacement_url = $v . '?token=' . $data->campaign_id;
+        $html = str_replace($v, $replacement_url, $html);
+      }
+    }
+
+    // Update campaign HTML content
+    $body = [
+      'Html-part' => $html,
+    ];
+    if (!$isCampaignDraft) {
+      $result = $mailjetApiClient->put(Resources::$NewsletterDetailcontent,
+        ['id' => $data->campaign_id, 'body' => $body]);
+      if ($result->success() && $result->getCount() > 0) {
+        $res = $result->getData();
+      }
+    } else {
+      $result = $mailjetApiClient->put(Resources::$CampaigndraftDetailcontent,
+        ['id' => $data->campaign_id, 'body' => $body]);
+      if ($result->success() && $result->getCount() > 0) {
+        $res = $result->getData();
+      }
+    }
+  }
+
+  if ($response->message == 'campaign added successfully') {
+    $user_infos = mailjet_user_infos();
+    $user_id = $user_infos['UserID'];
+
+    $filters = [
+      'User' => $user_id,
+    ];
+    $response = $mailjetApiClient->get(Resources::$Apikey, ['filters' => $filters]);
+    if ($response->success()) {
+        $akid = $response->getData()[0]['ID'];
+    }
+
+    $filters = [
+      'Akid' => $akid,
+      'Sort' => 'ID DESC',
+      'FromTs' => '1',
+      'Limit' => '1',
+    ];
+    $response = $mailjetApiClient->get(Resources::$Campaign, ['filters' => $filters]);
+    if ($response->success()) {
+      $result_campaign = $response->getData();
+    }
+
+    $created_date = strtotime($result_campaign[0]['CreatedAt']);
+    $campaign_name = $result_campaign[0]['Subject'];
+
+    $campaign_data = [
+      'name' => $campaign_name,
+      'created' => $created_date,
+      'camp_id_mailjet' => $data->campaign_id,
+    ];
+
+    $campaign = \Drupal::entityManager()
+      ->getStorage('campaign_entity')
+      ->create($campaign_data);
+
+    $campaign->save();
+  }
+
+  if ($data->campaign_id && strpos($data->next_step_url, "summary") !== false) {
+
+    if (
+      isset($data->block_type) && $data->block_type && isset($data->block_content) && $data->block_content
+    ) {
+      $html = $data->block_content;
+      watchdog('mailjet-danny1', $html);
+      $html = str_replace("test msg", "new msg", $html);
+      watchdog('mailjet-danny2', $html);
+
+      $res = [
+        "code" => 1, // necessary for Mailjet's system to proceed
+        "continue" => TRUE,
+        "continue_address" => $_POST['data']['next_step_url'],
+        "block_content" => $html,
+      ];
+
+      echo json_encode($res);
+    }
+  }
+  $res = [
+    "code" => 1, // necessary for Mailjet's system to proceed
+    "continue" => TRUE,
+    "continue_address" => $_POST['data']['next_step_url'],
+  ];
+
+  echo json_encode($res);
+}
+
+
+/**
+ * Implements hook_views_data_alter().
+ */
+function campaign_views_data_alter(array &$data) {
+  $data['commerce_order']['mailjet_campign']['relationship'] = [
+    'title' => t('Commerce ORDER ID'),
+    'label' => t('Commerce ORDER ID'),
+    'group' => 'Order ID',
+    'help' => t('Reference to orders.'),
+    'id' => 'standard',
+    'base' => 'commerce_order',
+    'base field' => 'order_id',
+    'field' => 'order_id',
+  ];
+}
