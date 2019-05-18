@@ -1,0 +1,408 @@
+<?php
+
+/**
+ * @file
+ * The module file for the commerce integration of customers canvas.
+ */
+
+use Drupal\commerce\PurchasableEntityInterface;
+use Drupal\commerce_order\Entity\OrderItemType;
+use Drupal\commerce_order\Entity\OrderType;
+use Drupal\commerce_product\Entity\ProductType;
+use Drupal\commerce_product\Entity\ProductVariationInterface;
+use Drupal\commerce_product\Entity\ProductVariationType;
+use Drupal\Component\Serialization\Json;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\field\Entity\FieldConfig;
+use Drupal\field\Entity\FieldStorageConfig;
+
+/**
+ * Implements hook_field_formatter_info().
+ */
+function customers_canvas_commerce_field_formatter_info() {
+  return [
+    'customers_canvas_commerce_link' => [
+      'label' => t("Customer's Canvas: Link"),
+      'description' => t("Creates a link that will either lead to editing the proof or downloading the proof."),
+      'field types' => [
+        'customers_canvas_commerce_link_download',
+        'customers_canvas_commerce_link_edit',
+      ],
+      'settings' => [
+        'customers_canvas_commerce_link_label' => t('Link'),
+        'customers_canvas_commerce_link_class' => 'button',
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_field_formatter_info_alter().
+ */
+function customers_canvas_commerce_field_formatter_info_alter(&$info) {
+  // Let a new field type re-use an existing formatter.
+  $info['text_default']['field types'][] = 'customers_canvas_commerce_state_id';
+}
+
+/**
+ * Implements hook_field_formatter_settings_form().
+ */
+function customers_canvas_commerce_field_formatter_settings_form($field, $instance, $view_mode, $form, &$form_state) {
+  $display = $instance['display'][$view_mode];
+  $settings = $instance['display'][$view_mode]['settings'];
+
+  $element = [];
+
+  if ($display['type'] == 'customers_canvas_commerce_link') {
+    $element['customers_canvas_commerce_link_label'] = [
+      '#title' => t('Download Link Label'),
+      '#type' => 'textfield',
+      '#size' => 90,
+      '#default_value' => $settings['customers_canvas_commerce_link_label'],
+      "#description" => t('Html allowed using the following tags: @tags', [
+        '@tags' => implode(", ", customers_canvas_xss_tags()),
+      ]),
+    ];
+    $element['customers_canvas_commerce_link_class'] = [
+      '#title' => t('Download Link Class'),
+      '#type' => 'textfield',
+      '#size' => 20,
+      '#default_value' => $settings['customers_canvas_commerce_link_class'],
+    ];
+  }
+  return $element;
+}
+
+/**
+ * Implements hook_field_formatter_view().
+ */
+function customers_canvas_commerce_field_formatter_view($entity_type, $entity, $field, $instance, $langcode, $items, $display) {
+  $element = [];
+  $settings = $display['settings'];
+  switch ($display['type']) {
+    case "customers_canvas_commerce_link":
+      foreach ($items as $delta => $item) {
+        $allowed_tags = customers_canvas_xss_tags();
+        $classes = explode(' ', $settings['customers_canvas_commerce_link_class']);
+        $options = [
+          'attributes' => [
+            'class' => $classes,
+          ],
+          'html' => TRUE,
+        ];
+        $element[$delta] = [
+          '#markup' => l(filter_xss($settings['customers_canvas_commerce_link_label'], $allowed_tags), $item['value'], $options),
+        ];
+      }
+
+  }
+  return $element;
+}
+
+/**
+ * Implements hook_field_formatter_settings_summary().
+ */
+function customers_canvas_commerce_field_formatter_settings_summary($field, $instance, $view_mode) {
+  $display = $instance['display'][$view_mode];
+  $settings = $instance['display'][$view_mode]['settings'];
+  if ($display['type'] == "customers_canvas_commerce_link") {
+    $output = t('Button label: @label<br>Button class: @class', [
+      '@label' => $settings['customers_canvas_commerce_link_label'],
+      '@class' => $settings['customers_canvas_commerce_link_class'],
+    ]);
+    return $output;
+  }
+  return '';
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function customers_canvas_commerce_form_customers_canvas_settings_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $form['types_config']['node_types']['#attributes'] = array('readonly' => 'readonly');
+  $form['types_config']['node_types']['#description'] .= '<br><br>' . t('Note: When the commerce integration is enabled, no other nodes can be used to create items. Upon saving, any existing fields will be deleted.');
+  $form_state->setValue('node_types', NULL);
+
+  $form['types_config']['product_type'] = [
+    '#title' => 'Product Type',
+    '#type' => 'checkboxes',
+    '#options' => customers_canvas_commerce_product_variation_bundles_options_list(),
+    '#default_value' =>  \Drupal::config('customers_canvas_commerce.settings')->get('product_type'),
+    '#description' => t('Tip: Upon submission of this form, a number of
+                               fields will be added to the product type
+                               selected.'),];
+
+  $form['types_config']['order_item_type'] = [
+    '#title' => 'Order Item Type',
+    '#type' => 'checkboxes',
+    '#options' => customers_canvas_commerce_order_item_bundles_options_list(),
+    '#default_value' =>  \Drupal::config('customers_canvas_commerce.settings')->get('order_item_type'),
+    '#description' => t('Tip: Upon submission of this form, a number of
+                               fields will be added to the order item type
+                               selected. Additionally, only the purchasable
+                               entity types referenced on this order item type
+                               can be used to create a cart.'),
+  ];
+  $form['redirect'] = [
+    '#title' => 'Commerce Redirect Path',
+    '#type' => 'textfield',
+    '#default_value' => \Drupal::config('customers_canvas_commerce.settings')->get('redirect'),
+    '#description' => t("Put in a path that will be redirected to after
+                               Customer's Canvas builder completes. Usually
+                               commerce_cart.page"),
+  ];
+  $form['#submit'][] = 'customers_canvas_commerce_form_customers_canvas_settings_submit';
+}
+
+/**
+ * Submission handler for customers_canvas_settings form.
+ *
+ * @param array $form
+ *   Form render array.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   State of the values in the form.
+ *
+ * @throws \Drupal\Core\Entity\EntityStorageException
+ */
+function customers_canvas_commerce_form_customers_canvas_settings_submit($form, FormStateInterface $form_state) {
+  \Drupal::configFactory()->getEditable('customers_canvas_commerce.settings')
+    ->set('order_item_type', $form_state->getValue('order_item_type'))
+    ->save();
+  \Drupal::configFactory()->getEditable('customers_canvas_commerce.settings')
+    ->set('product_type', $form_state->getValue('product_type'))
+    ->save();
+  \Drupal::configFactory()->getEditable('customers_canvas_commerce.settings')
+    ->set('redirect', $form_state->getValue('redirect'))
+    ->save();
+
+  // Add fields to Products.
+  $neededFields = [
+    'cc_product_json' => [
+      'field_type' => 'string_long',
+      'label' => t('Customers Canvas Product JSON'),
+      'cardinality' => 1,
+      'settings' => [],
+    ],
+    'cc_editor_type' => [
+      'field_type' => 'list_string',
+      'label' => t('Customers Canvas Editor'),
+      'settings' => [
+        'allowed_values' => [
+          'basic' => t('Basic'),
+          'multi_editor' => t('Multi Editor')
+        ],
+      ],
+      'cardinality' => 1,
+    ],
+  ];
+  $entity_types = $form_state->getValue('product_type');
+  $entity_type_id = 'commerce_product_variation';
+  customers_canvas_commerce_update_fields($neededFields, $entity_types, $entity_type_id);
+
+  // Add fields to Order Items.
+  $neededFields = [
+    'cc_download_link' => [
+      'field_type' => 'string',
+      'label' => t('Customers Canvas Download Link'),
+      'cardinality' => 1,
+      'settings' => [],
+    ],
+    'cc_state_id' => [
+      'field_type' => 'string',
+      'label' => t('Customers Canvas State ID'),
+      'cardinality' => 1,
+      'settings' => [],
+    ],
+    'cc_images' => [
+      'field_type' => 'string',
+      'label' => t('Customers Canvas Proof Images'),
+      'cardinality' => -1,
+      'settings' => [],
+    ],
+  ];
+  $entity_types = $form_state->getValue('order_item_type');
+  $entity_type_id = 'commerce_order_item';
+  customers_canvas_commerce_update_fields($neededFields, $entity_types, $entity_type_id);
+}
+
+/**
+ * Add or delete fields.
+ *
+ * @param array $neededFields
+ *   Simple array of key (field name) and values (label, field_type, etc.).
+ * @param array $entity_types
+ *   Designed to take a checkbox array of form values.
+ * @param string $entity_type_id
+ *   Entity type string like "commerce_order_item".
+ *
+ * @throws \Drupal\Core\Entity\EntityStorageException
+ */
+function customers_canvas_commerce_update_fields($neededFields, $entity_types, $entity_type_id) {
+  foreach ($entity_types as $key => $value) {
+    foreach ($neededFields as $fieldName => $neededField) {
+      $field_storage = FieldStorageConfig::loadByName($entity_type_id, $fieldName);
+      if (!$field_storage) {
+        FieldStorageConfig::create([
+          'entity_type' => $entity_type_id,
+          'field_name' => $fieldName,
+          'type' => $neededField['field_type'],
+          'cardinality' => $neededField['cardinality'],
+          'settings' => $neededField['settings'],
+        ])->save();
+      }
+
+      $field = FieldConfig::loadByName($entity_type_id, $key, $fieldName);
+      // Bit funky but allows us to delete the field if it exists,
+      // or skip if it doesn't.
+      if (!$value) {
+        if ($field) {
+          $field->delete();
+        }
+        continue;
+      }
+      if (!$field) {
+        $field = FieldConfig::create([
+          'entity_type' => $entity_type_id,
+          'field_name' => $fieldName,
+          'bundle' => $key,
+          'label' => $neededField['label'],
+        ]);
+        $field->save();
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function customers_canvas_commerce_form_customers_canvas_finish_alter(&$form, &$form_state, $form_id) {
+  $form['#submit'] = ['customers_canvas_commerce_finish_submit'];
+}
+
+/**
+ * Submission callback for the finish step.
+ */
+function customers_canvas_commerce_finish_submit($form, FormStateInterface $form_state) {
+  $result = $form_state->getValue('result');
+  $result = Json::decode($result);
+  // Reduce the extra deep array values for images.
+  foreach ($result['proofImageUrls'] as &$image) {
+    $image = current($image);
+  }
+  $build_info = $form_state->getBuildInfo();
+  $order_item_id = $build_info['args'][0]['order_item_id'];
+  $order_item = \Drupal\commerce_order\Entity\OrderItem::load($order_item_id);
+  if ($order_item) {
+    $order_item->set('cc_download_link', $result['hiResOutputUrls']);
+    $order_item->set('cc_state_id', $result['stateId']);
+    $order_item->set('cc_images', $result['proofImageUrls']);
+    $order_item->setData('cc_result', Json::encode($result));
+    try {
+      $order_item->save();
+    } catch (\Drupal\Core\Entity\EntityStorageException $e) {
+      \Drupal::service('messenger')->addError(t('Could not save your changes.'));
+    }
+  }
+
+  // Assume we're not an admin.
+  $path = \Drupal::config('customers_canvas_commerce.settings')->get('redirect');
+  $form_state->setRedirect($path);
+
+  // But if we are, go to the edit order page instead.
+  /** @var \Drupal\Core\Session\AccountProxyInterface $current_user */
+  $current_user = \Drupal::service('current_user');
+  $customer = $order_item->getOrder()->getCustomer();
+  if ($current_user->id() !== $customer->id()) {
+    $form_state->setRedirect('commerce_order.admin', ['commerce_order' => $order_item->getOrder()->id()]);
+  }
+}
+
+/**
+ * Creates an options list of all commerce order item product bundles.
+ */
+function customers_canvas_commerce_order_item_bundles_options_list() {
+  /** @var OrderItemType[] $types */
+  $types = OrderItemType::loadMultiple();
+  $types_formatted = [];
+  foreach ($types as $type) {
+    $types_formatted[$type->id()] = $type->label();
+  }
+  return $types_formatted;
+}
+
+/**
+ * Creates an options list of all commerce product bundles.
+ */
+function customers_canvas_commerce_product_variation_bundles_options_list() {
+  /** @var ProductVariationType[] $types */
+  $types = ProductVariationType::loadMultiple();
+  $types_formatted = [];
+  foreach ($types as $type) {
+    $types_formatted[$type->id()] = $type->label();
+  }
+  return $types_formatted;
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ *
+ * Alter all carts.
+ */
+function customers_canvas_commerce_form_commerce_order_item_add_to_cart_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // If a product is selected, use that value.
+  $selected_product = $form_state->getValue('purchased_entity');
+  $variation_widget = $form['purchased_entity']['widget'][0]['variation'];
+  // If a purchased entity has a value, use that value.
+  if (empty($selected_product) && !empty($variation_widget['#value'])) {
+    $selected_product = [[$variation_widget['#value']]];
+  }
+  // If a product selector widget has a default value, use that.
+  if (empty($selected_product) && !empty($variation_widget['#default_value'])) {
+    $selected_product = [[$variation_widget['#default_value']]];
+  }
+  $selected_product = current(current($selected_product));
+  // Add a submit function if this product has a customer's canvas definition.
+  if (!empty($selected_product)) {
+    $product_variation_storage = \Drupal::entityTypeManager()->getStorage('commerce_product_variation');
+    $product_variation = $product_variation_storage->load($selected_product);
+    if ($product_variation !== NULL) {
+      /** @var ProductVariationInterface $product_variation */
+      if ($product_variation->hasField('cc_product_json') &&
+          !empty($product_variation->get('cc_product_json')->getValue())) {
+        // Add a submit callback.
+        $form['actions']['submit']['#submit'][] = 'customers_canvas_commerce_add_to_cart_submit';
+      }
+    }
+  }
+}
+
+/**
+ *
+ */
+function customers_canvas_commerce_add_to_cart_submit($form, FormStateInterface $form_state) {
+  /** @var \Drupal\Core\Messenger\Messenger $messenger_service */
+  $messenger_service = \Drupal::service('messenger');
+
+  // Remove the cart message.
+  $all_messages = $messenger_service->all();
+  $messenger_service->deleteByType('status');
+  foreach ($all_messages as $message_type => $message_group) {
+    if ($message_type === "status") {
+      foreach ($message_group as $message) {
+        // Re add any status messages that aren't cart related.
+        /** @var \Drupal\Core\Render\Markup $message */
+        if (stripos($message->__toString(), 'your cart') === FALSE) {
+          $messenger_service->addStatus($message);
+        }
+      }
+    }
+  }
+
+  // Redirect to the builder using a commerce order item.
+  /** @var \Drupal\commerce_cart\Form\AddToCartForm $add_to_cart_form */
+  /** @var \Drupal\commerce_order\Entity\OrderItem $order_item */
+  $add_to_cart_form = $form_state->getFormObject();
+  $order_item = $add_to_cart_form->getEntity();
+  $form_state->setRedirect('customers_canvas.builder', ['commerce_order_item' => $order_item->id()]);
+}
