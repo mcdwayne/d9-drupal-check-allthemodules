@@ -1,0 +1,199 @@
+<?php
+
+use Drupal\chatwee\SSO\Configuration;
+use Drupal\chatwee\SSO\Session;
+use Drupal\chatwee\SSO\SsoUser;
+use Drupal\chatwee\SSO\SsoManager;
+
+function chatwee_page_bottom(array &$page_bottom) {
+	$settings = \Drupal::config('chatwee.settings');
+	if(!$settings->get('chatwee_enable')) {
+		return false;
+	}
+
+	if($settings->get('chatwee_enable_sso')) {
+		synchronize_sso_user();
+	}
+
+	$user = \Drupal::currentUser();
+	$chatwee_code = $settings->get('chatwee_code');
+	if($chatwee_code && ($user->id() || !$settings->get('chatwee_disable_offline_users'))) {
+		$page_bottom['chatwee'] = [
+            '#type' => 'inline_template',
+            '#template' => $chatwee_code
+		];
+	}
+}
+
+function chatwee_user_login() {
+	$settings = \Drupal::config('chatwee.settings');
+	if(!$settings->get('chatwee_enable')) {
+		return false;
+	}
+
+	if($settings->get('chatwee_enable_sso')) {
+		sso_login();
+	}
+}
+
+function chatwee_user_logout() {
+	$settings = \Drupal::config('chatwee.settings');
+	if(!$settings->get('chatwee_enable')) {
+		return false;
+	}
+
+	if($settings->get('chatwee_enable_sso')) {
+		sso_logout();
+	}
+}
+
+function log_error($error) {
+	\Drupal::logger('chatwee')->error($error);
+}
+
+function set_sso_credentials() {
+	$settings = \Drupal::config('chatwee.settings');
+
+	Configuration::setChatId($settings->get('chatwee_chat_id'));
+	Configuration::setClientKey($settings->get('chatwee_client_key'));
+	Configuration::setCustomUserAgent("Chatwee Drupal Plugin 8.x-1.0");
+}
+
+function synchronize_sso_user() {
+	if(!empty($_SERVER["HTTP_X_REQUESTED_WITH"]) && strtolower($_SERVER["HTTP_X_REQUESTED_WITH"]) === "xmlhttprequest") {
+		return false;
+	}
+
+	$user_id = \Drupal::currentUser()->id();
+
+	if(!$user_id) {
+		return false;
+	}
+
+	set_sso_credentials();
+
+	try {
+		if(Session::isSessionSet() === false) {
+			sso_login();
+		} else {
+			$session_id = Session::getSessionId();
+
+			$is_session_valid = SsoUser::validateSession(Array(
+				"sessionId" => $session_id
+			));
+
+			if($is_session_valid === false) {
+				sso_login();
+			}
+		}
+	} catch(\Exception $exception) {
+		log_error("Error while reinitializng SSO session: " . $exception->getMessage());
+	}
+}
+
+function sso_login() {
+	$settings = \Drupal::config('chatwee.settings');
+
+	if(!$settings->get('chatwee_chat_id') || !$settings->get('chatwee_client_key')) {
+		return false;
+	}
+
+	set_sso_credentials();
+
+	$user = \Drupal::currentUser();
+	$user_id = $user->id();
+
+	$user_chatwee_id = fetch_user_chatwee_id($user_id);
+
+	if(!$user_chatwee_id) {
+		$user_chatwee_id = sso_register($user);
+	}
+
+	try	{
+		SsoUser::edit(Array(
+			"userId" => $user_chatwee_id,
+			"login" => $user->getDisplayName(),
+			"avatar" => get_user_avatar($user),
+			"isAdmin" => is_chatwee_admin($user)
+		));
+	} catch(\Exception $exception) {
+		if(strpos($exception->getMessage(), "User does not exist") !== false) {
+			$user_chatwee_id = sso_register($user);
+		} else {
+			log_error("Error while executing sso_login: " . $exception->getMessage());
+		}
+	}
+
+	try {
+		$sessionId = SsoManager::loginUser(Array(
+			"userId" => $user_chatwee_id
+		));
+	} catch(\Exception $exception) {
+		log_error("Error while executing sso_login: " . $exception->getMessage());
+	}
+}
+
+function fetch_user_chatwee_id($user_id) {
+
+	$result = db_select("chatwee_users_data", "chatwee_id")
+	->fields("chatwee_id")
+	->condition("user_id", $user_id, "=")
+	->execute()
+	->fetchAssoc();
+
+	$result = $result["chatwee_id"];
+	return $result ? $result : null;
+}
+
+function sso_register($user) {
+	try {
+
+		$user_id = $user->id();
+		$chatwee_user_id = SsoManager::registerUser(Array(
+			"login" => $user->getDisplayName(),
+			"avatar" => get_user_avatar($user),
+			"isAdmin" => is_chatwee_admin($user)
+		));
+
+		db_delete("chatwee_users_data")
+		->condition('user_id', $user_id)
+		->execute();
+
+		db_insert("chatwee_users_data")
+		->fields(array("user_id", "chatwee_id"))
+		->values(array(
+			"user_id" => $user_id,
+			"chatwee_id" => $chatwee_user_id
+		))
+		->execute();
+
+		return $chatwee_user_id;
+	} catch(\Exception $exception) {
+		log_error("Error while executing sso_register: " . $exception->getMessage());
+		return null;
+	}
+}
+
+function sso_logout() {
+	set_sso_credentials();
+
+	try {
+		SsoManager::logoutUser();
+	} catch(\Exception $exception) {
+		log_error("Error while executing sso_logout: " . $exception->getMessage());
+	}
+}
+
+function get_user_avatar($user) {
+	if ($userEntity = \Drupal\user\Entity\User::load($user->id())) {
+		if (!$userEntity->user_picture->isEmpty()) {
+			return file_create_url($userEntity->user_picture->entity->getFileUri());
+		} else {
+			return "";
+		}
+	}
+}
+
+function is_chatwee_admin($user) {
+	return in_array("administrator", \Drupal::currentUser()->getRoles());
+}
