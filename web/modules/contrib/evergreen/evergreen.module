@@ -1,0 +1,256 @@
+<?php
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\evergreen\ExpiryParser;
+use Drupal\evergreen\Entity\EvergreenConfig;
+
+define('EVERGREEN_STATUS_EVERGREEN', 1);
+define('EVERGREEN_ONE_DAY', 60 * 60 * 24);
+
+/**
+ * Implements hook_views_data_alter().
+ */
+function evergreen_views_data_alter(array &$data) {
+  $plugins = Drupal::service('plugin.manager.evergreen');
+  $definitions = $plugins->getDefinitions();
+  foreach (array_keys($definitions) as $plugin) {
+    $instance = $plugins->createInstance($plugin);
+    $instance->alterViewsData($data);
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function evergreen_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+  $evergreen = Drupal::service('evergreen');
+  $evergreen->addForm($form, $form_state, $form_id);
+}
+
+/**
+ * Add the evergreen form.
+ */
+function evergreen_add_form(&$form, FormStateInterface $form_state, $form_id) {
+  $entity = $form_state->getFormObject()->getEntity();
+  $evergreen = Drupal::service('evergreen');
+
+  $configuration = $evergreen->getConfiguration($entity);
+  $content = $evergreen->getContent($entity, $configuration);
+
+  // display a message if the content has expired.
+  if ($evergreen->entityHasExpired($entity)) {
+    drupal_set_message('Evergreen: this content has expired and should be reviewed', 'status');
+  }
+
+  $form['evergreen'] = [
+    '#type' => 'details',
+    '#title' => t('Evergreen'),
+    '#group' => 'advanced',
+  ];
+
+  if (!$content->isNew() && !$content->isEvergreen()) {
+    $expires = $content->get('evergreen_expires')->first();
+    if ($expires && ($expires->getValue())['value'] > time()) {
+      $form['evergreen']['#description'] = t('This content will expire on %date', ['%date' => format_date($expires->value, 'short')]);
+    }
+    elseif ($expires) {
+      $form['evergreen']['#description'] = t('This content expired on %date', ['%date' => format_date($expires->value, 'short')]);
+    }
+  }
+
+  $status = ($content && !$content->isNew()) ? $content->get('evergreen_status')->value : $configuration->get(EvergreenConfig::STATUS);
+  $form['evergreen']['evergreen_status'] = [
+    '#type' => 'select',
+    '#options' => [
+      EVERGREEN_STATUS_EVERGREEN => t('Content is evergreen (does not expire)'),
+      0 => t('Content should expire'),
+    ],
+    '#title' => 'Status',
+    '#default_value' => $status,
+  ];
+
+  $expiry = ($content && !$content->isNew()) ? $content->get('evergreen_expiry')->value : $configuration->get(EvergreenConfig::EXPIRY);
+  $form['evergreen']['evergreen_expiry'] = [
+    '#type' => 'textfield',
+    '#description' => 'Enter the either a number of seconds or a value like "30 days"',
+    '#title' => 'Expiration time',
+    '#default_value' => evergreen_get_readable_expiry($expiry),
+  ];
+
+  if (!$content->isNew() && !$content->isEvergreen()) {
+    $form['evergreen']['evergreen_review'] = [
+      '#type' => 'checkbox',
+      '#title' => 'Mark as reviewed now',
+      '#description' => t('Last reviewed %date', ['%date' => format_date($content->get('evergreen_reviewed')->first()->value, 'short')]),
+      '#value' => 'yes',
+    ];
+  }
+
+  if (isset($form['actions'])) {
+    foreach (array_keys($form['actions']) as $key) {
+      // must be an array and must have #type & #submit
+      if (!is_array($form['actions'][$key]) || (!isset($form['actions'][$key]['#type'], $form['actions'][$key]['#submit']))) {
+        continue;
+      }
+
+      // only include submit buttons...
+      if (isset($form['actions'][$key]['#type']) && $form['actions'][$key]['#type'] !== 'submit') {
+        continue;
+      }
+
+      // avoid buttons that do not call ::save...
+      if (!in_array('::save', $form['actions'][$key]['#submit'])) {
+        continue;
+      }
+
+      $form['actions'][$key]['#submit'][] = 'evergreen_form_submit';
+    }
+  }
+}
+
+/**
+ * Handle evergreen form submissions.
+ */
+function evergreen_form_submit(array $form, FormStateInterface $form_state) {
+  $entity = $form_state->getFormObject()->getEntity();
+  $evergreen = Drupal::service('evergreen');
+
+  $configuration = $evergreen->getConfiguration($entity);
+  $content = $evergreen->getContent($entity, $configuration);
+
+  $expiry = $content->get('evergreen_expiry')->first();
+  if ($expiry) {
+    $expiry = $expiry->value;
+  }
+
+  $new_expiry = $evergreen->parseExpiry($form_state->getValue('evergreen_expiry'));
+  $expiry_changed = $expiry != $new_expiry;
+
+  $content->set('evergreen_status', $form_state->getValue('evergreen_status'));
+  $content->set('evergreen_expiry', $new_expiry);
+
+  // some content flags
+  $just_reviewed = $form_state->getValue('evergreen_review', FALSE);
+  $is_new_and_not_evergreen = !$content->isEvergreen() && $content->isNew();
+
+  // in cases where the content is new and not evergreen, we need to "review"
+  // the content...
+  if ($is_new_and_not_evergreen || $just_reviewed) {
+    $content->reviewed();
+  }
+
+  // if the content is not evergreen (might have just changed) and we don't
+  // have a review date, set the review date to now.
+  if (!$content->isEvergreen() && !$just_reviewed && $content->getEvergreenReviewed() === NULL) {
+    $content->set('evergreen_reviewed', time());
+  }
+
+  $content->save();
+}
+
+/**
+ * Returns the default expiry time for evergreen fields.
+ *
+ * Defaults to 30 days.
+ */
+function evergreen_expiry_default() {
+  return (EVERGREEN_ONE_DAY) * 30;
+}
+
+/**
+ * Get a human readable.
+ *
+ * See: http://stackoverflow.com/a/8273826/55151
+ */
+function evergreen_get_readable_expiry($expiry) {
+  $secondsInAMinute = 60;
+  $secondsInAnHour = 60 * $secondsInAMinute;
+  $secondsInADay = 24 * $secondsInAnHour;
+
+  // extract days
+  $days = floor($expiry / $secondsInADay);
+
+  // extract hours
+  $hourSeconds = $expiry % $secondsInADay;
+  $hours = floor($hourSeconds / $secondsInAnHour);
+
+  // extract minutes
+  $minuteSeconds = $hourSeconds % $secondsInAnHour;
+  $minutes = floor($minuteSeconds / $secondsInAMinute);
+
+  // extract the remaining seconds
+  $remainingSeconds = $minuteSeconds % $secondsInAMinute;
+  $seconds = ceil($remainingSeconds);
+
+  // return the final array
+  $obj = [
+    'd' => (int) $days,
+    'h' => (int) $hours,
+    'm' => (int) $minutes,
+    's' => (int) $seconds,
+  ];
+
+  $filtered = array_filter($obj);
+
+  $string = '';
+  if (isset($filtered['d'])) {
+    $string .= $filtered['d'];
+    if ($filtered['d'] == 1) {
+      $string .= ' ' . t('day');
+    }
+    else {
+      $string .= ' ' . t('days');
+    }
+  }
+  if (isset($filtered['h'])) {
+    $string .= $filtered['h'];
+    if ($filtered['h'] == 1) {
+      $string .= ' ' . t('hour');
+    }
+    else {
+      $string .= ' ' . t('hours');
+    }
+  }
+  if (isset($filtered['m'])) {
+    $string .= $filtered['m'];
+    if ($filtered['m'] == 1) {
+      $string .= ' ' . t('minute');
+    }
+    else {
+      $string .= ' ' . t('minutes');
+    }
+  }
+  if (isset($filtered['s'])) {
+    $string .= $filtered['s'];
+    if ($filtered['s'] == 1) {
+      $string .= ' ' . t('second');
+    }
+    else {
+      $string .= ' ' . t('seconds');
+    }
+  }
+  return $string;
+}
+
+/**
+ * Parse an expiry string.
+ */
+function evergreen_parse_expiry($expiry) {
+  $parser = new ExpiryParser();
+  return $parser->parse($expiry);
+}
+
+function evergreen_sync($entity, $config) {
+  if (!is_object($entity)) {
+    $entity = entity_load($config->getEvergreenEntityType(), $entity);
+  }
+  $evergreen = Drupal::service('evergreen');
+  if (!$evergreen->entityHasEvergreenContentEntity($entity)) {
+    $content = $evergreen->getContent($entity, $config);
+    $content->save();
+  }
+}
+
+function evergreen_sync_finished() {
+  drupal_set_message(t('Evergreen configuration synced'));
+}
