@@ -1,0 +1,2 @@
+// DO NOT REMOVE THIS FILE!!!
+// It allows to add a valid picker config for dev purposes. Do NOT check in your configuration!
