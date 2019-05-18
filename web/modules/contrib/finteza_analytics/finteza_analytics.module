@@ -1,0 +1,211 @@
+<?php
+
+/**
+ * @file
+ * The main code of Finteza Analytics module.
+ */
+
+use Drupal\Core\Url;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Component\Serialization\Json;
+use Drupal\Core\Routing\RouteMatchInterface;
+use GuzzleHttp\Exception\RequestException;
+use GuzzleHttp\Exception\BadResponseException;
+use Drupal\finteza_analytics\FintezaAnalyticsConfig;
+use Drupal\finteza_analytics\Component\Render\FintezaAnalyticsJavaScriptSnippet;
+
+/**
+ * Implements hook_page_attachments().
+ *
+ * Inject Finteza Analytics tracking script to the site header.
+ */
+function finteza_analytics_page_attachments(array &$page) {
+  if (!finteza_analytics_show_tracker()) {
+    return;
+  }
+
+  $website_id = \Drupal::config('finteza_analytics.settings')->get('tracking_settings.finteza_analytics_website_id');
+  $settings = finteza_analytics_tracking_settings_get();
+  $script = file_get_contents(drupal_get_path('module', 'finteza_analytics') . '/js/finteza_analytics.js.template');
+  $script = str_replace('$websiteId', '"' . htmlspecialchars($website_id, ENT_QUOTES) . '"', $script);
+  $script = str_replace('$trackHash', !!$settings['track_hash'] ? 'true' : 'false', $script);
+  $script = str_replace('$trackLinks', !!$settings['track_links'] ? 'true' : 'false', $script);
+  $script = str_replace('$timeOnPage', !!$settings['time_on_page'] ? 'true' : 'false', $script);
+
+  $page['#cache']['tags'][] = 'FINTEZA_ANALYTICS_SCRIPT';
+  $page['#attached']['html_head'][] = [
+    [
+      '#tag' => 'script',
+      '#value' => new FintezaAnalyticsJavaScriptSnippet($script),
+    ],
+    'finteza_analytics_script',
+  ];
+}
+
+/**
+ * Returns FALSE if tracker should be disabled on page.
+ *
+ * @return bool
+ *   Visibility of tracker.
+ */
+function finteza_analytics_show_tracker() {
+  $settings = finteza_analytics_tracking_settings_get();
+
+  $route = \Drupal::routeMatch()->getRouteObject();
+  $is_admin = FALSE;
+  if (!empty($route)) {
+    $is_admin_route = \Drupal::service('router.admin_context')->isAdminRoute($route);
+    $has_node_operation_option = $route->getOption('_node_operation_route');
+    $is_admin = ($is_admin_route || $has_node_operation_option);
+  }
+  else {
+    $current_path = \Drupal::service('path.current')->getPath();
+    if (preg_match('/node\/(\d+)\/edit/', $current_path, $matches)) {
+      $is_admin = TRUE;
+    }
+    elseif (preg_match('/taxonomy\/term\/(\d+)\/edit/', $current_path, $matches)) {
+      $is_admin = TRUE;
+    }
+  }
+
+  $is_configured = !!\Drupal::config('finteza_analytics.settings')->get('tracking_settings.finteza_analytics_website_id');
+  $is_admin = \Drupal::currentUser()->hasPermission('access administration pages');
+  $track_admins = !$settings['dont_track_admins'];
+
+  return $is_configured && ($track_admins || !$is_admin);
+}
+
+/**
+ * Register a new website via Finteza API.
+ */
+function finteza_analytics_register_website($registration) {
+  try {
+    $url = Url::fromUri(FintezaAnalyticsConfig::API_URL, ['query' => ['back_ref' => $GLOBALS['base_url']]]);
+    $data = \Drupal::httpClient()->post($url->toString(), [
+      'body' => http_build_query($registration),
+      'headers' => [
+        'Content-Type' => 'application/x-www-form-urlencoded',
+        'X-Requested-With' => 'XMLHttpRequest',
+      ],
+    ])->getBody()->getContents();
+    return Json::decode($data);
+  }
+  catch (RequestException $e) {
+    watchdog_exception('finteza_analytics', $e);
+  }
+  return NULL;
+}
+
+/**
+ * Issue GET request with custom header.
+ */
+function finteza_analytics_ping($url) {
+  $user_agent = 'Drupal/' . \Drupal::VERSION . ';' . $GLOBALS['base_url'];
+  try {
+    \Drupal::httpClient()->get($url, [
+      'headers' => [
+        'User-Agent' => $user_agent,
+      ],
+    ]);
+  }
+  catch (BadResponseException $e) {
+    return FALSE;
+  }
+  return NULL;
+}
+
+/**
+ * Implements hook_help().
+ */
+function finteza_analytics_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.finteza_analytics':
+      $output = '<p>';
+      $output .= t(
+        "How to use the plugin:<br /><br />&nbsp;1. <a href='@registration_url' target='_blank'>Register</a> an account in Finteza<br />&nbsp;2. Save the generated website ID in the settings<br />&nbsp;3. Configure tracking of link click events<br />&nbsp;4. View your website visit statistics in the <a href='@dashboard_url' target='_blank'>Finteza dashboard</a>",
+        finteza_analytics_urls()
+      );
+      $output .= '</p>';
+
+      return $output;
+
+    case 'finteza_analytics.admin_page':
+      $output = "<div class='finteza-analytics__help'>";
+      $output .= '<p>';
+      $output .= "<img alt='Finteza Analytics' class='finteza-analytics__logo' src='" . file_create_url(drupal_get_path('module', 'finteza_analytics') . '/images/logo.svg') . "' width='42' height='42' />";
+      $output .= t('Real-time web analytics. Track your site visits, page views and events. Analyze the incoming traffic quality, explore user behavior and create conversion funnels. With the user-friendly interface, you can access the most realistic unsampled data without delays');
+      $output .= '</p>';
+      $output .= '<ul>';
+      $output .= "<li><a href='" . FintezaAnalyticsConfig::WEBSITE_URL . "' target='_blank'>" . t('Official website') . '</a></li>';
+
+      $website_id = \Drupal::config('finteza_analytics.settings')->get('tracking_settings.finteza_analytics_website_id');
+
+      if ($website_id) {
+        $output .= "<li><a href='" . FintezaAnalyticsConfig::DASHBOARD_URL . "' title='" . $website_id . "' target='_blank'>" . t('View statistics') . '</a></li>';
+      }
+      else {
+        $output .= "<li><a href='" . FintezaAnalyticsConfig::DEMO_URL . "' target='_blank'>" . t('Demo') . '</a></li>';
+      }
+      $output .= '</ul>';
+      $output .= '</div>';
+      return [
+        '#markup' => $output,
+        '#cache' => [
+          'tags' => ['FINTEZA_ANALYTICS_HELP'],
+        ],
+      ];
+
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function finteza_analytics_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+
+  // Hide main submit button.
+  if ($form_id == 'finteza_analytics_tracking_settings') {
+    $form['actions']['submit']['#access'] = FALSE;
+  }
+  if ($form_id == 'finteza_analytics_registration') {
+    $form['actions']['submit']['#access'] = FALSE;
+    $form['actions']['#submit']['#disabled'] = TRUE;
+  }
+
+}
+
+/**
+ * Returns usable urls.
+ */
+function finteza_analytics_urls() {
+
+  $registration_url = '#finteza-analytics-registration';
+
+  if (\Drupal::config('finteza_analytics.settings')->get('tracking_settings.finteza_analytics_website_id')) {
+    $registration_url = FintezaAnalyticsConfig::REGISTRATION_URL;
+  }
+
+  return [
+    '@registration_url' => $registration_url,
+    '@dashboard_url' => FintezaAnalyticsConfig::DASHBOARD_URL,
+    '@password_recovery_url' => FintezaAnalyticsConfig::PASSWORD_RECOVERY_URL,
+    '@privacy_url' => FintezaAnalyticsConfig::PRIVACY_URL,
+    '@agreement_url' => FintezaAnalyticsConfig::AGREEMENT_URL,
+    '@ckeditor_url' => FintezaAnalyticsConfig::CKEDITOR_URL,
+  ];
+}
+
+/**
+ * Returns complete list of tracking settings (with fallback to defaults)
+ */
+function finteza_analytics_tracking_settings_get() {
+
+  $settings = \Drupal::config('finteza_analytics.settings')->get('tracking_settings');
+  $defaults = [
+    "track_hash" => FALSE,
+    "track_links" => TRUE,
+    "time_on_page" => FALSE,
+    "dont_track_admins" => TRUE,
+  ];
+  return array_merge($defaults, $settings);
+}
