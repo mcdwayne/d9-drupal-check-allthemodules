@@ -1,0 +1,186 @@
+<?php
+/**
+ * @file
+ * Implement a basic setup of timeout sesisons.
+ */
+use Drupal\form_submission_timeout\Controller\FstController;
+use Drupal\Component\Utility\SafeMarkup;
+
+/**
+ * Implements hook_theme().
+ */
+function form_submission_timeout_theme() {
+  return array(
+    'form_submission_timeout_config_form' => array(
+      'render element' => 'form',
+      'file' => 'form_submission_timeout.theme.inc',
+    ),
+    'form_submission_timeout_timed_config_form' => array(
+      'render element' => 'form',
+      'file' => 'form_submission_timeout.theme.inc',
+    )
+  );
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function form_submission_timeout_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  $form_ids = $timed_form_ids = \Drupal::config('form_submission_timeout.settings')->get('sub_out_form_ids');
+  $timed_form_ids = \Drupal::config('form_submission_timeout.settings')->get('sub_out_stop_form_ids');
+
+  // Initialize session counter and add custom submit handler.
+  if ($form_ids) {
+    if (array_key_exists($form_id, $form_ids)) {
+      global $base_url;
+
+      $form['#attached']['library'][] = 'form_submission_timeout/countdown_timer';
+      $form['#attached']['library'][] = 'form_submission_timeout/base_file';
+      $form['#attached']['drupalSettings']['form_submission_timeout']['countdown_timer'] = array(
+        'dom_form_id' => $form['#id'],
+        'form_id' => $form_id,
+        'time' => $form_ids[$form_id]['sub_out_timeout_period'],
+        'show_timer' => $form_ids[$form_id]['sub_out_show_timer'],
+        'message' => $form_ids[$form_id]['sub_out_timeout_message'],
+        'url' => $base_url . '/form_submission_timeout/reset',
+      );
+
+      // Reset any form ids in $_SESSION.
+      if (isset($_SESSION['form_submission_timeout_form_ids'][$form_id . '_session_start']['status'])) {
+        if ($_SESSION['form_submission_timeout_form_ids'][$form_id . '_session_start']['status'] == 'reset') {
+          unset($_SESSION['form_submission_timeout_form_ids'][$form_id . '_session_start']);
+        }
+      }
+
+      if (!isset($_SESSION['form_submission_timeout_form_ids'][$form_id . '_session_start'])) {
+        $_SESSION['form_submission_timeout_form_ids'][$form_id . '_session_start'] = array(
+          'session_time' => time(),
+          'status' => 'set'
+        );
+      }
+
+      // Custom form validation.
+      array_unshift($form['#validate'], 'fstValidateForm');
+    }
+  }
+
+  // Timed section starts.
+  if ($timed_form_ids) {
+    if (array_key_exists($form_id, $timed_form_ids)) {
+      $current = strtotime(date('Y-m-d H:i:s'));
+      $day = date('D', time());
+      $date = FstController::convertDateToTimestamps($form_id);
+
+      if (($current > $date['start']) && ($current < $date['end']) &&
+         ($date['frequency'] == 'once' || $date['frequency'] == 'everyday')) {
+        $remaining_time = $date['end'] - $current;
+
+        $time_ar = FstController::calRemainingTime($remaining_time);
+        $time_string = $time_ar['days'] . 'd ' . $time_ar['hours'] . 'h ' .
+         $time_ar['minutes'] . 'm ' . $time_ar['seconds'] . 's';
+
+        $message = 'Remaining time left: ' . $time_string . ', This form will expire on ' .
+           date('D, M jS Y H:i', $date['end']);
+        $class = 'warning';
+      }
+      elseif (($current > $date['start']) && ($current < $date['end']) &&
+         ($date['frequency'] == 'weekdays') && ($day != 'Sun' || $day != 'Sat')) {
+        $remaining_time = $date['end'] - $current;
+
+        $time_ar = FstController::calRemainingTime($remaining_time);
+        $time_string = $time_ar['days'] . 'd ' . $time_ar['hours'] . 'h ' .
+         $time_ar['minutes'] . 'm ' . $time_ar['seconds'] . 's';
+
+        $message = 'Remaining time left: ' . $time_string . ', This form will expire on ' .
+           date('D, M jS Y H:i', $date['end']);
+        $class = 'warning';
+      }
+      elseif (($current > $date['start']) && ($current < $date['end']) &&
+         ($date['frequency'] == 'weekends') && ($day == 'Sun' || $day == 'Sat')) {
+        $remaining_time = $date['end'] - $current;
+
+        $time_ar = FstController::calRemainingTime($remaining_time);
+        $time_string = $time_ar['days'] . 'd ' . $time_ar['hours'] . 'h ' .
+         $time_ar['minutes'] . 'm ' . $time_ar['seconds'] . 's';
+
+        $message = 'Remaining time left: ' . $time_string . ', This form will expire on ' .
+           date('D, M jS Y H:i', $date['end']);
+        $class = 'warning';
+      }
+      else {
+        $class = 'error';
+        $message = $timed_form_ids[$form_id]['sub_out_stop_timeout_message'];
+      }
+
+      $form['remaining_time'] = array(
+        '#markup' => '<div class="timed messages messages--' . $class . '">' . $message . '</div>',
+        '#weight' => -100
+      );
+      array_unshift($form['#validate'], 'fstValidateForm');
+    }
+  }
+}
+
+/**
+ * Validation handler for the forms.
+ *
+ * @param $form
+ * @param $form_state
+ */
+function fstValidateForm($form, $form_state) {
+  $form_ids = \Drupal::config('form_submission_timeout.settings')->get('sub_out_form_ids');
+  $timed_form_ids = \Drupal::config('form_submission_timeout.settings')->get('sub_out_stop_form_ids');
+  $form_id = $form['#form_id'];
+
+  // Check if session has countdown timed out.
+  if (array_key_exists($form_id, $form_ids)) {
+    $session_remaining = round(time() - $_SESSION['form_submission_timeout_form_ids'][$form_id . '_session_start']['session_time'], 2);
+    if (($session_remaining > $form_ids[$form_id]['sub_out_timeout_period'])) {
+
+      // Show an overlay on form.
+      $form['#attributes'] = array(
+        'class' => array('fst-input-disabled'),
+      );
+
+      // Remove submit actions, being safe.
+      unset($form['actions']);
+      $form_state->setErrorByName('', $form_ids[$form_id]['sub_out_timeout_message']);
+    }
+    $_SESSION['form_submission_timeout_form_ids'][$form_id . '_session_start']['status'] = 'reset';
+  }
+
+  // Timed section starts.
+  if (array_key_exists($form_id, $timed_form_ids)) {
+
+    // Convert date to timestamp.
+    $current = strtotime(date('Y-m-d H:i:s'));
+    $date = FstController::convertDateToTimestamps($form_id);
+    $day = date('D', time());
+  
+    if (($current > $date['start']) && ($current < $date['end']) &&
+       ($date['frequency'] == 'once' || $date['frequency'] == 'everyday')) {
+      unset($_SESSION['submission_timed_timeout_form_ids'][$form_id . '_session_end']);
+      $_SESSION['submission_timed_timeout_form_ids'][$form_id . '_session_start'] = time();
+    }
+    elseif (($current > $date['start']) && ($current < $date['end']) &&
+       ($date['frequency'] == 'weekdays') && ($day != 'Sun' || $day != 'Sat')) {
+      unset($_SESSION['submission_timed_timeout_form_ids'][$form_id . '_session_end']);
+      $_SESSION['submission_timed_timeout_form_ids'][$form_id . '_session_start'] = time();
+    }
+    elseif (($current > $date['start']) && ($current < $date['end']) &&
+       ($date['frequency'] == 'weekends') && ($day == 'Sun' || $day == 'Sat')) {
+      unset($_SESSION['submission_timed_timeout_form_ids'][$form_id . '_session_end']);
+      $_SESSION['submission_timed_timeout_form_ids'][$form_id . '_session_start'] = time();
+    }
+    else {
+      unset($_SESSION['submission_timed_timeout_form_ids'][$form_id . '_session_start']);
+      $_SESSION['submission_timed_timeout_form_ids'][$form_id . '_session_end'] = time();  
+      $form_state->setErrorByName('', SafeMarkup::checkPlain($timed_form_ids[$form_id]['sub_out_stop_timeout_message']));
+    }
+  
+    if (!isset($_SESSION['submission_timed_timeout_form_ids'][$form_id . '_session_start']) && 
+      isset($_SESSION['submission_timed_timeout_form_ids'][$form_id . '_session_end'])) {
+      $form_state->setErrorByName('', SafeMarkup::checkPlain($timed_form_ids[$form_id]['sub_out_stop_timeout_message']));
+    }
+  }
+}
