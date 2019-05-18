@@ -1,0 +1,1 @@
+A field group formatter to hide settings unobtrusively on the form.
