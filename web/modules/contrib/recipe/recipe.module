@@ -1,0 +1,564 @@
+<?php
+
+/**
+ * @file
+ * Contains functions for Recipe node CRUD and display.
+ */
+
+use Drupal\Core\Cache\Cache;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Template\Attribute;
+use Drupal\field\FieldConfigInterface;
+use Drupal\node\Entity\NodeType;
+use Drupal\node\NodeTypeInterface;
+
+/**
+ * Implements hook_theme().
+ */
+function recipe_theme($existing, $type, $theme, $path) {
+  return [
+    'ingredient_recipeml_formatter' => [
+      'variables' => ['name' => NULL, 'quantity' => 0, 'unit_name' => '', 'unit_abbreviation' => '', 'unit_display' => 0, 'note' => ''],
+    ],
+    'recipe_duration' => [
+      'variables' => ['duration' => 0],
+    ],
+    'recipe_total_time' => [
+      'variables' => ['total_time' => 0, 'label' => t('Total time'), 'label_display' => 'above'],
+    ],
+    'recipe_yield' => [
+      'variables' => ['yield' => '', 'label' => t('Yield'), 'label_display' => 'above'],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_permission().
+ */
+function recipe_permission() {
+  return array(
+    'export recipes' => array(
+      'title' => t('Export recipes'),
+      'description' => t('Export recipes in various formats.'),
+    ),
+    'import recipes' => array(
+      'title' => t('Import recipes'),
+      'description' => t('Import recipes in various formats.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function recipe_menu() {
+  // Add a tab on the recipe add screen for Recipe Import.
+  // Need to add 'file path' because some modules render node/add/recipe/std
+  // even though they shouldn't.
+  $items['node/add/recipe/std'] = array(
+    'title' => 'Standard entry',
+    'weight' => 0,
+    'file path' => drupal_get_path('module', 'node'),
+    'type' => MENU_DEFAULT_LOCAL_TASK
+  );
+  $items['node/add/recipe/import'] = array(
+    'title' => 'Recipe Import',
+    'description' => 'Allows you to create a recipe by pasting various formats into a big text box.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('recipe_import_form'),
+    'access callback' => 'recipe_import_myaccess',
+    'access arguments' => array('import recipes'),
+    'file' => 'recipe.admin.inc',
+    'weight' => 1,
+    'type' => MENU_LOCAL_TASK
+  );
+  $items['recipe/export'] = array(
+    'page callback' => 'recipe_export',
+    'type' => MENU_CALLBACK,
+    'access arguments' => array('access content'),  // lower level permissions are handled in recipe_export
+    'file' => 'recipe.pages.inc',
+  );
+  $items['admin/structure/recipe'] = array(
+    'title' => 'Recipe bulk import/export',
+    'description' => 'Export/Import all recipes from this site to/from a supported format.',
+    'page callback' => 'recipe_export_multi',
+    'access callback' => 'recipe_export_multi_myaccess',
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'recipe.admin.inc',
+  );
+  $items['admin/structure/recipe/export_multi'] = array(
+    'title' => 'Recipe bulk export',
+    'description' => 'Export all recipes from this site into a supported output format.',
+    'type' => MENU_DEFAULT_LOCAL_TASK | MENU_LOCAL_TASK,
+  );
+  $items['admin/structure/recipe/import_multi'] = array(
+    'title' => 'Recipe bulk import',
+    'description' => 'Import all recipes from this site into a supported output format.',
+    'page callback' => 'recipe_import_multi',
+    'access callback' => 'recipe_import_multi_myaccess',
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'recipe.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter() for 'field_config_edit_form'.
+ */
+function recipe_form_field_config_edit_form_alter(&$form, FormStateInterface $form_state) {
+  $field = $form_state->getFormObject()->getEntity();
+
+  if ($field->getTargetBundle() == 'recipe' && $field->getType() == 'integer') {
+    $form['third_party_settings']['recipe']['total_time'] = [
+      '#type' => 'checkbox',
+      '#title' => t("Add this field's value to the Recipe's total time."),
+      '#default_value' => $field->getThirdPartySetting('recipe', 'total_time', 0),
+    ];
+  }
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter() for 'node_type_edit_form'.
+ *
+ * Adds recipe options to the node type form.
+ *
+ * @see NodeTypeForm::form()
+ * @see recipe_form_node_type_form_builder()
+ */
+function recipe_form_node_type_edit_form_alter(&$form, FormStateInterface $form_state) {
+  $node_type = $form_state->getFormObject()->getEntity();
+
+  // Return if this isn't a Recipe node.
+  // @todo Add the ability to define other content types as recipes, allowing
+  //   those types to display the pseudo-fields by enabling them with a
+  //   checkbox.
+  if ($node_type->id() != 'recipe') {
+    return;
+  }
+
+  $form['recipe'] = [
+    '#type' => 'details',
+    '#title' => t('Recipe settings'),
+    '#group' => 'additional_settings',
+  ];
+
+  // Create form elements for configuring the Total time pseudo-field.
+  $form['recipe']['total_time'] = [
+    '#type' => 'fieldset',
+    '#title' => t('Total time pseudo-field'),
+  ];
+  $form['recipe']['total_time']['recipe_total_time_label'] = [
+    '#type' => 'textfield',
+    '#title' => t('Label'),
+    '#default_value' => $node_type->getThirdPartySetting('recipe', 'total_time_label', 'Total time'),
+    '#size' => 20,
+  ];
+  $form['recipe']['total_time']['recipe_total_time_label_display'] = [
+    '#type' => 'select',
+    '#title' => t('Label display'),
+    '#options' => [
+      'above' => t('Above'),
+      'inline' => t('Inline'),
+      'hidden' => '- ' . t('Hidden') . ' -',
+      'visually_hidden' => '- ' . t('Visually Hidden') . ' -',
+    ],
+    '#default_value' => $node_type->getThirdPartySetting('recipe', 'total_time_label_display', 'above'),
+  ];
+
+  // Create form elements for configuring the Yield pseudo-field.
+  $form['recipe']['yield'] = [
+    '#type' => 'fieldset',
+    '#title' => t('Yield pseudo-field'),
+  ];
+  $form['recipe']['yield']['recipe_yield_label'] = [
+    '#type' => 'textfield',
+    '#title' => t('Label'),
+    '#default_value' => $node_type->getThirdPartySetting('recipe', 'yield_label', 'Yield'),
+    '#size' => 20,
+  ];
+  $form['recipe']['yield']['recipe_yield_label_display'] = [
+    '#type' => 'select',
+    '#title' => t('Label display'),
+    '#options' => [
+      'above' => t('Above'),
+      'inline' => t('Inline'),
+      'hidden' => '- ' . t('Hidden') . ' -',
+      'visually_hidden' => '- ' . t('Visually Hidden') . ' -',
+    ],
+    '#default_value' => $node_type->getThirdPartySetting('recipe', 'yield_label_display', 'above'),
+  ];
+  $form['#entity_builders'][] = 'recipe_form_node_type_form_builder';
+}
+
+/**
+ * Entity builder for the node type form with menu options.
+ *
+ * @see recipe_form_node_type_form_alter()
+ */
+function recipe_form_node_type_form_builder($entity_type, NodeTypeInterface $type, &$form, FormStateInterface $form_state) {
+  $type->setThirdPartySetting('recipe', 'total_time_label', $form_state->getValue('recipe_total_time_label'));
+  $type->setThirdPartySetting('recipe', 'total_time_label_display', $form_state->getValue('recipe_total_time_label_display'));
+  $type->setThirdPartySetting('recipe', 'yield_label', $form_state->getValue('recipe_yield_label'));
+  $type->setThirdPartySetting('recipe', 'yield_label_display', $form_state->getValue('recipe_yield_label_display'));
+
+  // Invalidate the node cache so the changes will appear in node displays.
+  Cache::invalidateTags(['node_view']);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_view().
+ */
+function recipe_node_view(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display, $view_mode) {
+  if ($entity->getEntityTypeId() !== 'node' || $entity->bundle() !== 'recipe') {
+    return;
+  }
+
+  $node_type = NodeType::load('recipe');
+
+  // Calculate the total time required to make the recipe.
+  $total_time = 0;
+  $total_time_count = 0;
+  foreach ($entity->getFieldDefinitions() as $field_name => $field_definition) {
+    if (!($field_definition instanceof FieldConfigInterface)) {
+      continue;
+    }
+    if ($field_definition->getType() == 'integer' && $field_definition->getThirdPartySetting('recipe', 'total_time') == 1 && $entity->{$field_name}->value != NULL) {
+      $total_time += $entity->{$field_name}->value;
+      $total_time_count++;
+    }
+  }
+  // Do not display the total time if only one time field or none have been
+  // filled out for the recipe.
+  if ($total_time_count > 1) {
+    $build['recipe_total_time'] = [
+      '#theme' => 'recipe_total_time',
+      '#label' => $node_type->getThirdPartySetting('recipe', 'total_time_label'),
+      '#label_display' => $node_type->getThirdPartySetting('recipe', 'total_time_label_display'),
+      '#total_time' => ['#theme' => 'recipe_duration', '#duration' => $total_time],
+    ];
+  }
+
+  // Display the recipe yield by combining the recipe_yield_amount and
+  // recipe_yield_unit fields. Do not display if the yield_amount is NULL.
+  if ($entity->recipe_yield_amount->value != NULL) {
+    $arguments = [
+      '@yield_amount' => $entity->recipe_yield_amount->value,
+      '@yield_unit' => $entity->recipe_yield_unit->value,
+    ];
+    $build['recipe_yield'] = [
+      '#theme' => 'recipe_yield',
+      '#label' => $node_type->getThirdPartySetting('recipe', 'yield_label'),
+      '#label_display' => $node_type->getThirdPartySetting('recipe', 'total_time_label_display'),
+      '#yield' => t('@yield_amount @yield_unit', $arguments),
+    ];
+  }
+  /*if ( isset($node->in_preview) && $node->in_preview == 1 ) {
+    return;
+  }
+
+  if ($node->type == 'recipe' && $view_mode != 'rss' && $view_mode != 'teaser') {
+    $formats = module_invoke_all('recipeio', 'export_single');
+    $links = array();
+    foreach ($formats as $key => $format) {
+      $perm = isset($format['access arguments']) ? $format['access arguments'] : 'export recipes';
+      if (user_access($perm)) {
+        $links[$key] = array(
+          'title' => $format['format_name'],
+          'href' => "recipe/export/$key/$node->nid/" . $node->recipe_yield,
+          'attributes' => array('title' => $format['format_help']),
+        );
+      }
+    }
+
+    if (!empty($links)) {
+      array_unshift($links, array('title' => '<br/>' . t('Export to') . ':', 'html' => TRUE));
+      $node->content['links']['recipe'] = array(
+        '#theme' => 'links__recipe__node',
+        '#links' => $links,
+        '#attributes' => array('class' => array('links', 'inline')),
+      );
+    }
+  }*/
+}
+
+/**
+ * Prepares variables for the recipe_total_time template.
+ *
+ * Default template: recipe_total_time.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - total_time: The content of the pseudo-field.
+ *   - label: A string containing the pseudo-field's title.
+ *   - label_display: The display settings for the label.
+ */
+function template_preprocess_recipe_total_time(&$variables, $hook) {
+  // Add the RDF metadata to the content_attributes.
+  $mapping = [
+    'properties' => ['schema:totalTime'],
+    'datatype' => 'xsd:duration',
+    'datatype_callback' => ['callable' => 'recipe_duration_iso8601'],
+  ];
+  $variables['content_attributes'] = rdf_rdfa_attributes($mapping, $variables['total_time']['#duration']);
+
+  $variables['label_hidden'] = ($variables['label_display'] == 'hidden');
+}
+
+/**
+ * Prepares variables for the recipe_yield template.
+ *
+ * Default template: recipe_yield.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - yield: The content of the pseudo-field.
+ *   - label: A string containing the pseudo-field's title.
+ *   - label_display: The display settings for the label.
+ */
+function template_preprocess_recipe_yield(&$variables, $hook) {
+  // Add the RDF metadata to the content_attributes.
+  $mapping = [
+    'properties' => ['schema:recipeYield'],
+  ];
+  $variables['content_attributes'] = rdf_rdfa_attributes($mapping);
+
+  $variables['label_hidden'] = ($variables['label_display'] == 'hidden');
+}
+
+/**
+ * Extends user_access to handle the case where no import formats are available.
+ */
+function recipe_import_myaccess($string, $account = NULL, $reset = FALSE) {
+  // short circuit if there are no parsers available.
+  $formats = module_invoke_all('recipeio', 'import_single');
+  if (count($formats) == 0) {
+    return FALSE;
+  }
+  // we have a format so continue to user_access
+  return user_access($string, $account, $reset);
+}
+
+/**
+ * Extends user_access to handle the case where no export formats are available.
+ */
+function recipe_export_multi_myaccess($string, $account = NULL, $reset = FALSE) {
+  // short circuit if there are no parsers available.
+  $formats = module_invoke_all('recipeio', 'export_multi');
+  if (count($formats) == 0) {
+    return FALSE;
+  }
+  // we have a format so continue to user_access
+  return user_access($string, $account, $reset);
+}
+
+/**
+ * Extends user_access to handle the case where no import formats are available.
+ */
+function recipe_import_multi_myaccess($string, $account = NULL, $reset = FALSE) {
+  // short circuit if there are no parsers available.
+  $formats = module_invoke_all('recipeio', 'import_multi');
+  if (count($formats) == 0) {
+    return FALSE;
+  }
+  // we have a format so continue to user_access
+  return user_access($string, $account, $reset);
+}
+
+/**
+ * Prepares content for display in plain text recipe formats.
+ *
+ * Removes HTML tags and encodes the &deg; symbol.
+ */
+function _recipe_prepare_plain_text($string) {
+  $string = strip_tags($string);
+  $string = str_replace("&deg;", "\xB0", $string);
+  return trim($string);
+}
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function recipe_entity_extra_field_info() {
+  $extra = [];
+
+  $extra['node']['recipe']['display']['recipe_total_time'] = [
+    'label' => t('Total time'),
+    'description' => t('The total time required to make the recipe.'),
+    'weight' => 4,
+    'visible' => TRUE,
+  ];
+  $extra['node']['recipe']['display']['recipe_yield'] = [
+    'label' => t('Yield'),
+    'description' => t('The amount of food produced by the recipe.'),
+    'weight' => 1,
+    'visible' => TRUE,
+  ];
+
+  return $extra;
+}
+
+/**
+ * Checks a string for ISO-8859-1 chars and encodes them to UTF-8.
+ *
+ * @param string $in_str
+ *   A string with possible ISO-8859-1 chars.
+ *
+ * @return string
+ *   A UTF8 string representation of $in_str.
+ */
+function fixEncoding($in_str) {
+  $cur_encoding = mb_detect_encoding($in_str);
+  if ($cur_encoding == "UTF-8" && mb_check_encoding($in_str, "UTF-8")) {
+    return $in_str;
+  }
+  else {
+    return utf8_encode($in_str);
+  }
+}
+
+/**
+ * Prepares variables for the recipe duration template.
+ *
+ * Default template: recipe-duration.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - hours: The amount of hours in the time duration.
+ *   - minutes: The amount of minutes in the time duration.
+ */
+function template_preprocess_recipe_duration(&$variables) {
+  $hours = floor($variables['duration'] / 60);
+  $minutes = $variables['duration'] % 60;
+  $variables['hours'] = '';
+  $variables['minutes'] = '';
+  if ($hours > 0) {
+    $variables['hours'] = \Drupal::translation()->formatPlural($hours, '1 hour', '@count hours');
+  }
+  if ($minutes > 0 || $variables['duration'] == 0) {
+    $variables['minutes'] = \Drupal::translation()->formatPlural($minutes, '1 minute', '@count minutes');
+  }
+}
+
+/**
+ * Returns a duration string in ISO 8601 format.
+ *
+ * @param $duration
+ *   An integer or array with 'value' element representing a time duration.
+ *
+ * @return string
+ *   A string representing a time duration in ISO 8601 format.
+ */
+function recipe_duration_iso8601($duration = 0) {
+  if (is_array($duration) && isset($duration['value'])) {
+    $duration = $duration['value'];
+  }
+  $hours = floor($duration / 60);
+  $minutes = $duration % 60;
+  $output = '';
+  if ($hours > 0) {
+    $output .= $hours . 'H';
+  }
+  if ($minutes > 0) {
+    $output .= $minutes . 'M';
+  }
+  return empty($output) ? 'PT0M' : 'PT' . $output;
+}
+
+/**
+ * Prepares variables for the plain text style template.
+ *
+ * Default template: recipe-view-plain-text.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - view: A ViewExecutable object.
+ *   - options: An array of options. Each option contains:
+ *     - hide_empty: Whether the field is to be hidden if empty.
+ *   - rows: The raw row data.
+ */
+function template_preprocess_recipe_view_plain_text(&$variables) {
+  $view = $variables['view'];
+  $variables['recipes'] = [];
+
+  // During live preview we don't want to output the header since the contents
+  // of the text are being displayed inside a normal HTML page.
+  if (empty($variables['view']->live_preview)) {
+    $variables['view']->getResponse()->headers->set('Content-Type', 'text/plain; charset=utf-8');
+  }
+
+  // Strip HTML from the fields.
+  foreach ($variables['rows'] as $row) {
+    $recipe = [];
+
+    // Process the row fields.
+    foreach ($view->field as $id => $field) {
+      // Render this even if set to exclude so it can be used elsewhere.
+      $field_output = $view->style_plugin->getField($row->index, $id);
+      $empty = $field->isValueEmpty($field_output, $field->options['empty_zero']);
+      if (empty($field->options['exclude']) && (!$empty || (empty($field->options['hide_empty']) && empty($variables['options']['hide_empty'])))) {
+        $object = new stdClass();
+        $object->handler = $view->field[$id];
+        // Set up default value of the flag that indicates whether to display a
+        // colon after the label.
+        $object->has_label_colon = FALSE;
+
+        $object->content = wordwrap(_recipe_prepare_plain_text($field_output), $variables['options']['wordwrap_width']);
+        if (isset($view->field[$id]->field_alias) && isset($row->{$view->field[$id]->field_alias})) {
+          $object->raw = $row->{$view->field[$id]->field_alias};
+        }
+        else {
+          // Make sure it exists to reduce NOTICE.
+          $object->raw = NULL;
+        }
+
+        // Set up field label.
+        $object->label = $view->field[$id]->label();
+
+        // Set up field label wrapper and its attributes.
+        if ($object->label) {
+          // Add a colon in a label suffix.
+          if ($object->handler->options['element_label_colon']) {
+            $object->label_suffix = ': ';
+            $object->has_label_colon = TRUE;
+          }
+        }
+
+        $recipe['fields'][$id] = $object;
+      }
+    }
+
+    $variables['recipes'][] = $recipe;
+  }
+
+  $variables['row_separator'] = strip_tags($variables['options']['row_separator']);
+}
+
+/**
+ * Prepares variables for the RecipeML style template.
+ *
+ * Default template: recipe-view-recipeml.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - view: A ViewExecutable object.
+ *   - rows: The raw row data.
+ */
+function template_preprocess_recipe_view_recipeml(&$variables) {
+  $variables['recipes'] = $variables['rows'];
+
+  // During live preview we don't want to output the header since the contents
+  // of the RecipeML are being displayed inside a normal HTML page.
+  if (empty($variables['view']->live_preview)) {
+    $variables['view']->getResponse()->headers->set('Content-Type', 'text/xml; charset=utf-8');
+  }
+
+  // Add the language xml:lang attribute to each recipe.
+  foreach ($variables['recipes'] as $key => $recipe) {
+    $variables['recipes'][$key]['attributes'] = new Attribute(['xml:lang' => $recipe['langcode']]);
+  }
+}
