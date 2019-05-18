@@ -1,0 +1,321 @@
+<?php
+
+/**
+ * @file
+ * Enable chatroom support in Drupal.
+ */
+
+use Drupal\chatroom\Form\ChatroomIrcButtonsForm;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Template\Attribute;
+
+/**
+ * Return a list of Chatroom cid's the user has access to.
+ */
+function chatroom_user_chatroom_list($account) {
+  $chatroom_cids = array();
+
+  $cids = db_query('SELECT cid FROM {chatroom} WHERE public = 1 AND archived = 0')->fetchAll();
+  foreach ($cids as $cid) {
+    $chatroom_cids[] = $cid->cid;
+  }
+
+  $rids = array_keys($account->roles);
+  $sql = 'SELECT cr.cid
+          FROM {chatroom_role} cr
+          INNER JOIN {chatroom} c ON c.cid = cr.cid
+          WHERE cr.rid IN (:rids)
+          AND c.archived = 0';
+  $cids = db_query($sql, array(':rids' => $rids))->fetchAll();
+  foreach ($cids as $cid) {
+    $chatroom_cids[] = $cid->cid;
+  }
+
+  $sql = 'SELECT cu.cid
+          FROM {chatroom_user} cu
+          INNER JOIN {chatroom} c ON c.cid = cu.cid
+          WHERE cu.uid = :uid
+          AND c.archived = 0';
+  $cids = db_query('SELECT cid FROM {chatroom_user} WHERE uid = :uid', array(':uid' => $account->uid))->fetchAll();
+  foreach ($cids as $cid) {
+    $chatroom_cids[] = $cid->cid;
+  }
+
+  return array_unique($chatroom_cids);
+}
+
+/**
+ * Attaches the global js settings and needed libraries to a render array.
+ * The items are attached only once so this function can be called multiple
+ * times without duplicating the data.
+ *
+ * @param $elements
+ *   Render array to which the items will be attached;
+ */
+function chatroom_attach_js_settings(&$elements) {
+  static $initialised;
+
+  $user = \Drupal::currentUser();
+  $system_date = \Drupal::config('system.date');
+
+  if (is_null($initialised)) {
+    $initialised = TRUE;
+
+    $js = array(
+      'chatroomBasePath' => \Drupal\Core\Url::fromUri('internal:/chatroom')->toString(),
+    );
+
+    if (($system_date->get('timezone.user.configurable') ?: TRUE) && $user->id() && \Drupal\Component\Utility\Unicode::strlen($user->getTimeZone())) {
+      $js['timezone'] = $user->getTimeZone();
+    }
+    else {
+      $js['timezone'] = $system_date->get('timezone.default') ?: 0;
+    }
+
+    $elements['#attached']['library'][] = 'chatroom/chatroom';
+
+    // Allow module to add libraries to add functionality to the chatroom interface.
+    foreach (\Drupal::moduleHandler()->invokeAll('chatroom_js') as $library) {
+      $elements['#attached']['library'] = $library;
+    }
+
+    // Allow modules to alter the js settings sent down for a chat.
+    \Drupal::moduleHandler()->alter('chatroom_js_settings', $js);
+    $elements['#attached']['drupalSettings']['chatroom'] = $js;
+  }
+}
+
+/**
+ * Get the time string for a message from a UTC timestamp.
+ *
+ * @param mixed $timestamp
+ * @return string
+ */
+function chatroom_get_message_time_string($timestamp) {
+  $offset_in_hours = chatroom_get_user_timezone_offset() / 60 / 60;
+  $offset_in_hours = $offset_in_hours >= 0 ? '+' . $offset_in_hours : $offset_in_hours;
+  $date = new DateTime('@' . ($timestamp + chatroom_get_user_timezone_offset()), new DateTimeZone('Etc/GMT' . $offset_in_hours));
+  return $date->format(\Drupal::config('chatroom.settings')->get('msg_date_format'));
+}
+
+/**
+ * Check a token for a given form.
+ */
+function chatroom_check_token($token, $form_id) {
+  return \Drupal::csrfToken()->validate($token,$form_id);
+}
+
+/**
+ * Return the current user's offset from UTC.
+ */
+function chatroom_get_user_timezone_offset() {
+  $user = \Drupal::currentUser();
+
+  $system_date = \Drupal::config('system.date');
+  $timezone = $system_date->get('timezone.default') ?: 'UTC';
+  if (($system_date->get('timezone.user.configurable') ?: TRUE) && (NULL !== $user->getTimeZone())) {
+    $timezone = $user->getTimeZone();
+  }
+
+  $timezone = new DateTimeZone($timezone);
+  $now = new DateTime('now', $timezone);
+  $offset = $timezone->getOffset($now);
+  return $offset;
+}
+
+/**
+ * Try to load a user from a command argument.
+ *
+ * @param mixed $command_arg
+ * @return mixed - A user object or FALSE
+ */
+function chatroom_get_user_from_command_arg($command_arg) {
+  if (is_numeric($command_arg)) {
+    return user_load($command_arg);
+  }
+  else {
+    return user_load_by_name($command_arg);
+  }
+}
+
+/**
+ * Try to invoke a command.
+ *
+ * @param mixed $message
+ * @param mixed $chatroom
+ */
+function chatroom_call_command($message, $chatroom) {
+  $commands = \Drupal::moduleHandler()->invokeAll('chatroom_commands');
+  $command = chatroom_parse_command($message['msg']);
+  if ($command && isset($commands[$command->name])) {
+    $callback = $commands[$command->name]['callback'];
+    $command->callback_result = call_user_func_array($callback, array($command, $chatroom));
+    foreach (\Drupal::moduleHandler()->getImplementations('chatroom_command_api') as $module) {
+      call_user_func_array($module . '_chatroom_command_api', array($command, $chatroom));
+    }
+    return $command->callback_result;
+  }
+}
+
+/**
+ * Parse out the command name and any arguments from a chat message.
+ *
+ * @param mixed $message
+ * @return array
+ */
+function chatroom_parse_command($message) {
+  $command = new stdClass();
+  $command->args = array();
+  $command->name = FALSE;
+  $prefix = \Drupal::config('chatroom.settings')->get('command_prefix');
+  if (preg_match("#^$prefix([a-z_0-9]+)(.*)#i", $message, $matches)) {
+    $command->name = $matches[1];
+    if (isset($matches[2])) {
+      $command->args = explode(' ', $matches[2]);
+      array_shift($command->args);
+    }
+  }
+  return $command->name ? $command : FALSE;
+}
+
+/**
+ * Figure out what sort of message this is.
+ *
+ * @param mixed $message
+ */
+function chatroom_get_message_type($message) {
+  $prefix = \Drupal::config('chatroom.settings')->get('command_prefix');
+  if (\Drupal\Component\Utility\Unicode::substr($message, 0, \Drupal\Component\Utility\Unicode::strlen($prefix)) == $prefix) {
+    return 'command';
+  }
+  return 'message';
+}
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function chatroom_entity_extra_field_info() {
+  $extra = array();
+
+  $extra['chatroom']['chatroom']['display']['chat_window'] = array(
+    'label' => t('Chat window'),
+    'description' => t('Chat window for messages.'),
+    'weight' => 100,
+    'visible' => TRUE,
+  );
+
+  $extra['chatroom']['chatroom']['display']['user_list'] = array(
+    'label' => t('User list'),
+    'description' => t('List of online users.'),
+    'weight' => 90,
+    'visible' => TRUE,
+  );
+
+  return $extra;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function chatroom_theme() {
+  return array(
+    'chatroom' => array(
+      'render element' => 'elements',
+    ),
+    'chatroom_irc' => array(
+      'variables' => array('chatroom' => NULL),
+      'template' => 'chatroom-irc',
+    ),
+    'chatroom_irc_user_list' => array(
+      'variables' => array('chatroom' => NULL),
+      'template' => 'chatroom-irc-user-list',
+    ),
+    'chatroom_user' => array(
+      'variables' => array('account' => NULL),
+      'template' => 'chatroom-user',
+    ),
+    'chatroom_message' => array(
+      'variables' => array('chatroom_message' => NULL),
+      'template' => 'chatroom-message',
+    ),
+  );
+}
+
+/**
+ * Implements hook_preprocess_hook().
+ */
+function chatroom_preprocess_chatroom_irc(&$vars) {
+  $chatroom = $vars['chatroom'];
+
+  $vars['messages'] = [];
+  foreach ($chatroom->loadLatestMessages() as $chatroom_message) {
+    $vars['messages'][$chatroom_message->cmid->value] = [
+      '#theme' => 'chatroom_message',
+      '#chatroom_message' => $chatroom_message,
+    ];
+  }
+
+  $vars['can_post'] = $chatroom->access('post');
+
+  $vars['token'] = \Drupal::csrfToken()->get('chatroom_form_token_' . $chatroom->cid->value);
+
+  $form = new ChatroomIrcButtonsForm($chatroom);
+  $vars['chatroom_input_form'] = \Drupal::formBuilder()->getForm($form);
+}
+
+/**
+ * Implements hook_preprocess_hook().
+ */
+function chatroom_preprocess_chatroom_user(&$vars) {
+  $account = $vars['account'];
+  $vars['name'] = $account->getDisplayName();
+  $vars['uid'] = $account->id();
+}
+
+/**
+ * Implements hook_preprocess_hook().
+ */
+function chatroom_preprocess_chatroom_message(&$vars) {
+  $chatroom_message = $vars['chatroom_message'];
+  $vars['cmid'] = $chatroom_message->cmid->value;
+
+  // @TODO: allow for date format settings on the chatroom.
+  $vars['timestamp'] = chatroom_get_message_time_string($vars['chatroom_message']->created->value);
+
+  // Determine the name of the message author.
+  if ($chatroom_message->uid->entity) {
+    $chat_user = $chatroom_message->uid->entity;
+  }
+  else {
+    $chat_user = new \Drupal\Core\Session\AnonymousUserSession();
+  }
+
+  // For anonymous, use the name specified by the visitor.
+  if (!$chat_user->getUsername() && !empty($chatroom_message->anon_name->value)) {
+    $chat_user->name = $chatroom_message->anon_name->value;
+  }
+
+  $vars['username'] = $chat_user->getDisplayName();
+  $vars['message'] = $chatroom_message->text->value;
+}
+
+/**
+ * Prepares variables for the chatroom template.
+ */
+function template_preprocess_chatroom(&$variables) {
+  // Extract variables for easy access in the template.
+  $variables['view_mode'] = $variables['elements']['#view_mode'];
+  $variables['chatroom'] = $variables['elements']['#chatroom'];
+
+  // Copy fields to the $content variable so that they are easily accessible
+  // in the template.
+  $variables += array('content' => array());
+  foreach (Element::children($variables['elements']) as $key) {
+    $variables['content'][$key] = $variables['elements'][$key];
+  }
+
+  $variables['title'] = $variables['chatroom']->title->value;
+
+  $variables['attributes'] = new Attribute();
+  $variables['attributes']->addClass('chatroom');
+}
