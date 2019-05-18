@@ -1,0 +1,441 @@
+<?php
+
+/**
+ * @file
+ * Add ability to create menu links for commerce products.
+ */
+
+use Drupal\Core\Cache\CacheableMetadata;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\menu_link_content\Entity\MenuLinkContent;
+use Drupal\commerce_product\Entity\ProductInterface;
+use Drupal\commerce_product\Entity\Product;
+use Drupal\commerce_product\Entity\ProductTypeInterface;
+use Drupal\commerce_product\Entity\ProductType;
+use Drupal\Core\Entity\ContentEntityType;
+
+/**
+ * Implements hook_entity_type_build().
+ */
+function product_menu_ui_entity_type_build(array &$entity_types) {
+  /** @var $entity_types \Drupal\Core\Entity\EntityTypeInterface[] */
+  if (isset($entity_types['commerce_product'])) {
+    $entity_types['commerce_product']->addConstraint('MenuSettings', []);
+  }
+}
+
+/**
+ * Helper function to create or update a menu link for a commerce_product.
+ *
+ * @param \Drupal\commerce_product\Entity\ProductInterface $commerce_product
+ *   Commerce_product entity.
+ * @param array $values
+ *   Values for the menu link.
+ */
+function _menu_ui_commerce_product_save(ProductInterface $commerce_product, array $values) {
+  /** @var \Drupal\menu_link_content\MenuLinkContentInterface $entity */
+  if (!empty($values['entity_id'])) {
+    $entity = MenuLinkContent::load($values['entity_id']);
+    if ($entity->isTranslatable()) {
+      if (!$entity->hasTranslation($commerce_product->language()->getId())) {
+        $entity = $entity->addTranslation($commerce_product->language()
+          ->getId(), $entity->toArray());
+      }
+      else {
+        $entity = $entity->getTranslation($commerce_product->language()
+          ->getId());
+      }
+    }
+  }
+  else {
+    // Create a new menu_link_content entity.
+    $entity = MenuLinkContent::create([
+      'link' => ['uri' => 'entity:commerce_product/' . $commerce_product->id()],
+      'langcode' => $commerce_product->language()->getId(),
+    ]);
+    $entity->enabled->value = 1;
+  }
+  $entity->title->value = trim($values['title']);
+  $entity->description->value = trim($values['description']);
+  $entity->menu_name->value = $values['menu_name'];
+  $entity->parent->value = $values['parent'];
+  $entity->weight->value = isset($values['weight']) ? $values['weight'] : 0;
+  $entity->save();
+}
+
+/**
+ * Returns the definition for a menu link for the given commerce_product.
+ *
+ * @param \Drupal\commerce_product\Entity\ProductInterface $commerce_product
+ *   The commerce_product entity.
+ *
+ * @return array
+ *   An array that contains default values for the menu link form.
+ */
+function commerce_product_menu_ui_get_menu_link_defaults(ProductInterface $commerce_product) {
+  // Prepare the definition for the edit form.
+  /** @var \Drupal\commerce_product\Entity\ProductTypeInterface $commerce_product_type */
+  $commerce_product_type = $commerce_product->type->entity;
+  $menu_name = strtok($commerce_product_type->getThirdPartySetting('menu_ui', 'parent', 'main:'), ':');
+  $defaults = FALSE;
+  if ($commerce_product->id()) {
+    $id = FALSE;
+    // Give priority to the default menu
+    $type_menus = $commerce_product_type->getThirdPartySetting('menu_ui', 'available_menus', ['main']);
+    if (in_array($menu_name, $type_menus)) {
+      $query = \Drupal::entityQuery('menu_link_content')
+        ->condition('link.uri', 'commerce_product/' . $commerce_product->id())
+        ->condition('menu_name', $menu_name)
+        ->sort('id', 'ASC')
+        ->range(0, 1);
+      $result = $query->execute();
+
+      $id = (!empty($result)) ? reset($result) : FALSE;
+    }
+    // Check all allowed menus if a link does not exist in the default menu.
+    if (!$id && !empty($type_menus)) {
+      $query = \Drupal::entityQuery('menu_link_content')
+        ->condition('link.uri', 'entity:commerce_product/' . $commerce_product->id())
+        ->condition('menu_name', array_values($type_menus), 'IN')
+        ->sort('id', 'ASC')
+        ->range(0, 1);
+      $result = $query->execute();
+
+      $id = (!empty($result)) ? reset($result) : FALSE;
+    }
+    if ($id) {
+      $menu_link = MenuLinkContent::load($id);
+      $menu_link = \Drupal::service('entity.repository')
+        ->getTranslationFromContext($menu_link);
+      $defaults = [
+        'entity_id' => $menu_link->id(),
+        'id' => $menu_link->getPluginId(),
+        'title' => $menu_link->getTitle(),
+        'title_max_length' => $menu_link->getFieldDefinitions()['title']->getSetting('max_length'),
+        'description' => $menu_link->getDescription(),
+        'menu_name' => $menu_link->getMenuName(),
+        'parent' => $menu_link->getParentId(),
+        'weight' => $menu_link->getWeight(),
+      ];
+    }
+  }
+
+  if (!$defaults) {
+    // Get the default max_length of a menu link title from the base field
+    // definition.
+    $field_definitions = \Drupal::entityManager()
+      ->getBaseFieldDefinitions('menu_link_content');
+    $max_length = $field_definitions['title']->getSetting('max_length');
+    $defaults = [
+      'entity_id' => 0,
+      'id' => '',
+      'title' => '',
+      'title_max_length' => $max_length,
+      'description' => '',
+      'menu_name' => $menu_name,
+      'parent' => '',
+      'weight' => 0,
+    ];
+  }
+  return $defaults;
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter() for
+ * \Drupal\commerce_product\Commerce_productForm.
+ *
+ * Adds menu item fields to the commerce_product form.
+ *
+ * @see menu_ui_form_commerce_product_form_submit()
+ */
+function commerce_product_menu_ui_form_commerce_product_form_alter(&$form, FormStateInterface $form_state) {
+  // Generate a list of possible parents (not including this link or descendants).
+  // @todo This must be handled in a #process handler.
+  $commerce_product = $form_state->getFormObject()->getEntity();
+  $defaults = commerce_product_menu_ui_get_menu_link_defaults($commerce_product);
+  /** @var \Drupal\commerce_product\Entity\ProductTypeInterface $commerce_product_type */
+  $commerce_product_type = $commerce_product->type->entity;
+  /** @var \Drupal\Core\Menu\MenuParentFormSelectorInterface $menu_parent_selector */
+  $menu_parent_selector = \Drupal::service('menu.parent_form_selector');
+  $menu_names = menu_ui_get_menus();
+  $type_menus = $commerce_product_type->getThirdPartySetting('menu_ui', 'available_menus', ['main']);
+  $available_menus = [];
+  foreach ($type_menus as $menu) {
+    $available_menus[$menu] = $menu_names[$menu];
+  }
+  if ($defaults['id']) {
+    $default = $defaults['menu_name'] . ':' . $defaults['parent'];
+  }
+  else {
+    $default = $commerce_product_type->getThirdPartySetting('menu_ui', 'parent', 'main:');
+  }
+  $parent_element = $menu_parent_selector->parentSelectElement($default, $defaults['id'], $available_menus);
+  // If no possible parent menu items were found, there is nothing to display.
+  if (empty($parent_element)) {
+    return;
+  }
+
+  $form['menu'] = [
+    '#type' => 'details',
+    '#title' => t('Menu settings'),
+    '#access' => \Drupal::currentUser()->hasPermission('administer menu'),
+    '#open' => (bool) $defaults['id'],
+    '#group' => 'advanced',
+    '#attached' => [
+      'library' => ['menu_ui/drupal.menu_ui'],
+    ],
+    '#tree' => TRUE,
+    '#weight' => -2,
+    '#attributes' => ['class' => ['menu-link-form']],
+  ];
+  $form['menu']['enabled'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Provide a menu link'),
+    '#default_value' => (int) (bool) $defaults['id'],
+  ];
+  $form['menu']['link'] = [
+    '#type' => 'container',
+    '#parents' => ['menu'],
+    '#states' => [
+      'invisible' => [
+        'input[name="menu[enabled]"]' => ['checked' => FALSE],
+      ],
+    ],
+  ];
+
+  // Populate the element with the link data.
+  foreach (['id', 'entity_id'] as $key) {
+    $form['menu']['link'][$key] = [
+      '#type' => 'value',
+      '#value' => $defaults[$key],
+    ];
+  }
+
+  $form['menu']['link']['title'] = [
+    '#type' => 'textfield',
+    '#title' => t('Menu link title'),
+    '#default_value' => $defaults['title'],
+    '#maxlength' => $defaults['title_max_length'],
+  ];
+
+  $form['menu']['link']['description'] = [
+    '#type' => 'textarea',
+    '#title' => t('Description'),
+    '#default_value' => $defaults['description'],
+    '#rows' => 1,
+    '#description' => t('Shown when hovering over the menu link.'),
+  ];
+
+  $form['menu']['link']['menu_parent'] = $parent_element;
+  $form['menu']['link']['menu_parent']['#title'] = t('Parent item');
+  $form['menu']['link']['menu_parent']['#attributes']['class'][] = 'menu-parent-select';
+
+  $form['menu']['link']['weight'] = [
+    '#type' => 'number',
+    '#title' => t('Weight'),
+    '#default_value' => $defaults['weight'],
+    '#description' => t('Menu links with lower weights are displayed before links with higher weights.'),
+  ];
+
+  foreach (array_keys($form['actions']) as $action) {
+    if ($action != 'preview' && isset($form['actions'][$action]['#type']) && $form['actions'][$action]['#type'] === 'submit') {
+      $form['actions'][$action]['#submit'][] = 'commerce_product_menu_ui_form_commerce_product_form_submit';
+    }
+  }
+
+  $form['#entity_builders'][] = 'commerce_product_menu_ui_commerce_product_builder';
+}
+
+/**
+ * Entity form builder to add the menu information to the commerce_product.
+ */
+function commerce_product_menu_ui_commerce_product_builder($entity_type, ProductInterface $entity, &$form, FormStateInterface $form_state) {
+  if (!empty($form_state->getValue('menu'))) {
+    $entity->menu = $form_state->getValue('menu');
+  }
+}
+
+/**
+ * Form submission handler for menu item field on the commerce_product form.
+ *
+ * @see menu_ui_form_commerce_product_form_alter()
+ */
+function commerce_product_menu_ui_form_commerce_product_form_submit($form, FormStateInterface $form_state) {
+  $commerce_product = $form_state->getFormObject()->getEntity();
+  if (!$form_state->isValueEmpty('menu')) {
+    $values = $form_state->getValue('menu');
+    if (empty($values['enabled'])) {
+      if ($values['entity_id']) {
+        $entity = MenuLinkContent::load($values['entity_id']);
+        $entity->delete();
+      }
+    }
+    elseif (trim($values['title'])) {
+      // Decompose the selected menu parent option into 'menu_name' and 'parent',
+      // if the form used the default parent selection widget.
+      if (!empty($values['menu_parent'])) {
+        list($menu_name, $parent) = explode(':', $values['menu_parent'], 2);
+        $values['menu_name'] = $menu_name;
+        $values['parent'] = $parent;
+      }
+      _menu_ui_commerce_product_save($commerce_product, $values);
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for
+ * \Drupal\commerce_product\CommerceProductTypeForm.
+ *
+ * Adds menu options to the commerce_product type form.
+ *
+ * @see CommerceProductTypeForm::form()
+ * @see menu_ui_form_commerce_product_type_form_submit()
+ */
+function commerce_product_menu_ui_form_commerce_product_type_form_alter(&$form, FormStateInterface $form_state) {
+  if (!\Drupal::moduleHandler()->moduleExists('menu_ui')) {
+    return;
+  }
+  if (!\Drupal::currentUser()->hasPermission('administer menu')) {
+    // We're only interested in when the node is unsaved and the editor has
+    // permission to create new menu links.
+    return;
+  }
+
+  /** @var \Drupal\Core\Menu\MenuParentFormSelectorInterface $menu_parent_selector */
+  $menu_parent_selector = \Drupal::service('menu.parent_form_selector');
+  $menu_options = menu_ui_get_menus();
+  /** @var \Drupal\commerce_product\Entity\ProductTypeInterface $type */
+  $type = $form_state->getFormObject()->getEntity();
+  $form['menu'] = [
+    '#type' => 'details',
+    '#title' => t('Menu settings'),
+    '#attached' => [
+      'library' => ['menu_ui/drupal.menu_ui.admin'],
+    ],
+    '#group' => 'additional_settings',
+  ];
+  $form['menu']['menu_options'] = [
+    '#type' => 'checkboxes',
+    '#title' => t('Available menus'),
+    '#default_value' => $type->getThirdPartySetting('menu_ui', 'available_menus', ['main']),
+    '#options' => $menu_options,
+    '#description' => t('The menus available to place links in for this content type.'),
+  ];
+  // @todo See if we can avoid pre-loading all options by changing the form or
+  //   using a #process callback. https://www.drupal.org/commerce_product/2310319
+  //   To avoid an 'illegal option' error after saving the form we have to load
+  //   all available menu parents. Otherwise, it is not possible to dynamically
+  //   add options to the list using ajax.
+  $options_cacheability = new CacheableMetadata();
+  $options = $menu_parent_selector->getParentSelectOptions('', NULL, $options_cacheability);
+  $form['menu']['menu_parent'] = [
+    '#type' => 'select',
+    '#title' => t('Default parent item'),
+    '#default_value' => $type->getThirdPartySetting('menu_ui', 'parent', 'main:'),
+    '#options' => $options,
+    '#description' => t('Choose the menu item to be the default parent for a new link in the content authoring form.'),
+    '#attributes' => ['class' => ['menu-title-select']],
+  ];
+  $options_cacheability->applyTo($form['menu']['menu_parent']);
+
+  $form['#validate'][] = 'commerce_product_menu_ui_form_commerce_product_type_form_validate';
+  $form['#entity_builders'][] = 'commerce_product_menu_ui_form_commerce_product_type_form_builder';
+  $form['#entity_builders'][] = 'commerce_product_menu_link_submit_build_tokens';
+}
+
+/**
+ * Validate handler for forms with menu options.
+ *
+ * @see menu_ui_form_commerce_product_type_form_alter()
+ */
+function commerce_product_menu_ui_form_commerce_product_type_form_validate(&$form, FormStateInterface $form_state) {
+  $available_menus = array_filter($form_state->getValue('menu_options'));
+  // If there is at least one menu allowed, the selected item should be in
+  // one of them.
+  if (count($available_menus)) {
+    $menu_item_id_parts = explode(':', $form_state->getValue('menu_parent'));
+    if (!in_array($menu_item_id_parts[0], $available_menus)) {
+      $form_state->setErrorByName('menu_parent', t('The selected menu item is not under one of the selected menus.'));
+    }
+  }
+  else {
+    $form_state->setValue('menu_parent', '');
+  }
+}
+
+/**
+ * Entity builder for the commerce_product type form with menu options.
+ *
+ * @see menu_ui_form_commerce_product_type_form_alter()
+ */
+function commerce_product_menu_ui_form_commerce_product_type_form_builder($entity_type, $type, &$form, FormStateInterface $form_state) {
+  $type->setThirdPartySetting('menu_ui', 'available_menus', array_values(array_filter($form_state->getValue('menu_options'))));
+  $type->setThirdPartySetting('menu_ui', 'parent', $form_state->getValue('menu_parent'));
+}
+ 
+/**
+ * Entity builder for token support.
+ */
+function commerce_product_menu_link_submit_build_tokens($entity_type, $entity, &$form, FormStateInterface $form_state)
+{
+  /**
+   * $entity can be a product, but also a product type (see issue #2998482)
+   * @var $entity ProductInterface|ProductTypeInterface
+   */
+  if (!$entity instanceof ProductInterface) {
+    // This may be an instance of ProductTypeInterface in some cases. We don't handle that. See Issue #2998482
+    return;
+  }
+
+  // Entity builders run twice, once during validation and again during
+  // submission, so we only run this code after validation has been performed.
+  if (!$form_state->isValueEmpty('menu') && $form_state->getTemporaryValue('entity_validated')) {
+    $values = $form_state->getValue('menu');
+    if (!empty($values['enabled']) && trim($values['title'])) {
+      if (!empty($values['menu_parent'])) {
+        list($menu_name, $parent) = explode(':', $values['menu_parent'], 2);
+        $values['menu_name'] = $menu_name;
+        $values['parent'] = $parent;
+      }
+      // Construct an unsaved entity.
+      if ($menuLinkContentEntityId = $form_state->getValue(['menu', 'entity_id'])) {
+        // Use the existing menu_link_content entity.
+        $menuLinkContentEntity = MenuLinkContent::load($menuLinkContentEntityId);
+        // If the loaded MenuLinkContent doesn't have a translation for the
+        // products's active langcode, create a new translation.
+        if ($menuLinkContentEntity->isTranslatable()) {
+          if (!$menuLinkContentEntity->hasTranslation($entity->language()->getId())) {
+            $menuLinkContentEntity = $menuLinkContentEntity->addTranslation($entity->language()->getId(), $menuLinkContentEntity->toArray());
+          } else {
+            $menuLinkContentEntity = $menuLinkContentEntity->getTranslation($entity->language()->getId());
+          }
+        }
+      } else {
+        if ($entity->isNew()) {
+          // Create a new menu_link_content entity.
+          $menuLinkContentEntity = MenuLinkContent::create([
+            // Lets just reference the UUID for now, the link is not important for
+            // token generation.
+            'link' => ['uri' => 'internal:/product/' . $entity->uuid()],
+            'langcode' => $entity->language()->getId(),
+          ]);
+        } else {
+          // Create a new menu_link_content entity.
+          $menuLinkContentEntity = MenuLinkContent::create([
+            'link' => ['uri' => 'entity:product/' . $entity->id()],
+            'langcode' => $entity->language()->getId(),
+          ]);
+        }
+      }
+      $menuLinkContentEntity->title->value = trim($values['title']);
+      $menuLinkContentEntity->description->value = trim($values['description']);
+      $menuLinkContentEntity->menu_name->value = $values['menu_name'];
+      $menuLinkContentEntity->parent->value = $values['parent'];
+      $menuLinkContentEntity->weight->value = isset($values['weight']) ? $values['weight'] : 0;
+      $menuLinkContentEntity->save();
+      $entity->menu_link = $menuLinkContentEntity;
+      $form_state->setValue(['menu', 'entity_id'], $menuLinkContentEntity->id());
+    }
+  }
+}
