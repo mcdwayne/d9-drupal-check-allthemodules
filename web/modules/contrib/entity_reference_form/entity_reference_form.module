@@ -1,0 +1,218 @@
+<?php
+
+/**
+ * @file
+ * Contains entity_reference_form.module..
+ */
+
+use Drupal\Core\Entity\ContentEntityFormInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\FieldableEntityInterface;
+use Drupal\Core\Entity\Plugin\DataType\EntityReference;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Template\Attribute;
+
+/**
+ * Implements hook_help().
+ */
+function entity_reference_form_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the entity_reference_form module.
+    case 'help.page.entity_reference_form':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('A widget for entity reference fields to display the referenced entity as a form.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function entity_reference_form_theme() {
+  return [
+    'child_form' => [
+      'render element' => 'elements'
+    ]
+  ];
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK().
+ * @see hook_theme_suggestions_HOOK()
+ * @param array $variables
+ * @return array
+ */
+function entity_reference_form_theme_suggestions_child_form(array $variables) {
+  /** @var EntityInterface $entity */
+  $entity = $variables['elements']['#entity'];
+  $form_object = $variables['elements']['#form_object'];
+  $suggestions =  [
+    'child_form__' . $entity->getEntityTypeId(),
+    'child_form__' . $entity->getEntityTypeId() . '__' . $entity->bundle()
+  ];
+  if ($form_object instanceof ContentEntityFormInterface) {
+    $form_display_mode = $variables['elements']['#form_display_mode'];
+    $suggestions[] = 'child_form__' . $entity->getEntityTypeId() . '__' . $form_display_mode;
+    $suggestions[] = 'child_form__' . $entity->getEntityTypeId() . '__' . $entity->bundle() . '__' . $form_display_mode;
+  }
+
+  return $suggestions;
+}
+
+/**
+ * Implements hook_schema().
+ */
+function entity_reference_form_schema() {
+  return [
+    'broken_entity_reference' => [
+      'description' => 'Holds reference to sub-entities that failed to attach to their referencing main-entity.',
+      'fields' => [
+        'sub_entity_type' => [
+          'description' => 'The entity type id of the sub-entity',
+          'type' => 'varchar',
+          'length' => '256',
+          'not null' => TRUE,
+        ],
+        'sub_entity_uuid' => [
+          'description' => 'The uuid of the sub-entity',
+          'type' => 'varchar',
+          'length' => '256',
+          'not null' => TRUE,
+        ],
+        'timestamp' => [
+          'description' => 'The timestamp that the sub-entity was created',
+          'type' => 'int',
+          'not null' => TRUE,
+        ],
+        'main_entity_type' => [
+          'description' => 'The entity type id of the main-entity',
+          'type' => 'varchar',
+          'length' => '256',
+          'not null' => TRUE,
+        ],
+        'reference_field_name' => [
+          'description' => 'The field name (of the main entity) that the sub-entity was referenced from',
+          'type' => 'varchar',
+          'length' => '256',
+          'not null' => TRUE,
+        ],
+        'reference_field_delta' => [
+          'description' => 'The field delta (of the main entity) that the sub-entity was referenced from',
+          'type' => 'int',
+          'not null' => TRUE,
+        ],
+      ]
+    ]
+  ];
+}
+
+/**
+ * Implements hook_entity_insert().
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ */
+function entity_reference_form_entity_insert(EntityInterface $entity) {
+  /** @var \Drupal\entity_reference_form\BrokenEntityReferenceRegistry $broken_references */
+  $broken_references = \Drupal::service('broken_entity_reference.registry');
+
+  // If the entity is a sub-entity of another entity then add it to the broken reference table.
+  if ($broken_references->inBrokenReference($entity)) {
+    $values = [
+      'sub_entity_type' => $entity->getEntityTypeId(),
+      'sub_entity_uuid' => $entity->uuid(),
+      'timestamp' => time(),
+      'main_entity_type' => $broken_references->getParentTypeId($entity),
+      'reference_field_name' => $broken_references->getReferenceFieldName($entity),
+      'reference_field_delta' => $broken_references->getReferenceFieldDelta($entity),
+    ];
+    \Drupal::database()
+      ->insert('broken_entity_reference')
+      ->fields(array_keys($values), array_values($values))
+      ->execute();
+  }
+
+  // Clean all the sub-entities that this entity references.
+  if ($entity instanceof FieldableEntityInterface) {
+    _entity_reference_form_clean_solid_references($entity);
+  }
+}
+
+/**
+ * Implements hook_entity_update().
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ *
+ * @see hook_entity_update()
+ */
+function entity_reference_form_entity_update(EntityInterface $entity) {
+  // Clean all the sub-entities that this entity references.
+  if ($entity instanceof FieldableEntityInterface) {
+    _entity_reference_form_clean_solid_references($entity);
+  }
+}
+
+/************************* Template Functions *********************************/
+
+/**
+ * Implements template_preprocess_HOOK
+ * @param array $variables
+ */
+function template_preprocess_child_form(array &$variables, $hook, array &$info) {
+  $variables['attributes'] = (new Attribute($variables['attributes']));
+}
+
+/************************** Helper Functions **********************************/
+
+/**
+ * If the provided main_entity has sub_entities in the broken_entity_reference
+ * table, then calling this function will remove them from the table.
+ *
+ * @param \Drupal\Core\Entity\FieldableEntityInterface $main_entity
+ */
+function _entity_reference_form_clean_solid_references(FieldableEntityInterface $main_entity) {
+
+  // Retrieve all the broken references that their main_entity_type matches $main_entity.
+  $query = \Drupal::database()
+    ->select('broken_entity_reference')
+    ->fields('broken_entity_reference', [
+      'sub_entity_uuid',
+      'main_entity_type',
+      'reference_field_name',
+      'reference_field_delta',
+    ]);
+  $query
+    ->condition('main_entity_type', $main_entity->getEntityTypeId())
+    ->condition('reference_field_name', array_keys($main_entity->getFieldDefinitions()), 'IN');
+  $results = $query->execute()->fetchAllAssoc('sub_entity_uuid');
+
+  if (!empty($results)) {
+    // Build a deletion query
+    $delete_query = \Drupal::database()->delete('broken_entity_reference');
+    $delete_query_group = $delete_query->orConditionGroup();
+
+    foreach ($results as $sub_entity_uuid => $result) {
+      if ($main_entity->get($result->reference_field_name)->count() > $result->reference_field_delta) {
+        /** @var \Drupal\Core\Field\FieldItemInterface $field_item */
+        $field_item = $main_entity->get($result->reference_field_name)->get($result->reference_field_delta);
+        /** @var EntityReference $entity_property */
+        $entity_property = $field_item->get('entity');
+
+        // If the referenced entity uuid matches the one in the broken table, then
+        // add it to the delete query group for deletion.
+        if ($sub_entity_uuid === $entity_property->getTarget()->getValue()->uuid()) {
+          $delete_query_group->condition('sub_entity_uuid', $sub_entity_uuid);
+        }
+      }
+    }
+
+    if ($delete_query_group->count() > 0) {
+      $delete_query->condition($delete_query_group);
+
+      // Delete all the solid references.
+      $delete_query->execute();
+    }
+  }
+}
