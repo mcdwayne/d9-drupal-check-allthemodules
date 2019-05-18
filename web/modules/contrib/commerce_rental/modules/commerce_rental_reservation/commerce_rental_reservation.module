@@ -1,0 +1,161 @@
+<?php
+
+use Drupal\commerce_order\Entity\OrderItem;
+use Drupal\commerce_product\Entity\ProductVariation;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\commerce\EntityHelper;
+use Drupal\commerce_rental_reservation\Entity\RentalInstanceType;
+use Drupal\entity\BundleFieldDefinition;
+
+/**
+ * Implements hook_form_alter().
+ */
+function commerce_rental_reservation_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  if (in_array($form_id, ["commerce_product_variation_type_edit_form","commerce_product_variation_type_add_form"])) {
+    // @Todo: Don't allow people to uncheck 'rentable' trait if rental data exists.
+    /** @var Drupal\commerce_product\Entity\ProductVariationType $variation_type */
+    $variation_type = $form_state->getFormObject()->getEntity();
+    $instance_types = RentalInstanceType::loadMultiple();
+
+    $form['rental_instance_type'] = [
+      '#type' => 'select',
+      '#title' => t('Rental instance type'),
+      '#empty_option' => t('- Select -'),
+      '#default_value' => $variation_type->getThirdPartySetting('commerce_rental_reservation', 'rental_instance_type'),
+      '#options' => EntityHelper::extractLabels($instance_types),
+      '#states' => [
+        'visible' => [
+          ':input[name="traits[purchasable_entity_rental_reservation]"]' => ['checked' => TRUE],
+        ],
+        'required' => [
+          ':input[name="traits[purchasable_entity_rental_reservation]"]' => ['checked' => TRUE],
+        ],
+      ],
+    ];
+
+    $form['actions']['submit']['#submit'][] = 'commerce_rental_reservation_product_variation_type_form_submit';
+  }
+}
+
+/**
+ * Submission handler for commerce_rental_reservation_form_alter().
+ */
+function commerce_rental_reservation_product_variation_type_form_submit($form, FormStateInterface $form_state) {
+  // @TODO: Instance Type gets cleared if variation type is saved when rentable trait is already enabled.
+  /** @var Drupal\commerce_product\Entity\ProductVariationType $variation_type */
+  $variation_type = $form_state->getFormObject()->getEntity();
+  $rental_instance_type = $form_state->getValue('rental_instance_type');
+  $rentable = $variation_type->hasTrait('purchasable_entity_rental_reservation') ? TRUE : (bool) $form_state->getValue(['traits','purchasable_entity_rental_reservation']);
+  $previous_value = $variation_type->getThirdPartySetting('commerce_rental_reservation', 'rental_instance_type');
+  if ($rentable) {
+    $fields = \Drupal::service('entity_field.manager')->getFieldDefinitions('commerce_product_variation', $variation_type->id());
+    $fields['instances']->setSetting('handler_settings', ['target_bundles' => [ $rental_instance_type => $rental_instance_type]]);
+    $fields['instances']->save();
+    $variation_type->setThirdPartySetting('commerce_rental_reservation', 'rental_instance_type', $rental_instance_type);
+  } else if ($previous_value) {
+    $variation_type->unsetThirdPartySetting('commerce_rental_reservation', 'rental_instance_type');
+  }
+  $variation_type->save();
+}
+
+/**
+ * Implements hook_inline_entity_form_entity_form_alter().
+ */
+function commerce_rental_reservation_inline_entity_form_entity_form_alter(&$entity_form, FormStateInterface &$form_state) {
+  // make sure we are working with a rental order item type.
+  if ($entity_form['#entity'] instanceof OrderItem && $entity_form['#entity']->hasField('instance')) {
+    $entity_form['purchased_entity']['widget'][0]['target_id']['#ajax']['callback'] = 'commerce_rental_reservation_purchasable_entity_select';
+    // when editing an existing order item, load the options list based on the rental variation chosen.
+    if ($rental = $entity_form['purchased_entity']['widget'][0]['target_id']['#default_value']) {
+      $options = commerce_rental_reservation_get_instance_options_list($rental);
+      $entity_form['instance']['widget']['#options'] = $options;
+    }
+  }
+}
+
+function commerce_rental_reservation_get_instance_options_list(EntityInterface $rental) {
+  $options = ['_none' => 'Auto Select'];
+  $instances = $rental->get('instances')->referencedEntities();
+  foreach ($instances as $instance) {
+    $options[$instance->get('instance_id')->value] = $instance->get('serial')->value;
+  }
+  return $options;
+}
+
+function commerce_rental_reservation_purchasable_entity_select(array $entity_form, FormStateInterface &$form_state) {
+  $triggering_element = $form_state->getTriggeringElement();
+  $target_id = $form_state->getValue('order_items')['form']['inline_entity_form']['purchased_entity'][0]['target_id'];
+  $rental = \Drupal::entityTypeManager()->getStorage($triggering_element['#target_type'])->load($target_id);
+  $options = commerce_rental_reservation_get_instance_options_list($rental);
+  $entity_form['order_items']['widget']['form']['inline_entity_form']['instance']['widget']['#options'] = $options;
+  return $entity_form['order_items']['widget']['form']['inline_entity_form'];
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for 'commerce_order_type_form'.
+ */
+function commerce_rental_reservation_form_commerce_order_type_form_alter(array &$form, FormStateInterface $form_state) {
+  //TODO : Add validation handler that checks to see if orders have end dates saved already, dont allow disable end date if so.
+  $order_type = $form_state->getFormObject()->getEntity();
+  $form['commerce_rental_reservation']['enable_order_period'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Enable order period for this order type.'),
+    '#default_value' => $order_type->getThirdPartySetting('commerce_rental_reservation', 'enable_order_period'),
+  ];
+  $form['actions']['submit']['#submit'][] = 'commerce_rental_reservation_order_type_form_submit';
+}
+
+/**
+ * Submission handler for commerce_rental_reservation_form_commerce_order_type_form_alter().
+ */
+function commerce_rental_reservation_order_type_form_submit(array $form, FormStateInterface $form_state) {
+  /** @var \Drupal\commerce_order\Entity\OrderTypeInterface $order_type */
+  $order_type = $form_state->getFormObject()->getEntity();
+  $previous_value = $order_type->getThirdPartySetting('commerce_rental_reservation', 'enable_order_period');
+  $settings = $form_state->getValue(['commerce_rental_reservation']);
+  /** @var \Drupal\commerce\ConfigurableFieldManagerInterface $configurable_field_manager */
+  $configurable_field_manager = \Drupal::service('commerce.configurable_field_manager');
+
+  $field_definition = commerce_rental_reservation_build_order_period_field_definition($order_type->id());
+  if (!$previous_value && $settings['enable_order_period']) {
+    $configurable_field_manager->createField($field_definition);
+  }
+  elseif ($previous_value && !$settings['enable_order_period']) {
+    $configurable_field_manager->deleteField($field_definition);
+  }
+  $order_type->setThirdPartySetting('commerce_rental_reservation', 'enable_order_period', $settings['enable_order_period']);
+  $order_type->save();
+}
+
+/**
+ * Builds the $order->end_date field definition.
+ *
+ * @param string $order_type_id
+ *   The order type ID.
+ *
+ * @return \Drupal\entity\BundleFieldDefinition
+ *   The field definition.
+ */
+function commerce_rental_reservation_build_order_period_field_definition($order_type_id) {
+  $field_definition = BundleFieldDefinition::create('daterange')
+    ->setTargetEntityTypeId('commerce_order')
+    ->setTargetBundle($order_type_id)
+    ->setName('order_period')
+    ->setLabel(t('Order Period'))
+    ->setDescription(t('The start and end date of the order'))
+    ->setCardinality(1)
+    ->setRequired(TRUE)
+    ->setDisplayOptions('form', [
+      'type' => 'daterange_default',
+      'weight' => -99,
+    ])
+    ->setDisplayOptions('view', [
+      'label' => 'above',
+      'type' => 'daterange_default',
+      'weight' => -99,
+    ])
+    ->setDisplayConfigurable('view', TRUE);
+
+  return $field_definition;
+}
