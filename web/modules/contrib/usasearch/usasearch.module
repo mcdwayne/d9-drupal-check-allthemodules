@@ -1,0 +1,251 @@
+<?php
+
+/**
+ * @file
+ * Integrates search functionality with DigitalGov Search service.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\node\Entity\Node;
+use Drupal\node\NodeInterface;
+use Drupal\Core\Session\AnonymousUserSession;
+
+/**
+ * Implements hook_help().
+ */
+function usasearch_help($route_name) {
+  switch ($route_name) {
+    case 'usasearch.help':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('This is the help document for DigitalGov Search, see <a href="!usasearch-module">the online documentation</a></p>');
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Alter the block search form so that drupal's token attributes are not passed
+ * to the action as querystring params.
+ *
+ * @see \Drupal\usasearch\Form\SearchBlockForm::buildForm()
+ */
+function usasearch_form_usasearch_search_block_form_alter(&$form, FormStateInterface $form_state) {
+  $form['#token'] = FALSE;
+  $form['form_id']['#access'] = FALSE;
+  $form['form_build_id']['#access'] = FALSE;
+  $form['form_token']['#access'] = FALSE;
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function usasearch_node_insert($node) {
+  $index_node = (isset($_POST['usasearch_node_include'])) ? $_POST['usasearch_node_include'] : 0;
+  $config = \Drupal::config('usasearch.settings');
+  if (!$config->get('rules_enabled')) {
+    $api = \Drupal::service('usasearch.api');
+    $document = $api->createDocument($node);
+    if ($api->nodeEnabled($node) && $index_node == 1) {
+      if ($document && $document->hasRequiredFields()) {
+        $api->request('post', 'api/v1/documents', ['body' => $document->getJson()]);
+      }
+    }
+    if (isset($index_node) && isset($document->document_id)) {
+      usasearch_save_per_node_settings($document->document_id, $index_node, 1);
+    }
+  }
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function usasearch_node_update(NodeInterface $node, $index_node = 0) {
+  $index_node = (isset($_POST['usasearch_node_include'])) ? $_POST['usasearch_node_include'] : $index_node;
+  $config = \Drupal::config('usasearch.settings');
+  if (!$config->get('rules_enabled')) {
+    $api = \Drupal::service('usasearch.api');
+    if (!$node->isPublished() || $index_node === 0 || !$api->nodeEnabled($node)) {
+      // Delete from index if node has been unpublished.
+      usasearch_node_predelete($node, $index_node);
+    }
+    else {
+      if ($node->access('view', new AnonymousUserSession())) {
+        $document = $api->createDocument($node);
+        if ($document->hasRequiredFields()) {
+          // Create.
+          $insert = $api->request('post', 'api/v1/documents/', ['body' => $document->getJson()]);
+          if (!$insert) {
+            // Update.
+            $api->request('put', 'api/v1/documents/' . $document->document_id, ['body' => $document->getJson()]);
+          }
+        }
+        if (isset($document->document_id)) {
+          usasearch_save_per_node_settings($document->document_id, $index_node, 1);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_node_predelete().
+ */
+function usasearch_node_predelete(NodeInterface $node, $index_node = 0) {
+  $api = \Drupal::service('usasearch.api');
+  $api->request('delete', 'api/v1/documents/' . $node->id());
+  if (isset($_POST['op']) && $_POST['op'] === 'Delete') {
+    usasearch_remove_node_settings($node->id());
+  }
+  else {
+    $index_node = (isset($_POST['usasearch_node_include'])) ? $_POST['usasearch_node_include'] : $index_node;
+    usasearch_save_per_node_settings($node->id(), $index_node);
+  }
+}
+
+/**
+ * Add field to include/exclude node from usasearch index.
+ *
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function usasearch_form_node_form_alter(&$form, $form_state, $form_id) {
+  $config = \Drupal::config('usasearch.settings');
+  $entity = $form_state->getFormObject()->getEntity();
+  $type = $entity->get('type')->getValue()[0]['target_id'];
+  $contenttypes = array_values($config->get('content_types'));
+  $usasearch_content_type_settings = in_array($type, $contenttypes, TRUE);
+
+  if (isset($entity->nid->value) && $usasearch_content_type_settings) {
+    $query = \Drupal::database()->select('digitalgovsearch');
+    $query->addField('digitalgovsearch', 'search_include');
+    $query->condition('nid', $entity->nid->value);
+    $query->range(0, 1);
+    $usasearch_node_settings = $query->execute()->fetchField();
+
+    if (is_null($usasearch_node_settings) || $usasearch_node_settings == '') {
+      // No entry in the database, or the search_include column was null.
+      $usasearch_node_settings = 1;
+    }
+  }
+  else {
+    $usasearch_node_settings = $usasearch_content_type_settings;
+  }
+  // Include settings if allowed for content type.
+  if ($usasearch_content_type_settings == TRUE) {
+    $form['digitalgovsearch_settings'] = [
+      '#type' => 'details',
+      '#access' => \Drupal::currentUser()->hasPermission('administer nodes'),
+      '#title' => t('DigitalGov Search settings'),
+      '#group' => 'advanced',
+    ];
+
+    $form['digitalgovsearch_settings']['usasearch_node_include'] = [
+      '#type' => 'checkbox',
+      '#title' => t('Include in DigitalGov Search index'),
+      '#default_value' => $usasearch_node_settings,
+      '#description' => t('Check this box to inlcude this node in DigitalGov Search index.'),
+    ];
+    foreach (array_keys($form['actions']) as $action) {
+      if ($action != 'preview' && isset($form['actions'][$action]['#type']) && $form['actions'][$action]['#type'] === 'submit') {
+        array_unshift($form['actions'][$action]['#submit'], 'usasearch_node_form_submit');
+      }
+    }
+  }
+}
+
+/**
+ * Save node index settings.
+ */
+function usasearch_node_form_submit($form, FormStateInterface $form_state) {
+  $setting = $form_state->getValue('usasearch_node_include');
+  $nid = $form_state->getFormObject()->getEntity()->id();
+  if (isset($nid) && isset($setting)) {
+    usasearch_save_per_node_settings($nid, $setting);
+  }
+}
+
+/**
+ * Saves custom per node settings in the content_access table.
+ */
+function usasearch_save_per_node_settings($nid, $setting = 0, $status = 0, $reindex = 0) {
+  $query = \Drupal::database()->upsert('digitalgovsearch');
+  $query->fields([
+    'nid',
+    'search_include',
+    'index_status',
+    'reindex',
+  ]);
+  $query->values([
+    $nid,
+    $setting,
+    $status,
+    $reindex,
+  ]);
+  $query->key('nid');
+  $query->execute();
+}
+
+/**
+ * Get custom per node settings in the content_access table.
+ */
+function usasearch_get_per_node_settings($nid) {
+  $query = \Drupal::database()->select('digitalgovsearch');
+  $query->addField('digitalgovsearch', 'search_include');
+  $query->condition('nid', $nid);
+  $query->range(0, 1);
+  $usasearch_node_settings = $query->execute()->fetchField();
+  return ($usasearch_node_settings === FALSE) ? 1 : $usasearch_node_settings;
+}
+
+/**
+ * Delete custom per node settings in the content_access table.
+ */
+function usasearch_remove_node_settings($nid) {
+  $query = \Drupal::database()->delete('digitalgovsearch');
+  $query->condition('nid', $nid);
+  $query->execute();
+}
+
+/**
+ * Implements hook_cron().
+ */
+function usasearch_cron() {
+  $cron_config = \Drupal::configFactory()->getEditable('usasearch.cron');
+  $interval = $cron_config->get('interval');
+  $interval = !empty($interval) ? $interval : 3600;
+  $search_index = \Drupal::service('usasearch.index_repository');
+
+  $next_execution = \Drupal::state()->get('usasearch.next_execution');
+  $next_execution = !empty($next_execution) ? $next_execution : 0;
+
+  // If 60 minutes passed since last time.
+  if (REQUEST_TIME >= $next_execution) {
+    Drupal::logger('usasearch')->notice('request time is ' . REQUEST_TIME);
+
+    $nids = $search_index->getIndexableEntities();
+    foreach ($nids as $nid) {
+      $n = (int) $nid->nid;
+      $node = Node::load($n);
+      $index_node = (int) usasearch_get_per_node_settings($node->id());
+      usasearch_node_update($node, $index_node);
+    }
+    // Update last run.
+    \Drupal::state()->set('usasearch.next_execution', $next_execution);
+  }
+}
+
+/**
+ * Update index.
+ *
+ * @param array|int $nids
+ *   Array of node ids.
+ *
+ * @deprecated
+ */
+function usasearch_updateIndex($nids) {
+  $node_storage = $this->entityManager->getStorage('node');
+  foreach ($node_storage->loadMultiple($nids) as $node) {
+    $this->indexNode($node);
+  }
+}
