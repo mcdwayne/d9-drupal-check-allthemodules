@@ -1,0 +1,328 @@
+<?php
+
+/**
+ * @file
+ * This module enables AYAH game functionality.
+ *
+ * Administrators can add a game to desired forms that users without
+ * the 'skip AYAH' permission (typically anonymous visitors) have to play.
+ */
+
+use Drupal\Component\Serialization\Json;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Render\Element;
+use GuzzleHttp\Exception\RequestException;
+
+/**
+ * Implements hook_theme().
+ *
+ * {@inheritdoc}
+ */
+function ayah_theme($existing, $type, $theme, $path) {
+  return array(
+    'ayah' => array(
+      'render element' => '\Drupal\ayah\Element\AYAHField',
+      'function' => 'theme_ayah',
+    ),
+  );
+}
+
+/**
+ * Theme function for a AYAH element.
+ *
+ * {@inheritdoc}
+ */
+function theme_ayah($variables) {
+  $ayah = array(
+    '#markup' => "<div id='AYAH'></div>",
+    '#attached' => array(
+      'library' => array(
+        'ayah/ayah.script',
+      ),
+    ),
+    '#validate' => 'ayah_validate',
+  );
+  return \Drupal::service('renderer')->render($ayah);
+}
+
+
+/**
+ * AYAH validation handler.
+ *
+ * {@inheritdoc}
+ */
+function ayah_validate($form, FormStateInterface &$form_state) {
+  $session_secret = NULL;
+  if (isset($_REQUEST['session_secret'])) {
+    $session_secret = $_REQUEST["session_secret"];
+  }
+
+  // Only do this validation if we are using AYAH.
+  if ($session_secret) {
+    $ayah_web_service_host = 'ws.areyouahuman.com';
+    $is_a_human = FALSE;
+    if ($session_secret) {
+      $url = 'https://' . $ayah_web_service_host . "/ws/scoreGame";
+      $fields = array(
+        'session_secret' => urlencode($session_secret),
+        'scoring_key' => \Drupal::config('ayah.settings')
+          ->get('ayah_scoring_key'),
+      );
+      $resp = _ayah_do_call($url, $fields);
+      if ($resp) {
+        $is_a_human = ($resp['status_code'] == 1);
+      }
+    }
+    if (!$is_a_human) {
+      // Wrong answer, set form error.
+      $form_state->setErrorByName('ayah_response', t("You did not pass the game."));
+    }
+  }
+}
+
+/**
+ * Implements hook_library_info_alter().
+ *
+ * Add js file to library dynamically.
+ *
+ * {@inheritdoc}
+ */
+function ayah_library_info_alter(&$libraries, $extension) {
+  if ($extension === 'ayah' && isset($libraries['ayah.script'])) {
+    $ayah_web_service_host = "ws.areyouahuman.com";
+    $ayah_publisher_key = \Drupal::config('ayah.settings')->get('ayah_publisher_key');
+    $url = 'https://' . $ayah_web_service_host . "/ws/script/" . urlencode($ayah_publisher_key);
+    $libraries['ayah.script']['js'][$url] = array(
+      'type' => 'external',
+    );
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * This function adds a AYAH game to forms for untrusted users if needed.
+ *
+ * {@inheritdoc}
+ */
+function ayah_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+  $account = \Drupal::currentUser();
+  $ayah_config = \Drupal::config('ayah.settings');
+
+  if ($account->hasPermission('administer AYAH settings') && $ayah_config->get('ayah_form_finder')) {
+    drupal_set_message('Form ID: ' . $form_id);
+  }
+  if (!\Drupal::service('router.admin_context')->isAdminRoute() || $ayah_config->get('ayah_allow_on_admin_pages')) {
+    if (!$account->hasPermission('skip AYAH') && $ayah_config->get('ayah_publisher_key') && $ayah_config->get('ayah_scoring_key')) {
+      // See if we need to add the game for this form_id.
+      $ayah_form = $ayah_config->get('ayah_forms');
+      if (array_search($form_id, $ayah_form) !== FALSE) {
+        // Build AYAH form element.
+        $ayah_element = array(
+          '#theme' => 'ayah',
+        );
+        // Get placement in form and insert in form.
+        $ayah_placement = _ayah_get_ayah_placement($form_id, $form);
+        _ayah_insert_game_element($form, $ayah_placement, $ayah_element);
+      }
+    }
+  }
+}
+
+/**
+ * Helper function to get placement information for a given form_id.
+ *
+ * @param string $form_id
+ *   The form_id to get the placement information for.
+ * @param array $form
+ *   If a form corresponding to the given form_id, if there
+ *   is no placement info for the given form_id, this form is examined to
+ *   guess the placement.
+ *
+ * @return array
+ *   Placement info array.
+ */
+function _ayah_get_ayah_placement($form_id, array $form) {
+  $ayah_config = \Drupal::config('ayah.settings');
+
+  // Get AYAH placement map from cache.
+  $placement_map = $ayah_config->get('ayah_placement_map_cache');
+
+  if ($placement_map === NULL) {
+    // If cache missed: start from a fresh placement map.
+    $placement_map = array();
+    // TODO: also make the placement 'overridable' from the admin UI?
+  }
+
+  // Query the placement map.
+  if (isset($placement_map[$form_id])) {
+    $placement = $placement_map[$form_id];
+  }
+  // If no placement info is available in placement map:
+  // search the form for buttons and guess placement from it.
+  else {
+    $buttons = _ayah_search_buttons($form);
+    if (count($buttons)) {
+      // Pick first button.
+      // TODO: make this more sophisticated? Use cases needed.
+      $placement = $buttons[0];
+    }
+    else {
+      // Use NULL when no buttons were found.
+      $placement = NULL;
+    }
+    // Store calculated placement in caches.
+    $placement_map[$form_id] = $placement;
+    $ayah_config_editable = \Drupal::configFactory()->getEditable('ayah.settings');
+    $ayah_config_editable->set('ayah_placement_map_cache', $placement_map);
+
+    // Save the configuration object.
+    $ayah_config_editable->save();
+  }
+
+  return $placement;
+}
+
+/**
+ * Helper function for searching the buttons in a form.
+ *
+ * @param array $form
+ *   The form to search button elements in.
+ *
+ * @return array
+ *   An array of paths to the buttons.
+ *   A path is an array of keys leading to the button, the last
+ *   item in the path is the weight of the button element
+ *   (or NULL if undefined).
+ */
+function _ayah_search_buttons(array $form) {
+  $buttons = array();
+  foreach (Element::children($form) as $key) {
+    // Look for submit or button type elements.
+    if (isset($form[$key]['#type']) && ($form[$key]['#type'] == 'submit' || $form[$key]['#type'] == 'button')) {
+      $weight = isset($form[$key]['#weight']) ? $form[$key]['#weight'] : NULL;
+      $buttons[] = array(
+        'path' => array(),
+        'key' => $key,
+        'weight' => $weight,
+      );
+    }
+    // Process children recursively.
+    $children_buttons = _ayah_search_buttons($form[$key]);
+    foreach ($children_buttons as $b) {
+      $b['path'] = array_merge(array($key), $b['path']);
+      $buttons[] = $b;
+    }
+  }
+  return $buttons;
+}
+
+
+/**
+ * Helper function to insert a AYAH game element in a form.
+ *
+ * @param array $form
+ *   The form to add the AYAH element to.
+ * @param array $placement
+ *   Information where the AYAH element should be inserted.
+ *   $placement should be an associative array with fields:
+ *     - 'path': path (array of path items) of the container in the form where
+ *       the AYAH element should be inserted.
+ *     - 'key': the key of the element before which the AYAH element
+ *       should be inserted. If the field 'key' is undefined or NULL, the AYAH
+ *       will just be appended to the container.
+ *     - 'weight': if 'key' is not NULL: should be the weight of the element
+ *       defined by 'key'. If 'key' is NULL and weight is not NULL: set the
+ *       weight property of the AYAH element to this value.
+ * @param array $ayah_element
+ *   The AYAH element to insert.
+ */
+function _ayah_insert_game_element(array &$form, array $placement, array $ayah_element) {
+  // Get path, target and target weight or use defaults if not available.
+  $target_key = isset($placement['key']) ? $placement['key'] : NULL;
+  $target_weight = isset($placement['weight']) ? $placement['weight'] : NULL;
+  $path = isset($placement['path']) ? $placement['path'] : array();
+
+  // Walk through the form along the path.
+  $form_stepper = &$form;
+  foreach ($path as $step) {
+    if (isset($form_stepper[$step])) {
+      $form_stepper = & $form_stepper[$step];
+    }
+    else {
+      // Given path is invalid: stop stepping and
+      // continue in best effort (append instead of insert).
+      $target_key = NULL;
+      break;
+    }
+  }
+
+  // If no target is available: just append the AYAH element to the container.
+  if ($target_key == NULL || !isset($target_key)) {
+    // Optionally, set weight of AYAH element.
+    if ($target_weight != NULL) {
+      $ayah_element['#weight'] = $target_weight;
+    }
+    $form_stepper['ayah'] = $ayah_element;
+  }
+  // If there is a target available: make sure the AYAH element comes
+  // right before it.
+  else {
+    // If target has a weight: set weight of AYAH element a bit smaller
+    // and just append the AYAH: sorting will fix the ordering anyway.
+    if ($target_weight != NULL) {
+      $ayah_element['#weight'] = $target_weight - .1;
+      $form_stepper['ayah'] = $ayah_element;
+    }
+    else {
+      // If we can't play with weights: insert the AYAH element at the right
+      // position. Because PHP lacks a function for this (array_splice() comes
+      // close, but it does not preserve the key of the inserted element),
+      // we do it by hand: chop off the end, append the AYAH element and put
+      // the end back.
+      $offset = array_search($target_key, array_keys($form_stepper));
+      $end = array_splice($form_stepper, $offset);
+      $form_stepper['ayah'] = $ayah_element;
+      foreach ($end as $k => $v) {
+        $form_stepper[$k] = $v;
+      }
+    }
+  }
+
+  // Append our validator.
+  $form['#validate'][] = 'ayah_validate';
+}
+
+/**
+ * Internal: Makes a call with \Drupal::httpClient().
+ *
+ * @param string $url
+ *   The URL for AYAH.
+ * @param array $fields
+ *   An array for the http query data.
+ *
+ * @return mixed|null
+ *   The response from AYAH.
+ */
+function _ayah_do_call($url, $fields) {
+  $post = http_build_query($fields);
+
+  $headers = array('Content-Type' => 'application/x-www-form-urlencoded');
+  try {
+    $response = \Drupal::httpClient()->post($url, array('headers' => $headers, 'body' => $post));
+
+    try {
+      $m = Json::decode($response->getBody());
+    }
+    catch (\Exception $e) {
+      \Drupal::logger('ayah')->notice('_ayah_do_call() - Exception when calling Json::decode.');
+      $m = NULL;
+    }
+  }
+  catch (RequestException $e) {
+    \Drupal::logger('ayah')->notice('_ayah_do_call() - Exception when sending post request.');
+    $m = NULL;
+  }
+
+  return $m;
+}
