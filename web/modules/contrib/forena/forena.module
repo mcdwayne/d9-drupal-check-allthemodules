@@ -1,0 +1,819 @@
+<?php
+use Drupal\forena\FrxAPI;
+use Drupal\forena\FrxData;
+use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
+
+define('FRX_SQL_REWRITE_EXP', '/\[[^\n^\r^\]]+\]/');
+define('FRX_SQL_TOKEN', '/(?<!(:|[a-zA-Z]|[0-9]|[_\.])):[a-zA-Z]([a-zA-Z]|[0-9]|[_\.])+/');
+
+/**
+ * Implements hook_library_info_build().
+ */
+function forena_library_info_build() {
+  $libraries=[];
+  $skins = \Drupal\forena\ReportManager::instance()->skins();
+  foreach ($skins as $skin_name => $skin_label) {
+    $skin = \Drupal\forena\Skin::instance($skin_name);
+    if ($skin->library) {
+      $libraries["skin.$skin_name"] = $skin->library;
+    }
+  }
+  return $libraries;
+}
+
+/**
+ * Try and locate a library in common paths.
+ * @TODO: Move this to a method on the AppService class.
+ */
+function forena_library_file($library) {
+  $libraries = array(
+      'dataTables' => 'dataTables/media/js/jquery.dataTables.min.js',
+      'mpdf' => 'mpdf/mpdf.php',
+      'SVGGraph' => 'SVGGraph/SVGGraph.php',
+      'prince' => 'prince/prince.php'
+  );
+  $path = isset($libraries[$library]) && file_exists('libraries/' . $libraries[$library]) ? 'libraries/' . $libraries[$library] : '';
+  return $path;
+}
+
+/**
+ * Auto complete for categories
+ *
+ */
+
+function forena_categories_autocomplete($string='') {
+  require_once('forena.admin.inc');
+  $categories = @forena_get_categories($string);
+  print drupal_json_output($categories);
+}
+
+
+/**
+ * Implementation of hook_perm
+ *
+ * @return unknown
+ */
+function forena_permission() {
+  $perms = array(
+    'administer forena reports' => array('title' => t('Administer Forena Reports')),
+    'list reports' => array('title' => t('List reports')),
+    'create any report' => array('title' => t('Create a report')),
+    'design any report' => array('title' => t('Design reports')),
+    'delete report' => array('title' => t('Delete reports')),
+    'perform email merge' => array('title' => t('Peform email merge')),
+    'access forena block xml' => array('title' => t('Access data from data blocks directly'), 'description' => t('Useful for ajax calls to data blocks')),
+  );
+  foreach (FrxAPI::RepoMan()->repositories as $repos => $conf) {
+    $name = $conf['title'] ? $conf['title'] : $repos;
+    $perms['access '. $repos . ' data'] = array('title' =>  'Access ' . $name . ' Data');
+  }
+  return $perms;
+}
+
+function forena_user_access_check($right) {
+  // Get the current user
+  $user = \Drupal::currentUser();
+
+  // Check for permission
+  return $user->hasPermission(trim($right));
+}
+
+function forena_user_reports($category = '') {
+  require_once('forena.common.inc');
+  $output='';
+  $categories = forena_get_user_reports($category);
+  $report_repos = \Drupal::config('forena.settings')->get('forena_path');
+  if (!$categories) {
+    $output = 'No Reports Found';
+  }
+  $links = '';
+  foreach ($categories as $category => $reports) {
+    $links .= '<li><a href="#' . urlencode($category) . '">' . $category . '</a></li> ';
+    $output .= '<h3 id="' . urlencode($category) . '">' . $category . '</h3>';
+    $output .= '<ul>';
+    foreach ($reports as $r) {
+      // @FIXME Provide a valid URL, generated from a route name, as the second argument to l(). See https://www.drupal.org/node/2346779 for more information.
+// $output .= '<li>' . l($r['title'], $report_repos . '/' . str_replace('/', '.', $r['report_name'])) . '</li>';
+
+    }
+    $output .= '</ul>';
+  }
+  return $output;
+}
+
+/**
+ * Tries to load data tables libary and other libraries that help.
+ */
+function forena_include_data_tables() {
+  static $init = FALSE;
+  if (!$init) {
+    $init = TRUE;
+    $lib = 'sites/all/libraries/dataTables/media/js/jquery.dataTables.min.js';
+    if (file_exists($lib)) {
+      drupal_add_js($lib);
+    }
+    $lib = 'sites/all/libraries/FixedColumns/media/js/FixedColumns.min.js';
+    if (file_exists($lib)) {
+      drupal_add_js($lib);
+    }
+    $lib = 'sites/all/libraries/FixedHeader/js/FixedHeader.min.js';
+    if (file_exists($lib)) {
+      drupal_add_js($lib);
+    }
+  }
+}
+
+
+/**
+ * Load and render a report based on a drupal path.
+ * In this function the arglist is used to get the full path to the report.
+ *
+ * @return array|string
+ *   Report contents. 
+ */
+
+function forena_report($name_in, $parms = NULL, $print = TRUE, $filename='') {
+  require_once('forena.common.inc');
+  $desc = FrxAPI::Menu()->parseURL($name_in);
+  $time = @new DateTime($value);
+  $desc['time'] = date_format($time, 'Y-m-d H:i:s');
+  $desc['basepath'] = base_path();
+  $desc['path'] = $desc['basepath'] . FrxAPI::File()->directory(FrxAPI::File()->path($desc['filename'], TRUE));
+  $desc['theme'] = $desc['basepath'] . drupal_get_path('theme',\Drupal::theme()->getActiveTheme()->getName());
+  $format = $desc['format'];
+  if (!$desc['exists']) {
+    \Drupal::logger('error')->error('Report %s not found', array('%s' => $name_in));
+    if($print) {
+      throw new NotFoundHttpException();
+    }
+    return '';
+  }
+  FrxData::instance()->setContext('cookie', $_COOKIE);
+  FrxData::instance()->setContext('report', $desc);
+  $report_name = $desc['name'];
+  // Load dataTable plugin if possible.
+  //forena_include_data_tables();
+
+  $content = FrxAPI::Editor($name_in, FALSE)->report($parms, $print, FALSE, $filename);
+  if ($format == 'web' && $print) {
+    $content['#attached']['css'][] = drupal_get_path('module', 'forena') . '/forena.css';
+  }
+  $m_path = drupal_get_path('module', 'forena');
+  if ($content) {
+    // This has been deprecated, but we'll eave it in for now.
+    $content['#attached']['js'][] =  $m_path . '/forena.js';
+  }
+  if (!$print && is_array($content)) {
+    return drupal_render($content['content']);
+  }
+  return $content;
+
+
+}
+
+/**
+ * Render report as an inlcude.  Don't perform the output fuctnions for the document
+ * @param $report_name String
+ * @param $parms array of parameters to include
+ * @return string 
+ *   String representation of inlcuded report. 
+ */
+function forena_report_include($report_name, $parms=array()) {
+  $output = '';
+  require_once 'forena.common.inc';
+  $desc= FrxAPI::Menu()->parseURL($report_name);
+  $name = $desc['name'];
+
+  $r = @FrxReportGenerator::instance()->get_report($name, $parms);
+  if (!$r || !$r->rpt_xml) {
+    return '';
+  }
+  //check for default parameters
+  $r->processParameters();
+  $format = $desc['format'];
+  $r->render($format, FALSE);
+
+  $o =  FrxAPI::Document($format);
+  if ($o) {
+    $output = $o->render($r, $format,  array());
+  }
+  return $output;
+}
+
+
+/**
+ * Menu callback for rendering the forena report.
+ */
+function forena_report_menu_callback() {
+  $args = func_get_args();
+  $path = array_shift($args);
+  $report_name = array_shift($args);
+  $parms = $_GET;
+  unset($parms['q']);
+  $menu_parms = array();
+  $tokens = FrxAPI::Menu()->tokens($path);
+  if ($args && $tokens) {
+    foreach ($args as $i=> $value) {
+      @$menu_parms[$tokens[$i]] = $value;
+    }
+  }
+
+  FrxAPI::Data()->setContext('menu-parms', $menu_parms);
+  $parms = array_merge($parms, $menu_parms);
+  return forena_report($report_name, $parms);
+}
+
+/**
+ * Used in hook_menu to test access to menu items.
+ * @param $checks array key value of callbacks and args to check.
+ * @return bool 
+ *   FALSE implies access should be denied. 
+ */
+function forena_check_all_access($checks) {
+  // Check each callback function to see if we have an error.
+  $access = FALSE;
+  // Check each callback function to see if we have an error.
+  if ($checks) foreach ($checks as $provider => $callbacks) {
+    foreach ($callbacks as $callback=>$args) {
+      if ($callback) foreach ($args as $arg) {
+        if (function_exists($callback) && $arg) {
+          $a = $callback($arg);
+          if ($a) $access = TRUE;
+        }
+        else {
+          $access = TRUE;
+        }
+      }
+      else {
+        $access = TRUE;
+      }
+    }
+  }
+  return $access;
+}
+
+/**
+ * Callback for setting international titles
+ * @param $report_name string name of report
+ * @param $use_menu_title boolean indicate wether to use menu title attribute.
+ * @return string 
+ *   title of report. 
+ */
+function forena_report_title_callback($report_name, $use_menu_title=TRUE) {
+  $title = '';
+  $info = FrxAPI::File()->getReportCacheInfo($report_name);
+  if ($info) {
+    $title = $use_menu_title && $info && isset($info->cache['menu']['title']) ? $info->cache['menu']['title']:  $info->cache['title'];
+  }
+  return $title;
+}
+
+
+
+/**
+ * Render report with some data
+ *
+ * @param string $report
+ * @param string $format
+ * @param mixed $data
+ * @return unknown
+ */
+function forena_render_report($report, $format='', $data='', $options= array(), $print = TRUE) {
+  require_once('forena.common.inc');
+  $o = forena_report_object($report, $data);
+  $output = $o->render($format, $print);
+
+  //If a format was requested render a custom non-drupal document
+  if ($format && $format != 'web') {
+    $output = FrxReportGenerator::instance()->generate_doc($format, $output, $options, $print);
+  }
+  return $output;
+}
+
+/**
+ * Self register plugins with forena.
+ *
+ */
+function forena_forena_plugins() {
+  $path = drupal_get_path('module', 'forena');
+
+  $plugins['FrxPDO'] = array(
+                     'parent' => 'DriverBase',
+                     'class' => '\Drupal\forena\DataProviders\FrxPDO',
+  );
+
+  $plugins['FrxOracle'] = array(
+                     'parent' => 'DriverBase',
+                     'class' => '\Drupal\forena\DataProviders\FrxOracle',
+  );
+
+  $plugins['FrxDrupal'] = array(
+                     'parent' => 'DriverBase',
+                     'class' => '\Drupal\forena\DataProviders\FrxDrupal',
+  );
+
+  $plugins['FrxFiles'] = array(
+                     'parent' => 'DriverBase',
+                     'class' => '\Drupal\forena\DataProviders\FrxFiles',
+  );
+
+  $plugins['FrxPostgres'] = array(
+                     'class' => '\Drupal\forena\DataProviders\FrxPostgres',
+                     'parent' => 'DriverBase'
+  );
+
+  $plugins['FrxMSSQL'] = array('file' => 'plugins/FrxMSSQL.inc',
+                     'parent' => 'DriverBase',
+                     'class' => '\Drupal\fornea\DataProviders\FrxMSSQL',
+  );
+  // Normally you wouldn't do this but I wanted to make the FrxReport sytax work.
+  $plugins['FrxReport'] = array(
+    'file' => 'plugins/FrxReport.inc',
+    'parent' => 'FrxContext',
+    'class' => 'FrxReport',
+  );
+
+  return $plugins;
+}
+
+
+/**
+ * Self register controls with forena.
+ *
+ */
+function forena_forena_controls() {
+
+
+  $controls[] = array(
+    'class' => '\Drupal\forena\Plugin\FrxControls',
+  );
+  $controls[] = array(
+    'class' => '\Drupal\forena\Plugin\FrxDrupalControls',
+  );
+
+  $controls[] = array(
+    'class' => 'FrxSection',
+  );
+
+  $controls[] = array(
+    'class' => '\Drupal\forena\FrxPlugin\Renderer\FrxCrosstab',
+  );
+
+  $controls[] = array(
+      'class' => '\Drupal\forena\FrxPlugin\Renderer\FrxEmailMerge',
+  );
+
+  $controls[] = array(
+      'class' => '\Drupal\forena\FrxPlugin\Renderer\FrxFieldTable',
+  );
+
+  $controls[] = array(
+    'class' => '\Drupal\forena\FrxPlugin\Renderer\FrxRenderer',
+  );
+
+  $controls[] = array(
+    'class' => '\Drupal\forena\FrxPlugin\Renderer\FrxTable',
+  );
+
+  $controls[] = array(
+      'class' => '\Drupal\forena\FrxPlugin\Renderer\FrxMergeDocument',
+  );
+
+  $controls[] = array(
+    'class' => '\Drupal\forena\FrxPlugin\Renderer\FrxSource',
+  );
+
+  $controls[] = array(
+    'class' => '\Drupal\forena\FrxPlugin\Renderer\FrxXML',
+  );
+
+  $controls[] = array(
+    'class' => '\Drupal\forena\FrxPlugin\Renderer\FrxInclude',
+  );
+
+  $controls[] = array(
+    'class' => '\Drupal\forena\FrxPlugin\Renderer\FrxMyReports',
+  );
+
+  $controls[] = array(
+    'class' => '\Drupal\forena\FrxPlugin\Renderer\FrxParameterForm',
+  );
+
+  $controls[] = array(
+    'file' => 'Renderer/FrxTitle.inc',
+    'class' => 'FrxTitle',
+  );
+
+  if (forena_library_file('SVGGraph')) {
+    $controls[] = array(
+      'file' => 'Renderer/FrxSVGGraph.inc',
+      'class' => 'FrxSVGGraph'
+      );
+  }
+  return $controls;
+}
+
+/**
+ * Load the report repository path
+ *
+ * @return unknown
+ */
+function forena_report_path() {
+  return FrxAPI::File()->dir;
+}
+
+/**
+ * Rename function for backwards compatibility
+ */
+function forena_current_user_uid() {
+  return forena_current_user_id();
+}
+
+/**
+ * Helper function for current user for the drupal instance
+ *
+ * @return unknown
+ */
+function forena_current_user_id() {
+  return \Drupal::currentUser()->id();
+}
+
+/**
+ * Helper function for current user for the drupal instance
+ *
+ * @return unknown
+ */
+function forena_current_user_name() {
+  $user = \Drupal::currentUser();
+  if (isset($user->name)) {
+    return $user->name;
+  } 
+  else {
+    return NULL; 
+  }
+}
+
+/**
+ * Implememntation of hook_filter
+ */
+function forena_filter_info() {
+
+  $filters['forena_report'] = array(
+    'title' => t('Embed Forena Reports'),
+    'description' => t('Allows you to embed a report in a text'),
+    'process callback' => '_forena_filter_process',
+    'cache' => FALSE,
+  );
+
+  return $filters;
+}
+
+/**
+ * Process tag replacement for xml filters
+ */
+function _forena_filter_process($text='') {
+  require_once('forena.admin.inc');
+  GLOBAL $language;
+  // initial Parameters
+  $in_parms = array();
+  $in_parms  = $_GET;
+
+  // Find the instances of [xmlreport:view,
+  if (preg_match_all("/\[report?:?([^\]]+)\]/i", $text, $match)) {
+
+    foreach ($match[1] as $idx => $value) {
+      $parms=array();
+      // Separate view from parmeters
+      @list($report_name, $parmsStr) = explode(':', $value);
+
+      // Get any static parmeters
+      $pairs = explode(',', $parmsStr);
+      if ($pairs) foreach ($pairs as $pair) {
+        @list($key, $value)=explode('=', $pair);
+        $parms[$key]=$value;
+      }
+
+      $parms = array_merge($parms, $in_parms);
+      // Render it
+      $output = forena_report($report_name, $parms, FALSE);
+
+      // Finally replace the parameters
+      $find[]=$match[0][$idx];
+      $replace[]=$output;
+    }
+    return str_replace($find, $replace, $text);
+  }
+  // If we didn't find anything return the text.
+  return $text;
+}
+
+/**
+ * Impementation of hook_mail
+ * Builds an email to send when mailing large numbers of users.
+ */
+function forena_mail($key, &$message, $parms) {
+  switch ($key) {
+    case 'mailmerge':
+      $message['subject'] = $parms['subject'];
+      $body = $parms['body'];
+      $message['body'][] = $body;
+      if (isset($parms['headers'])) $message['headers'] += $parms['headers'];
+      $htmlmail = FALSE;
+      break;
+  }
+}
+
+
+/**
+ * Make sure a drectory exists in the report path prior to save.
+ *
+ * @param $fullpath Full path to the drectory to be copied
+ * @param $recursive Whether we are in a recursive call.
+ * @return bool 
+ *   Indicates whether the directory exists. 
+ */
+function _forena_verify_directory($fullpath, $recursive=FALSE) {
+  static $path='';
+  $success = TRUE;
+  if (!$recursive) {
+    $path = forena_report_path();
+    if (!is_writable($path)) {
+      drupal_set_message(t('Report directory %s is not modifiable', array('%s' => $path)), 'error', FALSE);
+      return FALSE;
+    }
+  }
+  @list($dir, $file) = explode('/', $fullpath, 2);
+  $path .= '/' . $dir;
+
+  // Path
+  if (!file_exists($path) && $file) {
+    @mkdir($path);
+    if (!@is_writable($path)) {
+      drupal_set_message(t('Error creating directory %path', array('%path' => $path)), 'error');
+      return FALSE;
+    }
+
+  }
+  // Recurse to next file.
+  if ($file && strpos($file, '/')) {
+    _forena_verify_directory($file, TRUE);
+  }
+  return TRUE;
+}
+
+
+
+/**
+ * Recursively ,  all report files from the source directory to the destination directory
+ * @param $src_dir  Source directory to copy files from
+ * @return int 
+ *   Number of reports reverted. 
+ */
+function _forena_revert_reports($subdir = '') {
+  static $cnt = 0;
+  $cnt++;
+  if ($cnt > 100) return 0;
+  $i = 0;
+  $src_dir = rtrim(FrxAPI::File()->dir, '/');
+  if ($subdir) $src_dir .= '/' . $subdir;
+  $d = dir($src_dir);
+  while ($d && false !== ($rpt_file = $d->read())) {
+    $src_file = $d->path . '/' . $rpt_file;
+    if (strpos($rpt_file, '.')!==0 && is_file($src_file)) {
+      $filename = $subdir ? "$subdir/$rpt_file" : $rpt_file;
+      $i += FrxAPI::File()->revert($filename);
+    }
+    else {
+      if (strpos($rpt_file, '.')!==0) {
+        // Recurse into sub directory
+
+        $dir = $subdir ? $subdir . '/' . $rpt_file : $rpt_file;
+        $i += _forena_revert_reports($dir);
+      }
+    }
+  }
+  if ($d) $d->close();
+  return $i;
+}
+
+
+
+/**
+ *
+ * Enter description here ...
+ * @param $copy_reports If true, reports will by re-copied from
+ *         module source files to destination.
+ */
+function forena_sync_reports($copy_reports=FALSE) {
+  if ($copy_reports) {
+    $i = _forena_revert_reports();
+    if ($i > 0) drupal_set_message($i . ' reports reverted');
+  }
+}
+
+function forena_theme() {
+  return array(
+    'forena_web_report' => array(
+      'variables' => array('doc_types' => NULL, 'parameters' => NULL, 'content' => NULL),
+     ),
+    'forena_inline_form_element' => array(
+      'render element' => 'element',
+      'file' => 'forena.common.inc',
+     ),
+    'forena_inline_field' => array(
+      'render element' => 'field',
+      'file' => 'forena.common.inc',
+    ),
+    'forena_fieldset_template' => array(
+      'render element' => 'fieldset',
+      'file' => 'forena.common.inc',
+    ),
+    'forena_data_table' => array(
+    	'file' => 'forena.common.inc',
+      'variables' => array('header' => NULL, 'data' => NULL),
+      ),
+    'forena_report_parameters_form' => array(
+    	'file' => 'forena.report.inc',
+      'render element' => 'form',
+    ),
+    'forena_element_draggable' => array(
+    	'file' => 'forena.report.inc',
+      'render element' => 'element',
+    ),
+  );
+}
+
+/**
+ * Default theme function for forena web reports.
+ * @param $variables Array of variables to theme
+ * @return string 
+ *   themed output of web report. 
+ * @TODO: Remove? 
+ */
+function theme_forena_web_report ($variables) {
+  $output = '';
+  if (@$variables['parameters']) {
+    $output .= '<div id="forena-parameters">' . $variables['parameters'] . '</div>';
+  }
+  if (@$variables['doc_links']) {
+    $output .= "<div id='forena-doc-links'>" . $variables['doc_links']. '</div>';
+  }
+  $output .= '<div class="forena-report">' . $variables['content'] . '</div>';
+  return $output;
+}
+
+
+/**
+ * Iemplents hook_views_api
+ * @return multitype:number The Ambigous <The, string>
+ */
+function forena_views_api() {
+  return array(
+    'api' => 3,
+    'path' => drupal_get_path('module', 'forena') ,
+    'template path' => drupal_get_path('module', 'forena') ,
+  );
+}
+
+/**
+ * Implements hook_feeds_plugins().
+ */
+function forena_feeds_plugins() {
+  module_load_include('inc', 'forena', 'feeds/forena_feeds');
+  return _forena_feeds_plugins();
+}
+
+
+/**
+ * Implements hook_bean_types_api_info().
+ */
+function forena_bean_types_api_info() {
+  return array('api' => 4);
+}
+
+
+/**
+ * Implements hook_bean_types().
+ */
+function forena_bean_types() {
+  $plugins = array();
+  $plugin_path = drupal_get_path('module', 'forena') . '/bean';
+  $plugins['forena'] = array(
+    'label' => t('Forena report'),
+    'description' => t('Display a report.'),
+    'handler' => array(
+      'class' => 'FrxBean',
+      'parent' => 'bean',
+      'path' => $plugin_path,
+      'file' => 'FrxBean.inc',
+  ),
+    'path' => $plugin_path,
+    'file' => 'FrxBean.inc',
+  );
+  return $plugins;
+}
+
+/**
+ * Function to reflect back forms that are built by classes
+ * @param $formid
+ * @param $form_state form state array
+ * @param $form array of form elements to be reflected
+ * @return array 
+ *   form definition. 
+ */
+function forena_form_reflector($formid, &$form_state, $form) {
+  return $form;
+}
+
+function forena_requirements($phase) {
+  $requirements = array();
+  switch ($phase) {
+  	case 'runtime':
+  	  $writeable = is_writable(\Drupal\forena\File\ReportFileSystem::instance()->dir);
+  	  if (!$writeable) {
+    	  $requirements['fornea_writable'] = array(
+    	    'title' => 'Forena Report Directory',
+    	    'value' => \Drupal\forena\File\ReportFileSystem::instance()->dir,
+    	    'severity' => REQUIREMENT_ERROR,
+    	    'description' => t('The directory must be writable by the web user in order to create custom reports. '),
+    	  ) ;
+  	  }
+
+  	  $req = array('severity' => REQUIREMENT_INFO, 'requirement');
+  	  $libraries = array('dataTables' ,'mpdf', 'prince', 'SVGGraph' );
+  	  foreach ($libraries as $lib) {
+  	    $requirements['forena_' . $lib] = $req;
+  	    $requirements['forena_' . $lib]['title'] = "Forena $lib support";
+  	    $requirements['forena_' . $lib]['value'] = forena_library_file($lib) ? t('Enabled') : t('Not Enabled:');
+  	    $requirements['forena_' . $lib]['severity'] = forena_library_file($lib) ? REQUIREMENT_OK : REQUIREMENT_INFO;
+  	  }
+  	  if (!\Drupal::moduleHandler()->moduleExists('forena_pdf')) {
+  	    unset($requirements['forena_prince']);
+  	    unset($requirements['forena_mpdf']);
+  	  }
+  	  break;
+  }
+  return $requirements;
+}
+
+/**
+ * Custom override of machine_name validate that does not include
+ * @param unknown $element
+ * @param unknown $form_state
+ */
+function forena_machine_name_validate($element, &$form_state) {
+
+  // Verify that the machine name not only consists of replacement tokens.
+  if (preg_match('@^' . $element['#machine_name']['replace'] . '+$@', $element['#value'])) {
+    form_error($element, t('The machine-readable name must contain unique characters.'));
+  }
+
+  // Verify that the machine name contains no disallowed characters.
+  if (preg_match('@' . $element['#machine_name']['replace_pattern'] . '@', $element['#value'])) {
+    if (!isset($element['#machine_name']['error'])) {
+      // Since a hyphen is the most common alternative replacement character,
+      // a corresponding validation error message is supported here.
+      if ($element['#machine_name']['replace'] == '-') {
+        form_error($element, t('The machine-readable name must contain only letters, numbers, and hyphens.'));
+      }
+      // Otherwise, we assume the default (underscore).
+      else {
+        form_error($element, t('The machine-readable name must contain only letters, numbers, and underscores.'));
+      }
+    }
+    else {
+      form_error($element, $element['#machine_name']['error']);
+    }
+  }
+
+}
+
+function forena_process_machine_name($element, &$form_state) {
+  $element['#machine_name']['replace_pattern'] = '[^A-Za-z0-9_\.\/]+';
+  return $element;
+}
+
+
+/**
+ * Create a derivative to the machine name field with relaxed restrictions.
+ * @return multitype:boolean string NULL number multitype:string
+ */
+function forena_element_info() {
+  $types['forena_machine_name'] = array(
+    '#input' => TRUE,
+    '#element_validate' => array('forena_machine_name_validate'),
+    '#default_value' => NULL,
+    '#size' => 60,
+    '#maxlength' => 64,
+    '#required' => TRUE,
+    '#autocomplete_path' => FALSE,
+    '#process' => array(
+  	  'form_process_machine_name',
+      'forena_process_machine_name',
+      'ajax_process_form',
+     ),
+    '#theme_wrappers' => array('form_element'),
+    '#theme' => 'textfield',
+  );
+  return $types;
+}
