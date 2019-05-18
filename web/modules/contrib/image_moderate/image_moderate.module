@@ -1,0 +1,280 @@
+<?php
+
+/**
+ * @file
+ * Contains image_moderate.module.
+ */
+
+use Drupal\Core\Url;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Entity\ContentEntityInterface;
+use Drupal\image_moderate\Entity\ImageModerate;
+
+/**
+ * Implements hook_modules_installed().
+ */
+function image_moderate_modules_installed($modules) {
+  if (in_array('image_moderate', $modules)) {
+    drupal_set_message(t('Microsoft Azure API key and Endpoint URL is not set and it is required for the module to work. Please set it up at the <a href=":settings">Automatic image moderate settings page</a>.', [
+      ':settings' => Url::fromRoute('image_moderate.settings')->toString(),
+    ]));
+  }
+}
+
+/**
+ * Implements hook_entity_presave().
+ */
+function image_moderate_entity_presave(EntityInterface $entity) {
+  if ($entity instanceof ContentEntityInterface) {
+    $entity_manager = \Drupal::service('entity_field.manager');
+    foreach ($entity_manager->getFieldDefinitions($entity->getEntityTypeId(), $entity->bundle()) as $field_name => $field_definition) {
+      if (!empty($field_definition->getTargetBundle())) {
+        if ($field_definition->getType() == 'image') {
+          $images = $entity->get($field_name);
+          foreach ($images as $key => $image) {
+            if (image_moderate_check_data($entity->uuid(), $image->target_id) == FALSE) {
+              $entitys = image_moderate_status($entity->uuid(), $image->target_id);
+              if (count($entitys) == 0) {
+                $user = \Drupal::currentUser();
+                $uid = $user->id();
+                $values = [
+                  'fid' => $image->target_id,
+                  'entity_uuid' => $entity->uuid(),
+                  'entity_type' => $entity->getEntityTypeId(),
+                  'user_id' => $uid,
+                  'status' => 0,
+                ];
+                $new_image_moderate = ImageModerate::create($values);
+                $new_image_moderate->save();
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function image_moderate_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $display_warn = \Drupal::config('image_moderate.settings')->get('display_warn');
+  if (isset($form['#entity_builders'])) {
+    $entity = $form_state->getFormObject()->getEntity();
+    if($entity->getEntityType()->id() != 'field_config'){
+      $entity_manager = \Drupal::service('entity_field.manager');
+      foreach ($entity_manager->getFieldDefinitions($entity->getEntityTypeId(), $entity->bundle()) as $field_name => $field_definition) {
+        if (!empty($field_definition->getTargetBundle())) {
+          if ($field_definition->getType() == 'image') {
+            $images = $entity->get($field_name);
+            foreach ($images as $key => $image) {
+              if (isset($form[$field_name]['widget'][$key]['#default_value']['fids'][0])) {
+                $fid = $form[$field_name]['widget'][$key]['#default_value']['fids'][0];
+                if (image_moderate_check_data($entity->uuid(), $fid) == FALSE) {
+                  $entity_manager = \Drupal::entityTypeManager();
+                  $file = $entity_manager->getStorage('file')->load($fid);
+                  $filename = $file->getFilename();
+                  $form[$field_name]['field_image_moderate_status__' . $fid] = [
+                    '#title' => t('Image Moderation Status'),
+                    '#type' => 'select',
+                    '#description' => t("Check the image and decide how to proceed"),
+                    '#options' => [
+                      0 => t('<em>%image</em> needs Review', ['%image' => $filename]),
+                      1 => t('Reviewed, can be published'),
+                      2 => t('Can not be published'),
+                    ],
+                    '#weight' => $form[$field_name]['#weight'],
+                    '#access' => \Drupal::currentUser()->hasPermission('administer image moderate entity'),
+                  ];
+                  $form['field_image_moderate_status__' . $fid] = [
+                    '#type' => 'text',
+                    '#default_value' => $field_name,
+                  ];
+                  $form[$field_name]['#states'] = [
+                    'invisible' => [
+                      'select[name="field_image_moderate_status__' . $fid . '"]',
+                    ],
+                  ];
+                  if (!\Drupal::currentUser()->hasPermission('administer image moderate entity')) {
+                    $form['status']['widget']['value']['#attributes'] = ['disabled' => 'disabled'];
+                    $form['status']['widget']['value']['#description'] = t('Blocked by Automatic Image Moderate. You do not have permission to review and publish this content!');
+                  }
+                  foreach (array_keys($form['actions']) as $action) {
+                    if ($action != 'preview' && isset($form['actions'][$action]['#type']) && $form['actions'][$action]['#type'] === 'submit') {
+                      $form['actions'][$action]['#submit'][] = 'image_moderate_form_submit';
+                    }
+                  }
+                }
+                elseif (image_moderate_check_data($entity->uuid(), $fid) !== TRUE) {
+                  $entity_manager = \Drupal::entityTypeManager();
+                  $file = $entity_manager->getStorage('file')->load($fid);
+                  $filename = $file->getFilename();
+                  $entitys = image_moderate_status(($entity->uuid()), $fid);
+                  if (count($entitys) > 0) {
+                    $keys = array_keys($entitys);
+                    $image_moderate_entity = ImageModerate::load($entitys[$keys[0]]);
+                    $reviewer_id = $image_moderate_entity->reviewed_by->getValue()[0]['target_id'];
+                    $reviewer = \Drupal::entityTypeManager()->getStorage('user')->load($reviewer_id)->toLink()->toString();
+                    $form[$field_name]['field_image_moderate_status__' . $fid] = [
+                      '#title' => t('Image Moderation Status'),
+                      '#markup' => t('%image has been reviewed by @reviewer on %review', [
+                        '%image' => $filename,
+                        '@reviewer' => $reviewer,
+                        '%review' => \Drupal::service('date.formatter')->format($image_moderate_entity->reviewed->value),
+                      ]),
+                    ];
+                    //$form[$field_name]['#prefix'] .= 'Has been reviewed by ...';
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_submit().
+ */
+function image_moderate_form_submit($form, FormStateInterface $form_state) {
+  $entity = $form_state->getFormObject()->getEntity();
+  // mymodule_do_something($node);
+  \Drupal::logger(' mymodule')->notice('mymodule submit ');
+  foreach ($form as $element => $value) {
+    if (strpos($element, 'image_moderate_status__')) {
+      $fid = explode("__", $element)[1];
+      $entitys = image_moderate_status($entity->uuid(), $fid);
+      $form_image_moderate_status = $form[$value['#default_value']][$element]['#value'];
+      if (count($entitys) != 0) {
+        $user = \Drupal::currentUser();
+        $uid = $user->id();
+        $time = \Drupal::time()->getCurrentTime();
+        $keys = array_keys($entitys);
+        $image_moderate_entity = ImageModerate::load($entitys[$keys[0]]);
+        $image_moderate_entity->set('status', $form_image_moderate_status);
+        if ($form_image_moderate_status != 0) {
+          $image_moderate_entity->set('reviewed_by', $uid);
+          $image_moderate_entity->set('reviewed', $time);
+        }
+        $image_moderate_entity->save();
+      }
+      if ($form_image_moderate_status != 1) {
+        $entity->setPublished(FALSE);
+        $entity->save();
+      }
+    }
+  }
+}
+
+/**
+ * Implements image_moderate_get_tempdata().
+ *
+ * @param string $uuid
+ *   UUID of target entity.
+ * @param int $fid
+ *   File ID.
+ */
+function image_moderate_status($uuid, $fid) {
+  $ret = TRUE;
+  $query = \Drupal::entityQuery('image_moderate');
+  $query->condition('fid', $fid, '=');
+  $query->condition('entity_uuid', $uuid, '=');
+  return $query->execute();
+}
+
+/**
+ * Implements image_moderate_get_tempdata().
+ *
+ * @param string $uuid
+ *   UUID of target entity.
+ * @param int $fid
+ *   File ID.
+ */
+function image_moderate_check_data($uuid, $fid) {
+  $ret = TRUE;
+  $entitys = image_moderate_status($uuid, $fid);
+  if (count($entitys) == 0) {
+    $tempstore = \Drupal::service('user.shared_tempstore')->get('image_moderate');
+    if ($image_moderate_data = $tempstore->get('image_moderate_data')) {
+      if (isset($image_moderate_data[$fid])) {
+        $racist = $image_moderate_data[$fid]->racist;
+        $adult = $image_moderate_data[$fid]->adult;
+        $racist_treshold = \Drupal::config('image_moderate.settings')->get('racist') / 100;
+        $adult_treshold = \Drupal::config('image_moderate.settings')->get('adult') / 100;
+        if ($racist > $racist_treshold || $adult > $adult_treshold) {
+          $ret = FALSE;
+        }
+      }
+      else {
+        $ret = image_moderate_get_data($fid);
+      }
+    }
+    else {
+      $ret = image_moderate_get_data($fid);
+    }
+  }
+  else {
+    $keys = array_keys($entitys);
+    $entity = ImageModerate::load($entitys[$keys[0]]);
+    $status = $entity->get('status')->value;
+    if ($status == 0) {
+      $ret = FALSE;
+    }
+    else {
+      $ret = $status;
+    }
+  }
+  return $ret;
+}
+
+/**
+ * Implements image_moderate_get_data($fid).
+ *
+ * @param int $fid
+ *   File ID.
+ */
+function image_moderate_get_data($fid) {
+  $ret = TRUE;
+  if (\Drupal::service('image_moderate.get_data')->checksetup() === FALSE) {
+    drupal_set_message(
+      t('Microsoft Azure API key and Endpoint URL is not set and it is required for the module to work. Please set it up at the <a href=":settings">Image Automatic Alternative Text settings page</a>.', [
+        ':settings' => Url::fromRoute('image_moderate.settings')->toString(),
+      ])
+    );
+    return TRUE;
+  }
+  $entity_manager = \Drupal::entityTypeManager();
+  $file = $entity_manager->getStorage('file')->load($fid);
+
+  $uri = \Drupal::service('image_moderate.get_data')->geturi($file);
+  $path = \Drupal::service('file_system')->realpath($uri);
+  $filename = $file->getFilename();
+  $request = \Drupal::service('image_moderate.get_data')->getdata($path);
+  if ($request->getStatusCode() == 200) {
+    $response = json_decode($request->getBody());
+    $racist = $response->RacyClassificationScore;
+    $adult = $response->AdultClassificationScore;
+    $image_moderate_data = [];
+    $image_moderate_data[$fid] = new stdClass();
+    $image_moderate_data[$fid]->racist = $racist;
+    $image_moderate_data[$fid]->adult = $adult;
+    $tempstore = \Drupal::service('user.shared_tempstore')->get('image_moderate');
+    $tempstore->set('image_moderate_data', $image_moderate_data);
+    $racist_treshold = \Drupal::config('image_moderate.settings')->get('racist') / 100;
+    $adult_treshold = \Drupal::config('image_moderate.settings')->get('adult') / 100;
+    if ($racist > $racist_treshold) {
+      drupal_set_message(t('Your image <em>%image</em> seems to contain racist content. Your content needs to be reviewed before it is published.', ['%image' => $filename]), 'warning');
+      $ret = FALSE;
+    }
+    if ($adult > $adult_treshold) {
+      drupal_set_message(t('Your image <em>%image</em> seems to contain adult content. Your content needs to be reviewed before it is published.', ['%image' => $filename]), 'warning');
+      $ret = FALSE;
+    }
+  }
+  return $ret;
+
+}
