@@ -1,0 +1,263 @@
+<?php
+
+/**
+ * @file
+ * Contains commerce_epayco.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\user\Entity\User;
+use Drupal\commerce_epayco\CommerceEPayco;
+use Drupal\commerce_epayco\Entity\CommerceEpaycoApiData;
+
+/**
+ * Implements hook_help().
+ */
+function commerce_epayco_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the commerce_ccavenue module.
+    case 'help.page.commerce_epayco':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Integrating ePayco Payment Gateway with Drupal Commerce.') . '</p>';
+      $output .= '<p>' . t('See more at <a href="@epayco_docs">ePayco docs</a>.', ['@epayco_docs' => 'https://epayco.co']) . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_entity_base_field_info().
+ */
+function commerce_epayco_entity_base_field_info(EntityTypeInterface $entity_type) {
+  if ($entity_type->id() === 'commerce_store') {
+    $fields['epayco_p_cust_id_cliente'] = BaseFieldDefinition::create('string')
+      ->setLabel(t('Override @epayco_parameter', ['@epayco_parameter' => 'p_cust_id_cliente']))
+      ->setRequired(FALSE)
+      ->setTranslatable(FALSE)
+      ->setSettings([
+        'default_value' => '',
+        'max_length' => 255,
+      ])
+      ->setDisplayOptions('form', [
+        'type' => 'string_textfield',
+        'weight' => 0,
+      ])
+      ->setDisplayConfigurable('view', TRUE)
+      ->setDisplayConfigurable('form', TRUE);
+
+    $fields['epayco_p_key'] = BaseFieldDefinition::create('string')
+      ->setLabel(t('Override @epayco_parameter', ['@epayco_parameter' => 'p_key']))
+      ->setRequired(FALSE)
+      ->setTranslatable(FALSE)
+      ->setSettings([
+        'default_value' => '',
+        'max_length' => 255,
+      ])
+      ->setDisplayOptions('form', [
+        'type' => 'string_textfield',
+        'weight' => 0,
+      ])
+      ->setDisplayConfigurable('view', TRUE)
+      ->setDisplayConfigurable('form', TRUE);
+
+    $fields['epayco_mode'] = BaseFieldDefinition::create('boolean')
+      ->setLabel(t('Test mode enabled'))
+      ->setDisplayOptions('form', [
+        'type' => 'boolean_checkbox',
+        'settings' => [
+          'display_label' => TRUE,
+        ],
+        'weight' => 3,
+      ])
+      ->setDisplayConfigurable('view', TRUE)
+      ->setDisplayConfigurable('form', TRUE)
+      ->setDefaultValue(FALSE);
+
+    return $fields;
+  }
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter() for 'commerce_store_form'.
+ */
+function commerce_epayco_form_commerce_store_form_alter(&$form, FormStateInterface $form_state) {
+  if (isset($form['epayco_p_cust_id_cliente']) || isset($form['epayco_p_key']) || isset($form['epayco_mode'])) {
+    $form['epayco_settings'] = [
+      '#title' => t('Epayco settings'),
+      '#weight' => 99,
+      '#type' => 'details',
+      '#collapsible' => TRUE,
+      '#open' => TRUE,
+      '#access' => commerce_epayco_check_access(),
+    ];
+    $form['epayco_p_cust_id_cliente']['#group'] = 'epayco_settings';
+    $form['epayco_p_key']['#group'] = 'epayco_settings';
+    $form['epayco_mode']['#group'] = 'epayco_settings';
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function commerce_epayco_cron() {
+  commerce_epayco_check_pending_orders();
+}
+
+/**
+ * Helper function to check if user has access to set ePayco parameters.
+ *
+ * And check if there is any ePayco payment gateway provided.
+ *
+ * @param \Drupal\user\Entity\User $user
+ *   - The user to check permissions to.
+ *
+ * @return bool
+ *   $access-TRUE or FALSE, depending if user has access and available gateways.
+ */
+function commerce_epayco_check_access(User $user = NULL) {
+  if (!$user || !($user instanceof User)) {
+    $user = \Drupal::currentUser();
+  }
+
+  $has_permission = $user->hasPermission('override commerce_epayco parameters');
+
+  // We use "IN" as operator,because in the future, another method may be added.
+  $query = \Drupal::entityQuery('commerce_payment_gateway')
+    ->condition('plugin', ['epayco_offsite_redirect'], 'IN');
+  $gateways = $query->count()->execute();
+
+  $gateways_available = $gateways > 0 ? TRUE : FALSE;
+
+  $access = $has_permission && $gateways_available;
+
+  return $access;
+}
+
+/**
+ * Get information about a transaction.
+ */
+function commerce_epayco_get_transaction_information($transaction_id) {
+  $url_confirm_payment = 'https://secure.payco.co/pasarela/estadotransaccion?id_transaccion=' . $transaction_id;
+  $ch = curl_init($url_confirm_payment);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, TRUE);
+  curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'GET');
+  $response = curl_exec($ch);
+  curl_close($ch);
+  if (!$response) {
+    $data = NULL;
+  }
+  else {
+    $data = json_decode($response);
+  }
+
+  return $data;
+}
+
+/**
+ * Helper function to check pending payments.
+ */
+function commerce_epayco_check_pending_orders($conf = []) {
+  $return = [
+    'counters' => [
+      '_total' => 0,
+    ],
+  ];
+
+  $offset = isset($conf['limit']['offset']) ? $conf['limit']['offset'] : 0;
+  $range = isset($conf['limit']['range']) ? $conf['limit']['range'] : 10;
+
+  $query = \Drupal::entityQuery('commerce_payment');
+  $query->condition('payment_gateway', 'epayco_%', 'LIKE');
+  $query->condition('state', 'authorization');
+  if (isset($conf['properties']['remote_id'])) {
+    $query->condition('remote_id', $conf['properties']['remote_id'], 'IN');
+  }
+  $query->range($offset, $range);
+  $query->sort('payment_id', 'ASC');
+  $payment_ids = $query->execute();
+
+  $payments = \Drupal::entityTypeManager()->getStorage('commerce_payment')->loadMultiple($payment_ids);
+  foreach ($payments as $payment) {
+    $remote_id = $payment->remote_id->getString();
+    $data = commerce_epayco_get_transaction_information($remote_id);
+    $__x_cod_response = isset($data->data->x_cod_response) ? $data->data->x_cod_response : NULL;
+    $__x_response = isset($data->data->x_response) ? $data->data->x_response : NULL;
+    switch ($__x_cod_response) {
+      case 1:
+        $payment->setState('completed');
+        $payment->setRemoteState($__x_response);
+        $payment->save();
+        break;
+
+      case 2:
+      case 4:
+        $payment->setState('authorization_voided');
+        $payment->setRemoteState($__x_response);
+        $payment->save();
+        break;
+    }
+    $return['counters'][$__x_cod_response] = isset($return['counters'][$__x_cod_response]) ? $return['counters'][$__x_cod_response] + 1 : 1;
+    $return['counters']['_total'] += 1;
+  }
+
+  return $return;
+}
+
+/**
+ * Load payment by external ID.
+ */
+function commerce_epayco_load_payment_by_external_id($external_id) {
+  $payment = \Drupal::entityTypeManager()->getStorage('commerce_payment')->loadByProperties([
+    'remote_id' => $external_id,
+  ]);
+
+  return reset($payment);
+}
+
+/**
+ * Helper function to get an ePayco main class instance. This way we keep
+ * main class \Drupal\commerce_epayco\CommerceEPayco re-usable for third-party
+ * features passing just configuration entity.
+ *
+ * @param \Drupal\commerce_epayco\Entity\CommerceEpaycoApiData $configuration
+ *   Configuration entity from admin/commerce/config/commerce-epayco/api-data.
+ *
+ * @return \Drupal\commerce_epayco\CommerceEPayco
+ *   The main class instance.
+ */
+function commerce_epayco_get_epayco_manager(CommerceEpaycoApiData $configuration) {
+  $api_key = $configuration->getApiKey();
+  $private_key = $configuration->getPrivateKey();
+  $language = $configuration->getLanguageCode();
+  $test = $configuration->isTestMode();
+
+  $epayco = new CommerceEPayco($api_key, $private_key, $language, $test);
+
+  return $epayco;
+}
+
+/**
+ * Return the valid signature for a payment.
+ *
+ * @param string $p_cust_id_cliente
+ *   Value found at ePayco dashboard page.
+ * @param string $p_key
+ *   Value found at ePayco dashboard page.
+ * @param int $order_id
+ *   Drupal commerce order id.
+ * @param int|float|double $p_amount
+ *   Amount to be paid.
+ * @param string $p_currency_code
+ *   Currency code. Examples: "USD", "COP".
+ *
+ * @return string
+ *   Encoded string as needed for the POST request.
+ */
+function commerce_epayco_get_payment_signature($p_cust_id_cliente, $p_key, $order_id, $p_amount, $p_currency_code) {
+  return md5($p_cust_id_cliente . '^' . $p_key . '^' . $order_id . '^' . $p_amount . '^' . $p_currency_code);
+}
