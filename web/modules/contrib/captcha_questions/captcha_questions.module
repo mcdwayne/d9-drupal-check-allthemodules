@@ -1,0 +1,95 @@
+<?php
+
+/**
+ * @file
+ * Module file for the Captcha questions module.
+ *
+ * The module hooks into forms and adds a configurable question field and a
+ * custom validate function returning an error if the answer is wrong.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Component\Utility\Html;
+use Drupal\Component\Utility\Unicode;
+
+/**
+ * Implements hook_help().
+ */
+function captcha_questions_help($route_name, RouteMatchInterface $route_match) {
+  if ($route_name == 'help.page.captcha_questions') {
+    return t('Captcha questions allows the site administrator to add a question to selected forms');
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function captcha_questions_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+
+  // Only show captcha questions if user is anonymous.
+  if (\Drupal::currentUser()->isAnonymous()) {
+    // Fetching variables for form ids, question and description.
+    $config = \Drupal::config('captcha_questions.settings');
+    $captcha_questions_form_ids = $config->get('captcha_questions_form_ids');
+    $question = $config->get('captcha_questions_question');
+    $description = $config->get('captcha_questions_description');
+    if (in_array($form_id, $captcha_questions_form_ids)) {
+      // If we're on a multi page form, find current page.
+      $form_page_count = isset($form['details']['page_num']['#value']) ? $form['details']['page_num']['#value'] : 1;
+      // Set field to hidden unless on the first page.
+      $form['captcha_questions_answer_given'] = [
+        '#type' => $form_page_count == 1 ? 'textfield' : 'hidden',
+        '#description' => t("@description", ['@description' => $description]),
+        '#title' => Html::escape($question),
+        '#size' => 60,
+        '#required' => TRUE,
+      ];
+      $form['#validate'][] = 'captcha_questions_form_validate';
+    }
+
+    return $form;
+  }
+}
+
+/**
+ * Implements hook_form_validate().
+ */
+function captcha_questions_form_validate(&$form, FormStateInterface $form_state) {
+  $ip = \Drupal::request()->getClientIp();
+  $form_id = $form_state->getValue('form_id');
+  $config = \Drupal::config('captcha_questions.settings');
+  $question_asked = $config->get('captcha_questions_question');
+  $answers = $config->get('captcha_questions_answers');
+  $answer_given = $form_state->getValue('captcha_questions_answer_given');
+
+  // Comparison is done in lowercase, ensure answers are lowercase.
+  $answers = array_map('strtolower', $answers);
+  $answer_given = Unicode::strtolower($answer_given);
+
+  // Check answer.
+  if (in_array($answer_given, $answers) == FALSE) {
+    // Log to watchdog if enabled.
+    if ($config->get('captcha_questions_watchdog')) {
+      $message = t('Blocked submission of form with form_id @form_id. Answer given was %answer_given', ['@form_id' => $form_id, '%answer_given' => $form_state->getValue('captcha_questions_answer_given')]);
+      \Drupal::logger('captcha_questions')->error($message);
+    }
+    // Log to dblog if enabled and module exists and enabled.
+    $dblog_enabled = \Drupal::config('captcha_questions.settings')->get('captcha_questions_dblog');
+    $dblog_module_exists = \Drupal::moduleHandler()->moduleExists('captcha_questions_dblog') ? TRUE : FALSE;
+    if ($dblog_enabled && $dblog_module_exists) {
+      db_insert('captcha_questions_dblog')
+        ->fields([
+          'timestamp' => REQUEST_TIME,
+          'ip' => $ip,
+          'form_id' => $form_id,
+          'question_asked' => Html::escape($question_asked),
+          'answer_given' => Html::escape($answer_given),
+          'answer_correct' => implode(",", $answers),
+        ])
+        ->execute();
+    }
+    // Display error.
+    $form_state->setErrorByName('captcha_questions_answer_given', t('Invalid answer'));
+  }
+}
