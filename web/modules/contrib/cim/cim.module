@@ -1,0 +1,563 @@
+<?php
+
+/**
+ * @file
+ * Configuration interchange and management.
+ */
+
+use Drupal\cim\SnapshotController;
+use Drupal\cim\Difference;
+use Drupal\cim\Changeset;
+use Drupal\cim\Crypt;
+use Drupal\cim\Peer;
+use Drupal\cim\DefaultStorage;
+use Drupal\cim\ConfigArray;
+
+/**
+ * Implements hook_menu().
+ */
+function cim_menu() {
+  $root = 'admin/config/development/cim';
+
+  $items[$root] = array(
+    'title' => 'Configuration Interchange and Management',
+    'page callback' => 'cim_admin_list',
+    'access arguments' => array('administer snapshots'),
+    'file' => 'cim.admin.inc',
+  );
+
+  $items[$root . '/authenticate'] = array(
+    'title' => 'CIM authentication',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cim_admin_authenticate_form'),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+    'file' => 'cim.admin.inc',
+  );
+
+  $items[$root . '/list'] = array(
+    'title' => 'List',
+    'description' => 'List snapshots',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => -1,
+    'file' => 'cim.admin.inc',
+  );
+
+  $items[$root . '/create'] = array(
+    'title' => 'Create snapshot.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cim_admin_create_snapshot_form'),
+    'access arguments' => array('administer snapshots'),
+    'type' => MENU_LOCAL_ACTION,
+    'file' => 'cim.admin.inc',
+  );
+
+  $items[$root . '/snapshot/%cim_snapshot'] = array(
+    'title' => 'Snapshot details',
+    'page callback' => 'cim_admin_snapshot_view',
+    'page arguments' => array(5),
+    'access arguments' => array('administer snapshots'),
+    'file' => 'cim.admin.inc',
+  );
+
+  $items[$root . '/snapshot/%cim_snapshot/details'] = array(
+    'title' => 'Details',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => -1,
+  );
+
+  $items[$root . '/snapshot/%cim_snapshot/revert'] = array(
+    'title' => 'Revert',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cim_admin_revert_snapshot_form', 5),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'cim.admin.inc',
+    'access callback' => 'cim_snapshot_access',
+    'access arguments' => array(5),
+  );
+
+  $items[$root . '/snapshot/%cim_snapshot/rollback'] = array(
+    'title' => 'Rollback',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cim_admin_rollback_snapshot_form', 5),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'cim.admin.inc',
+    'access callback' => 'cim_snapshot_access',
+    'access arguments' => array(5),
+  );
+
+  $items[$root . '/snapshot/%cim_snapshot/push'] = array(
+    'title' => 'Push to upstream',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cim_admin_push_confirm_form', 5),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'cim.admin.inc',
+    'access arguments' => array('administer snapshots'),
+  );
+
+  $items[$root . '/upstream'] = array(
+    'title' => 'Upstream',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cim_admin_add_upstream_form'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'cim.admin.upstream.inc',
+    'access arguments' => array('administer snapshots'),
+  );
+
+  $items[$root . '/upstream/setup'] = array(
+    'title' => 'Setup',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+  );
+
+  $items[$root . '/upstream/pull'] = array(
+    'title' => 'Pull configuration',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cim_admin_pull_confirm_form'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'cim.admin.upstream.inc',
+    'access arguments' => array('administer snapshots'),
+  );
+
+  return $items;
+}
+
+/**
+ * Menu loader function.
+ */
+function cim_snapshot_load($sha) {
+  $ssc = cim_get_controller();
+  return $ssc->load($sha);
+}
+
+/**
+ * Menu access function.
+ *
+ * Returns TRUE if snapshot has a parent, isn't the latest snapshot and user has
+ * 'administer snapshots' permission.
+ */
+function cim_snapshot_access($snapshot) {
+  $latest = &drupal_static(__FUNCTION__, NULL);
+  if (!$latest) {
+    $latest = cim_get_controller()->latest();
+  }
+  if (user_access('administer snapshots') && $snapshot->parent_sha() && $snapshot != $latest) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Get the snapshot controller.
+ */
+function cim_get_controller() {
+  $controller = &drupal_static(__FUNCTION__, NULL);
+  if (!isset($controller)) {
+    $crypt = new Crypt(cim_keys());
+    // todo: this is odd, figure out how to do it.
+    $crypt->setPeerKey($crypt->getPublicKey());
+    $controller = new SnapshotController($crypt);
+  }
+  return $controller;
+}
+
+/**
+ * Get the storage controller.
+ */
+function cim_get_storage() {
+  $controller = &drupal_static(__FUNCTION__, NULL);
+  if (!isset($controller)) {
+    $crypt = new Crypt(cim_keys());
+    // todo: this is odd, figure out how to do it.
+    $crypt->setPeerKey($crypt->getPublicKey());
+    $dir = config_get_config_directory() . '/' . hash('sha256', $crypt->getPublicKey());
+    file_prepare_directory($dir, FILE_CREATE_DIRECTORY);
+    // Really, should be pluggable.
+    $controller = new DefaultStorage($crypt, $dir);
+
+  }
+  return $controller;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function cim_permission() {
+  return array(
+    'administer snapshots' => array(
+      'title' => t('Administer configuration snapshots'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_theme().
+ */
+function cim_theme() {
+  return array(
+    'cim_admin_snapshot_overview' => array(
+      'variables' => array('sha' => NULL, 'message' => NULL),
+    ),
+  );
+}
+
+/**
+ * Returns HTML for a snapshot description for the snapshot listing admin page.
+ *
+ * @param $vars
+ *   An associative array containing:
+ *   - sha: Snapshot SHA.
+ *   - link: Path to the snapshot page.
+ *   - message: The logged message of the snapshot.
+ *
+ * @ingroup themeable
+ */
+function theme_cim_admin_snapshot_overview($vars) {
+  $output = l($vars['sha'], $vars['link']);
+  if ($vars['message']) {
+    $output .= '<div class="message">' . filter_xss_admin($vars['message']) . '</div>';
+  }
+  return $output;
+}
+
+/**
+ * Implements hook_element_info().
+ */
+function cim_element_info() {
+  return array(
+    'cim_changeset_view' => array(
+      '#input' => FALSE,
+      '#pre_render' => array('cim_process_changeset_view_pre_render'),
+    ),
+  );
+}
+
+/**
+ * Process cim_changeset_view element.
+ */
+function cim_process_changeset_view_pre_render($element) {
+  // Include the utility drupal_var_export() function.
+  include_once './core/includes/utility.inc';
+
+  $rows = array();
+  foreach ($element['#changeset']->changes() as $change) {
+    $rows[] = array(
+      join('.', $change->path),
+      $change->a === Difference::NULL ? check_plain('<unset>') : (is_array($change->a) ? '<pre>' . drupal_var_export($change->a) . '</pre>' : check_plain($change->a)),
+      $change->b === Difference::NULL ? check_plain('<unset>') : (is_array($change->b) ? '<pre>' . drupal_var_export($change->b) . '</pre>' : check_plain($change->b)),
+    );
+  }
+
+  $element['changes'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Changes'),
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+  );
+
+  $element['changes']['details'] = array(
+    '#theme' => 'table',
+    '#header' => array(t('Configuration key'), t('From'), t('To')),
+    '#rows' => $rows,
+  );
+
+  return $element;
+}
+
+/**
+ * Implements hook_xmlrpc().
+ */
+function cim_xmlrpc() {
+  return array(
+    array(
+      'cim.request',
+      'cim_xmlrpc_request',
+      array('string', 'string'),
+      '',
+    ),
+  );
+}
+
+/**
+ * Make a request to upstream.
+ */
+function cim_peer_request($request, $upstream = NULL, $crypt = NULL) {
+  if (!$upstream) {
+    $upstream = cim_upstream();
+  }
+  if (!$crypt) {
+    $crypt = new Crypt(cim_keys(), $upstream->publicKey());
+  }
+  // Crypt request.
+  $message = array(
+    'request' => $crypt->encrypt($request),
+    'peer_id' => hash('sha256', $crypt->getPublicKey()),
+  );
+  $result = cim_request($upstream->url(), $message);
+  if ($result === FALSE) {
+    throw new Exception('Major failure at upstream. Most likely the best place to look for an error message is the error.log.');
+  }
+  if (!($result = base64_decode($result))) {
+    throw new Exception('Could not decode response');
+  }
+  // In the case that peer cannot encrypt the response, it might return an
+  // unencrypted response. Check if the data has an envelope.
+  $unserialized = unserialize($result);
+  if (isset($unserialized['envelope'])) {
+    if (!($result = $crypt->decrypt($result))) {
+      throw new Exception('Could not decrypt response');
+    }
+  }
+  else {
+    $result = $unserialized;
+  }
+  if (!is_array($result)) {
+    throw new Exception('Upstream failed giving a proper answer');
+  }
+  $result += array(
+    'status' => 'ERR',
+    'message' => 'Upstream gave no message.',
+  );
+  // Helpful shortcut.
+  $result['success'] = $result['status'] == 'OK';
+  return $result;
+}
+
+/**
+ * Make a XMLRPC request.
+ */
+function cim_request($site, $request) {
+  $url = $site . 'xmlrpc.php';
+  $request = base64_encode(serialize($request));
+  $response = xmlrpc($url, array('cim.request' => array($request)));
+  return $response;
+}
+
+/**
+ * XMLRPC callback.
+ *
+ * Handles a XMLRPC request.
+ */
+function cim_xmlrpc_request($request) {
+  $request = unserialize(base64_decode($request));
+  $request += array(
+    'action' => '',
+  );
+  $response = array(
+    'status' => 'ERR',
+    'message' => '',
+  );
+
+  $keys = cim_keys();
+  $crypt = new Crypt($keys);
+  $peer = NULL;
+  // Authenticate is the only request not encrypted.
+  if ($request['action'] != 'authenticate') {
+    $request += array(
+      'request' => '',
+      'peer_id' => '',
+    );
+    $peer = Peer::load($request['peer_id']);
+    if (!$peer) {
+      $response['message'] = 'Unknown peer.';
+      return base64_encode(serialize($response));
+    }
+    else {
+      $crypt->setPeerKey($peer->publicKey());
+      if (!($request = $crypt->decrypt($request['request']))) {
+        $response['message'] = 'Cannot decrypt request.';
+      }
+    }
+  }
+  else {
+    $request += array(
+      'public_key' => '',
+      'return_url' => '',
+      'signature' => '',
+      'version' => '',
+      'core' => '',
+    );
+
+    $crypt->setPeerKey($request['public_key']);
+    // Check sig...
+    if (empty($request['signature'])) {
+      $response['message'] = 'Request not signed.';
+    }
+    else {
+      $signature = $request['signature'];
+      unset($request['signature']);
+      ksort($request);
+      /*
+       * Checking the signature with the public key contained in the request
+       * might seem odd, but it ensures that the request was created by the peer
+       * with the corresponding private key.
+       */
+      if (!$crypt->verify(serialize($request), $signature)) {
+        $response['message'] = 'Signature invalid.';
+      }
+    }
+  }
+
+  // If no error has been set yet, continue.
+  if (empty($response['message'])) {
+    $commands = array('authenticate', 'blob', 'pull', 'push');
+    if (in_array($request['action'], $commands)) {
+      $func = 'cim_request_' . $request['action'];
+      $func($request, $response, $crypt, $peer);
+      if (isset($response['status']) && $response['status'] != 'OK' && empty($response['message'])) {
+        $response['message'] = 'Unknown internal error.';
+      }
+      // Authenticate response isn't encrypted.
+      if ($request['action'] == 'authenticate') {
+        return base64_encode(serialize($response));
+      }
+    }
+    else {
+      $response = array(
+        'status' => 'ERR',
+        'message' => 'Unsupported action.',
+      );
+    }
+  }
+  return base64_encode($crypt->encrypt($response));
+}
+
+/**
+ * XMLRPC authenticate command.
+ */
+function cim_request_authenticate($request, &$response, $crypt, $peer) {
+  $request += array(
+    'public_key' => '',
+    'return_url' => '',
+    'signature' => '',
+    'version' => '',
+    'core' => '',
+  );
+  $peer_id = hash('sha256', $request['public_key']);
+  $keys = $crypt->getKeyPair();
+  /*
+   * Create a token for this authentication.  Uses the key to make it
+   * unguessable, REQUEST_TIME to make it change over time, and peer id to allow
+   * auth requests from different peers in the same second.
+   */
+  $token = hash('sha256', $keys[0] . $peer_id . REQUEST_TIME);
+
+  // @todo check that core and version is compatible.
+  cache()->set('cim_auth_upstream:' . $token, $request, REQUEST_TIME + 3600);
+
+  $response += array(
+    'token' => $token,
+    'authenticate_url' => url('admin/config/development/cim/authenticate', array('absolute' => TRUE)),
+    'public_key' => $crypt->getPublicKey(),
+  );
+
+  $response['status'] = 'OK';
+  $response = $crypt->seal(serialize($response));
+}
+
+/**
+ * XMLRPC blob command.
+ */
+function cim_request_blob($request, &$response, $crypt, $peer) {
+  if ($request['sha'] && $blob = cim_get_storage()->readSecure($request['sha'])) {
+    $response['blob'] = $blob;
+    $response['status'] = 'OK';
+  }
+  else {
+    $response['message'] = 'Unknown SHA.';
+  }
+}
+
+/**
+ * XMLRPC pull command.
+ */
+function cim_request_pull($request, &$response, $crypt, $peer) {
+  // Work from latest snapshot.
+  $snapshot = cim_get_controller()->latest();
+
+  $response['sha'] = $snapshot->sha();
+  $response['snapshot'] = $snapshot;
+  $response['status'] = 'OK';
+}
+
+/**
+ * XMLRPC push command.
+ */
+function cim_request_push($request, &$response, $crypt, $peer) {
+  // @todo switch user.
+  $changeset = !empty($request['changeset']) ? $request['changeset'] : NULL;
+  $latest = cim_get_controller()->latest();
+
+  $response['latest_sha'] = $latest->sha();
+  if (!($changeset instanceof Changeset)) {
+    watchdog('cim', 'Invalid push request.', NULL, WATCHDOG_WARNING);
+    $response['message'] = 'Not proper changeset.';
+    return;
+  }
+
+  if ($latest->sha() != $request['base_sha']) {
+    // Not based on latest snapshot. Return error.
+    $response['message'] = 'Base SHA not latest.';
+    return;
+  }
+
+  /* Check that there's no conflicting local changes, not yet snapshotted. We do
+   * that by creating a changeset for the local changes, and testing if it
+   * applies to the new config.
+  */
+  if ($current = cim_get_controller()->create()) {
+    // @todo why is $lastest->dump() not already a ConfigArray?
+    $post_push = $changeset->apply(new ConfigArray($latest->dump()));
+    if (!$current->changeset()->appliesTo($post_push)) {
+      $response['message'] = 'Conflicts with local chanegs.';
+      return;
+    }
+  }
+
+  $message = !empty($request['message']) &&
+    ($request['message'] != 'No message.') ?
+    'Changeset pushed from ' . $peer['name'] . ' with message "' .
+    $request['message'] . '"' : 'Changeset pushed from ' . $peer->name() . ' without a message.';
+
+  $new_snapshot = cim_get_controller()->apply($changeset, $message);
+  if ($new_snapshot) {
+    $response['latest_sha'] = $new_snapshot->sha();
+    $response['status'] = 'OK';
+  }
+  else {
+    $response['message'] = 'Could not apply changeset.';
+  }
+}
+
+/**
+ * Returns site keys.
+ *
+ * @todo proper key storage.
+ */
+function cim_keys() {
+  $keys = &drupal_static(__FUNCTION__);
+  // @todo not convinced that using the php extension is a safe bet, this needs
+  // more investigation
+  $path = config_get_config_directory() . '/cim_key.php';
+  if (!file_exists($path)) {
+    $crypto = new Crypt();
+    $crypto->keyGen();
+    $keys = $crypto->getKeyPair();
+    $php = "<?php\n\n\$keys = " . var_export($keys, TRUE) . ";\n";
+    file_put_contents($path, $php);
+  }
+  else {
+    include $path;
+  }
+  return $keys;
+}
+
+/**
+ * Returns the peer configured as upstream.
+ */
+function cim_upstream() {
+  $peer_id = cim_get_storage()->read('upstream');
+  if (!($peer = Peer::load($peer_id))) {
+    throw new Exception('No upstream.');
+  }
+  return $peer;
+}
