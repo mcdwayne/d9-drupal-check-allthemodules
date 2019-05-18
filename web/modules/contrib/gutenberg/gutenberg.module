@@ -1,0 +1,678 @@
+<?php
+
+/**
+ * @file
+ * Provides integration with the Gutenberg editor.
+ */
+
+use Drupal\Core\Entity\EntityFormInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\node\NodeInterface;
+use Drupal\views\ViewExecutable;
+use Symfony\Component\Yaml\Yaml;
+use Drupal\Core\Discovery\YamlDiscovery;
+use Drupal\image\Entity\ImageStyle;
+use Drupal\gutenberg\Controller\UtilsController;
+
+/**
+ * Implements hook_form_alter().
+ */
+function gutenberg_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  if ($form_id == 'node_type_edit_form' || $form_id == 'node_type_add_form') {
+    $config = \Drupal::service('config.factory')->getEditable('gutenberg.settings');
+
+    $form['gutenberg'] = [
+      '#type' => 'details',
+      '#title' => t('Gutenberg experience'),
+      '#description' => t(''),
+      '#group' => 'additional_settings',
+      '#weight' => 999,
+      'enable_gutenberg_experience' => [
+        '#type' => 'checkbox',
+        '#title' => t('Enable Gutenberg experience'),
+        '#description' => t('Turn the node edit form into a full Gutenberg UI experience. At least one field of long text type is necessary.'),
+        '#default_value' => $config->get($form['type']['#default_value'] . '_enable_full'),
+      ],
+    ];
+
+    $form['gutenberg']['categories'] = [
+      '#type' => 'hidden',
+      '#default_value' => [],
+    ];
+
+    $form['gutenberg']['allowed_blocks_details'] = [
+      '#type' => 'details',
+      '#title' => t('Allowed Gutenberg blocks'),
+      '#states' => [
+        'visible' => [
+          'input[name="enable_gutenberg_experience"]' => ['checked' => TRUE],
+        ]
+      ],
+    ];
+
+    $settings = _gutenberg_get_allowed_blocks();
+    $blocks_settings = UtilsController::getBlocksSettings();
+
+    foreach ($settings['categories'] as $category) {
+      $category['reference'] = str_replace('/', '-', $category['reference']);
+      $form['gutenberg']['categories']['#default_value'][] = $category['reference'];
+
+      $form['gutenberg']['allowed_blocks_details'][$category['reference']] = [
+        '#type' => 'fieldset',
+        '#title' => $category['name'],
+      ];
+
+      $options = [$category['reference'] . '/all' => t('All')];
+      foreach ($category['blocks'] as $block) {
+        if (!in_array($block['id'], $blocks_settings['blacklist'])) {
+          $options[$block['id']] = $block['name'];
+        }
+      }
+
+      $default_values = array_combine(
+        array_map(
+          function($block){
+            return $block['id'];
+          },
+          $category['blocks']
+        ),
+        array_map(
+          function($block){
+            return $block['default'] ? $block['id'] : 0;
+          },
+          $category['blocks']
+        )
+      );
+
+      $config_values = $config->get($form['type']['#default_value'] . '_allowed_blocks');
+
+      $form['gutenberg']['allowed_blocks_details'][$category['reference']]['allowed_blocks_' . $category['reference']] = [
+        '#type' => 'checkboxes',
+        '#options' => $options,
+        '#default_value' => array_merge($default_values, $config_values ? $config_values : []),
+      ];
+    }
+
+    $form['gutenberg']['allowed_drupal_blocks_details'] = [
+      '#type' => 'details',
+      '#title' => t('Allowed Drupal blocks'),
+      '#states' => [
+        'visible' => [
+          'input[name="enable_gutenberg_experience"]' => ['checked' => TRUE],
+        ]
+      ],
+    ];
+
+    $blockManager = \Drupal::service('plugin.manager.block');
+    $contextRepository = \Drupal::service('context.repository');
+
+    // Get blocks definition
+    // $definitions = $blockManager->getDefinitionsForContexts($contextRepository->getAvailableContexts());
+    $definitions = $blockManager->getDefinitions($contextRepository->getAvailableContexts());
+    $groups = $blockManager->getGroupedDefinitions($definitions);
+
+    $form['gutenberg']['categories_drupal'] = [
+      '#type' => 'hidden',
+      '#default_value' => [],
+    ];
+
+    $default_values = array_fill_keys(
+      array_map(function($key){
+        return str_replace('drupalblock/', '', $key);
+      }, $settings['default_drupal_blocks']),
+      true
+    );
+
+    foreach ($groups as $key => $blocks) {
+      $group_reference = preg_replace('@[^a-z0-9-]+@','_', strtolower($key));
+      $options = [];
+      $input_default_values = [];
+
+      foreach ($blocks as $key_block => $block) {
+        if (!in_array('drupalblock/' . $key_block, $blocks_settings['blacklist'])) {
+          $options[$key_block] = $block['admin_label'];
+          if (isset($default_values[$key_block]) && $default_values[$key_block]) {
+            $input_default_values[$key_block] = $key_block;
+          }
+        }
+      }
+
+      if (count($options) > 0) {
+        $form['gutenberg']['categories_drupal']['#default_value'][] = $group_reference;
+        $form['gutenberg']['allowed_drupal_blocks_details'][$group_reference] = [
+          '#type' => 'fieldset',
+          '#title' => $key,
+        ];
+  
+        $config_values = $config->get($form['type']['#default_value'] . '_allowed_drupal_blocks');
+  
+        $form['gutenberg']['allowed_drupal_blocks_details'][$group_reference]['allowed_drupal_blocks_' . $group_reference] = [
+          '#type' => 'checkboxes',
+          '#options' => $options,
+          '#default_value' => array_merge($input_default_values, $config_values ? $config_values : []),
+        ];
+      }
+    }
+
+    $form['#attached']['library'][] = 'gutenberg/admin';
+    $form['actions']['submit']['#submit'][] = '_gutenberg_node_form_submit';
+  }
+}
+
+/**
+ *
+ */
+function _gutenberg_node_form_submit(array $form, FormStateInterface $form_state) {
+  $gutenberg_enabled =  $form_state->getValue('enable_gutenberg_experience');
+
+  $config = \Drupal::service('config.factory')->getEditable('gutenberg.settings');
+  $config->set($form_state->getValue('type') . '_enable_full', $gutenberg_enabled)->save();
+
+  if (!$gutenberg_enabled) {
+    $config->delete($form_state->getValue('type') . '_allowed_blocks')->save();
+    $config->delete($form_state->getValue('type') . '_allowed_drupal_blocks')->save();
+    return;
+  }
+
+  // Save Gutenberg core blocks settings.
+  $categories = explode(' ', $form_state->getValue('categories'));
+  $values = [];
+  foreach ($categories as $category) {
+    $values = array_merge($values, $form_state->getValue('allowed_blocks_' . $category));
+  }
+  $config->set($form_state->getValue('type') . '_allowed_blocks', $values)->save();
+
+  // Save Drupal blocks settings.
+  $categories = explode(' ', $form_state->getValue('categories_drupal'));
+  $values = [];
+  foreach ($categories as $category) {
+    $values = array_merge($values, $form_state->getValue('allowed_drupal_blocks_' . $category));
+  }
+  $config->set($form_state->getValue('type') . '_allowed_drupal_blocks', $values)->save();
+}
+
+/**
+ * Implements hook_form_node_form_alter().
+ */
+function gutenberg_form_node_form_alter(&$form, FormStateInterface $form_state) {
+  $config = \Drupal::service('config.factory')->getEditable('gutenberg.settings');
+  $node = $form_state->getFormObject()->getEntity();
+  $node_type = $node->type->getString();
+
+  $gutenberg_enabled = $config->get($node_type . '_enable_full');
+
+  // Leave early if Gutenberg not enabled.
+  if (!$gutenberg_enabled) {
+    return;
+  }
+
+  $module_settings = _gutenberg_get_all_modules_settings();
+  foreach ($module_settings as $provider => $settings) {
+    if (isset($settings['libraries-edit'])) {
+      foreach($settings['libraries-edit'] as $library) {
+        $form['#attached']['library'][] = $library;
+      }
+    }
+  }
+
+  $theme_settings = _gutenberg_get_default_theme_settings();
+  if (isset($theme_settings['libraries-edit'])) {
+    foreach ($theme_settings['libraries-edit'] as $key => $value) {
+      $form['#attached']['library'][] = $value;
+    }
+  }
+  if (isset($theme_settings['theme-support'])) {
+    $form['#attached']['drupalSettings']['gutenberg']['theme-support'] = $theme_settings['theme-support'];
+  }
+
+  // Set available image sizes for editor.
+  $styles = ImageStyle::loadMultiple();
+  $sizes = [
+    [
+      'slug' => 'full',
+      'name' => t('Original'),
+    ],
+  ];
+  foreach ($styles as $key => $style) {
+    $sizes[] = [
+      'slug' => $style->getName(),
+      'name' => $style->label(),
+    ];
+  }
+  $form['#attached']['drupalSettings']['gutenberg']['image-sizes'] = $sizes;
+
+  $text_fields = [];
+
+  // Iterate over all node fields and apply gutenberg text format
+  // on first text field found.
+  $field_names = array_keys($node->getFields());
+
+  foreach ($field_names as $key => $value) {
+    $field = $node
+      ->getFieldDefinition($value)
+      ->getFieldStorageDefinition()
+      ->getPropertyDefinitions();
+
+    $field_properties = array_keys($node
+      ->getFieldDefinition($value)
+      ->getFieldStorageDefinition()
+      ->getPropertyDefinitions());
+
+    if (in_array('format', $field_properties)) {
+      $text_fields[] = $value;
+    }
+  }
+
+  // No point going forward when no text fields on the form.
+  if (count($text_fields) === 0) {
+    return;
+  }
+
+  $form[$text_fields[0]]['widget'][0]['#format'] = 'gutenberg';
+  $form[$text_fields[0]]['#attributes']['class'][] = 'field--gutenberg';
+
+  // Hide the field label.
+  $form[$text_fields[0]]['widget'][0]['#title_display'] = 'hidden';
+
+  // Disable the summary field.
+  if (isset($form[$text_fields[0]]['widget'][0]['summary'])) {
+    $form[$text_fields[0]]['widget'][0]['summary']['#access'] = FALSE;
+  }
+
+  foreach ($text_fields as $fieldname) {
+    // For the rest of the text fields call after build to remove
+    // Gutenberg from text format options.
+    if ($gutenberg_enabled) {
+      if ($text_fields[0] !== $fieldname) {
+        $form[$fieldname]['widget']['#after_build'][] = 'gutenberg_form_node_form_after_build';
+      }
+    }
+    else {
+      $form[$fieldname]['widget']['#after_build'][] = 'gutenberg_form_node_form_after_build';
+    }
+  }
+
+  // Let's move the remaining fields to a "special"
+  // form group that can be used lated by JS to move to
+  // Gutenberg's sidebar.
+  // $form['additional_fields'] = [
+  //   '#type' => 'details',
+  //   '#access' => TRUE,
+  //   '#title' => t('More settings'),
+  //   '#weight' => 99,
+  //   '#group' => 'advanced',
+  // ];
+
+  $form['metabox_fields'] = [
+    '#type' => 'details',
+    '#access' => TRUE,
+    '#title' => t('More settings'),
+    '#weight' => 99,
+    '#group' => 'advanced', // group fallback in case JS fails to move to metaboxes.
+  ];
+
+  // Some other module might have already init this container.
+  if (!isset($form['additional_fields'])) {
+    $form['additional_fields'] = [
+      '#type' => 'container',
+      '#title' => 'Additional',
+      '#weight' => -100,
+    ];
+  }
+
+  // Move status to Published/meta pane.
+  $form['status']['#group'] = 'meta';
+
+  $excluded_fields = [
+    'status',
+    'title',
+    'uid',
+    'created',
+    'changed',
+    'promote',
+    'sticky',
+    'path',
+    'comment',
+    'revision_log',
+    'langcode',
+  ];
+
+  /**
+   * Rationale behind this "messy" algo:
+   * If there's any details fieldset on the form, add it to a special array
+   * and then, on the form after build, add its #id to a JS array.
+   * For any other type of fields, group them on the metabox_fields fieldset.
+   * This fieldset will also move to metaboxes area.
+   */
+  $metabox_has_fields = FALSE;
+  $fields_with_details = [];
+  foreach ($field_names as $key => $value) {
+    if (
+      array_key_exists($value, $form)
+      && $value !== $text_fields[0]
+      && !in_array($value, $excluded_fields)
+    ) {
+      if (isset($form[$value]['widget'])
+        && isset($form[$value]['widget'][0])
+        && isset($form[$value]['widget'][0]['#type'])
+        && $form[$value]['widget'][0]['#type'] === 'details') {
+        $fields_with_details[] = $value;
+      } else {
+        $form[$value]['#group'] = 'metabox_fields';
+        $metabox_has_fields = TRUE;
+      }
+    }
+  }
+
+  $form['#after_build'][] = 'gutenberg_form_node_form_details_after_build';
+  $form['#fields_with_details'] = $fields_with_details;
+
+  if (!$metabox_has_fields) {
+    unset($form['metabox_fields']);
+  }
+  // Is Bartik the default theme? Add some custom styles
+  // to look even better.
+  $default_theme = \Drupal::config('system.theme')->get('default');
+  if ($default_theme === 'bartik') {
+    $form['#attached']['library'][] = 'gutenberg/bartik';
+  }
+
+  $form['#attached']['drupalSettings']['gutenberg']['metaboxes'][] = 'edit-metabox-fields';
+}
+
+function gutenberg_handle_messages(&$form) {
+  $messages = \Drupal::messenger()->deleteAll();
+  $form['#attached']['drupalSettings']['gutenberg']['messages'] = $messages;
+}
+
+/**
+ * Called by after build text fields on the form.
+ */
+function gutenberg_form_node_form_after_build(array $element, FormStateInterface $form_state) {
+  unset($element[0]['format']['format']['#options']['gutenberg']);
+  return $element;
+}
+
+/**
+ * Called by form after build.
+ */
+function gutenberg_form_node_form_details_after_build(array $element, FormStateInterface $form_state) {
+  // gutenberg_handle_messages($element);
+
+  foreach ($element['#fields_with_details'] as $key => $value) {
+    $element['#attached']['drupalSettings']['gutenberg']['metaboxes'][] = $element[$value]['widget'][0]['#id'];
+  }
+  return $element;
+}
+
+/**
+ * Implements template_preprocess_field().
+ */
+function gutenberg_preprocess_node(&$variables) {
+  $config = \Drupal::service('config.factory')->getEditable('gutenberg.settings');
+  $node = $variables['elements']['#node'];
+  $node_type = $node->type->getString();
+
+  $gutenberg_enabled = $config->get($node_type . '_enable_full');
+
+  if (!$gutenberg_enabled) {
+    return;
+  }
+
+  $variables['#attached']['library'][] = 'gutenberg/blocks-view';
+
+  $module_settings = _gutenberg_get_all_modules_settings();
+  foreach ($module_settings as $provider => $settings) {
+    if (isset($settings['libraries-view'])) {
+      foreach($settings['libraries-view'] as $library) {
+        $variables['#attached']['library'][] = $library;
+      }
+    }
+  }
+
+  $default_theme = \Drupal::config('system.theme')->get('default');
+  if ($default_theme === 'bartik') {
+    $variables['#attached']['library'][] = 'gutenberg/bartik';
+  }
+}
+
+/**
+ *
+ */
+function _gutenberg_get_default_theme_settings() {
+  $settings = &drupal_static(__FUNCTION__);
+
+  if (!isset($settings)) {
+    $theme_name = \Drupal::config('system.theme')->get('default');
+    $theme_path = drupal_get_path('theme', $theme_name);
+
+    $file_path = DRUPAL_ROOT . '/' . $theme_path . '/' . $theme_name . '.gutenberg.yml';
+    if (file_exists($file_path)) {
+      $file_contents = file_get_contents($file_path);
+      $settings = Yaml::parse($file_contents);
+    }
+  }
+
+  return $settings;
+}
+
+/**
+ *
+ */
+function _gutenberg_get_all_modules_settings() {
+  $settings = &drupal_static(__FUNCTION__);
+
+  if(!isset($settings)) {
+    $directories = \Drupal::service('module_handler')->getModuleDirectories();
+    $discovery = new YamlDiscovery('gutenberg', $directories);
+    $settings = $discovery->findAll();
+  }
+
+  return $settings;
+}
+
+function _gutenberg_get_allowed_blocks() {
+  $settings = &drupal_static(__FUNCTION__);
+
+  if(!isset($settings)) {
+    $module_handler = \Drupal::service('module_handler');
+    $path = $module_handler->getModule('gutenberg')->getPath();
+
+    $file_path = DRUPAL_ROOT . '/' . $path . '/' . 'gutenberg.blocks.yml';
+    if (file_exists($file_path)) {
+      $file_contents = file_get_contents($file_path);
+      $settings = Yaml::parse($file_contents);
+    }
+  }
+
+  return $settings;
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK_alter().
+ */
+function gutenberg_theme_suggestions_node_edit_form_alter(array &$suggestions, array $variables) {
+  $config = \Drupal::service('config.factory')->getEditable('gutenberg.settings');
+  $node = \Drupal::routeMatch()->getParameter('node');
+
+  if (!$node) {
+    $route_match = \Drupal::service('current_route_match');
+    if (!$route_match->getParameter('node_type')) {
+      return;
+    }
+    $node_type = $route_match->getParameter('node_type')->get('type');
+  }
+  else {
+    $node_type = $node->type->getString();
+  }
+
+  $gutenberg_enabled = $config->get($node_type . '_enable_full');
+
+  if (!$gutenberg_enabled) {
+    return;
+  }
+
+  $suggestions = ['node_edit_form__gutenberg'];
+}
+
+/**
+ * Implements hook_theme_registry_alter.
+ */
+function gutenberg_theme_registry_alter(&$theme_registry) {
+  // dsm($theme_registry);
+  // $theme_registry['page']['path'] = drupal_get_path('module', 'my_module') . '/templates';
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK_alter().
+ */
+function gutenberg_theme_suggestions_page_alter(array &$suggestions, array $variables) {
+  if (!in_array('page__node__edit', $suggestions)
+      && !in_array('page__node__add', $suggestions)) {
+    return;
+  }
+
+  $config = \Drupal::service('config.factory')->getEditable('gutenberg.settings');
+  $node = \Drupal::routeMatch()->getParameter('node');
+
+  if (!$node) {
+    $route_match = \Drupal::service('current_route_match');
+    if (!$route_match->getParameter('node_type')) {
+      return;
+    }
+    $node_type = $route_match->getParameter('node_type')->get('type');
+  }
+  else {
+    $node_type = $node->type->getString();
+  }
+
+  $gutenberg_enabled = $config->get($node_type . '_enable_full');
+
+  if ($gutenberg_enabled) {
+    if (in_array('page__node__edit', $suggestions)) {
+      $suggestions = ['page__node__edit__gutenberg'];
+    }
+
+    if (in_array('page__node__add', $suggestions)) {
+      $suggestions = ['page__node__add__gutenberg'];
+    }
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function gutenberg_theme() {
+  return [
+    'page__node__edit__gutenberg' => [
+      'template' => 'page--node--edit--gutenberg',
+    ],
+    'page__node__add__gutenberg' => [
+      'template' => 'page--node--add--gutenberg',
+    ],
+    'node_edit_form__gutenberg' => [
+      'template' => 'node-edit-form--gutenberg',
+    ],
+  ];
+}
+
+/**
+ * Implements hook_element_info_alter().
+ */
+function gutenberg_element_info_alter(array &$info) {
+  if (!empty($info['text_format'])) {
+    // Add custom processor to eliminate the format if needed.
+    $info['text_format']['#process'][] = '_gutenberg_text_format_processor';
+  }
+}
+
+/**
+ * Process the text format element to eliminate the gutenberg format.
+ *
+ * On the fields that don't belong to content types with enabled gutenberg
+ * experience there is no need to have the gutenberg format.
+ *
+ * @param array $element
+ *   Render Element.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   Form state object.
+ * @param array $complete_form
+ *   Complete form array.
+ *
+ * @return array
+ *   Processed render element.
+ */
+function _gutenberg_text_format_processor($element, FormStateInterface $form_state, array &$complete_form) {
+  // Check first if the format is in the list. It might be disabled or the
+  // current user has not rights to access it.
+  if (!empty($element['format']) && isset($element['format']['format']['#options']['gutenberg'])) {
+    // By default let's assume that gutenberg format is not allowed.
+    $gutenberg_allowed = FALSE;
+    /** @var \Drupal\Core\Entity\ContentEntityForm $form */
+    $form = $form_state->getFormObject();
+    // Check whether the form that contains the element is an EntityForm.
+    if ($form instanceof EntityFormInterface) {
+      // Get the entity from the form object for further processing.
+      $entity = $form->getEntity();
+      // Check whether entity is of node type, because currently only them are
+      // supported.
+      if ($entity instanceof NodeInterface) {
+        // Get the node type to get the Gutenberg experience setting.
+        $node_type = $entity->bundle();
+        /** @var \Drupal\Core\Config\Config $config */
+        $config = \Drupal::service('config.factory')
+          ->getEditable('gutenberg.settings');
+        $gutenberg_enabled = $config->get($node_type . '_enable_full');
+        if (!empty($gutenberg_enabled)) {
+          // Gutenberg experience is enabled for current content type and
+          // the current user is allowed to use the format.
+          $gutenberg_allowed = TRUE;
+        }
+      }
+    }
+    // If Gutenberg experience is not enabled for the current form or
+    // current user is not allowed to use the format, disable the choice of
+    // Gutenberg format for this element.
+    if (!$gutenberg_allowed) {
+      unset($element['format']['format']['#options']['gutenberg']);
+    }
+  }
+  return $element;
+}
+
+/**
+ * Implements hook_views_pre_render().
+ */
+function gutenberg_views_pre_render(ViewExecutable $view) {
+  if ($view->id() == "reusable_blocks" && $view->current_display == 'page_1') {
+    // Attached Gutenberg's basic style to reusable blocks view.
+    // $view->element['#attached']['library'][] = 'gutenberg/frontend';
+    $view->element['#attached']['library'][] = 'gutenberg/admin';
+    $view->element['#attached']['library'][] = 'gutenberg/blocks-view';
+  }
+}
+
+/**
+ * Implements hook_library_info_alter().
+ */
+function gutenberg_library_info_alter(&$libraries, $extension) {
+  if ($extension === 'gutenberg') {
+    $moduleHandler = \Drupal::moduleHandler();
+    $js_files_edit = [];
+    $css_files_edit = [];
+    $css_files_view = [];
+    $moduleHandler->alter('gutenberg_blocks', $js_files_edit, $css_files_edit, $css_files_view);
+
+    foreach ($js_files_edit as $file) {
+      $libraries['blocks-edit']['js'][$file] = [];
+    }
+
+    foreach ($css_files_edit as $file) {
+      $libraries['blocks-edit']['css']['base'][$file] = [];
+    }
+
+    foreach ($css_files_view as $file) {
+      $libraries['blocks-view']['css']['base'][$file] = [];
+    }
+  }
+}
