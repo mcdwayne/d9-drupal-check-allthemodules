@@ -1,0 +1,194 @@
+<?php
+
+/**
+ * @file
+ * Contains paragraphs_tools_setmode.module..
+ */
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\FieldableEntityInterface;
+use Drupal\Core\Field\FieldItemListInterface;
+use Drupal\Core\Field\WidgetInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\entity_reference_revisions\EntityReferenceRevisionsFieldItemList;
+use Drupal\Core\Entity\Entity\EntityFormDisplay;
+use Drupal\paragraphs\Plugin\Field\FieldWidget\InlineParagraphsWidget;
+
+/**
+ * Implements hook_field_widget_form_alter().
+ * 
+ * @param array $element
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ * @param array $context
+ */
+function paragraphs_tools_setmode_field_widget_form_alter(&$element, FormStateInterface $form_state, $context) {
+  $key = paragraphs_tools_setmode_querystring_key();
+  $request = Drupal::request();
+  $query = $request->query;
+  if ($query->has($key)) {
+    /** @var array $form */
+    $form = $context['form'];
+    /** @var WidgetInterface $widget */
+    $widget = $context['widget'];
+    /** @var FieldItemListInterface $items */
+    $items = $context['items'];
+    /** @var int $delta */
+    $delta = $context['delta'];
+    /** @var bool $default */
+    $default = $context['default'];
+
+    $field_name = $items->getName();
+
+    $querystring = $query->get($key);
+    $commands = paragraphs_tools_setmode_parse($querystring, $items->getEntity(), $errors);
+
+    if ($errors) {
+      foreach ($errors as $error) {
+        drupal_set_message($error, 'error');
+      }
+      return;
+    }
+    
+    if (!empty($commands[$field_name][$delta])) {
+      $mode = $commands[$field_name][$delta];
+    }
+    elseif (!empty($commands[$field_name]['*'])) {
+      $mode = $commands[$field_name]['*'];
+    }
+    if (!empty($mode)) {
+      $mode_parents = ['field_storage', '#parents', '#fields', $field_name, 'paragraphs', $delta, 'mode'];
+      $form_state->set($mode_parents, $mode);
+
+      // Voodoo...
+      // @see \Drupal\Core\Entity\Entity\EntityFormDisplay::buildForm
+      // @see \Drupal\paragraphs\Plugin\Field\FieldWidget\InlineParagraphsWidget::formMultipleElements
+      // @see \Drupal\Core\Field\WidgetBase::formSingleElement
+      $keys_to_preserve = ['#title', '#description', '#field_parents', '#required', '#delta', '#weight'];
+      $element = array_intersect_key($element, array_fill_keys($keys_to_preserve, TRUE));
+      $element = $widget->formElement($items, $delta, $element, $form, $form_state);
+    }
+  }
+}
+
+
+/**
+ * Get the query key.
+ * 
+ * This can be made configurable later.
+ * 
+ * @return string
+ */
+function paragraphs_tools_setmode_querystring_key() {
+  return 'paragraphs-tools-setmode';
+}
+
+/**
+ * Parse our query string.
+ *
+ * @todo This may get some caching.
+ *
+ * @param $string
+ *  The query string. Syntax is like
+ *   node/add/foo?paragraphs-preopen=field_par1:text|field_par1:image|field_par2:link
+ * @param EntityInterface $entity
+ *   THe entity to edit.
+ * @param array $errors
+ *   Errors returned by reference.
+ * @return array
+ *   An array of commands.
+ */
+function paragraphs_tools_setmode_parse($string, EntityInterface $entity, &$errors = NULL) {
+  if (!$errors) {
+    $errors = [];
+  }
+  $t_args = [
+    '%par' => paragraphs_tools_setmode_querystring_key(),
+  ];
+  if (!is_string($string) || !$string) {
+    $errors[] = t('Query parameter %par must be a nonempty string.', $t_args);
+    return [];
+  }
+  if (!$entity instanceof FieldableEntityInterface) {
+    $errors[] = t('Query parameter %par must only be used for fieldable entities.', $t_args);
+    return [];
+  }
+  /** @var FieldableEntityInterface $entity */
+  $form_entity_type = $entity->getEntityType()->id();
+  $t_args['%type'] = $form_entity_type;
+  $t_args['%bundle'] = $entity->bundle();
+  
+  $chunks = explode('|', $string);
+  $commands = [];
+  foreach ($chunks as $chunk) {
+    $t_args['%chunk'] = $chunk;
+    $parts = explode(':', $chunk);
+    if (count($parts) == 3) {
+      $parts[] = '*';
+    }
+    if (count($parts) == 4) {
+      // That's good.
+    }
+    else {
+      $errors[] = t('Query parameter %par: Can not understand %chunk.', $t_args);
+      continue;
+    }
+
+    list($mode, $entity_type, $field_name, $delta) = $parts;
+    if ($form_entity_type !== $entity_type) {
+      // This does not concern us.
+      continue;
+    }
+    $t_args['%mode'] = $mode;
+    $t_args['%field'] = $field_name;
+    $t_args['%delta'] = $delta;
+
+    $modes = ['edit', 'preview', 'closed', 'collapsed', 'remove'];
+    if (!in_array($mode, $modes)) {
+      $t_args['%modes'] = implode(', ', $modes);
+      $errors[] = t('Query parameter %par: Mode %mode not allowed. Allowed values are: %modes.', $t_args);
+      continue;
+    }
+
+    if (!$entity->hasField($field_name)) {
+      $errors[] = t('Query parameter %par: %type bundle %bundle does not have field %field.', $t_args);
+      continue;
+    }
+
+    /** @var FieldItemListInterface $field */
+    $field = $entity->get($field_name);
+    if (!(paragraphs_tools_setmode_field_is_paragraph($field))) {
+      $errors[] = t('Query parameter %par: Field %field must be of type paragraph.', $t_args);
+      continue;
+    }
+    /** @var EntityReferenceRevisionsFieldItemList $field */
+
+    if ($delta === '*') {
+      // Fine.
+    }
+    elseif (preg_match('/-?[0-9]+', $delta)) {
+      // Good. We voluntarily allow leading zeros here and do not check if the
+      // delta really exists.
+      if ($delta < 0) {
+        $delta += $field->count();
+      }
+    } else {
+      $errors[] = t('Query parameter %par: Delta %delta not allowed. Must be integer, "*" or omitted.', $t_args);
+      continue;
+    }
+
+    $commands[$field_name][$delta] = $mode;
+  }
+  return $commands;
+}
+
+/**
+ * Check if field is paragraph items.
+ *
+ * @param FieldItemListInterface $field
+ * @return bool
+ */
+function paragraphs_tools_setmode_field_is_paragraph(FieldItemListInterface $field) {
+  $field_is_entity_reference_revisions = $field instanceof EntityReferenceRevisionsFieldItemList;
+  $field_has_paragraph_handler = $field->getItemDefinition()
+      ->getSetting('handler') === 'default:paragraph';
+  return $field_is_entity_reference_revisions && $field_has_paragraph_handler;
+}

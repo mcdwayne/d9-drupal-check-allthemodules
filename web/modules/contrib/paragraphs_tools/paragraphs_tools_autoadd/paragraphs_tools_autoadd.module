@@ -1,0 +1,162 @@
+<?php
+
+/**
+ * @file
+ * Contains paragraphs_tools_autoadd.module..
+ */
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\FieldableEntityInterface;
+use Drupal\Core\Field\FieldItemListInterface;
+use Drupal\Core\Field\WidgetInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\entity_reference_revisions\EntityReferenceRevisionsFieldItemList;
+use Drupal\Core\Entity\Entity\EntityFormDisplay;
+use Drupal\paragraphs\Plugin\Field\FieldWidget\InlineParagraphsWidget;
+
+/**
+ * Implements hook_entity_prepare_form().
+ * 
+ * @param EntityInterface $entity
+ * @param string $operation
+ * @param FormStateInterface $form_state
+ */
+function paragraphs_tools_autoadd_entity_prepare_form(EntityInterface $entity, $operation, FormStateInterface $form_state) {
+
+  $key = paragraphs_tools_autoadd_querystring_key();
+  $request = Drupal::request();
+  $query = $request->query;
+  if ($query->has($key)) {
+    $querystring = $query->get($key);
+    $commands = paragraphs_tools_autoadd_parse($querystring, $entity, $errors);
+    if ($errors) {
+      foreach ($errors as $error) {
+        drupal_set_message($error, 'error');
+      }
+      return;
+    }
+
+    $entity_manager = \Drupal::entityManager();
+    $langcode = $form_state->get('langcode');
+
+    // The thorough checks in the parser guarantee we won't get exceptions here.
+    /** @var FieldableEntityInterface $entity */
+    foreach ($commands as $field_name => $bundles) {
+      $field = $entity->get($field_name);
+      $target_type = $field->getSetting('target_type');
+      foreach ($bundles as $bundle_name) {
+        // Create paragraph and display.
+        $entity_type = $entity_manager->getDefinition($target_type);
+        $bundle_key = $entity_type->getKey('bundle');
+        /** @var FieldableEntityInterface $paragraphs_entity */
+        $paragraphs_entity = $entity_manager->getStorage($target_type)->create(array(
+          $bundle_key => $bundle_name,
+          'langcode' => $langcode,
+        ));
+
+        // Field values.
+        $field->appendItem($paragraphs_entity);
+      }
+    }
+  }
+}
+
+/**
+ * Get the query key.
+ * 
+ * This can be made configurable later.
+ * 
+ * @return string
+ */
+function paragraphs_tools_autoadd_querystring_key() {
+  return 'paragraphs-tools-autoadd';
+}
+
+/**
+ * Parse our query string.
+ *
+ * @param $string
+ *  The query string. Syntax is like
+ *   node/add/foo?paragraphs-autoadd=field_par1:text|field_par1:image|field_par2:link
+ * @param EntityInterface $entity
+ *   THe entity to edit.
+ * @param array $errors
+ *   Errors returned by reference.
+ * @return array
+ *   An array of commands.
+ */
+function paragraphs_tools_autoadd_parse($string, EntityInterface $entity, &$errors = NULL) {
+  if (!$errors) {
+    $errors = [];
+  }
+  $t_args = [
+    '%par' => paragraphs_tools_autoadd_querystring_key(),
+  ];
+  if (!is_string($string) || !$string) {
+    $errors[] = t('Query parameter %par must be a nonempty string.', $t_args);
+    return [];
+  }
+  if (!$entity instanceof FieldableEntityInterface) {
+    $errors[] = t('Query parameter %par must only be used for fieldable entities.', $t_args);
+    return [];
+  }
+  /** @var FieldableEntityInterface $entity */
+  $form_entity_type = $entity->getEntityType()->id();
+  $t_args['%type'] = $form_entity_type;
+  $t_args['%bundle'] = $entity->bundle();
+  
+  $chunks = explode('|', $string);
+  $commands = [];
+  foreach ($chunks as $chunk) {
+    $t_args['%chunk'] = $chunk;
+    $parts = explode(':', $chunk);
+    if (count($parts) !== 3) {
+      $errors[] = t('Query parameter %par: Can not understand %chunk.', $t_args);
+      continue;
+    }
+    
+    list($entity_type, $field_name, $target_bundle) = $parts;
+    if ($form_entity_type !== $entity_type) {
+      // This does not concern us.
+      continue;
+    }
+
+    $t_args['%field'] = $field_name;
+    $t_args['%target'] = $target_bundle;
+    
+    if (!$entity->hasField($field_name)) {
+      $errors[] = t('Query parameter %par: %type bundle %bundle does not have field %field.', $t_args);
+      continue;
+    }
+
+    /** @var FieldItemListInterface $field */
+    $field = $entity->get($field_name);
+    if (!(paragraphs_tools_autoadd_field_is_paragraph($field))) {
+      $errors[] = t('Query parameter %par: Field %field must be of type paragraph.', $t_args);
+      continue;
+    }
+    /** @var EntityReferenceRevisionsFieldItemList $field */
+
+    $handler_settings = $field->getItemDefinition()->getSetting('handler_settings');
+    $target_bundles = $handler_settings['target_bundles'];
+    if (!isset($target_bundles[$target_bundle])) {
+      $errors[] = t('Query parameter %par: Field %field does not allow paragraph type %target.', $t_args);
+      continue;
+    }
+    
+    $commands[$field_name][] = $target_bundle;
+  }
+  return $commands;
+}
+
+/**
+ * Check if field is paragraph items.
+ *
+ * @param FieldItemListInterface $field
+ * @return bool
+ */
+function paragraphs_tools_autoadd_field_is_paragraph(FieldItemListInterface $field) {
+  $field_is_entity_reference_revisions = $field instanceof EntityReferenceRevisionsFieldItemList;
+  $field_has_paragraph_handler = $field->getItemDefinition()
+      ->getSetting('handler') === 'default:paragraph';
+  return $field_is_entity_reference_revisions && $field_has_paragraph_handler;
+}
