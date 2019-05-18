@@ -1,0 +1,1295 @@
+<?php
+
+/**
+ * @file
+ * A module for uc_dropdown_attributes.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\node\Entity\Node;
+
+/**
+ * @file
+ * Show/hide attributes based on the values of other attributes.
+ *
+ * Some attributes may not be applicable depending upon the value of another
+ * attribute.  It may be desireable to hide the attribute unless an appropriate
+ * value is selected for the other attribute to avoid confusing users.  This
+ * module has an administrative interface for specifying the dependencies
+ * and Javascript code for hiding and showing the attributes.
+ */
+
+/**
+ * AJAX callback for the uc_dropdown_attributes_product form.
+ */
+function uc_dropdown_attributes_dependent_callback($form,
+  FormStateInterface $form_state) {
+
+  $trigger = $form_state->getTriggeringElement();
+
+  $wrapper = explode('-', $trigger['#ajax']['wrapper']);
+  $attribute = $wrapper[1];
+  return $form['attributes'][$attribute]['values'];
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function uc_dropdown_attributes_form_alter(&$form, $form_state, $form_id) {
+  if (!isset($form['node']['#value'])) {
+    return;
+  }
+  $nid = $form['node']['#value']->id();
+  $node = Node::load($nid);
+  if (!uc_product_is_product($nid) && 'product_kit' != $node->getType()) {
+    return;
+  }
+  if (isset($form['products'])) {
+    foreach ($form['products'] as $key => $value) {
+      if (is_numeric($key)) {
+        $type = uc_dropdown_attributes_dependency_type($key);
+        if (!is_null($type)) {
+          $input = &$form_state->getUserInput();
+          if (!isset($input['products'][$key])) {
+            $input['products'][$key] = array();
+          }
+          uc_dropdown_attributes_product_alter($key, $form['products'][$key],
+            $input['products'][$key], $type, $form_state->isRebuilding());
+          // Make sure these have not been added more than once.
+          if (!isset($form['#after_build']) ||
+              !in_array('_uc_dropdown_attributes_kit_build',
+                        $form['#after_build'])) {
+            $form['#after_build'][] = '_uc_dropdown_attributes_kit_build';
+          }
+        }
+      }
+    }
+  }
+  else {
+    $type = uc_dropdown_attributes_dependency_type($nid);
+    if (!is_null($type)) {
+      $values = $form_state->getValues();
+      uc_dropdown_attributes_product_alter($nid, $form, $values, $type,
+        $form_state->isRebuilding());
+      $form['node_id'] = array(
+        '#type' => 'hidden',
+        '#value' => $nid,
+      );
+      switch ($type) {
+        case 'node':
+          $form['#after_build'][] = '_uc_dropdown_attributes_product_build';
+          break;
+
+        case 'class':
+          $form['#after_build'][] = '_uc_dropdown_attributes_class_build';
+          break;
+      }
+    }
+  }
+}
+
+/**
+ * Alter products in preparation for drop down attributes.
+ *
+ * Adds the 'Select' and removes the default value.  Ubercart does this
+ * for required attributes but since these attributes can no longer be required
+ * if the attributes are dependent then this reproduces the same thing.
+ *
+ * @param int $nid
+ *   Node ID.
+ * @param array $form
+ *   Product form.
+ * @param array $form_values
+ *   Form values.
+ * @param string $type
+ *   For dependencies defined on the node level use 'node'; 'class' for
+ *   dependencies defined on the product class.
+ * @param bool $rebuild
+ *   Whether the form is being rebuilt.
+ */
+function uc_dropdown_attributes_product_alter($nid, &$form, $form_values, $type, $rebuild) {
+  $fields = array('aid', 'parent_aid', 'parent_values', 'required');
+  switch ($type) {
+    case 'node':
+      $attributes = \Drupal::database()->select('uc_dropdown_products', 'products')
+        ->fields('products', $fields)
+        ->condition('products.nid', $nid)
+        ->execute();
+      break;
+
+    case 'class':
+      $pcid = uc_dropdown_attributes_get_type($nid);
+      $attributes = \Drupal::database()->select('uc_dropdown_classes', 'classes')
+        ->fields('classes', $fields)
+        ->condition('classes.pcid', $pcid)
+        ->execute();
+      break;
+  }
+  $parent_aids = array();
+  if (!$rebuild && isset($form['node'])) {
+    $data = $form['node']['#value']->data;
+  }
+  $load = FALSE;
+  foreach ($attributes as $attribute) {
+    if ($attribute->parent_aid == 0) {
+      continue;
+    }
+    $parent_aid = $attribute->parent_aid;
+    $parent_aids[$parent_aid] = $parent_aid;
+    $aid = $attribute->aid;
+    if (($form['attributes'][$aid]['#type'] == 'textfield') ||
+        (isset($form['attributes'][$aid]['#options']) &&
+        count($form['attributes'][$aid]['#options'])) &&
+        $attribute->required) {
+
+      if (isset($form_values['attributes'][$parent_aid])) {
+        $values = unserialize($attribute->parent_values);
+        switch ($form['attributes'][$parent_aid]['#type']) {
+          case 'select':
+            $parent_value = $form_values['attributes'][$parent_aid];
+            if (in_array($parent_value, $values)) {
+              $form['attributes'][$aid]['#required'] = TRUE;
+            }
+            break;
+
+          case 'radios':
+            $parent_value = $form_values['attributes'][$parent_aid];
+            if (in_array($parent_value, $values)) {
+              $form['attributes'][$aid]['#required'] = TRUE;
+            }
+            break;
+
+          case 'checkboxes':
+            $parent_values = $form_values['attributes'][$parent_aid];
+            $values = unserialize($attribute->parent_values);
+            if (count(array_intersect($parent_values, $values)) > 0) {
+              $form['attributes'][$aid]['#required'] = TRUE;
+            }
+            break;
+
+        }
+      }
+
+      switch ($form['attributes'][$aid]['#type']) {
+        case 'select':
+          $form['attributes'][$aid]['#options'] = array('' => t('- Select -')) +
+            $form['attributes'][$aid]['#options'];
+          $form['attributes'][$aid]['#default_value'] = '';
+          if (!$rebuild && isset($data['attributes'][$aid])) {
+            $data['attributes'][$aid] = '';
+            $load = TRUE;
+          }
+          break;
+
+        case 'radios':
+          $form['attributes'][$aid]['#default_value'] = NULL;
+          if (!$rebuild && isset($data['attributes'][$aid])) {
+            $data['attributes'][$aid] = NULL;
+            $load = TRUE;
+          }
+          break;
+
+        case 'checkboxes':
+          $form['attributes'][$aid]['#default_value'] = array();
+          if (!$rebuild && isset($data['attributes'][$aid])) {
+            $data['attributes'][$aid] = array();
+            $load = TRUE;
+          }
+          break;
+
+      }
+    }
+  }
+  if ($load) {
+    $form['node']['#value'] = uc_product_load_variant($nid, $data);
+  }
+  $update = \Drupal::config('uc_product.settings')->get('update_node_view');
+  if (!$update) {
+    // If Ubercart update is not enabled then ajax needs to be attached to
+    // parent attributes.
+    foreach ($parent_aids as $aid) {
+      $form['attributes'][$aid]['#ajax'] = array(
+        'callback' => 'uc_dropdown_attributes_ajax_callback',
+        'wrapper' => $form['attributes']['#attributes']['id'],
+      );
+    }
+  }
+}
+
+/**
+ * Ajax callback for attribute selection form elements.
+ */
+function uc_dropdown_attributes_ajax_callback($form, $form_state) {
+  $trigger = $form_state->getTriggeringElement();
+  if ($form['node']['#value']->getType() == 'product_kit') {
+    $key = $trigger['#parents'][1];
+    return $form['products'][$key]['attributes'];
+  }
+  return $form['attributes'];
+}
+
+/**
+ * Form build for products.
+ *
+ * Callback for $form['#after_build'] for products. Adds the CSS to hide
+ * the dependent attributes.
+ */
+function _uc_dropdown_attributes_product_build($form, &$form_state) {
+  $nid = $form['node']['#value']->id();
+  $fields = array('aid', 'parent_aid', 'parent_values', 'required');
+  $attributes = \Drupal::database()->select('uc_dropdown_products', 'products')
+    ->fields('products', $fields)
+    ->condition('products.nid', $nid)
+    ->execute();
+  $trigger = $form_state->getTriggeringElement();
+  $form_values = $form_state->getValues();
+  if (!is_null($trigger)) {
+    $parents = $trigger['#parents'];
+    $parent_aid = $parents[1];
+    $parent_value = $trigger['#value'];
+    uc_dropdown_attributes_remove_values($parent_aid, $parent_value, $nid,
+      'node', $form_values);
+  }
+  foreach ($attributes as $attribute) {
+    if ($attribute->parent_aid == 0) {
+      continue;
+    }
+    $parent_value = $form_values['attributes'][$attribute->parent_aid];
+    $values = unserialize($attribute->parent_values);
+    if ($form['attributes'][$attribute->parent_aid]['#type'] == 'checkboxes') {
+      $parent_values = array_diff($parent_value, array(0));
+      if (count(array_intersect($parent_values, $values)) == 0) {
+        uc_dropdown_attributes_hide_attribute($form, $attribute->aid);
+        if ($attribute->required) {
+          uc_dropdown_attributes_clear_input($form, $form_state,
+            $attribute->aid);
+        }
+      }
+    }
+    else {
+      if (is_numeric($parent_value)) {
+        if (!in_array($parent_value, $values)) {
+          uc_dropdown_attributes_hide_attribute($form, $attribute->aid);
+          if ($attribute->required) {
+            uc_dropdown_attributes_clear_input($form, $form_state,
+              $attribute->aid);
+          }
+        }
+      }
+      else {
+        uc_dropdown_attributes_hide_attribute($form, $attribute->aid);
+        if ($attribute->required) {
+          uc_dropdown_attributes_clear_input($form, $form_state,
+            $attribute->aid);
+        }
+      }
+    }
+  }
+  return $form;
+}
+
+/**
+ * Hide attribute.
+ *
+ * @param array $form
+ *   Form array.
+ * @param int $aid
+ *   Attribute ID.
+ */
+function uc_dropdown_attributes_hide_attribute(&$form, $aid) {
+  $form['attributes'][$aid]['#attributes']['style'] = 'display:none';
+  unset($form['attributes'][$aid]['#title']);
+  $form['attributes'][$aid]['#description'] = '';
+}
+
+/**
+ * Clear inputs for attribute.
+ *
+ * @param array $form
+ *   Form array.
+ * @param array $form_state
+ *   Form state array.
+ * @param int $aid
+ *   Attribute ID.
+ * @param int $id
+ *   Node or product class ID.
+ */
+function uc_dropdown_attributes_clear_input(&$form, &$form_state, $aid, $id = NULL) {
+  switch ($form['attributes'][$aid]['#type']) {
+    case 'checkboxes':
+      $input = &$form_state->getUserInput();
+      if (isset($input['product_controls'])) {
+        foreach ($input['product_controls']['attributes'][$aid] as $oid => $value) {
+          $input['product_controls']['attributes'][$aid][$oid] = NULL;
+        }
+      }
+      else {
+        if (is_null($id)) {
+          if (isset($input['attributes'])) {
+            foreach ($input['attributes'][$aid] as $oid => $value) {
+              $input['attributes'][$aid][$oid] = NULL;
+            }
+          }
+        }
+        else {
+          if (isset($input['products'][$id]['attributes'])) {
+            foreach ($input['products'][$id]['attributes'][$aid] as $oid => $value) {
+              $input['products'][$id]['attributes'][$aid][$oid] = NULL;
+            }
+          }
+        }
+      }
+      $form_state->setUserInput($input);
+      break;
+
+    case 'radios':
+    case 'textfield':
+      $input = &$form_state->getUserInput();
+      if (isset($input['product_controls'])) {
+        $input['product_controls']['attributes'][$aid] = NULL;
+      }
+      else {
+        if (is_null($id)) {
+          $input['attributes'][$aid] = NULL;
+        }
+        else {
+          $input['products'][$id]['attributes'][$aid] = NULL;
+        }
+      }
+      $form_state->setUserInput($input);
+      break;
+
+    case 'select':
+      if ($form['attributes'][$aid]['#value'] != '') {
+        $form['attributes'][$aid]['#value'] = '';
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
+/**
+ * Form build for classes.
+ *
+ * Callback for $form['#after_build'] for product classes.  Adds
+ * the CSS to hide the dependent attributes.
+ */
+function _uc_dropdown_attributes_class_build($form, &$form_state) {
+  $pcid = uc_dropdown_attributes_get_type($form['nid']['#value']);
+  $attributes = \Drupal::database()->select('uc_dropdown_classes', 'classes')
+    ->fields('classes', array('aid', 'parent_aid', 'parent_values', 'required'))
+    ->condition('classes.pcid', $pcid)
+    ->execute();
+  $form_values = $form_state->getValues();
+  $trigger = $form_state->getTriggeringElement();
+  if (!is_null($trigger)) {
+    $parents = $trigger['#parents'];
+    $parent_aid = $parents[1];
+    $parent_value = $trigger['#value'];
+    uc_dropdown_attributes_remove_values($parent_aid, $parent_value, $pcid,
+      'class', $form_values);
+  }
+  if (isset($form_values['attributes'])) {
+    foreach ($attributes as $attribute) {
+      $parent_value = $form_values['attributes'][$attribute->parent_aid];
+      $values = unserialize($attribute->parent_values);
+      if ($form['attributes'][$attribute->parent_aid]['#type'] == 'checkboxes') {
+        $parent_values = array_diff($parent_value, array(0));
+        if (count(array_intersect($parent_values, $values)) == 0) {
+          uc_dropdown_attributes_hide_attribute($form, $attribute->aid);
+          if ($attribute->required) {
+            uc_dropdown_attributes_clear_input($form, $form_state,
+              $attribute->aid);
+          }
+        }
+      }
+      else {
+        if (is_numeric($parent_value)) {
+          if (!in_array($parent_value, $values)) {
+            uc_dropdown_attributes_hide_attribute($form, $attribute->aid);
+            if ($attribute->required) {
+              uc_dropdown_attributes_clear_input($form, $form_state,
+                $attribute->aid);
+            }
+          }
+        }
+        else {
+          uc_dropdown_attributes_hide_attribute($form, $attribute->aid);
+          if ($attribute->required) {
+            uc_dropdown_attributes_clear_input($form, $form_state,
+              $attribute->aid);
+          }
+        }
+      }
+    }
+  }
+  return $form;
+}
+
+/**
+ * Form build for product kits.
+ *
+ * Callback for $form['#after_build'] for product kits. Renders the dependent
+ * attributes and stores the html as a Javascript array.
+ */
+function _uc_dropdown_attributes_kit_build($form, &$form_state) {
+  foreach ($form['products'] as $key => $value) {
+    if (is_numeric($key)) {
+      $type = uc_dropdown_attributes_dependency_type($key);
+      switch ($type) {
+        case 'node':
+          $id = $key;
+          $fields = array('aid', 'parent_aid', 'parent_values', 'required');
+          $attributes = \Drupal::database()->select('uc_dropdown_products', 'products')
+            ->fields('products', $fields)
+            ->condition('products.nid', $key)
+            ->execute();
+          break;
+
+        case 'class':
+          $pcid = uc_dropdown_attributes_get_type($key);
+          $id = $pcid;
+          $fields = array('aid', 'parent_aid', 'parent_values', 'required');
+          $attributes = \Drupal::database()->select('uc_dropdown_classes', 'classes')
+            ->fields('classes', $fields)
+            ->condition('classes.pcid', $pcid)
+            ->execute();
+          break;
+
+        default:
+          $attributes = array();
+      }
+      $input = &$form_state->getUserInput();
+      $trigger = $form_state->getTriggeringElement();
+      if (!is_null($trigger)) {
+        $parents = $trigger['#parents'];
+        $parent_aid = $parents[3];
+        $parent_value = $trigger['#value'];
+        if (!is_null($type)) {
+          uc_dropdown_attributes_remove_values($parent_aid, $parent_value, $id,
+            $type, $input['products'][$key]);
+        }
+      }
+      foreach ($attributes as $attribute) {
+        $aid = $attribute->aid;
+        $parent_aid = $attribute->parent_aid;
+        if ($parent_aid == 0) {
+          continue;
+        }
+        if (!isset($input['products'][$key]['attributes'][$parent_aid])) {
+          $input['products'][$key]['attributes'][$parent_aid] = array();
+        }
+        $parent_value = $input['products'][$key]['attributes'][$parent_aid];
+        $type = $form['products'][$key]['attributes'][$parent_aid]['#type'];
+        $values = unserialize($attribute->parent_values);
+        if ($type == 'checkboxes') {
+          $parent_values = array_diff($parent_value, array(0));
+          if (count(array_intersect($parent_values, $values)) == 0) {
+            uc_dropdown_attributes_hide_attribute($form['products'][$key],
+              $attribute->aid);
+            if ($attribute->required) {
+              uc_dropdown_attributes_clear_input($form['products'][$key],
+                $form_state, $attribute->aid, $id);
+            }
+          }
+        }
+        else {
+          if (!is_numeric($parent_value) || !in_array($parent_value, $values)) {
+            uc_dropdown_attributes_hide_attribute($form['products'][$key],
+              $attribute->aid);
+            if ($attribute->required) {
+              uc_dropdown_attributes_clear_input($form['products'][$key],
+                $form_state, $attribute->aid, $id);
+            }
+          }
+        }
+      }
+    }
+  }
+  return $form;
+}
+
+/**
+ * Unset values of orphaned children.
+ *
+ * Called recursively to remove orphaned values from form_state.
+ *
+ * @param int $parent_aid
+ *   Attribute ID of the triggering element.
+ * @param int $parent_value
+ *   Option ID of the value of the triggering element.
+ * @param int $id
+ *   Node ID or product class ID.
+ * @param string $type
+ *   Type of 'node' or 'class'.
+ * @param array $form_values
+ *   Part of the form_state array containing the attributes.
+ */
+function uc_dropdown_attributes_remove_values(
+  $parent_aid,
+  $parent_value,
+  $id,
+  $type,
+  &$form_values) {
+
+  switch ($type) {
+    case 'node':
+      $children = \Drupal::database()->select('uc_dropdown_products', 'products')
+        ->fields('products', array('aid', 'required', 'parent_values'))
+        ->condition('products.nid', $id)
+        ->condition('products.parent_aid', $parent_aid)
+        ->execute();
+      break;
+
+    case 'class':
+      $children = \Drupal::database()->select('uc_dropdown_classes', 'classes')
+        ->fields('classes', array('aid', 'required', 'parent_values'))
+        ->condition('classes.pcid', $id)
+        ->condition('classes.parent_aid', $parent_aid)
+        ->execute();
+      break;
+
+    default:
+      $children = array();
+      break;
+  }
+  foreach ($children as $child) {
+    if ($child->required) {
+      $value = $form_values['attributes'][$child->aid];
+      $form_values['attributes'][$child->aid] = '';
+      if ($value) {
+        $values = unserialize($child->parent_values);
+        if (!in_array($parent_value, $values)) {
+          uc_dropdown_attributes_remove_values($child->aid, $value, $id, $type,
+            $form_values);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Create an attribute dependency.
+ *
+ * A public function that creates and stores an attribute dependency for a
+ * product.
+ *
+ * @param int $nid
+ *   Node ID.
+ * @param int $aid
+ *   Attribute ID of the dependent (child) attribute.
+ * @param int $parent_aid
+ *   Attribute ID of the parent attribute.
+ * @param array $options
+ *   Array of the Option IDs that trigger the dependent attribute.
+ * @param bool $required
+ *   TRUE if the dependent (child) attribute is required when it appears and
+ *   FALSE if it is not required.
+ */
+function uc_dropdown_attributes_product_create_dependency(
+  $nid,
+  $aid,
+  $parent_aid,
+  $options,
+  $required) {
+
+  $attribute = uc_attribute_load($aid);
+  $dep = \Drupal::database()->insert('uc_dropdown_products')
+    ->fields(array(
+      'nid' => $nid,
+      'aid' => $aid,
+      'parent_aid' => $parent_aid,
+      'parent_values' => serialize($options),
+      'required' => $required,
+    ))
+    ->execute();
+
+  // Need to check to make sure attribute is not required all the time.
+  $result = \Drupal::database()->select('uc_product_attributes', 'attributes')
+    ->fields('attributes', array('nid', 'aid', 'required'))
+    ->condition('attributes.nid', $nid)
+    ->condition('attributes.aid', $aid)
+    ->execute();
+  foreach ($result as $item) {
+    if ($item->required == 1) {
+      $dep = \Drupal::database()->update('uc_product_attributes')
+        ->fields(array(
+          'required' => 0,
+        ))
+        ->condition('nid', $item->nid)
+        ->condition('aid', $item->aid)
+        ->execute();
+    }
+  }
+}
+
+/**
+ * Create an attribute dependency for product classes.
+ *
+ * A public function that creates and stores an attribute dependency for
+ * product classes.
+ *
+ * @param int $pcid
+ *   Product class ID.
+ * @param int $aid
+ *   Attribute ID of the dependent (child) attribute.
+ * @param int $parent_aid
+ *   Attribute ID of the parent attribute.
+ * @param array $options
+ *   Array of the Option IDs that trigger the dependent attribute.
+ * @param bool $required
+ *   TRUE if the dependent (child) attribute is required when it appears and
+ *   FALSE if it is not required.
+ */
+function uc_dropdown_attributes_class_create_dependency(
+  $pcid,
+  $aid,
+  $parent_aid,
+  $options,
+  $required) {
+
+  $attribute = uc_attribute_load($aid);
+  $dep = \Drupal::database()->insert('uc_dropdown_classes')
+    ->fields(array(
+      'pcid' => $pcid,
+      'aid' => $aid,
+      'parent_aid' => $parent_aid,
+      'parent_values' => serialize($options),
+      'required' => $required,
+    ))
+    ->execute();
+
+  // Need to check to make sure attribute is not required all the time.
+  $result = \Drupal::database()->select('uc_class_attributes', 'attributes')
+    ->fields('attributes', array('pcid', 'aid', 'required'))
+    ->condition('attributes.pcid', $pcid)
+    ->condition('attributes.aid', $aid)
+    ->execute();
+  foreach ($result as $item) {
+    if ($item->required == 1) {
+      $dep = \Drupal::database()->update('uc_class_attributes')
+        ->fields(array(
+          'required' => 0,
+        ))
+        ->condition('pcid', $item->pcid)
+        ->condition('aid', $item->aid)
+        ->execute();
+    }
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function uc_dropdown_attributes_theme() {
+  return array(
+    'uc_dropdown_attributes_product' => array(
+      'render element' => 'form',
+    ),
+    'uc_dropdown_attributes_class' => array(
+      'render element' => 'form',
+    ),
+  );
+}
+
+/**
+ * Retrieve product class from the node ID.
+ *
+ * @param int $nid
+ *   Node id.
+ *
+ * @return string
+ *   The type field from the node object.
+ */
+function uc_dropdown_attributes_get_type($nid) {
+  $type = \Drupal::database()->select('node', 'n')
+    ->fields('n', array('type'))
+    ->condition('n.nid', $nid)
+    ->execute()
+    ->fetchField();
+  return $type;
+}
+
+/**
+ * Retrieve whether dependencies are defined by node or class.
+ *
+ * @param int $nid
+ *   Node id.
+ *
+ * @return string
+ *   'node' for dependencies defined on the node level; 'class' for dependencies
+ *   defined on the product class; otherwise, NULL.
+ */
+function uc_dropdown_attributes_dependency_type($nid) {
+  $count = \Drupal::database()->select('uc_dropdown_products', 'products')
+    ->fields('products', array('nid'))
+    ->condition('products.nid', $nid)
+    ->countQuery()
+    ->execute()
+    ->fetchField();
+  if ($count > 0) {
+    return 'node';
+  }
+  $pcid = uc_dropdown_attributes_get_type($nid);
+  $count = \Drupal::database()->select('uc_dropdown_classes', 'classes')
+    ->fields('classes', array('pcid'))
+    ->condition('classes.pcid', $pcid)
+    ->countQuery()
+    ->execute()
+    ->fetchField();
+  if ($count > 0) {
+    return 'class';
+  }
+  return NULL;
+}
+
+/**
+ * Determine the correct theme to use for dependencies admin page.
+ *
+ * @return string
+ *   theme to use or empty string if default theme.
+ */
+function uc_dropdown_attributes_admin_theme() {
+  if (variable_get('node_admin_theme', 0) == 1) {
+    return variable_get('admin_theme', '');
+  }
+  return '';
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for uc_order_edit_form().
+ */
+function uc_dropdown_attributes_form_uc_order_edit_form_alter(&$form,
+  FormStateInterface $form_state) {
+
+  if ($form_state->has('products_action') &&
+    $form_state->get('products_action') == 'add_product') {
+
+    $nid = $form['products']['product_controls']['nid']['#value'];
+    $product = Node::load($nid);
+    if ($product->getType() == 'product_kit') {
+/*
+      foreach ($form['product_controls']['sub_products'] as $nid => $product) {
+        if (is_numeric($nid)) {
+          $type = uc_dropdown_attributes_dependency_type($nid);
+          if (!is_null($type)) {
+            uc_dropdown_attributes_order_product_alter($nid, $form['product_controls']['sub_products'][$nid]['attributes'], $type);
+            if (!in_array('_uc_dropdown_attributes_order_product_kit_build',
+              $form['#after_build'])) {
+
+              $form['#after_build'][]
+                = '_uc_dropdown_attributes_order_product_kit_build';
+            }
+          }
+        }
+      }
+*/
+    }
+    else {
+      $type = uc_dropdown_attributes_dependency_type($nid);
+      if (!is_null($type)) {
+        $values = $form_state->getValues();
+        uc_dropdown_attributes_order_product_alter($nid,
+          $form['products']['product_controls']['attributes'],
+          $values['products']['product_controls'],
+          $type);
+        switch ($type) {
+          case 'node':
+            $form['#after_build'][]
+              = '_uc_dropdown_attributes_order_product_build';
+            break;
+
+          case 'class':
+            $form['#after_build'][]
+              = '_uc_dropdown_attributes_order_class_build';
+            break;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Alter products on oder page in preparation for drop down attributes.
+ *
+ * Adds the 'Please select' and removes the default value.  Ubercart does this
+ * for required attributes but since these attributes can no longer be required
+ * if the attributes are dependent then this reproduces the same thing.
+ *
+ * @param int $nid
+ *   Node ID.
+ * @param array $form_attributes
+ *   Attributes part of the product form.
+ * @param array $form_values
+ *   Form state.
+ * @param string $type
+ *   For dependencies defined on the node level use 'node'; 'class' for
+ *   dependencies defined on the product class.
+ */
+function uc_dropdown_attributes_order_product_alter(
+  $nid,
+  &$form_attributes,
+  $form_values,
+  $type) {
+
+  $fields = array('aid', 'parent_aid', 'parent_values', 'required');
+  switch ($type) {
+    case 'node':
+      $attributes = \Drupal::database()->select('uc_dropdown_products', 'products')
+        ->fields('products', $fields)
+        ->condition('products.nid', $nid)
+        ->execute();
+      break;
+
+    case 'class':
+      $pcid = uc_dropdown_attributes_get_type($nid);
+      $attributes = \Drupal::database()->select('uc_dropdown_classes', 'classes')
+        ->fields('classes', $fields)
+        ->condition('classes.pcid', $pcid)
+        ->execute();
+      break;
+  }
+  $parent_aids = array();
+  foreach ($attributes as $attribute) {
+    if ($attribute->parent_aid == 0) {
+      continue;
+    }
+    $parent_aid = $attribute->parent_aid;
+    $parent_aids[$parent_aid] = $parent_aid;
+    $aid = $attribute->aid;
+    if (($form_attributes[$aid]['#type'] == 'textfield') ||
+      (isset($form_attributes[$aid]['#options']) &&
+      count($form_attributes[$aid]['#options'])) && $attribute->required) {
+
+      if (isset($form_values['attributes'][$parent_aid])) {
+        $values = unserialize($attribute->parent_values);
+        switch ($form_attributes[$parent_aid]['#type']) {
+          case 'select':
+            $parent_value = $form_values['attributes'][$parent_aid];
+            if (in_array($parent_value, $values)) {
+              $form_attributes[$aid]['#required'] = TRUE;
+            }
+            break;
+
+          case 'radios':
+            $parent_value = $form_values['attributes'][$parent_aid];
+            if (in_array($parent_value, $values)) {
+              $form_attributes[$aid]['#required'] = TRUE;
+            }
+            break;
+
+          case 'checkboxes':
+            $parent_values = $form_values['attributes'][$parent_aid];
+            if (count(array_intersect($parent_values, $values)) > 0) {
+              $form_attributes[$aid]['#required'] = TRUE;
+            }
+
+            break;
+
+        }
+      }
+
+      switch ($form_attributes[$aid]['#type']) {
+        case 'select':
+          $form_attributes[$aid]['#options'] = array('' => t('- Select -')) +
+            $form_attributes[$aid]['#options'];
+          $form_attributes[$aid]['#default_value'] = '';
+          break;
+
+        case 'radios':
+          $form_attributes[$aid]['#default_value'] = NULL;
+          break;
+
+        case 'checkboxes':
+          $form_attributes[$aid]['#default_value'] = array();
+          break;
+
+      }
+    }
+  }
+  foreach ($parent_aids as $aid) {
+    $form_attributes[$aid]['#ajax'] = array(
+      'callback' => 'uc_dropdown_attributes_order_ajax_callback',
+      'wrapper' => $form_attributes['#attributes']['id'],
+      'event' => 'change',
+    );
+  }
+}
+
+/**
+ * Ajax callback for order attribute selection form elements.
+ */
+function uc_dropdown_attributes_order_ajax_callback($form, $form_state) {
+  $trigger = $form_state->getTriggeringElement();
+  if (in_array('sub_products', $trigger['#parents'])) {
+    // This is a product kit.
+    $nid = $trigger['#parents'][2];
+    return $form['products']['product_controls']['sub_products'][$nid]['attributes'];
+  }
+  return $form['products']['product_controls']['attributes'];
+}
+
+/**
+ * Form build for products for the order page.
+ *
+ * Callback for $form['#after_build'] for products. Adds the CSS to hide
+ * the dependent attributes.
+ */
+function _uc_dropdown_attributes_order_product_build($form, $form_state) {
+  $nid = $form['products']['product_controls']['nid']['#value'];
+  $fields = array('aid', 'parent_aid', 'parent_values', 'required');
+  $attributes = \Drupal::database()->select('uc_dropdown_products', 'products')
+    ->fields('products', $fields)
+    ->condition('products.nid', $nid)
+    ->execute();
+  $trigger = $form_state->getTriggeringElement();
+  $form_values = $form_state->getValues();
+  if (!is_null($trigger)) {
+    $parents = $trigger['#parents'];
+    $parent_aid = $parents[2];
+    $parent_value = $trigger['#value'];
+    uc_dropdown_attributes_remove_values($parent_aid, $parent_value, $nid,
+      'node', $form_values['product_controls']);
+  }
+  foreach ($attributes as $attribute) {
+    if ($attribute->parent_aid == 0) {
+      continue;
+    }
+    $parent_value = $form_values['product_controls']['attributes'][$attribute->parent_aid];
+    $values = unserialize($attribute->parent_values);
+    if ($form['products']['product_controls']['attributes'][$attribute->parent_aid]['#type'] == 'checkboxes') {
+      $parent_values = array_diff($parent_value, array(0));
+      if (count(array_intersect($parent_values, $values)) == 0) {
+        uc_dropdown_attributes_hide_attribute($form['products']['product_controls'],
+          $attribute->aid);
+        if ($attribute->required) {
+          uc_dropdown_attributes_clear_input($form['products']['product_controls'],
+            $form_state, $attribute->aid);
+        }
+      }
+    }
+    else {
+      if (is_numeric($parent_value)) {
+        // A value has been entered in parent attribute.
+        if (!in_array($parent_value, $values)) {
+          uc_dropdown_attributes_hide_attribute($form['products']['product_controls'], $attribute->aid);
+          if ($attribute->required) {
+            uc_dropdown_attributes_clear_input($form['products']['product_controls'],
+              $form_state, $attribute->aid);
+          }
+        }
+      }
+      else {
+        uc_dropdown_attributes_hide_attribute($form['products']['product_controls'], $attribute->aid);
+        if ($attribute->required) {
+          uc_dropdown_attributes_clear_input($form['products']['product_controls'],
+            $form_state, $attribute->aid);
+        }
+      }
+    }
+  }
+  return $form;
+}
+
+/**
+ * Form build for classes for the order page.
+ *
+ * Callback for $form['#after_build'] for product classes.  Adds
+ * the CSS to hide the dependent attributes.
+ */
+function _uc_dropdown_attributes_order_class_build($form, &$form_state) {
+  $pcid = uc_dropdown_attributes_get_type($form['products']['product_controls']['nid']['#value']);
+  $attributes = \Drupal::database()->select('uc_dropdown_classes', 'classes')
+    ->fields('classes', array('aid', 'parent_aid', 'parent_values', 'required'))
+    ->condition('classes.pcid', $pcid)
+    ->execute();
+  $form_values = $form_state->getValues();
+  $trigger = $form_state->getTriggeringElement();
+  if (!is_null($trigger)) {
+    $parents = $trigger['#parents'];
+    $parent_aid = $parents[2];
+    if (is_numeric($parent_aid)) {
+      $parent_value = $trigger['#value'];
+      // Note that values are stored in input, not values.
+      uc_dropdown_attributes_remove_values($parent_aid, $parent_value, $pcid,
+        'class', $form_values['product_controls']);
+    }
+  }
+  foreach ($attributes as $attribute) {
+    $parent_value = $form_values['product_controls']['attributes'][$attribute->parent_aid];
+    $values = unserialize($attribute->parent_values);
+    if ($form['products']['product_controls']['attributes'][$attribute->parent_aid]['#type'] == 'checkboxes') {
+      $parent_values = array_diff($parent_value, array(0));
+      if (count(array_intersect($parent_values, $values)) == 0) {
+        uc_dropdown_attributes_hide_attribute($form['products']['product_controls'],
+          $attribute->aid);
+        if ($attribute->required) {
+          uc_dropdown_attributes_clear_input($form['products']['product_controls'], $form_state,
+            $attribute->aid);
+        }
+      }
+    }
+    else {
+      if (is_numeric($parent_value)) {
+        if (!in_array($parent_value, $values)) {
+          uc_dropdown_attributes_hide_attribute($form['products']['product_controls'], $attribute->aid);
+          if ($attribute->required) {
+            uc_dropdown_attributes_clear_input($form['products']['product_controls'],
+              $form_state, $attribute->aid);
+          }
+        }
+      }
+      else {
+        uc_dropdown_attributes_hide_attribute($form['products']['product_controls'], $attribute->aid);
+        if ($attribute->required) {
+          uc_dropdown_attributes_clear_input($form['products']['product_controls'],
+            $form_state, $attribute->aid);
+        }
+      }
+    }
+  }
+  return $form;
+}
+
+/**
+ * Form build for product kits for the order page.
+ *
+ * Callback for $form['#after_build'] for products. Adds the CSS to hide
+ * the dependent attributes.
+ */
+function _uc_dropdown_attributes_order_product_kit_build($form, &$form_state) {
+  foreach ($form['product_controls']['sub_products'] as $nid => $product) {
+    if (is_numeric($nid)) {
+      $type = uc_dropdown_attributes_dependency_type($nid);
+      switch ($type) {
+        case 'node':
+          $fields = array('aid', 'parent_aid', 'parent_values', 'required');
+          $attributes = \Drupal::database()->select('uc_dropdown_products', 'products')
+            ->fields('products', $fields)
+            ->condition('products.nid', $nid)
+            ->execute();
+          $trigger = $form_state->getTriggeringElement();
+          if (!is_null($trigger) && $nid == $trigger['#parents'][2]) {
+            $parents = $trigger['#parents'];
+            $parent_aid = $parents[count($parents) - 1];
+            $parent_value = $trigger['#value'];
+            uc_dropdown_attributes_remove_values($parent_aid, $parent_value,
+              $nid, 'node', $form_state['values']['product_controls']['sub_products'][$nid]);
+          }
+          uc_dropdown_attributes_order_attribute_display(
+            $attributes,
+            $form['product_controls']['sub_products'][$nid]['attributes'],
+            $form_state['values']['product_controls']['sub_products'][$nid]['attributes'],
+            $form_state
+          );
+          break;
+
+        case 'class':
+          $pcid = uc_dropdown_attributes_get_type($nid);
+          $fields = array('aid', 'parent_aid', 'parent_values', 'required');
+          $attributes = \Drupal::database()->select('uc_dropdown_classes', 'classes')
+            ->fields('classes', $fields)
+            ->condition('classes.pcid', $pcid)
+            ->execute();
+          $trigger = $form_state->getTriggeringElement();
+          if (!is_null($trigger) && $nid == $trigger['#parents'][2]) {
+            $parents = $trigger['#parents'];
+            $parent_aid = $parents[count($parents) - 1];
+            $parent_value = $trigger['#value'];
+            // Note that values are stored in input, not values.
+            uc_dropdown_attributes_remove_values($parent_aid, $parent_value,
+              $pcid, 'class', $form_state['input']['product_controls']['sub_products'][$nid]);
+          }
+          uc_dropdown_attributes_order_attribute_display(
+            $attributes,
+            $form['product_controls']['sub_products'][$nid]['attributes'],
+            $form_state['values']['product_controls']['sub_products'][$nid]['attributes'],
+            $form_state
+          );
+          break;
+
+      }
+    }
+  }
+  return $form;
+}
+
+/**
+ * Alter display of attributes on the order page.
+ *
+ * @param array $attributes
+ *   Array of attribute dependency objects.
+ * @param array &$form_attributes
+ *   Attributes part of the product form.
+ * @param array $form_state_attributes
+ *   Attributes part of the product form_state.
+ */
+function uc_dropdown_attributes_order_attribute_display(
+  $attributes,
+  &$form_attributes,
+  $form_state_attributes,
+  $form_state) {
+
+  foreach ($attributes as $attribute) {
+    if ($attribute->parent_aid == 0) {
+      continue;
+    }
+    $parent_value = $form_state_attributes[$attribute->parent_aid];
+    if ($parent_value) {
+      // A value has been entered in parent attribute.
+      $values = unserialize($attribute->parent_values);
+      if (!in_array($parent_value, $values)) {
+        uc_dropdown_attributes_hide_attribute($form_attributes, $attribute->aid);
+        if ($attribute->required) {
+          uc_dropdown_attributes_clear_input($form_attributes,
+            $form_state_attributes, $attribute->aid);
+        }
+      }
+    }
+    else {
+      uc_dropdown_attributes_hide_attribute($form_attributes, $attribute->aid);
+      if ($attribute->required) {
+        uc_dropdown_attributes_clear_input($form_attributes,
+          $form_state_attributes, $attribute->aid);
+      }
+    }
+  }
+}
+
+/**
+ * Form build for classes in product kits for the order page.
+ *
+ * Callback for $form['#after_build'] for product classes.  Adds
+ * the CSS to hide the dependent attributes.
+ */
+function _uc_dropdown_attributes_order_class_kit_build($form, &$form_state) {
+  $pcid = uc_dropdown_attributes_get_type($form['nid']['#value']);
+  $attributes = \Drupal::database()->select('uc_dropdown_classes', 'classes')
+    ->fields('classes', array('aid', 'parent_aid', 'parent_values', 'required'))
+    ->condition('classes.pcid', $pcid)
+    ->execute();
+  $trigger = $form_state->getTriggeringElement();
+  if (!is_null($trigger)) {
+    $parents = $trigger['#parents'];
+    $parent_aid = $parents[count($parents) - 1];
+    $parent_value = $trigger['#value'];
+    uc_dropdown_attributes_remove_values($parent_aid, $parent_value, $pcid,
+      'class', $form_state['values']['product_controls']);
+  }
+  foreach ($attributes as $attribute) {
+    $parent_value = $form_state['values']['product_controls']['attributes'][$attribute->parent_aid];
+    if ($parent_value) {
+      // A value has been entered in parent attribute.
+      $values = unserialize($attribute->parent_values);
+      if (array_key_exists($parent_value, $values)) {
+        // Show dependent attribute.
+        if ($attribute->required) {
+          $form['product_controls']['attributes'][$attribute->aid]['#required']
+            = TRUE;
+        }
+      }
+      else {
+        // Hide dependent attribute.
+        $form['product_controls']['attributes'][$attribute->aid]['#post_render'][] = 'uc_dropdown_attributes_post_render';
+        if ($form['product_controls']['attributes'][$attribute->aid]['#required'] && $form['product_controls']['attributes'][$attribute->aid]['#value'] != '') {
+          $form['product_controls']['attributes'][$attribute->aid]['#value']
+            = '';
+        }
+      }
+    }
+    else {
+      $form['product_controls']['attributes'][$attribute->aid]['#post_render'][] = 'uc_dropdown_attributes_post_render';
+      if ($form['product_controls']['attributes'][$attribute->aid]['#required'] && $form['product_controls']['attributes'][$attribute->aid]['#value'] != '') {
+        $form['product_controls']['attributes'][$attribute->aid]['#value']
+          = '';
+      }
+    }
+  }
+  return $form;
+}
+
+/**
+ * Implements hook_node_load().
+ *
+ * Ubercart fails to load attributes for product classes.
+ */
+function uc_dropdown_attributes_node_load($nodes) {
+  foreach ($nodes as $node) {
+    if (uc_product_is_product($node)) {
+      if (empty($node->attributes)) {
+        $node->attributes = uc_class_get_attributes($node->getType());
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function uc_dropdown_attributes_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'node_insert') {
+    $group = $implementations['uc_dropdown_attributes'];
+    unset($implementations['uc_dropdown_attributes']);
+    $implementations['uc_dropdown_attributes'] = $group;
+  }
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function uc_dropdown_attributes_node_insert($node) {
+  $count = \Drupal::database()->select('uc_class_attributes', 'ca')
+    ->condition('pcid', $node->getType())
+    ->countQuery()
+    ->execute()
+    ->fetchField();
+  if ($count > 0) {
+    // Ubercart copies over the class attributes and class options to the
+    // product so need to delete them.
+    \Drupal::database()->delete('uc_product_attributes')
+      ->condition('nid', $node->id())
+      ->execute();
+    \Drupal::database()->delete('uc_product_options')
+      ->condition('nid', $node->id())
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for uc_object_attributes_form().
+ */
+function uc_dropdown_attributes_form_uc_object_attributes_form_alter(&$form, $form_state) {
+  $path = \Drupal::request()->getpathInfo();
+  $arg = explode('/', $path);
+  if (!is_numeric($arg[2])) {
+    // The form is also used for product class attributes where no changes are
+    // needed.
+    return;
+  }
+  $node = node_load($arg[2]);
+  $type = $node->getType();
+  $count = \Drupal::database()->select('uc_class_attributes', 'ca')
+    ->condition('pcid', $type)
+    ->countQuery()
+    ->execute()
+    ->fetchField();
+  if ($count > 0) {
+    $link = '/admin/structure/types/manage/' . $type . '/attributes';
+    $form['attributes']['#empty'] = t('The attributes are defined for the product class <a href="@link">@class</a>', array('@link' => $link, '@class' => $type));
+  }
+}
+
+/**
+ * Implements hook_uc_product_types().
+ *
+ * Ubercart fails to load product kits in order edit.
+ */
+function uc_dropdown_attributes_uc_product_types() {
+  $types = array();
+  if (\Drupal::moduleHandler()->moduleExists('uc_product_kit')) {
+    $types['product_kit'] = 'product_kit';
+  }
+  return $types;
+}
