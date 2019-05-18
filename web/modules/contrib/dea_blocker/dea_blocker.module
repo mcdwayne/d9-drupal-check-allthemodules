@@ -1,0 +1,271 @@
+<?php
+
+// TODO: a better way could be to use field Constraints instead of hooks:
+// https://drupal.stackexchange.com/questions/183685/how-do-i-add-a-custom-validation-to-an-existing-form-field
+
+use Drupal\Core\Config\Config;
+use Drupal\Core\Url;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\dea_blocker\Classes\EmailBlacklist;
+
+
+/**
+ * Intercept comment form and add our custom validation.
+ */
+function dea_blocker_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+
+  // Load settings.
+  /* @var $settings Config */
+  $settings = \Drupal::service('config.factory')->get('dea_blocker.settings');
+
+  // Array of enabled form IDs.
+  $enabledForms = $settings->get('forms') ?: [];
+
+  // Test if the form is enabled and add our validator.
+  $mode = $settings->get('mode');
+  $enabled = $mode == 'all'
+             || ($mode == 'sel' && in_array($form_id, $enabledForms))
+             || ($mode == '!sel' && !in_array($form_id, $enabledForms))
+             ;
+  if ($enabled) {
+    // Email fields.
+    $emailFields = &_dea_blocker_search_email_fields($form);
+    foreach ($emailFields as &$field) {
+      $field['#element_validate'][] = 'dea_blocker_email_validate';
+    }
+  }
+
+  // Append a datablock to the form, if enabled and allowed.
+  if ($settings->get('show_form_selector')
+      && $form_id != 'dea_blocker_admin'
+      && \Drupal::currentUser()->hasPermission('administer dea blocker')) {
+    _dea_blocker_add_form_datablock($form, $form_id, $enabledForms);
+  }
+
+}
+
+
+/**
+ * Validate field value against email blacklist.
+ */
+function dea_blocker_email_validate($element, FormStateInterface &$form_state) {
+
+  /* @var $blacklist EmailBlacklist */
+  $blacklist = \Drupal::service('dea_blocker.emailblacklist');
+
+  $email = trim($element['#value']);
+  if (!$email) {
+    // Empty elements are allowed.
+    return;
+  }
+  elseif ($blacklist->isBlacklisted($email) !== FALSE) {
+    $form_state->setError(
+      $element,
+      t('Email address is not valid or not acceptable.')
+    );
+  }
+
+}
+
+
+/**
+ * Search the given form array for email type fields.
+ */
+function &_dea_blocker_search_email_fields(&$elem) {
+
+  $res = [];
+  $children = \Drupal\Core\Render\Element::children($elem);
+  foreach ($children as $name) {
+    $child = &$elem[$name];
+    if (\Drupal\Core\Render\Element::isVisibleElement($child)) {
+      if (isset($child['#type']) && $child['#type'] == 'email') {
+        $res[$name] = &$child;
+      }
+      $res += _dea_blocker_search_email_fields($child);
+    }
+  }
+  return $res;
+
+}
+
+
+/**
+ * Append DEA Blocker datablock to the given form.
+ * Datablock is an element that reports form values like:
+ * - form id
+ * - name and cound of all email fields
+ *
+ * @param array $enabledForms
+ *   List of currently enabled form IDs.
+ */
+function _dea_blocker_add_form_datablock(&$form, $form_id, $enabledForms) {
+
+  $elems = _dea_blocker_search_email_fields($form);
+  $elemNames = [];
+  foreach ($elems as $name => $elem) {
+    $elemNames[] = $name;
+  }
+
+  $form['dea_blocker'] = [
+    '#type' => 'fieldset',
+    '#title' => 'DEA Blocker',
+    '#weight' => 9999,
+  ];
+  $form['dea_blocker']['data'] = [
+    '#prefix' => '<pre>',
+    '#suffix' => '</pre>',
+    '#markup' =>
+      t('Form ID: :form_id', [':form_id' => $form_id])
+      . "\n"
+      . t('Email fields: :email_fields', [
+        ':email_fields' => count($elemNames)
+                          . (count($elemNames) ? ' ('. join(', ', $elemNames) . ')' : ''),
+      ]),
+  ];
+  $form['dea_blocker']['links'] = [
+    '#type' => 'actions'
+  ];
+
+  // Show the Add or Remove commands.
+  if (in_array($form_id, $enabledForms)) {
+    $form['dea_blocker']['links']['remove_form'] = [
+      '#type' => 'link',
+      '#title' => t('Remove from DEA Blocker'),
+      '#url' => Url::fromRoute('dea_blocker.add_remove_form', ['command' => 'remove_form', 'formId' => $form_id]),
+      '#suffix' => ' | ',
+    ];
+  }
+  else {
+    $form['dea_blocker']['links']['add_form'] = [
+      '#type' => 'link',
+      '#title' => t('Add to DEA Blocker'),
+      '#url' => Url::fromRoute('dea_blocker.add_remove_form', ['command' => 'add_form', 'formId' => $form_id]),
+      '#suffix' => ' | ',
+    ];
+  }
+
+  $form['dea_blocker']['links']['dea_blocker_config'] = [
+    '#type' => 'link',
+    '#title' => t('Settings'),
+    '#url' => Url::fromRoute('dea_blocker.admin'),
+  ];
+}
+
+
+/**
+ * Download and import (merge) a JSON file containing domain blacklist items
+ * from the given URL.
+ *
+ * @param string $url
+ *   URL of the file to download.
+ *   Must be a supported PHP stream URL (see file_get_contents()).
+ * @param string $result
+ *   Returns a messge to be logged or shown to user.
+ * @return boolean
+ *   TRUE if success, FALSE otherwise.
+ *   $result argument will contain a description of what happened.
+ */
+function _dea_blocker_import_from_url($url, &$result = '') {
+
+  try {
+    // Set a local error handler.
+    set_error_handler(function ($errno, $errstr, $errfile, $errline) {
+      throw new \ErrorException($errstr);
+    });
+    $json = file_get_contents($url);
+    if ($json === FALSE) {
+      $result = t('Error downloading file');
+      return FALSE;
+    }
+  }
+  catch (\ErrorException $e) {
+    $result = t('Error downloading file: :error_message', [':error_message' => $e->getMessage()]);
+    return FALSE;
+  }
+  finally {
+    // Restore previous error handler.
+    restore_error_handler();
+  }
+
+  return _dea_blocker_import_from_json($json, $result);
+
+}
+
+
+/**
+ * Import (merge) a JSON file containing domain blacklist items
+ * from the given URL.
+ *
+ * @param string $json_content
+ *   JSON array with blacklist items to import.
+ * @param string $result
+ *   Returns a messge to be logged or shown to user.
+ * @return boolean
+ *   TRUE if success, FALSE otherwise.
+ *   $result argument will contain a description of what happened.
+ */
+function _dea_blocker_import_from_json($json_content, &$result = '') {
+
+  $new_items = json_decode($json_content);
+  if ($new_items === NULL) {
+    $result = t('JSON file content is empty or not valid');
+    return FALSE;
+  }
+
+  // Validate new items.
+  $errors =  EmailBlacklist::validateItems($new_items);
+  if ($errors) {
+    $error_msg = t('One or more regular expression patterns are not valid:');
+    foreach ($errors as $value => $error) {
+      $error_msg .= '<br/><b>'.$value.'</b> - '.$error;
+    }
+    $result = $error_msg;
+    return;
+  }
+
+  // Merge new items to blacklist.
+  /* @var $blacklist EmailBlacklist */
+  $blacklist = \Drupal::getContainer()->get('dea_blocker.emailblacklist');
+  $count = count($blacklist->getItems());
+  $blacklist->addItems($new_items)
+            ->save();
+  $result = t(':count blacklist items (excluding duplicates) imported successfully', [':count' => (count($blacklist->getItems()) - $count)]);
+  return TRUE;
+
+}
+
+
+/**
+ * Implements hook_cron().
+ */
+function dea_blocker_cron() {
+
+  // Is automatic import enabled?
+  $settings = \Drupal::config('dea_blocker.settings');
+  $import_frequency = $settings->get('import_frequency');
+  if (!$import_frequency) {
+    return;
+  }
+
+  // Test if we should run.
+  $last_import = (int)\Drupal::state()->get('dea_blocker.last_import', 0);
+  if (time() < $last_import + $import_frequency * 86400) {
+    return;
+  }
+
+  // Import the updated file.
+  $url = $settings->get('import_url');
+  if ($url) {
+    $logger = \Drupal::logger('dea_blocker');
+    if (_dea_blocker_import_from_url($url, $result)) {
+      $logger->info($result);
+    }
+    else {
+      $logger->error($result);
+    }
+
+    // Update last cron execution.
+    \Drupal::state()->set('dea_blocker.last_import', time());
+  }
+
+}
