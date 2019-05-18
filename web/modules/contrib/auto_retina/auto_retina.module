@@ -1,0 +1,94 @@
+<?php
+/**
+ * @file
+ * Base file for the auto_retina module.
+ *
+ * @defgroup auto_retina Auto Retina
+ * @{
+ */
+
+use Drupal\image\ImageStyleInterface;
+
+/**
+ * Implements hook_page_alter().
+ *
+ * Adds in our JS vars per settings.
+ */
+function auto_retina_preprocess_html(&$vars) {
+
+  // Adds a Javascript settings array if asked.
+  if (\Drupal::config('auto_retina.settings')->get('js')) {
+    $settings = \Drupal::service('auto_retina.core')->getSettings();
+
+    // Trim the slashes for JS compatibility.
+    if (preg_match('/\/(.+)\//', $settings['regex'], $matches)) {
+      $settings['regex'] = $matches[1];
+    }
+    $vars['#attached']['drupalSettings']['autoRetina'] = $settings;
+  }
+}
+
+/**
+ * Implements hook_entity_type_build().
+ *
+ * Use our image style class instead.
+ */
+function auto_retina_entity_type_alter(array &$entity_types) {
+  $entity_types['image_style']->setClass('\Drupal\auto_retina\Entity\RetinaImageStyle');
+}
+
+/**
+ * Implements hook_auto_retina_create_derivative_alter().
+ */
+function auto_retina_auto_retina_create_derivative_alter(ImageStyleInterface $style, &$source, &$destination) {
+  $args = func_get_args();
+  if (\Drupal::service('auto_retina.core')->isPathRetina($destination)) {
+    module_load_include('inc', 'auto_retina', 'includes/auto_retina.effects');
+    $settings = $style->getThirdPartySettings('auto_retina');
+    foreach ($style->getEffects() as &$effect) {
+      $alters = [
+        'auto_retina_effect_' . $effect->getPluginId(),
+        'auto_retina_effect',
+      ];
+      foreach ($alters as $hook) {
+        \Drupal::moduleHandler()
+          ->alter($hook, $effect, $settings, $args);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_auto_retina_effect_alter().
+ *
+ * Calculates the correct retina size for $effect.
+ */
+function auto_retina_auto_retina_effect_alter(&$effect, $retina_info, $context) {
+  $config = $effect->getConfiguration();
+  if (!empty($config['data']['width'])) {
+    list(, $original) = $context;
+    $width = \Drupal::service('image.factory')->get($original)->getWidth();
+
+    // We always upscale.  The maximum value to upscale to will be optimized.
+    $config['data']['upscale'] = TRUE;
+
+    // Optimize the retina image size.
+    $data = $config['data'] + ['height' => NULL];
+    $optimized = \Drupal::service('auto_retina.core')
+      ->optimizeImageSize($data['width'], $data['height'], $retina_info['multiplier'], $width);
+    $config['data']['width'] = $optimized['width'];
+    $config['data']['height'] = $optimized['height'];
+    $effect->setConfiguration($config);
+
+    // Make a log entry if the image is of lower quality.
+    if ($optimized['is_suboptimum']
+      && \Drupal::config('auto_retina.settings')->get('log')) {
+      \Drupal::logger('auto_retina')
+        ->notice('Poor retina quality, @percentage% of ideal.  To fix this, you must upload a new version of %file at least @width pixels wide.', [
+          '%file' => $original,
+          '@width' => $optimized['optimum_width'],
+          '@percentage' => $optimized['percent_of_optimum'],
+        ]);
+    }
+  }
+}
