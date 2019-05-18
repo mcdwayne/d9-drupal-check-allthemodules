@@ -1,0 +1,172 @@
+<?php
+
+/**
+ * @file
+ * Contains implementations of hooks.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Url;
+use Drupal\Component\Utility\UrlHelper;
+use Drupal\Core\Entity\EntityFormInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\field_ui\FieldUI;
+use Drupal\core\Entity\EntityInterface;
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Add a 'Cancel' button to all entity forms.
+ */
+function cancel_button_form_alter(&$form, FormStateInterface $form_state) {
+
+  if ($form_state->getFormObject() instanceof EntityFormInterface) {
+    // If this is an entity form, get the current request and the current route.
+    // The current request exposes the 'destination' parameter and the HTTP
+    // Referer, and current route match exposes the route for this form
+    // (to differentiate if this is a entity add or entity edit form.
+    $current_request = \Drupal::requestStack()->getCurrentRequest();
+    $current_route_match = \Drupal::service('current_route_match');
+    $route_provider = \Drupal::service('router.route_provider');
+    $destination = NULL;
+    // Get the entity type corresponding to the entity form.
+    $entity_type_id = $form_state
+      ->getFormObject()
+      ->getEntity()
+      ->getEntityTypeId();
+
+    $cancel_button_settings = \Drupal::config('cancel_button.settings')
+      ->get('entity_type_cancel_destination');
+    $entity_type = \Drupal::entityTypeManager()->getDefinition($entity_type_id);
+
+    // Cancel button is enabled/disabled at the entity type level, determine
+    // if the button has to be enabled.
+    if (array_key_exists($entity_type_id, $cancel_button_settings)) {
+      $cancel_button_setting_enabled = $cancel_button_settings[$entity_type_id]['enabled'];
+    }
+    else {
+      $cancel_button_setting_enabled = $cancel_button_settings['default']['enabled'];
+    }
+
+    if ($cancel_button_setting_enabled) {
+      // If the 'cancel' button is enabled for this entity type,
+      // get the default redirect for the current entity type as a
+      // final fallback. If this is a bundle, then the redirect path is
+      // stored at the bundle level.
+      if ($entity_type->hasKey('bundle')) {
+        $entity = $form_state->getFormObject()->getEntity();
+        $bundle_entity_id = $entity->bundle();
+        $config_key = $entity_type_id . '_' . $bundle_entity_id;
+      }
+      else {
+        $config_key = $entity_type_id;
+      }
+      if (array_key_exists($config_key, $cancel_button_settings)) {
+        $cancel_button_path = $cancel_button_settings[$config_key]['path'];
+      }
+      else {
+        $cancel_button_path = $cancel_button_settings['default']['path'];
+      }
+      // If there is a form redirect set, use that for the cancel button.
+      if ($redirect = $form_state->getRedirect()) {
+        // Set the destination from the form state redirect.
+        $destination = Url::fromRoute($redirect->getRouteName());
+      }
+      // Use the destination parameter on the current request for the cancel
+      // button, if there is one.
+      elseif ($destination_param = $current_request->query->get('destination')) {
+        // The contextual links menu does not correctly prefix the destination
+        // parameter with a leading slash, so we need to add it if it's missing.
+        if (strpos($destination_param, '/') !== 0) {
+          $destination_param = '/' . $destination_param;
+        }
+        $destination = Url::fromUserInput($destination_param);
+      }
+      elseif (preg_match('/entity\..+\.*edit_form/', $current_route_match->getRouteName())) {
+        // If this is the entity edit form (as opposed to the entity add form),
+        // set the destination as the canonical route if available and the
+        // collection route otherwise.
+        // For field configs, the fields list for the bundle should be
+        // displayed.
+        $parameter_bag = $current_route_match->getParameters();
+        if ($parameter_bag) {
+          $parameters = $parameter_bag->all();
+          if ($parameters && array_key_exists($entity_type_id, $parameters)) {
+            if ($parameters[$entity_type_id] instanceof EntityInterface) {
+              $id = $parameters[$entity_type_id]->id();
+              $entity = \Drupal::entityTypeManager()
+                ->getStorage($entity_type_id)
+                ->load($id);
+
+              if ($entity->hasLinkTemplate('canonical')) {
+                $canonical_destination = $entity->toUrl('canonical');
+                $canonical_route_name = $canonical_destination->getRouteName();
+                if (!empty($route_provider->getRoutesByNames([$canonical_route_name]))) {
+                  $destination = $canonical_destination;
+                }
+              }
+              // Redirect to the collection otherwise.
+              if (empty($destination) && $entity->hasLinkTemplate('collection')) {
+                $collection_destination = $entity->toUrl('collection');
+                $collection_route_name = $collection_destination->getRouteName();
+                if (!empty($route_provider->getRoutesByNames([$collection_route_name]))) {
+                  $destination = $collection_destination;
+                }
+              }
+              // For field configs, redirect to the overview form.
+              if ($entity_type_id == 'field_config') {
+                $destination = FieldUI::getOverviewRouteInfo($entity->getTargetEntityTypeId(), $entity->getTargetBundle());
+              }
+            }
+          }
+        }
+      }
+      else {
+        $http_referer = $current_request->headers->get('referer');
+
+        if (!empty($http_referer) && $http_referer !== $current_request->getUri()) {
+          // If the HTTP Referer is NOT the current page (e.g., not from a page
+          // reload), set the destination from the referer.
+          $redirect = UrlHelper::stripDangerousProtocols($http_referer);
+          $destination = Url::fromUri($redirect);
+        }
+      }
+      if (empty($destination)) {
+        $destination = Url::fromUserInput($cancel_button_path);
+      }
+      // Allow other modules to alter the destination.
+      $alter_context = [
+        'settings' => $cancel_button_settings,
+        'request' => $current_request,
+        'route_match' => $current_route_match,
+        'entity_type' => $entity_type,
+        'form_state' => $form_state,
+      ];
+      \Drupal::moduleHandler()->alter('cancel_button_destination', $destination, $alter_context);
+
+      if (!is_null($destination) && !isset($form['actions']['cancel'])) {
+        $form['actions']['cancel'] = [
+          '#type' => 'link',
+          '#title' => t('Cancel'),
+          '#url' => $destination,
+          '#attributes' => [
+            'class' => [
+              'button',
+            ],
+          ],
+          '#weight' => 30,
+        ];
+      }
+    }
+  }
+}
+
+/**
+ * {@inheritdoc}
+ */
+function cancel_button_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'cancel_button.admin_settings':
+      return t('<p>Enter the default paths to use for the <strong>Cancel</strong> button on entity forms when there is no form state redirect, destination query parameter, or HTTP Referer.</p>');
+  }
+}
