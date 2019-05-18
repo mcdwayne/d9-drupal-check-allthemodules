@@ -1,0 +1,386 @@
+<?php
+
+/**
+ * @file
+ * Module providing role access relations.
+ */
+
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Session\AccountInterface;
+
+/**
+ * Determine the access for a given accont and operation.
+ */
+function _rac_get_account_roles($op, $account) {
+  $userRoles = [];
+  $roles = user_roles();
+  foreach ($roles as $role) {
+    $permission = "RAC_" . $op . "_" . $role->id();
+    if ($account->hasPermission($permission)) {
+      $userRoles[] = $role;
+    }
+  }
+  return $userRoles;
+}
+
+/**
+ * Get list of role reference fields for an entity bundle.
+ *
+ * Retrieves a list of field names of Entity reference fields with type role.
+ *
+ * @param \Drupal\Core\Entity\EntityTypeInterface $type
+ *   Entity type to retrieve fields of.
+ * @param string $bundle
+ *   Name of Entity Bundle to filter fields by. Defaults to Entity type id if
+ *   none provided.
+ *
+ * @return array
+ *   List of field name of role reference fields on the bundle. If there are
+ *   no fields, the array is empty.
+ */
+function _rac_get_entity_reference_role_fields(EntityTypeInterface $type, $bundle = NULL) {
+  $bundle_fields = &drupal_static(__FUNCTION__);
+  if (!$type->isSubclassOf('\Drupal\Core\Entity\FieldableEntityInterface')) {
+    return [];
+  }
+  $type_id = $type->id();
+  if ($bundle === NULL) {
+    $bundle = $type_id;
+  }
+  if (!isset($bundle_fields[$type_id]) || !isset($bundle_fields[$type_id][$bundle])) {
+    $bundle_fields[$type_id][$bundle] = [];
+    // Get fields of bundle.
+    $fields = \Drupal::entityManager()->getFieldDefinitions($type_id, $bundle);
+    // Filter fields on bundle to only role references.
+    foreach ($fields as $field) {
+      $field_type = method_exists($field, 'getType') ? $field->getType() : NULL;
+      $target_type = method_exists($field, 'getSetting') ? $field->getSetting('target_type') : NULL;
+      if ($field_type === 'entity_reference' && $target_type === 'user_role') {
+        $field_storage = $field->getFieldStorageDefinition();
+        if ($field_storage->getThirdPartySetting("rac", "enabled", FALSE)) {
+          $bundle_fields[$type_id][$bundle][] = $field->getName();
+        }
+      }
+    }
+  }
+  return isset($bundle_fields[$type_id][$bundle]) ? $bundle_fields[$type_id][$bundle] : FALSE;
+}
+
+/**
+ * Get list of roles refrenced by $entity and cache it.
+ *
+ * Retrives entity reference values for a node. Return values are cached.
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ *   Entity to find field values for.
+ *
+ * @see tac_lite_node_get_terms
+ */
+function _rac_get_entity_reference_roles(EntityInterface $entity) {
+  $roles = &drupal_static(__FUNCTION__);
+  if (!$entity) {
+    return [];
+  }
+
+  $id = $entity->id();
+  $type = $entity->getEntityType();
+  $type_id = $type->id();
+  if (!isset($roles[$type_id]) || !isset($roles[$type_id][$id])) {
+
+    // Get list of fields.
+    $bundle = $entity->bundle();
+    $fields = _rac_get_entity_reference_role_fields($type, $bundle);
+
+    // Get values for each field.
+    foreach ($fields as $field_name) {
+      if ($items = $entity->get($field_name)->getValue()) {
+        // Filter out empty values from items list.
+        $items = array_filter($items);
+        foreach ($items as $item) {
+          $roles[$type_id][$id][] = $item['target_id'];
+        }
+      }
+    }
+
+    // Filter out null values from forms.
+    if (isset($roles[$type_id][$id])) {
+      $roles[$type_id][$id] = array_filter(array_unique($roles[$type_id][$id]));
+    }
+    else {
+      $roles[$type_id][$id] = [];
+    }
+  }
+  return isset($roles[$type_id][$id]) ? $roles[$type_id][$id] : [];
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Hide Role Access permissions from global permissions list since they have
+ * their own display.
+ */
+function rac_form_user_admin_permissions_alter(&$form, FormStateInterface &$form_state, $form_id) {
+  $ops = ['view', 'update'];
+  $roles = user_roles();
+  foreach ($ops as $op) {
+    foreach ($roles as $role) {
+      $permission = "RAC_" . $op . "_" . $role->id();
+      if (isset($form['permissions'][$permission])) {
+        unset($form['permissions'][$permission]);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Add submissions handler to role edit form.
+ */
+function rac_form_user_role_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $form['actions']['submit']['#submit'][] = '_rac_form_user_role_form_submit';
+}
+
+/**
+ * Implements hook_submit().
+ *
+ * Handle submission of role form to grant access permission for own content.
+ */
+function _rac_form_user_role_form_submit(&$form, FormStateInterface $form_state) {
+  $role = $form_state->getFormObject()->getEntity();
+  $permission = "RAC_view_" . $role->id();
+  if (!$role->hasPermission($permission)) {
+    $role->grantPermission($permission);
+    $role->save();
+  }
+}
+
+/**
+ * Implements hook_user_role_delete().
+ *
+ * On Role deletion, revoke RAC update permission from other roles.
+ */
+function rac_user_role_delete(EntityInterface $role) {
+  $roles = user_roles();
+  $permission = "RAC_update_" . $role->id();
+  foreach ($roles as $r) {
+    if ($r->hasPermission($permission)) {
+      $r->revokePermission($permission);
+    }
+  }
+}
+
+/**
+ * Remove options from a field that should not be displayed to the user.
+ *
+ * @param string $fieldName
+ *   Field name of field being processesed.
+ * @param array $element
+ *   Form element for Role Entity Reference Field.
+ * @param \Drupal\Core\Session\AccountInterface $user
+ *   Optional User to restrict values for, defaults to \Drupal::currentUser().
+ */
+function _rac_restrict_field_values($fieldName, array &$element, AccountInterface $user = NULL) {
+  if ($user === NULL) {
+    $user = \Drupal::currentUser();
+  }
+
+  if (isset($element['widget']['#type']) && in_array($element['widget']['#type'], ["select", "checkboxes"])) {
+    // Get original field values.
+    $orig_options = $element['widget']["#options"];
+    $orig_value = $element['widget']["#default_value"];
+
+    // Helper function to map roles to string ids.
+    $mapRoleID = function ($role) {
+      return $role->id();
+    };
+
+    // Calculate the values the user is allowed to see, and which values
+    // should be displayed as selected on the form.
+    $allowed_roles = _rac_get_account_roles("update", $user);
+    $visible = array_map($mapRoleID, $allowed_roles);
+    // Strip any options not visible to the user.
+    $allowed_options = array_intersect_key($orig_options, array_flip($visible));
+    // Strip any options not visible to the user.
+    $allowed_values = array_intersect($orig_value, $visible);
+    $restricted_values = array_diff($orig_value, $allowed_values);
+
+    // Restrict the values visible on the form.
+    $element['widget']["#options"] = $allowed_options;
+    $element['widget']["#default_value"] = $allowed_values;
+    // Store $restricted_values for use on submission.
+    $element['widget']["#restricted_value"] = $restricted_values;
+
+    // Set list of visible values so we can pass them back on form submission.
+    // This is set via default_value as to not override any values coming
+    // From the users form submission. Alloed options are encoded in base64 so
+    // The data is not easily manipulated by the end user.
+    $element["_rac_" . $fieldName . "_original"] = [
+      '#type' => "hidden",
+      "#default_value" => base64_encode(json_encode(array_keys($allowed_options))),
+    ];
+
+    // Setup Validate Call back on the field.
+    $element["#element_validate"][] = "_rac_field_validate";
+    $element["#field_name"] = $fieldName;
+  }
+}
+
+/**
+ * Implements hook_field_validate().
+ *
+ * Add back restircted field values, to fields they were removed from.
+ */
+function _rac_field_validate($element, FormStateInterface $form_state, $form) {
+  $fieldName = $element["#field_name"];
+  // Pass on value restoration to helper function.
+  _rac_restore_field_values($fieldName, $element, $form_state);
+}
+
+/**
+ * Repopulate the restricted values for a given field.
+ *
+ * @param string $fieldName
+ *   Fieldname of field being processesed.
+ * @param array $element
+ *   Form element for Role Entity Reference Field.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   Optional User to restrict values for, defaults to \Drupal::currentUser().
+ */
+function _rac_restore_field_values($fieldName, array &$element, FormStateInterface $form_state) {
+  // Form values to retrieve stored data.
+  $formValues = $form_state->getValues();
+
+  if (!isset($formValues[$fieldName])) {
+    // Field value is not set, so we can't restore value.
+    return;
+  }
+
+  // Get data from request and generated form.
+  $was_visibile = (array) json_decode(base64_decode($formValues["_rac_" . $fieldName . "_original"]));
+  $current_visible = array_keys($element['widget']["#options"]);
+  $restricted_values = $element['widget']["#restricted_value"];
+
+  // Helper function to dereferenced the submitted value.
+  $map_target_id = function ($v) {
+    return $v["target_id"];
+  };
+  // Helper function to revert dereferencing.
+  $map_target_id_reverse = function ($v) {
+    return ["target_id" => $v];
+  };
+
+  // Calculate the set of data submitted.
+  //
+  // We need to take into account that the users access may have changed
+  // between form generation and form submission. Thus, use the following
+  // alogorythm to recalculate the selected values. where orig is the
+  // value when original form was built, and the cur is the default_value
+  // the last time the form was regenerated on form submission.
+  //
+  // Selected = cur.default_value - (cur.vis - (orig.vis - submitted))
+  //
+  $always_visible = array_intersect($was_visibile, $current_visible);
+  $submitted_value = array_map($map_target_id, $formValues[$fieldName]);
+  $removed = array_diff($always_visible, $submitted_value);
+  $visible_value = array_diff($current_visible, $removed);
+  $selected = array_merge($visible_value, $restricted_values);
+
+  // Remap back to original value format and set the form state.
+  $remapped = array_map($map_target_id_reverse, $selected);
+  $form_state->setValue($fieldName, $remapped);
+}
+
+/**
+ * Get entity types which have access controled by rac plugins.
+ *
+ * Controlled entity types are defined by Role Access Consumer Plugins. Each
+ * plugin provides a list of the entity types it handles access control for.
+ *
+ * @return array
+ *   List of entity type ids.
+ */
+function _rac_get_supported_entity_types() {
+  static $supportedTypes = NULL;
+  if ($supportedTypes === NULL) {
+    // For each consumer get its list of supported entity types.
+    $supportedTypes = [];
+    $providerManager = \Drupal::service('plugin.manager.adva.consumer');
+    foreach ($providerManager->getConsumersForProviderId('rac') as $consumer) {
+      $supportedTypes[] = $consumer->getEntityTypeId();
+    }
+  }
+  return array_unique($supportedTypes);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Add a setting to role access fields to enable access controll baded on the
+ * fields value. This allows us to add role type fields that are not restricted
+ * rac.
+ */
+function rac_form_field_storage_config_edit_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // Get form object and field we are editing.
+  $form_obj = $form_state->getFormObject();
+  $field_storage = $form_obj->getEntity();
+
+  if ($field_storage->getType() !== "entity_reference") {
+    // We only want to modify entity reference fields. If not, exit.
+    return $form;
+  }
+
+  $racEntityTypes = _rac_get_supported_entity_types();
+  $host_type = $field_storage->getTargetEntityTypeId();
+
+  if (!in_array($host_type, $racEntityTypes)) {
+    // We only want want to controll access on entity types managed by a rac
+    // consumer. Otherwise, we exit.
+    return $form;
+  }
+
+  $target_type = $field_storage->getSetting("target_type");
+
+  if (empty($target_type) || $target_type !== "user_role") {
+    // We can't determine the reference type. Stop trying.
+    return $form;
+  }
+
+  $form['third_party_settings']['rac'] = [
+    '#type' => 'details',
+    '#open' => TRUE,
+    '#title' => t('Role Access Control'),
+  ];
+  $form['third_party_settings']['rac']['rac_enabled'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Enable Role Access Control on this field.'),
+    '#description' => t('This field will restrict access to content and the field options.'),
+    '#default_value' => $field_storage->getThirdPartySetting('rac', 'enabled', FALSE),
+  ];
+
+  $form['actions']['submit']['#submit'][] = '_rac_form_field_storage_config_edit_form_submit';
+
+}
+
+/**
+ * Implements hook_submit().
+ *
+ * On submission of the Field Storage Config form, save the state of rac for
+ * the filed to its Third Party Settings config.
+ */
+function _rac_form_field_storage_config_edit_form_submit($form, FormStateInterface $form_state) {
+  // Get form object and field we are editing.
+  $form_obj = $form_state->getFormObject();
+  $field_storage = $form_obj->getEntity();
+  $field_storage->setThirdPartySetting('rac', 'enabled', $form_state->getValue("rac_enabled"))->save();
+}
+
+/**
+ * Check if access grants should apply to unpublished content.
+ */
+function _rac_update_unpublished() {
+  return \Drupal::config("rac.settings")
+    ->get("update_unpublished");
+}
