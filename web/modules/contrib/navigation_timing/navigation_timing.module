@@ -1,0 +1,257 @@
+<?php
+
+/**
+ * @file
+ * Navigation timing module.
+ */
+
+/**
+ * Implements hook_css_alter().
+ */
+function navigation_timing_css_alter(&$css) {
+  if (!empty($_REQUEST['no_css']) && $_REQUEST['no_css'] == 1) {
+    $css = array();
+  }
+}
+
+/**
+ * Implements hook_js_alter().
+ */
+function navigation_timing_js_alter(&$js) {
+  if (!empty($_REQUEST['no_js']) && $_REQUEST['no_js'] == 1) {
+    $settings = array();
+    if (!empty($js['settings'])) {
+      $settings = $js['settings'];
+    }
+    $js = array('settings' => $settings);
+  }
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function navigation_timing_views_api() {
+  return array(
+    'api' => 2.0,
+    'path' => drupal_get_path('module', 'navigation_timing') . '/views',
+  );
+}
+
+/**
+ * Implements hook_page_alter().
+ */
+function navigation_timing_page_alter(&$page) {
+  drupal_add_library('system', 'drupalSettings');
+  $page['#post_render'][] = 'navigation_timing_inject';
+}
+
+/**
+ * Implements hook_rebuild().
+ *
+ * Refresh the variable containing the js to log navigation timing data.
+ */
+function navigation_timing_rebuild() {
+  $js_file = drupal_get_path('module', 'navigation_timing') . '/navigation_timing.min.js';
+  variable_set('navigation_timing_js', file_get_contents($js_file));
+}
+
+/**
+ * Adds the required js at the end of the page to send timing information to
+ * the database.
+ *
+ * Fetches performance data, current theme and user.
+ *
+ * @param string $page
+ *
+ * @return string
+ *   Page HTML with navigation timing JS injected before </body>.
+ */
+function navigation_timing_inject($page) {
+  global $user;
+
+  $log_percent = db_select('navigation_timing_profile', 'ntp')
+    ->fields('ntp', array('log_percent'))
+    ->condition('profile_name', variable_get('navigation_timing_profile', 'default'))
+    ->execute()
+    ->fetchField();
+
+  $js_file = variable_get('navigation_timing_js', 'console.log("Please run the updates");');
+
+  // Custom data that will be logged in the database.
+  $data = array(
+    'gid' => (int) variable_get('navigation_timing_group', 1),
+    'uid' => (int) $user->uid,
+    'logPercent' => (int) $log_percent,
+    'path' => current_path(),
+    'theme' => $GLOBALS['theme_key'],
+  );
+  // Module configuration data.
+  $config = array(
+    'url' => file_create_url(drupal_get_path('module', 'navigation_timing') . '/navigation_timing.php'),
+  );
+  // Let contrib alter data sent to JS.
+  drupal_alter('navigation_timing_data', $data, $config);
+  $data_json = drupal_json_encode($data);
+  $config_json = drupal_json_encode($config);
+
+  // Some special treatments to handle JS injection.
+  $inject_js = '';
+  $inject_invoke = module_invoke_all('navigation_timing_inject_js');
+  if (!empty($inject_invoke)) {
+    foreach ($inject_invoke as $ijs) {
+      $inject_js .= 'try {' . $ijs . '} catch (e) {}';
+    }
+  }
+
+  $search = array('"$config$"', '"$data$"', '"$inject_js$"');
+  $replace = array($config_json, $data_json, $inject_js);
+  $script = '<script>' . str_replace($search, $replace, $js_file) . '</script>';
+  // Adds the script just before </body>.
+  return str_replace('</body>', $script . "\n</body>", $page);
+}
+
+/**
+ * Implements hook_modules_enabled().
+ *
+ * Creates a new profile on module enable
+ */
+function navigation_timing_modules_enabled($modules) {
+  if (!empty($modules) && count($modules) > 1 || $modules[0] != 'navigation_timing') {
+    navigation_timing_create_group();
+  }
+}
+
+/**
+ * Implements hook_modules_disabled().
+ *
+ * Creates a new profile on module disable.
+ */
+function navigation_timing_modules_disabled($modules) {
+  if (!empty($modules)) {
+    navigation_timing_create_group();
+  }
+}
+
+/**
+ * Implements hook_form_FORMID_alter().
+ *
+ * Adds a custom submit handler to check CSS or JS aggregation settings change.
+ */
+function navigation_timing_form_system_performance_settings_alter(&$form, &$form_state) {
+  $form['#submit'][] = '_navigation_timing_performance_settings_update';
+}
+
+/**
+ * Creates a new group in the current profile if CSS or JS aggregation
+ * setting changed.
+ *
+ * @param array $form
+ * @param array $form_state
+ */
+function _navigation_timing_performance_settings_update($form, &$form_state) {
+  $values = $form_state['values'];
+  $css_changed = $values['preprocess_css'] !== $form['bandwidth_optimization']['preprocess_css']['#default_value'];
+  $js_changed = $values['preprocess_js'] !== $form['bandwidth_optimization']['preprocess_js']['#default_value'];
+  if ($css_changed || $js_changed) {
+    navigation_timing_create_group();
+  }
+}
+
+/**
+ * Implements hook_menu().
+ */
+function navigation_timing_menu() {
+  $items = array();
+  $items['admin/config/development/navigation_timing'] = array(
+    'title' => 'Navigation timing',
+    'description' => 'Administer navigation timing data gathering.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('navigation_timing_admin'),
+    'file' => 'navigation_timing.admin.inc',
+    'access arguments' => array('administer site configuration'),
+  );
+  $items['admin/config/development/navigation_timing/profile/add'] = array(
+    'title' => 'Add a new navigation timing profile',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('navigation_timing_admin_create_profile'),
+    'file' => 'navigation_timing.admin.inc',
+    'access arguments' => array('administer site configuration'),
+  );
+  $items['admin/config/development/navigation_timing/profile/%/edit'] = array(
+    'title' => 'Add a new navigation timing profile',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('navigation_timing_admin_edit_profile', 5),
+    'file' => 'navigation_timing.admin.inc',
+    'access arguments' => array('administer site configuration'),
+  );
+  return $items;
+}
+
+/**
+ * Adds a new user-created timing profile to aggregate data.
+ *
+ * @param string $profile_name
+ *   Machine name of profile.
+ *
+ * @param array $data
+ *   Associative array of administrative values
+ *   - 'title': Human readable title,
+ *   - 'description': A short text describing the profile.
+ *
+ * @return bool
+ *   Returns TRUE if successful.
+ */
+function navigation_timing_create_profile($profile_name, $data = array()) {
+  $default = array(
+    'created' => time(),
+    'title' => '',
+    'description' => '',
+    'log_percent' => 100,
+  );
+  if (!empty($profile_name) && is_string($profile_name)) {
+    // Filters data.
+    $data = array_intersect_key($data, array_flip(array_keys($default)));
+    // Forces profile name.
+    $data['profile_name'] = $profile_name;
+    db_insert('navigation_timing_profile')
+      ->fields($data + $default)
+      ->execute();
+
+    // Creates a new group in the new profile.
+    $group = navigation_timing_create_group($profile_name);
+    // Sets current profile.
+    variable_set('navigation_timing_profile', $profile_name);
+    return TRUE;
+  }
+  return FALSE;
+}
+
+
+/**
+ * Creates a new group in the specified or default profile.
+ *
+ * @param string $profile_name
+ *   Optional profile_name the new group will belong to.
+ *
+ * @return bool
+ *   Returns TRUE if successful.
+ */
+function navigation_timing_create_group($profile_name = '') {
+  if (empty($profile_name)) {
+    $profile_name = variable_get('navigation_timing_profile', 'default');
+  }
+
+  $modules = module_list();
+  $gid = db_insert('navigation_timing_group')
+    ->fields(array(
+      'profile_name' => $profile_name,
+      'created' => time(),
+      'aggregate_js' => variable_get('preprocess_js', 0),
+      'aggregate_css' => variable_get('preprocess_css', 0),
+      'modules' => implode("\n", $modules),
+    ))
+    ->execute();
+
+  variable_set('navigation_timing_group', $gid);
+  return (bool) $gid;
+}
