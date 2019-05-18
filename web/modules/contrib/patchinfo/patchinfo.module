@@ -1,0 +1,436 @@
+<?php
+
+/**
+ * @file
+ * Patch Info primary module file.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Extension\Extension;
+use Drupal\Component\Utility\Html;
+use Drupal\Core\Link;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_system_info_alter().
+ */
+function patchinfo_system_info_alter(array $info, Extension $file, $type) {
+  $patches = [];
+
+  // Gather patch information from patch sources.
+  $plugin_manager = \Drupal::service('plugin.manager.patchinfo_source');
+  $sources = $plugin_manager->getDefinitions();
+  foreach ($sources as $plugin_id => $plugin_defintion) {
+    $source = $plugin_manager->createInstance($plugin_id, []);
+    $patches_source = $source->getPatches($info, $file, $type);
+    $patches = array_merge_recursive($patches, $patches_source);
+  }
+
+  // Update patch database.
+  _patchinfo_clear_db($file->getName());
+  foreach ($patches as $module => $info) {
+    _patchinfo_process_module($file->getName(), $module, $info);
+  }
+}
+
+/**
+ * Implements hook_update_projects_alter().
+ */
+function patchinfo_update_projects_alter(&$projects) {
+  // Get modules to be excluded from update check from configuration.
+  $config = \Drupal::config('patchinfo.settings');
+  $excluded_modules = (array) $config->get('exclude from update check');
+
+  // Hide excluded modules from update check.
+  if (count($excluded_modules) > 0) {
+    foreach ($excluded_modules as $module) {
+      if (isset($projects[$module])) {
+        unset($projects[$module]);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for update_manager_update_form().
+ */
+function patchinfo_form_update_manager_update_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // Add our CSS.
+  $form['#attached']['library'][] = 'patchinfo/patchinfo';
+
+  // Add a highly visible notice for patched modules.
+  $patch_info = _patchinfo_get_info();
+  if (count($patch_info) > 0) {
+    // Get project information from update manager service.
+    $projects = \Drupal::service('update.manager')->getProjects();
+
+    // Check each project and its submodules for patches.
+    foreach (Element::children($form['project_downloads']) as $module) {
+      $patches = _patchinfo_get_patches($patch_info, $projects[$module]);
+      if (count($patches) > 0) {
+        // Determine, if the module is enabled or disabled and add the patch
+        // list to the appropriate section of the form.
+        $key = '';
+        if (isset($form['projects']['#options'][$module]['title'])) {
+          $key = 'projects';
+        }
+        elseif (isset($form['disabled_projects']['#options'][$module]['title'])) {
+          $key = 'disabled_projects';
+        }
+        if (!empty($key)) {
+          $patch_list = [
+            '#theme' => 'patchinfo_patches',
+            '#patches' => $patches,
+          ];
+          $form[$key]['#options'][$module]['title']['data']['patches'] = $patch_list;
+        }
+      }
+    }
+
+    // If a manual update is available, check, if Drupal core has any
+    // patches. If so, show a warning above the update form.
+    if (isset($form['manual_updates'])) {
+      $patches_drupal = _patchinfo_get_patches($patch_info, $projects['drupal']);
+      if (count($patches_drupal) > 0) {
+        $patch_list = [
+          '#theme' => 'patchinfo_patches',
+          '#patches' => $patches_drupal,
+        ];
+        $form['manual_updates']['#rows']['drupal']['data']['title']['data']['patches'] = $patch_list;
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for update_settings().
+ */
+function patchinfo_form_update_settings_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $config = \Drupal::config('patchinfo.settings');
+
+  $form['patchinfo_exclude_from_update_check'] = [
+    '#type' => 'textarea',
+    '#title' => t('Exclude modules from update check'),
+    '#description' => t('Modules, which should be excluded from the update check, can be listed here. Each entry should use the machine readable name of the module and go on a separate line.'),
+    '#default_value' => implode("\n", (array) $config->get('exclude from update check')),
+  ];
+
+  $form['#submit'][] = 'patchinfo_update_settings_form_submit';
+}
+
+/**
+ * Submission handler for extended update settings form.
+ *
+ * @param array $form
+ *   Drupal Form API form information.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   Drupal Form API form state information.
+ */
+function patchinfo_update_settings_form_submit(array $form, FormStateInterface &$form_state) {
+  // Get value of exclude from update check setting from form state and prepare
+  // it for storage.
+  $exclude_modules = $form_state->getValue('patchinfo_exclude_from_update_check');
+  $exclude_modules = explode("\n", $exclude_modules);
+  foreach ($exclude_modules as $k => $e) {
+    $e = trim($e);
+    if (!empty($e)) {
+      $exclude_modules[$k] = $e;
+    }
+    else {
+      unset($exclude_modules[$k]);
+    }
+  }
+
+  // Store exclude from update check setting in configuration.
+  $config = \Drupal::service('config.factory')->getEditable('patchinfo.settings');
+  $config->set('exclude from update check', $exclude_modules);
+  $config->save();
+}
+
+/**
+ * Remove all patch information for a module from DB.
+ *
+ * @param string $module
+ *   Machine readable module name.
+ */
+function _patchinfo_clear_db($module) {
+  if (!empty($module)) {
+    // We need to wrap this in a try/catch, sice the code might be called during
+    // the update process from 8.x-1.x when the source_module field is still
+    // missing. The alternative would be to check the schema everytime, which
+    // would be much more expensive.
+    try {
+      db_delete('patchinfo')->condition('source_module', $module)->execute();
+    }
+    catch (Exception $e) {
+      watchdog_exception('patchinfo', $e);
+    }
+  }
+}
+
+/**
+ * Get all patches for a module (including its submodules).
+ *
+ * @param array $patch_info
+ *   Patch information as returned by _patchinfo_get_info().
+ * @param array $project_info
+ *   Project information for a single project, i.e. a single value from
+ *   the array returned by \Drupal::service('update.manager')->getProjects().
+ *
+ * @return array
+ *   Array containing all patch information for a module and its
+ *   submodules.
+ */
+function _patchinfo_get_patches(array $patch_info, array $project_info) {
+  $return = [];
+
+  // For each module in this project (including submodules) check, if
+  // there are patches and if so, merge them into our array containing
+  // all patch information for this project.
+  foreach ($project_info['includes'] as $module_key => $module_name) {
+    if (isset($patch_info[$module_key])) {
+      $return = array_merge($return, $patch_info[$module_key]);
+    }
+  }
+
+  return $return;
+}
+
+/**
+ * Get patch information from DB.
+ *
+ * @param bool $raw
+ *   If TRUE, uses an array containing url and info keys for each
+ *   patch. If FALSE (default), either use info text only or, if
+ *   a URL is available, a suitable link for each patch.
+ *
+ * @return array
+ *   Array of patches in DB keyed by machine readable module name.
+ */
+function _patchinfo_get_info($raw = FALSE) {
+  $patch_info = [];
+  $result = db_select('patchinfo', 'pi')->fields('pi', [
+    'module',
+    'id',
+    'url',
+    'info',
+    'source',
+  ])->execute();
+  foreach ($result as $row) {
+    if (!isset($patch_info[$row->module])) {
+      $patch_info[$row->module] = [];
+    }
+    if ($raw) {
+      $patch_info[$row->module][$row->id]['url'] = $row->url;
+      $patch_info[$row->module][$row->id]['info'] = $row->info;
+      $patch_info[$row->module][$row->id]['source'] = $row->source;
+    }
+    else {
+      if (!empty($row->url)) {
+        $url = Url::fromUri($row->url);
+        $text = $row->info;
+        if (!empty($row->source)) {
+          $text = t('@text <abbr title="@source">(src)</abbr>', [
+            '@text' => $row->info,
+            '@source' => $row->source,
+          ]);
+        }
+        $patch_info[$row->module][$row->id] = Link::fromTextAndUrl($text, $url);
+      }
+      else {
+        $text = Html::escape($row->info);
+        if (!empty($row->source)) {
+          $text = t('@text <abbr title="@source">(src)</abbr>', [
+            '@text' => $row->info,
+            '@source' => $row->source,
+          ]);
+        }
+        $patch_info[$row->module][$row->id] = $text;
+      }
+    }
+  }
+  return $patch_info;
+}
+
+/**
+ * Process patch information for a module.
+ *
+ * @param string $module
+ *   Machine readable module name.
+ * @param array $patch_info
+ *   Patch info from module info.yml file.
+ */
+function _patchinfo_process_module($source_module, $module, array $patch_info) {
+  if (!empty($source_module) && !empty($module)) {
+    foreach ($patch_info as $key => $info) {
+      // Calculate an index for each patch, which is not 0.
+      $index = $key + 1;
+
+      if (!is_array($info)) {
+        continue;
+      }
+
+      $source = isset($info['source']) ? $info['source'] : '';
+      $info = isset($info['info']) ? $info['info'] : '';
+
+      // @todo: Move this to a processor plugin.
+      // Extract URL from patch information, if any.
+      $info = explode(' ', $info);
+      $url = '';
+      if (filter_var($info[0], FILTER_VALIDATE_URL) !== FALSE) {
+        $url = $info[0];
+        unset($info[0]);
+      }
+      $info = implode(' ', $info);
+
+      // We need to wrap this in a try/catch, sice the code might be called
+      // during the update process from 8.x-1.x when the source_module and
+      // source fields are still missing. The alternative would be to check the
+      // schema everytime, which would be much more expensive.
+      try {
+        // Write patch information to db.
+        db_merge('patchinfo')
+          ->key([
+            'source_module' => $source_module,
+            'module' => $module,
+            'id' => $index,
+          ])
+          ->fields([
+            'url' => $url,
+            'info' => $info,
+            'source' => $source,
+          ])
+          ->execute();
+      }
+      catch (Exception $e) {
+        watchdog_exception('patchinfo', $e);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function patchinfo_theme($existing, $type, $theme, $path) {
+  return [
+    'patchinfo_excluded_modules' => [
+      'variables' => [
+        'excluded_modules' => [],
+      ],
+    ],
+    'patchinfo_patches' => [
+      'variables' => [
+        'patches' => [],
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_theme_registry_alter().
+ */
+function patchinfo_theme_registry_alter(&$theme_registry) {
+  $module_path = drupal_get_path('module', 'patchinfo');
+
+  if (isset($theme_registry['update_report'])) {
+    // Replace template location for update report with our own templates
+    // folder, so that we can alter the template.
+    $theme_registry['update_report']['path'] = $module_path . '/templates';
+  }
+  if (isset($theme_registry['update_project_status'])) {
+    // Update module will sort parts of the project information using sort().
+    // Unfortunately, this results in the keys being lost. Since we need these
+    // keys to check for patch information, we will move our preprocess function
+    // in front of the preprocess function provided by upate module.
+    $position = array_search('patchinfo_preprocess_update_project_status', $theme_registry['update_project_status']['preprocess functions']);
+    if ($position) {
+      $out = array_splice($theme_registry['update_project_status']['preprocess functions'], $position, 1);
+      array_splice($theme_registry['update_project_status']['preprocess functions'], 1, 0, $out);
+    }
+    // Replace template location for update project status with our own
+    // templates folder, so that we can alter the template.
+    $theme_registry['update_project_status']['path'] = $module_path . '/templates';
+  }
+}
+
+/**
+ * Implements hook_preprocess_HOOK() for update-report.html.twig.
+ */
+function patchinfo_preprocess_update_report(&$variables) {
+  $config = \Drupal::config('patchinfo.settings');
+
+  // Provide excluded modules variable.
+  $variables['excluded_modules'] = [
+    '#theme' => 'patchinfo_excluded_modules',
+    '#excluded_modules' => (array) $config->get('exclude from update check'),
+    '#attached' => [
+      'library' => [
+        'patchinfo/patchinfo',
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_preprocess_HOOK() for update-project-status.html.twig.
+ */
+function patchinfo_preprocess_update_project_status(&$variables) {
+  $patch_info = _patchinfo_get_info();
+  $patches = _patchinfo_get_patches($patch_info, $variables['project']);
+
+  // Provide patches variable.
+  if (count($patches) > 0) {
+    $variables['patches'] = [
+      '#theme' => 'patchinfo_patches',
+      '#patches' => $patches,
+    ];
+  }
+}
+
+/**
+ * Prepares variables for patchinfo excluded modules templates.
+ *
+ * Default template: patchinfo-excluded-modules.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - excluded_modules: List of modules excluded from update check.
+ */
+function template_preprocess_patchinfo_excluded_modules(array &$variables) {
+  if (count($variables['excluded_modules']) > 0) {
+    // Prepare excluded modules for use in template.
+    $variables['excluded_modules'] = [
+      '#theme' => 'item_list',
+      '#items' => $variables['excluded_modules'],
+    ];
+
+    // Provide URL to settings page of update module.
+    $variables['settings_url'] = new Url('admin/reports/updates/settings', [], [
+      'query' => \Drupal::destination()->getAsArray(),
+    ]);
+  }
+}
+
+/**
+ * Prepares variables for a patch listing of a module and its submodules.
+ *
+ * Default template: patchinfo-patches.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - patches: List of patch information for a module and its submodules.
+ */
+function template_preprocess_patchinfo_patches(array &$variables) {
+  // Prepare patch list for use in template.
+  $variables['patches'] = [
+    '#theme' => 'item_list',
+    '#items' => $variables['patches'],
+    '#attached' => [
+      'library' => [
+        'patchinfo/patchinfo',
+      ],
+    ],
+  ];
+}
