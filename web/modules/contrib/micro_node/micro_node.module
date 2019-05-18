@@ -1,0 +1,832 @@
+<?php
+
+/**
+ * @file
+ * Contains micro_node.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\node\Entity\NodeType;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\node\NodeTypeInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Core\Field\FieldDefinitionInterface;
+use Drupal\Core\Field\FieldItemListInterface;
+use Drupal\node\NodeInterface;
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\user\Entity\User;
+use Drupal\Core\Form\FormState;
+use Drupal\micro_site\Entity\SiteInterface;
+use Drupal\Core\Url;
+use Drupal\Core\Database\Query\AlterableInterface;
+use Symfony\Component\HttpFoundation\Request;
+use Drupal\Core\Database\Query\SelectInterface;
+use Drupal\micro_node\MicroNodeFields;
+use Drupal\micro_site\SiteUsers;
+use Drupal\Core\Cache\CacheBackendInterface;
+use Drupal\Core\Cache\Cache;
+use Drupal\views\ViewExecutable;
+use Drupal\views\Plugin\views\query\QueryPluginBase;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+
+/**
+ * Implements hook_help().
+ */
+function micro_node_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the micro_node module.
+    case 'help.page.micro_node':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Provide page for micro site') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_entity_base_field_info().
+ */
+function micro_node_entity_base_field_info(EntityTypeInterface $entity_type) {
+  $fields = [];
+
+  if ($entity_type->id() === 'node') {
+    $fields['site_id'] = BaseFieldDefinition::create('entity_reference')
+      ->setLabel(t('Site'))
+      ->setDescription(t('The site on which the node is created.'))
+      ->setRevisionable(TRUE)
+      ->setSetting('target_type', 'site')
+      ->setSetting('handler', 'default')
+      ->setSetting('handler_settings', [
+        'target_bundles' => NULL,
+        'auto_create' => FALSE,
+      ])
+      ->setDefaultValueCallback('Drupal\micro_node\MicroNodeManager::getCurrentSiteId')
+      ->setTranslatable(TRUE)
+      ->setDisplayOptions('view', [
+        'label' => 'hidden',
+        'type' => 'entity_reference_label',
+        'weight' => 0,
+      ])
+      ->setDisplayOptions('form', [
+        'type' => 'entity_reference_autocomplete',
+        'weight' => 5,
+        'settings' => [
+          'match_operator' => 'CONTAINS',
+          'size' => '60',
+          'placeholder' => '',
+        ],
+      ])
+      ->setDisplayConfigurable('form', TRUE)
+      ->setDisplayConfigurable('view', TRUE);
+  }
+
+  return $fields;
+}
+
+/**
+ * Implements hook_node_grants().
+ */
+function micro_node_node_grants(AccountInterface $account, $op) {
+  /** @var \Drupal\micro_site\SiteNegotiatorInterface $negotiator */
+  $negotiator = \Drupal::service('micro_site.negotiator');
+  /** @var \Drupal\micro_site\Entity\SiteInterface $site */
+  $site = $negotiator->getSite();
+  $site_id = ($site) ? $site->id() : 'master';
+
+  $grants = &drupal_static(__FUNCTION__ . '_' . $site_id . '_' . $op . '_' . $account->id());
+
+  if (is_null($grants)) {
+    $cid = 'micro_node.site:' . $site_id . '.user:' . $account->id() . '.op:' . $op;
+    $data = \Drupal::cache('micro_node_grants')->get($cid);
+
+    if (!$data) {
+      /** @var \Drupal\micro_node\MicroNodeManagerInterface $micro_node_manager */
+      $micro_node_manager = \Drupal::service('micro_node.manager');
+      // Get the user's sites.
+      $sites_user = $micro_node_manager->getSitesReferencingUsers($account);
+      $grants = micro_node_get_account_grants($account, $op, $sites_user, $site);
+      $cache_tags = User::load($account->id())->getCacheTags();
+      \Drupal::cache('micro_node_grants')->set($cid, $grants, CacheBackendInterface::CACHE_PERMANENT, $cache_tags);
+    }
+    else {
+      $grants = $data->data;
+    }
+
+  }
+
+  return $grants;
+}
+
+/**
+ * Get the grants for a given account and an operation.
+ *
+ * @param \Drupal\Core\Session\AccountInterface $account
+ *   The account to check.
+ * @param $op
+ *   The operation to check
+ * @param array $sites_user
+ *   An array of site id referencing the account.
+ * @param \Drupal\micro_site\Entity\SiteInterface $site
+ *  The active site on which check the permissions.
+ *
+ * @return array
+ *   The grants array.
+ */
+function micro_node_get_account_grants(AccountInterface $account, $op, $sites_user, SiteInterface $site = NULL) {
+  $grants = [];
+  /** @var \Drupal\micro_node\MicroNodeManagerInterface $micro_node_manager */
+  $micro_node_manager = \Drupal::service('micro_node.manager');
+
+  // No site means we are on the master host. We provide grants which
+  // reproduce standard access following the account permission except for
+  // the view operation, in order to isolate master's content from sites's
+  // content.
+  if (empty($site)) {
+    if ($account->hasPermission('administer nodes')) {
+      $grants['master'][] = 0;
+      $grants['master_unpublished'][] = 0;
+      // All permissions given. Nothing to add.
+      return $grants;
+    }
+
+    $node_types = \Drupal::entityTypeManager()->getStorage('node_type')->loadMultiple();
+    if ($op == 'view') {
+      if ($account->hasPermission('access content')) {
+        $grants['master'][] = 0;
+      }
+
+      if ($account->hasPermission('view own unpublished content')) {
+        $grants['master_own_unpublished'][] = $account->id();
+      }
+    }
+    elseif ($op == 'update') {
+      foreach ($node_types as $node_type_id => $node_type) {
+        if ($account->hasPermission("edit any {$node_type_id} content")) {
+          $grants["master_{$node_type_id}"][] = 0;
+        }
+        if ($account->hasPermission("edit own {$node_type_id} content")) {
+          $grants["master_own_{$node_type_id}"][] = $account->id();
+        }
+      }
+
+    }
+    elseif ($op = 'delete') {
+      foreach ($node_types as $node_type_id => $node_type) {
+        if ($account->hasPermission("delete any {$node_type_id} content")) {
+          $grants["master_{$node_type_id}"][] = 0;
+        }
+        if ($account->hasPermission("delete own {$node_type_id} content")) {
+          $grants["master_own_{$node_type_id}"][] = $account->id();
+        }
+      }
+    }
+  }
+
+  // Give grants according to the site context.
+  else {
+    $id = $site->id();
+    if ($account->hasPermission('administer site entities')) {
+      $grants['site_id'][] = $id;
+      $grants['site_unpublished'][] = $id;
+      $grants['site_all'][] = 0;
+      // No need to check ohters grants
+      return $grants;
+    }
+
+    // Grants for view are simple. Use the active site and the all sites option.
+    if ($op == 'view') {
+      $grants['site_id'][] = $id;
+      $grants['site_all'][] = 0;
+
+      if (in_array($id, $sites_user)) {
+        $grants['site_unpublished'][] = $id;
+      }
+    }
+
+    elseif ($op == 'update' || $op == 'delete') {
+      // Get the user's sites where he is referenced as an administrator or a manager.
+      $sites_user_admin = $micro_node_manager->getSitesUserCanUpdateAnyContent($account);
+      if (in_array($id, $sites_user_admin)) {
+        $grants['site_id'][] = $id;
+      }
+      elseif (in_array($id, $sites_user)) {
+        $grants['site_node_owner'][] = $account->id();
+      }
+    }
+  }
+  $context = [
+    'op' => $op,
+    'sites_user' => $sites_user,
+    'site' => $site,
+  ];
+  \Drupal::moduleHandler()->alter('get_account_grants', $grants, $account, $context);
+  return $grants;
+}
+
+/**
+ * Implements hook_node_access_records().
+ */
+function micro_node_node_access_records(NodeInterface $node) {
+  $grants = [];
+  /** @var \Drupal\micro_node\MicroNodeManagerInterface $micro_node_manager */
+  $micro_node_manager = \Drupal::service('micro_node.manager');
+
+  // Grants may not be the same for all languages.
+  $translations = $node->getTranslationLanguages();
+  foreach ($translations as $langcode => $language) {
+    $translation = $node->getTranslation($langcode);
+
+    // If there are no site set, we are on the master host. We can't let
+    // standard permissions apply, because we need to isolate master's content
+    // from sites's content. We provide so a record to filter content on the view
+    // operation. Update and delete operations are given following the standard
+    // permissions applied on the master host. @See micro_node_node_grants().
+    $sites = $micro_node_manager->getAllSitesFromEntity($node);
+    if (empty($sites)) {
+      $grants[] = [
+        'realm' => ($translation->isPublished()) ? 'master' : 'master_unpublished',
+        'gid' => 0,
+        'grant_view' => 1,
+        'grant_update' => 1,
+        'grant_delete' => 1,
+        'langcode' => $langcode,
+      ];
+
+      $grants[] = [
+        'realm' => 'master_own_unpublished',
+        'gid' => $node->getOwnerId(),
+        'grant_view' => 1,
+        'grant_update' => 1,
+        'grant_delete' => 1,
+        'langcode' => $langcode,
+      ];
+
+      $grants[] = [
+        'realm' => 'master_' . $translation->bundle(),
+        'gid' => 0,
+        'grant_view' => 1,
+        'grant_update' => 1,
+        'grant_delete' => 1,
+        'langcode' => $langcode,
+      ];
+
+      $grants[] = [
+        'realm' => 'master_own_' . $translation->bundle(),
+        'gid' => $node->getOwnerId(),
+        'grant_view' => 1,
+        'grant_update' => 1,
+        'grant_delete' => 1,
+        'langcode' => $langcode,
+      ];
+
+    }
+
+    // The content is created on a micro site.
+    else {
+      /** @var \Drupal\micro_site\Entity\SiteInterface $site */
+      foreach ($sites as $id => $site) {
+        $grants[] = [
+          'realm' => ($translation->isPublished()) ? 'site_id' : 'site_unpublished',
+          'gid' => $id,
+          'grant_view' => 1,
+          'grant_update' => 1,
+          'grant_delete' => 1,
+          'langcode' => $langcode,
+        ];
+      }
+
+      // Give always to the node owner permissions for its node.
+      $grants[] = array(
+        'realm' => 'site_node_owner',
+        'gid' => $translation->getOwnerId(),
+        'grant_view' => 1,
+        'grant_update' => 1,
+        'grant_delete' => 1,
+        'langcode' => $langcode,
+      );
+    }
+
+    // Set the site_all grant.
+    if ($translation->hasField(MicroNodeFields::NODE_SITES_ALL)) {
+      if (!empty($translation->get(MicroNodeFields::NODE_SITES_ALL)->value) && $translation->isPublished()) {
+        $grants[] = array(
+          'realm' => 'site_all',
+          'gid' => 0,
+          'grant_view' => 1,
+          'grant_update' => 0,
+          'grant_delete' => 0,
+          'langcode' => $langcode,
+        );
+      }
+      // Because of language translation, we must save a record for each language.
+      // even if that record adds no permissions, as this one does.
+      else {
+        $grants[] = array(
+          'realm' => 'site_all',
+          'gid' => 1,
+          'grant_view' => 0,
+          'grant_update' => 0,
+          'grant_delete' => 0,
+          'langcode' => $langcode,
+        );
+      }
+    }
+
+  }
+
+  return $grants;
+}
+
+
+/**
+ * Implements hook_entity_access().
+ */
+function micro_node_view_access(EntityInterface $entity, $operation, AccountInterface $account) {
+  // Prevent user to delete the view site content which provide the local
+  // task on site entities.
+  if ($entity->id() == 'site_content' && $operation == 'delete') {
+    return AccessResult::forbidden('This view can not be deleted because we add custom access on its route.');
+  }
+}
+
+/**
+ * Implements hook_node_access().
+ */
+function micro_node_node_access(NodeInterface $node, $op, AccountInterface $account) {
+  /** @var \Drupal\micro_node\MicroNodeManagerInterface $micro_node_manager */
+  $micro_node_manager = \Drupal::service('micro_node.manager');
+  $result = $micro_node_manager->nodeAccess($node, $op, $account);
+
+  // Also allow modules to alter the returned grants/denies.
+  $context = [
+    'node' => $node,
+    'operation' => $op,
+    'account' => $account,
+  ];
+
+  // @TODO dispatch an event instead of hook_alter.
+  \Drupal::moduleHandler()->alter('site_node_access', $result, $context);
+
+  return $result;
+
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter() for \Drupal\node\NodeForm.
+ *
+ * Move fields to an advanced tab like other node settings.
+ */
+function micro_node_form_node_form_alter(&$form, FormState $form_state, $form_id) {
+  /** @var \Drupal\node\NodeInterface $node */
+  $node = $form_state->getFormObject()->getEntity();
+  $type = $node->type->entity;
+  $node_types_enabled = \Drupal::config('micro_node.settings')->get('node_types') ?: [];
+  $account = \Drupal::currentUser();
+  $node_type_enabled = in_array($type->id(), $node_types_enabled);
+
+  /** @var \Drupal\micro_site\SiteNegotiatorInterface $negotiator */
+  $negotiator = \Drupal::service('micro_site.negotiator');
+  $active_site = $negotiator->getSite();
+
+  /** @var \Drupal\micro_node\MicroNodeManagerInterface $micro_node_manager */
+  $micro_node_manager = \Drupal::service('micro_node.manager');
+
+  $form['site'] = [
+    '#type' => 'details',
+    '#title' => t('Site settings'),
+    '#group' => isset($form['additional_settings']) ? 'additional_settings' : 'advanced',
+    '#attributes' => [
+      'class' => ['node-form-options'],
+    ],
+    '#attached' => [
+      'library' => ['node/drupal.node'],
+    ],
+    '#weight' => 100,
+    '#optional' => TRUE,
+  ];
+
+  if ($active_site instanceof SiteInterface) {
+    /** @var \Drupal\micro_site\Entity\SiteTypeInterface $site_type */
+    $site_type = $active_site->type->entity;
+    $site_node_types_enabled = $site_type->getTypes();
+    $node_type_enabled = $node_type_enabled && in_array($type->id(), $site_node_types_enabled);
+  }
+
+  if ($active_site instanceof SiteInterface && isset($form['site_id'])) {
+    $form['site_id']['widget'][0]['target_id']['#required'] = TRUE;
+  }
+
+  // Move to the tab container the site related form elements.
+  if (isset($form['site_id'])) {
+    $form['site_id']['#group'] = 'site';
+  }
+
+  if (isset($form[MicroNodeFields::NODE_SITES])) {
+    $form[MicroNodeFields::NODE_SITES]['#group'] = 'site';
+    $form[MicroNodeFields::NODE_SITES]['#access'] = $micro_node_manager->userCanCrossPublish($account, $active_site) && $node_type_enabled;
+  }
+
+  if (isset($form[MicroNodeFields::NODE_SITES_ALL])) {
+    $form[MicroNodeFields::NODE_SITES_ALL]['#group'] = 'site';
+    // A node can only be published on all sites from the master host.
+    $form[MicroNodeFields::NODE_SITES_ALL]['#access'] = empty($active_site) && $account->hasPermission('publish on any site') && $node_type_enabled;
+  }
+
+  if (isset($form[MicroNodeFields::NODE_SITES_DISABLE_CANONICAL_URL])) {
+    $form[MicroNodeFields::NODE_SITES_DISABLE_CANONICAL_URL]['#group'] = 'site';
+    $form[MicroNodeFields::NODE_SITES_DISABLE_CANONICAL_URL]['#states'] = [
+      'visible' => [
+        [
+          ':input[name="' . MicroNodeFields::NODE_SITES . '[0][target_id]"]' => ['filled' => TRUE],
+        ],
+        'xor',
+        [
+          ':input[name="' . MicroNodeFields::NODE_SITES_ALL . '[value]"]' => ['checked' => TRUE],
+        ],
+
+      ],
+    ];
+  }
+
+  if (!$node_type_enabled) {
+    $form['site']['#access'] = FALSE;
+  }
+
+  $site = $node->get('site_id')->referencedEntities();
+  $site = ($site) ? reset($site) : NULL;
+  if (!$node->isNew() && $site instanceof SiteInterface) {
+    $form['meta_site'] = [
+      '#attributes' => ['class' => ['entity-meta__header']],
+      '#type' => 'container',
+      '#group' => 'advanced',
+      '#weight' => -200,
+      'site' => [
+        '#type' => 'html_tag',
+        '#tag' => 'h4',
+        '#value' => t('Site : @label (@url)', ['@label' => $site->label(), '@url' => $site->getSiteUrl()]),
+        '#attributes' => [
+          'class' => ['entity-meta__title'],
+        ],
+      ],
+    ];
+  }
+
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function micro_node_site_delete(EntityInterface $entity) {
+  $query = \Drupal::entityQuery('node')
+    ->condition('site_id', $entity->id());
+  $result = $query->execute();
+  if ($result) {
+    $nodes_to_delete = \Drupal::entityTypeManager()->getStorage('node')->loadMultiple($result);
+    foreach ($nodes_to_delete as $node_to_delete) {
+      $node_to_delete->delete();
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_field_access_alter().
+ */
+function micro_node_entity_field_access_alter(array &$grants, array $context) {
+  /** @var \Drupal\Core\Field\FieldDefinitionInterface $field_definition */
+  $field_definition = $context['field_definition'];
+  $operation = $context['operation'];
+  $account = $context['account'];
+  $items = $context['items'];
+  $administrative_fields = ['uid', 'status', 'created', 'promote', 'sticky'];
+
+  if (!$items instanceof FieldItemListInterface) {
+    return;
+  }
+
+  $entity = $items->getEntity();
+  if (!$entity instanceof NodeInterface) {
+    return;
+  }
+
+  if (!$entity->hasField('site_id')) {
+    return;
+  }
+
+  $site = $entity->get('site_id')->referencedEntities();
+  if ($site) {
+    $site = reset($site);
+  }
+  else {
+    return;
+  }
+
+  /** @var \Drupal\micro_node\MicroNodeManagerInterface $micro_node_manager */
+  $micro_node_manager = \Drupal::service('micro_node.manager');
+  /** @var \Drupal\micro_site\Entity\SiteInterface $site */
+  if ($operation == 'edit' && in_array($field_definition->getName(), $administrative_fields, TRUE)) {
+    $sites = $micro_node_manager->getSitesUserCanUpdateAdministrativeFields($account);
+    if (in_array($site->id(), $sites) ) {
+      $grants['micro_node'] = AccessResult::allowed()->addCacheableDependency($site);
+    }
+  }
+
+
+}
+
+/**
+ * Implements hook_site_references_alter().
+ *
+ * Limit the site a user can reference from a node.
+ */
+function micro_node_site_references_alter($query, $account, $context) {
+  // Restrict sites by editorial assignment.
+  if ($context['field_type'] != 'editor') {
+    return;
+  }
+
+  if ($account->hasPermission('publish on any site')) {
+    return $query;
+  }
+
+  elseif ($account->hasPermission('publish on any assigned site')) {
+      /** @var \Drupal\micro_node\MicroNodeManagerInterface $micro_node_manager */
+    $micro_node_manager = \Drupal::service('micro_node.manager');
+    $allowed = $micro_node_manager->getSitesUserCanReference($account);
+    $query->condition('id', $allowed, 'IN');
+  }
+
+  else {
+    // Remove all options.
+    $query->condition('id', '-no-possible-match-');
+  }
+}
+
+
+/**
+ * Implements hook_entity_view_alter().
+ *
+ * Alter the rel metatags for node published on multiple sites.
+ */
+function micro_node_entity_view_alter(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display) {
+
+  if ($build['#view_mode'] == 'full' && $entity Instanceof NodeInterface) {
+    if (!isset($build['#attached']['html_head_link'])) {
+      return;
+    }
+
+    $override_canonical_url = FALSE;
+    $site = NULL;
+    /** @var \Drupal\micro_node\MicroNodeManagerInterface $micro_node_manager */
+    $micro_node_manager = \Drupal::service('micro_node.manager');
+    /** @var \Drupal\micro_site\SiteNegotiatorInterface $negotiator */
+    $negotiator = \Drupal::service('micro_site.negotiator');
+    $active_site = $negotiator->getActiveSite();
+    // For node published on multiple site, we insure that the canonical url
+    // is always the absolute url from main site if the node is
+    // displayed in an another context (other site or on the master host)
+    if ($site = $micro_node_manager->getMainSiteFromEntity($entity)) {
+      if ($active_site instanceof SiteInterface && $active_site->id() != $site->id()) {
+        $override_canonical_url = TRUE;
+      }
+      elseif (is_null($active_site)) {
+        $override_canonical_url = TRUE;
+      }
+    }
+    else {
+      // The node is on the master host because it has not a main site.
+      // We check if we are on an active site.
+      if ($active_site instanceof SiteInterface) {
+        $override_canonical_url = TRUE;
+      }
+    }
+
+    if ($override_canonical_url) {
+      $html_head_link = &$build['#attached']['html_head_link'];
+      $options = [
+        'absolute' => TRUE,
+      ];
+      if ($site instanceof SiteInterface) {
+        $options['base_url'] = $site->getSitePath();
+      }
+      else {
+        $micro_site_settings = \Drupal::config('micro_site.settings');
+        $base_url = $micro_site_settings->get('base_scheme') . '://' . $micro_site_settings->get('public_url');
+        $options['base_url'] = $base_url;
+      }
+
+      foreach ($html_head_link as $key => $value) {
+        if (isset($value[0]['rel'])){
+          $rel = $value[0]['rel'];
+          if ($rel == 'shortlink') {
+            $url = $entity->toUrl('canonical', $options)->setOption('alias', TRUE)->toString();
+            $html_head_link[$key][0]['href'] = $url;
+          }
+          elseif ($entity->hasLinkTemplate($rel)) {
+            $url = $entity->toUrl($rel, $options)->toString();
+            $html_head_link[$key][0]['href'] = $url;
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_page_attachments_alter().
+ */
+function micro_node_page_attachments_alter(array &$attachments) {
+  if (!isset($attachments['#attached']['html_head'])) {
+    return;
+  }
+  $entity = \Drupal::routeMatch()->getParameter('node');
+  if (!$entity instanceof NodeInterface) {
+    return;
+  }
+
+  $override_canonical_url = FALSE;
+  $site = NULL;
+  /** @var \Drupal\micro_node\MicroNodeManagerInterface $micro_node_manager */
+  $micro_node_manager = \Drupal::service('micro_node.manager');
+  /** @var \Drupal\micro_site\SiteNegotiatorInterface $negotiator */
+  $negotiator = \Drupal::service('micro_site.negotiator');
+  $active_site = $negotiator->getActiveSite();
+  // For node published on multiple site, we insure that the canonical url
+  // is always the absolute url from main site if the node is
+  // displayed in an another context (other site or on the master host)
+  if ($site = $micro_node_manager->getMainSiteFromEntity($entity)) {
+    if ($active_site instanceof SiteInterface && $active_site->id() != $site->id()) {
+      $override_canonical_url = TRUE;
+    }
+    elseif (is_null($active_site)) {
+      $override_canonical_url = TRUE;
+    }
+  }
+  else {
+    // The node is on the master host because it has not a main site.
+    // We check if we are on an active site.
+    if ($active_site instanceof SiteInterface) {
+      $override_canonical_url = TRUE;
+    }
+  }
+
+  if ($override_canonical_url) {
+    $html_head = &$attachments['#attached']['html_head'];
+    $options = [
+      'absolute' => TRUE,
+    ];
+    if ($site instanceof SiteInterface) {
+      $options['base_url'] = $site->getSitePath();
+    }
+    else {
+      $micro_site_settings = \Drupal::config('micro_site.settings');
+      $base_url = $micro_site_settings->get('base_scheme') . '://' . $micro_site_settings->get('public_url');
+      $options['base_url'] = $base_url;
+    }
+
+    foreach ($html_head as $key => $value) {
+      if (isset($value[0]['#attributes']['rel'])){
+        $rel = $value[0]['#attributes']['rel'];
+        if ($rel == 'shortlink') {
+          $url = $entity->toUrl('canonical', $options)->setOption('alias', TRUE)->toString();
+          $html_head[$key][0]['#attributes']['href'] = $url;
+        }
+        elseif ($entity->hasLinkTemplate($rel)) {
+          $url = $entity->toUrl($rel, $options)->toString();
+          $html_head[$key][0]['#attributes']['href'] = $url;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Creates our site user fields for an entity bundle.
+ *
+ * @param string $entity_type
+ *   The entity type being created. Node and user are supported.
+ * @param string $bundle
+ *   The bundle being created.
+ *
+ * This function is here for convenience during installation. It is not really
+ * an API function. Modules wishing to add fields to non-node entities must
+ * provide their own field storage.
+ *
+ * @see micro_node_node_type_insert()
+ * @see micro_node_install()
+ */
+function micro_node_assign_fields($entity_type, $bundle) {
+
+  try {
+    $field_storage = \Drupal::entityTypeManager()->getStorage('field_config');
+    // Assign the field_sites field.
+    $id = $entity_type . '.' . $bundle . '.' . MicroNodeFields::NODE_SITES;
+    if (!$field = $field_storage->load($id)) {
+      $field = array(
+        'field_name' => MicroNodeFields::NODE_SITES,
+        'entity_type' => $entity_type,
+        'label' => 'Others sites',
+        'bundle' => $bundle,
+        'required' => FALSE,
+        'description' => 'Publish the content on others sites.',
+        'settings' => [
+          'handler' => 'default:site',
+          'handler_settings' => [
+            'target_bundles' => NULL,
+            'sort' => ['field' => 'id', 'direction' => 'ASC'],
+          ],
+        ],
+        'field_type' => 'entity_reference',
+      );
+      $field_config = $field_storage->create($field);
+      $field_config->save();
+    }
+
+    // Assign the field_sites_all field.
+    $id = $entity_type . '.' . $bundle . '.' . MicroNodeFields::NODE_SITES_ALL;
+    if (!$field = $field_storage->load($id)) {
+      $field = array(
+        'field_name' => MicroNodeFields::NODE_SITES_ALL,
+        'entity_type' => $entity_type,
+        'label' => 'All sites',
+        'bundle' => $bundle,
+        'required' => FALSE,
+        'description' => 'Publish on any site',
+      );
+      $field_config = $field_storage->create($field);
+      $field_config->save();
+    }
+
+    // Assign the field_disable_canonical_url field.
+    $id = $entity_type . '.' . $bundle . '.' . MicroNodeFields::NODE_SITES_DISABLE_CANONICAL_URL;
+    if (!$field = $field_storage->load($id)) {
+      $field = array(
+        'field_name' => MicroNodeFields::NODE_SITES_DISABLE_CANONICAL_URL,
+        'entity_type' => $entity_type,
+        'label' => 'Disable main site canonical url',
+        'bundle' => $bundle,
+        'required' => FALSE,
+        'description' => 'If you publish a content on several sites, the content\'\'s canonical url will always be the canonical url on the content on the main site it has been published. Check this option to disable this unique canonical url behavior and then the content will be display on each site instead to be redirected to the main site. Be carrefully with this option, this can generate some duplicate content.',
+      );
+      $field_config = $field_storage->create($field);
+      $field_config->save();
+    }
+
+    // Tell the form system how to behave. Default to auto complete.
+    /** @var \Drupal\Core\Entity\Entity\EntityFormDisplay $entity_form_display */
+    $entity_form_display = \Drupal::entityTypeManager()->getStorage('entity_form_display')->load($entity_type . '.' . $bundle . '.default');
+    if (!$entity_form_display) {
+      $values = array(
+        'targetEntityType' => $entity_type,
+        'bundle' => $bundle,
+        'mode' => 'default',
+        'status' => TRUE,
+      );
+      $entity_form_display = \Drupal::entityTypeManager()->getStorage('entity_form_display') ->create($values);
+    }
+
+    $entity_form_display
+      ->setComponent(MicroNodeFields::NODE_SITES, array(
+        'type' => 'entity_reference_autocomplete',
+        'weight' => 40,
+      ))
+      ->setComponent(MicroNodeFields::NODE_SITES_ALL, array(
+        'type' => 'boolean_checkbox',
+        'settings' => array('display_label' => 1),
+        'weight' => 41,
+      ))
+      ->setComponent(MicroNodeFields::NODE_SITES_DISABLE_CANONICAL_URL, array(
+        'type' => 'boolean_checkbox',
+        'settings' => array('display_label' => 1),
+        'weight' => 42,
+      ))
+      ->save();
+
+    // Tell the view system how to behave.
+    /** @var \Drupal\Core\Entity\Entity\EntityViewDisplay $entity_view_display */
+    $entity_view_display = \Drupal::entityTypeManager()->getStorage('entity_view_display')->load($entity_type . '.' . $bundle . '.default');
+    if (!$entity_view_display) {
+      $values = array(
+        'targetEntityType' => $entity_type,
+        'bundle' => $bundle,
+        'mode' => 'default',
+        'status' => TRUE,
+      );
+      $entity_view_display = \Drupal::entityTypeManager()->getStorage('entity_view_display') ->create($values);
+    }
+
+    $entity_view_display
+      ->removeComponent(MicroNodeFields::NODE_SITES)
+      ->removeComponent(MicroNodeFields::NODE_SITES_ALL)
+      ->removeComponent(MicroNodeFields::NODE_SITES_DISABLE_CANONICAL_URL)
+      ->save();
+  }
+  catch (Exception $e) {
+    \Drupal::logger('micro_node')->error('Node site fields installation failed with message @message.', ['@message' => $e->getMessage()]);
+  }
+}
+
