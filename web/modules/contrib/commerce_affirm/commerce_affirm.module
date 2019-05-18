@@ -1,0 +1,215 @@
+<?php
+
+/**
+ * @file
+ * Module file for commerce_affirm.
+ */
+
+use Drupal\commerce_payment\Entity\PaymentGateway;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\commerce_product\Entity\ProductVariation;
+use Drupal\commerce_product\Entity\ProductVariationInterface;
+
+/**
+ * @file
+ * Main module for controlling the set up of the gateway.
+ */
+
+/**
+ * The possible values for the data-page-types attribute.
+ */
+function _commerce_affirm_page_types() {
+  return [
+    'category' => 'category',
+    'product' => 'product',
+    'cart' => 'cart',
+    'payment' => 'payment',
+    'homepage' => 'homepage',
+    'landing' => 'landing',
+    'search' => 'search',
+    'banner' => 'banner',
+  ];
+}
+
+/**
+ * Implements hook_theme().
+ */
+function commerce_affirm_theme($existing, $type, $theme, $path) {
+  return [
+    'commerce_affirm_banner_image' => [
+      'variables' => [
+        'width' => NULL,
+        'banner_size' => '',
+      ],
+      'path' => $path . '/templates',
+      'template' => 'commerce-affirm-banner-image',
+    ],
+    'commerce_affirm_monthly_payment_message' => [
+      'variables' => [
+        // The Affirm html element's data-page-type attribute.
+        'page_type' => 'product',
+        'number' => NULL,
+        'variation' => NULL,
+      ],
+      'path' => $path . '/templates',
+      'template' => 'commerce-affirm-monthly-payment-message',
+    ],
+    'commerce_affirm_site_modal' => [
+      'variables' => [
+        'link_text' => t('Learn more'),
+        'page_type' => 'payment',
+      ],
+      'path' => $path . '/templates',
+      'template' => 'commerce-affirm-site-modal',
+    ],
+  ];
+}
+
+/**
+ * Render array for the Affirm monthly payment widget.
+ *
+ * @param string $page_type
+ *   The Affirm page_type attribute.
+ * @param \Drupal\commerce_product\Entity\ProductVariationInterface $variation
+ *   The product variation.
+ *
+ * @return array
+ *   The render array for the Affirm monthly payment widget.
+ */
+function commerce_affirm_monthly_payment_message_render_array($page_type, ProductVariationInterface $variation) {
+  $price = $variation->getPrice();
+  $minor_units = \Drupal::service('commerce_affirm.minor_units');
+  $number = $minor_units->toMinorUnits($price);
+  return [
+    '#theme' => 'commerce_affirm_monthly_payment_message',
+    '#number' => $number,
+    '#page_type' => $page_type,
+    '#prefix' => '<div class="' . commerce_affirm_extra_field_class($page_type, $variation->getProductId()) . '">',
+    '#suffix' => '</div>',
+    '#variation' => $variation,
+  ];
+}
+
+/**
+ * Return the css class used to wrap the extra field in.
+ *
+ * @param string $page_type
+ *   The Affirm page type.
+ * @param int $product_id
+ *   The product ID the variation belongs to.
+ *
+ * @return string
+ *   The CSS class.
+ */
+function commerce_affirm_extra_field_class($page_type, $product_id) {
+  return 'product--variation-affirm-extra-field-commerce_affirm_monthly_payment_message_' . $page_type . '__' . $product_id;
+}
+
+/**
+ * Preprocess hook to add js settings.
+ */
+function commerce_affirm_preprocess(&$variables, $hook) {
+  if (in_array($hook, ['commerce_affirm_monthly_payment_message', 'commerce_affirm_site_modal'])) {
+    $affirm_gateway = commerce_affirm_get_gateway();
+    if ($affirm_gateway) {
+      $configuration = $affirm_gateway->getPlugin()->getConfiguration();
+      $settings = [];
+      $settings['PublicKey'] = $configuration['public_key'];
+      $settings['ApiMode'] = $affirm_gateway->getPlugin()->getMode();
+      $settings['PageType'] = 'product';
+      if (!isset($variables['#attached']['drupalSettings']['commerce_affirm'])) {
+        $variables['#attached']['drupalSettings']['commerce_affirm'] = [];
+      }
+      $variables['#attached']['drupalSettings']['commerce_affirm'] += $settings;
+      $variables['#attached']['library'][] = 'commerce_affirm/affirm';
+    }
+  }
+}
+
+/**
+ * Get the first affirm gateway when there's no better way to get one.
+ */
+function commerce_affirm_get_gateway() {
+  $affirm_gateway_ids = \Drupal::entityTypeManager()
+    ->getStorage('commerce_payment_gateway')
+    ->getQuery()
+    ->condition('plugin', 'affirm_redirect')
+    ->execute();
+  if (!empty($affirm_gateway_ids)) {
+    return PaymentGateway::load(reset($affirm_gateway_ids));
+  }
+  return NULL;
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function commerce_affirm_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $storage = $form_state->getStorage();
+  if (strpos($form_id, 'commerce_order_item_add_to_cart_form_commerce_product_') === 0 &&
+      \Drupal::config('commerce_affirm.settings')->get('monthly_payment_on_add_to_cart') &&
+      isset($storage['view_mode']) &&
+      $storage['view_mode'] === 'full') {
+    $variation = ProductVariation::load($form['purchased_entity']['widget'][0]['variation']['#value']);
+    $number = \Drupal::service('commerce_affirm.minor_units')->toMinorUnits($variation->getPrice());
+    $form['monthly_payment'] = [
+      '#theme' => 'commerce_affirm_monthly_payment_message',
+      '#page_type' => 'product',
+      '#number' => $number,
+      '#variation' => $variation,
+      '#weight' => 101,
+    ];
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function commerce_affirm_form_commerce_checkout_flow_multistep_default_alter(&$form, FormStateInterface $form_state) {
+  if ($form_state->getBuildInfo()['args'][0] === 'payment') {
+    /** @var Drupal\commerce_checkout\Plugin\Commerce\CheckoutFlow\CheckoutFlowInterface $checkout_flow */
+    $checkout_flow = $form_state->getBuildInfo()['callback_object'];
+    if ($checkout_flow->getOrder()->get('payment_gateway')->entity->getPluginId() === 'affirm_redirect') {
+      /** @var \Drupal\commerce_payment\Plugin\Commerce\PaymentGateway\PaymentGatewayInterface $gateway_plugin */
+      $form['#title'] = t('Pay via Affirm');
+      $gateway_plugin = $checkout_flow->getOrder()->get('payment_gateway')->entity->getPlugin();
+      if ($gateway_plugin->getConfiguration()['window_mode'] === 'redirect') {
+        $form['help']['#markup'] = t('You will be redirected to Affirm to confirm payment shortly.');
+      }
+      else {
+        $form['help']['#markup'] = t('The Affirm payment window will open shortly.');
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function commerce_affirm_page_attachments(array &$attachments) {
+  // Add Affirm tracking js to all non-admin pages.
+  $is_admin = \Drupal::service('router.admin_context')->isAdminRoute();
+  if (\Drupal::config('commerce_affirm.settings')->get('analytics') && !$is_admin) {
+    $affirm_gateway = commerce_affirm_get_gateway();
+    if ($affirm_gateway) {
+      $attachments['#attached']['library'][] = 'commerce_affirm/affirm';
+      $configuration = $affirm_gateway->getPlugin()->getConfiguration();
+      if (!isset($configuration['public_key'])) {
+        return;
+      }
+      $settings = [];
+      $settings['PublicKey'] = $configuration['public_key'];
+      $settings['ApiMode'] = $affirm_gateway->getPlugin()->getMode();
+      if (!isset($attachments['#attached']['drupalSettings']['commerce_affirm'])) {
+        $attachments['#attached']['drupalSettings']['commerce_affirm'] = [];
+      }
+      if (empty(\Drupal::request()->cookies->get('commerce_affirm_session_id'))) {
+        $affirm_session_id = uniqid('commerce_affirm_');
+        setcookie('commerce_affirm_session_id', $affirm_session_id);
+        \Drupal::request()->cookies->set('commerce_affirm_session_id', $affirm_session_id);
+      }
+      $settings['SessionId'] = \Drupal::request()->cookies->get('commerce_affirm_session_id');
+      $attachments['#attached']['drupalSettings']['commerce_affirm'] += $settings;
+    }
+  }
+}
