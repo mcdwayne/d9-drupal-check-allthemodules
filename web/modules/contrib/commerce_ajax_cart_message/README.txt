@@ -1,0 +1,1 @@
+Commerce Ajax cart message
