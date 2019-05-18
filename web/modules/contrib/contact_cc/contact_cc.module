@@ -1,0 +1,185 @@
+<?php
+
+/**
+ * @file
+ * CC and BCC functionality for sitewide contact forms.
+ */
+
+use Drupal\contact\Entity\ContactForm;
+
+/**
+ * Implements hook_help().
+ */
+function contact_cc_help($path = NULL, $arg = NULL) {
+  $output = "";
+  switch ($path) {
+    case 'admin/help#contact_cc':
+      $output = t('Adds cc and bcc fields to site-wide contact form.');
+      break;
+  }
+  return $output;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function contact_cc_form_contact_form_edit_form_alter(&$form, &$form_state) {
+  $formid = $form['id']['#default_value'];
+  $contact_cc_data = [];
+  if (empty($formid)) {
+    $formid = 0;
+  }
+  if (!empty($form['actions']['submit']['#submit'])) {
+    array_unshift($form['actions']['submit']['#submit'], '_contact_cc_submit');
+  }
+  else {
+    array_unshift($form['#submit'], '_contact_cc_submit');
+  }
+  $contact_cc_data = _contact_cc_get($formid);
+  $form['contact_cc_cc'] = [
+    '#type' => 'textarea',
+    '#default_value' => $contact_cc_data['cc'],
+    '#title' => t('CC recipients'),
+    '#description' => t('Email addresses to appear in the CC field.'),
+    '#required' => FALSE,
+    '#element_validate' => ['_contact_cc_validate'],
+  ];
+  $form['contact_cc_bcc'] = [
+    '#type' => 'textarea',
+    '#default_value' => $contact_cc_data['bcc'],
+    '#title' => t('BCC recipients'),
+    '#description' => t('Email addresses to appear in the BCC field. These will not be visible to the mail recipient.'),
+    '#required' => FALSE,
+    '#element_validate' => ['_contact_cc_validate'],
+  ];
+  $order = [
+    'category',
+    'recipients',
+    'contact_cc_cc',
+    'contact_cc_bcc',
+    'reply',
+    'weight',
+    'selected',
+    'submit',
+  ];
+  foreach ($order as $key => $value) {
+    $form[$value]['#weight'] = $key;
+  }
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function contact_cc_entity_delete($entity) {
+  // Only act on content entities.
+  if (!($entity instanceof ContactForm)) {
+    return;
+  }
+  _contact_cc_del($entity->id());
+}
+
+/**
+ * Custom submit functions.
+ */
+function _contact_cc_submit($form, &$form_state) {
+  $formid = $form_state->getValue('id');
+  $contact_cc_data = [
+    'cc' => $form_state->getValue('contact_cc_cc'),
+    'bcc' => $form_state->getValue('contact_cc_bcc'),
+  ];
+  _contact_cc_set($formid, $contact_cc_data);
+}
+
+/**
+ * Implements hook_mail_alter().
+ */
+function contact_cc_mail_alter(&$message) {
+  if ($message['module'] != 'contact') {
+    // Do not act on mail other than core contact module.
+    return;
+  }
+  if(isset($message['id']) && in_array($message['id'], [
+    'contact_user_mail',
+    'contact_user_copy'
+  ])) {
+    $formid = 'personal';
+  } else {
+    $formid = $message['params']['contact_form']->getOriginalId();
+  }
+  if (!$formid) {
+    // No contact form id returned, abort.
+    return;
+  }
+  $contact_cc_data = _contact_cc_get($formid);
+  if ($contact_cc_data['cc']) {
+    $message['headers']['Cc'] = $contact_cc_data['cc'];
+  }
+  if ($contact_cc_data['bcc']) {
+    $message['headers']['Bcc'] = $contact_cc_data['bcc'];
+  }
+}
+
+/**
+ * Validate function.
+ */
+function _contact_cc_validate($element, &$form_state) {
+  if ($element['#value']) {
+    $mailarr = explode(",", $element['#value']);
+    $invalidarr = [];
+    foreach ($mailarr as $email) {
+      if (!valid_email_address(trim($email))) {
+        $invalidarr[] = trim($email);
+      }
+    }
+    if (!empty($invalidarr)) {
+      $translation = \Drupal::service('string_translation');
+      $message = $translation->formatPlural(count($invalidarr), "The following email is invalid: %emails", "The following emails are invalid: %emails", ['%emails' => implode(', ', $invalidarr)]);
+      $form_state->setErrorByName($element['#name'], $message);
+    }
+  }
+}
+
+/**
+ * Custom db functions below.
+ */
+function _contact_cc_set($cid, $data) {
+  $testresult = db_query("SELECT cid FROM {contact_cc} WHERE cid = :cid", [':cid' => $cid]);
+  $results = $testresult->fetchField();
+  if ($results) {
+    // Update record.
+    db_update('contact_cc')
+      ->fields(['contact_cc_data' => serialize($data)])
+      ->condition('cid', $cid)
+      ->execute();
+  }
+  else {
+    // New record.
+    db_insert('contact_cc')
+      ->fields([
+        'cid' => $cid,
+        'contact_cc_data' => serialize($data),
+      ])
+      ->execute();
+  }
+}
+
+/**
+ * {@inheritdoc}
+ */
+function _contact_cc_get($cid) {
+  $result = db_query("SELECT contact_cc_data FROM {contact_cc} WHERE cid = :cid", [':cid' => $cid])->fetchField();
+  $output = ['cc' => '', 'bcc' => ''];
+  if ($result) {
+    $output = unserialize($result);
+  }
+  return $output;
+}
+
+/**
+ * {@inheritdoc}
+ */
+function _contact_cc_del($cid) {
+  db_delete('contact_cc')
+    ->condition('cid', $cid)
+    ->execute();
+}
