@@ -1,0 +1,113 @@
+<?php
+
+/**
+ * @file
+ * Provides UI and implements hook to force taxonomies to be flat.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Config\Entity\ThirdPartySettingsInterface;
+use Drupal\taxonomy\Entity\Term;
+use Drupal\taxonomy\Entity\Vocabulary;
+
+/**
+ * Taxonomy is not flat.
+ */
+define('FLAT_TAXONOMY_NORMAL', 0);
+
+/**
+ * Taxonomy is flat.
+ */
+define('FLAT_TAXONOMY_FLAT', 1);
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function flat_taxonomy_form_taxonomy_vocabulary_form_alter(&$form, FormStateInterface $form_state) {
+  $vocabulary = $form_state->getFormObject()->getEntity();
+
+  $form['flat'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Flat taxonomy'),
+    '#description' => t("If checked, the taxonomy will be flat, terms can be ordered but can't be nested"),
+    '#default_value' => $vocabulary->getThirdPartySetting('flat_taxonomy', 'flat'),
+  );
+
+  $form['#entity_builders'][] = 'flat_taxonomy_form_taxonomy_vocabulary_form_builder';
+
+  // @TODO: Add a confirm step if the vocabulary is updated to be flatten and
+  // already has terms (see 7.x version of the module).
+}
+
+/**
+ * Entity form builder to add the flat information to the vocabulary.
+ *
+ * @param $entity_type
+ * @param \Drupal\taxonomy\Entity\Vocabulary $vocabulary
+ * @param $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+function flat_taxonomy_form_taxonomy_vocabulary_form_builder($entity_type, Drupal\taxonomy\Entity\Vocabulary $vocabulary, &$form, FormStateInterface $form_state) {
+  if ($form_state->getValue('flat')) {
+    $vocabulary->setThirdPartySetting('flat_taxonomy', 'flat', $form_state->getValue('flat'));
+    \Drupal::service('flat_taxonomy.taxonomy_flattener')->flatten($vocabulary);
+    return;
+  }
+
+  $vocabulary->unsetThirdPartySetting('flat_taxonomy', 'flat');
+}
+
+/**
+ * Implements hook_taxonomy_term_presave().
+ */
+function flat_taxonomy_taxonomy_term_presave(Term $term) {
+  // If the term is nested but is part of a flat taxonomy, we update the
+  // parent and log the change. This is not supposed to occur via the normal
+  // edit form as the parent field is hidden but it may occur via a
+  // programmatical save (migration, services, ...).
+  $vocabulary = Vocabulary::load($term->getVocabularyId());
+
+  if (
+    $vocabulary->getThirdPartySetting('flat_taxonomy', 'flat') == FLAT_TAXONOMY_FLAT
+    && !empty($term->parent->target_id)
+  ) {
+    \Drupal::logger('flat_taxonomy')->warning('Illegal parent %parent_tid for the term %name as vocabulary is flat. Parent has been updated.', array('%parent_tid' => $term->parent->target_id, '%name' => $term->name->value));
+    drupal_set_message(t('Illegal parent %parent_tid for the term %name as vocabulary is flat. Parent has been updated.', array('%parent_tid' => $term->parent->target_id, '%name' => $term->name->value)), 'warning');
+
+    // @TODO: Update the term weight so it is ordered after the parent.
+    $term->parent = 0;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function flat_taxonomy_form_taxonomy_term_form_alter(&$form, FormStateInterface $form_state) {
+  if ($form_state->getStorage()['taxonomy']['vocabulary']->getThirdPartySetting('flat_taxonomy', 'flat') == FLAT_TAXONOMY_FLAT) {
+    $form['relations']['parent']['#access'] = FALSE;
+
+    $form['#validate'][] = 'flat_taxonomy_form_taxonomy_form_term_validate';
+  }
+}
+
+/**
+ * Custom validate handler for the taxonomy term add/edit form.
+ */
+function flat_taxonomy_form_taxonomy_form_term_validate($form, FormStateInterface &$form_state) {
+  if ($form_state->getValue('parent')[0]) {
+    $form_state->setErrorByName('parent', $this->t("This term can't have any parent has it is part of a flat taxonomy."));
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function flat_taxonomy_form_taxonomy_overview_terms_alter(&$form, FormStateInterface $form_state) {
+  if ($form_state->getStorage()['taxonomy']['vocabulary']->getThirdPartySetting('flat_taxonomy', 'flat') == FLAT_TAXONOMY_FLAT) {
+    foreach ($form['terms']['#tabledrag'] as $index => $data) {
+      if (isset($data['group']) && ($data['group'] == 'term-depth' || $data['group'] == 'term-parent')) {
+        unset($form['terms']['#tabledrag'][$index]);
+      }
+    }
+  }
+}
