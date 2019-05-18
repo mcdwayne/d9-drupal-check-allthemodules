@@ -1,0 +1,198 @@
+<?php
+
+/**
+* @file
+* Mail Redirect
+* 
+*   redirect any system generated email to your configured email domain
+*   usage (in your test site's settings.php set):
+* 
+*     $conf = array('mail_redirect_opt' => "domain");
+*     $conf = array('mail_redirect_domain' => "mydomain.com");
+*
+*   results in:
+*     - input $to:    john_smith@about.com
+*     - output $to:   john_smith@mydomain.com
+* 
+*       OR
+* 
+*     $conf = array('mail_redirect_opt' => "address");
+*     $conf = array('mail_redirect_address' => "tom@mydomain.com");
+*
+*   results in:
+*     - input $to:    john_smith@about.com
+*     - output $to:   tom@mydomain.com  (also, Subject modified to show original TO address)
+* 
+*  See README.txt for additional details on test setup
+* 
+*  NOTE - This module will handle redirecting all email messages created and sent with drupal_mail(). Email messages sent using functions other than drupal_mail() will not 
+* be affect. For example, a contributed module directly calling the drupal_mail_system()->mail() or PHP mail() function will not be affect.
+* All core modules use drupal_mail() for messaging, it is best practice but not mandatory in contributed modules.
+*/
+
+/**
+* Implements hook_help().
+*/
+function mail_redirect_help($route_name, \Drupal\Core\Routing\RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.mail_redirect':
+      $help = file_get_contents(drupal_get_path('module', 'mail_redirect') . '/README.txt');
+      return '<pre>' . t($help) . '</pre>';
+  }
+}
+
+/**
+* Implement mail_alter hook to replace domain of all email addresses
+* redirect any system generated email to your configured email domain
+*
+*   shows a msg to indicate whenever an email has been redirected.
+* 
+* We need to handle RFC2822 formats for $message['to']:
+*    user@example.com
+*    user@example.com, anotheruser@example.com
+*    User <user@example.com>
+*    User <user@example.com>, Another User <anotheruser@example.com>
+* 
+* @param string $message
+*
+* @todo Handle CC and BCC headers.
+*/
+function mail_redirect_mail_alter(&$message) {
+  // if we don't have a To address; no point in doing anything
+  if (!$message['to']) {
+    return;
+  }
+  $redirect  = \Drupal::config('mail_redirect.settings')->get('mail_redirect_opt');
+  
+  switch ($redirect) {
+    // do not redirect anything
+    case 'none':
+      return;
+    
+    // Redirect all recipients to a catch-all domain.
+    case 'domain':
+      if (!$myredirect = \Drupal::config('mail_redirect.settings')->get('mail_redirect_domain')) {
+        return;
+      }
+      $type = 'DOMAIN';
+      $replace1 = '$1<$3@' . $myredirect . '>';
+      $replace2 = '$2@' . $myredirect;
+      break;
+    
+    // Redirect each message to a single catch-all address.
+    case 'address':  
+      if (!$myredirect = \Drupal::config('mail_redirect.settings')->get('mail_redirect_address')) {
+        return;
+      }
+      $type = 'ADDRESS';
+      $replace1 = '$1<' . $myredirect . '>';
+      $replace2 = $myredirect;
+      break; 
+  } 
+  
+
+  $skips = explode(',', \Drupal::config('mail_redirect.settings')->get('mail_redirect_skip_redirect'));
+  array_walk($skips, '_mail_redirect_trim_array_values');
+  
+  $original_tos = mail_redirect_recipients($message);
+  
+  foreach ($original_tos as $to) {
+    // if it's a SKIP addresses we leave it alone
+    $address = preg_replace('^(.*)<((.+)@(.+))>^', "$3@$4", $to);
+    if (in_array($address, $skips)) {
+      $skipped[] = $to;
+      $tos[] = $to;
+    }
+    // if it isn't a SKIP address then we either modify the address or, if no_mail is set, we simply drop the address from our list
+    else {
+      $not_skipped[] = $to;
+      if (\Drupal::config('mail_redirect.settings')->get('mail_redirect_nomail')) {
+        continue;
+      }
+      else {
+        // Swap in our redirect domain or address for the remaining addresses.
+        if (stristr($to, "<")) {
+          $tos[] = preg_replace('^(.*)<((.+)@.+)>^', $replace1, $to);
+        }
+        else {
+          $tos[] = preg_replace('^((.+)@.+)^', $replace2, $to);
+        }
+      }
+    }
+  }
+  
+  // if we have no items left in our list that were not skipped; let's just quit
+  if (!count($not_skipped)) {
+    return;  
+  }
+
+  // Replace To with our modified address/list. 
+  // This could include some addresses that have been skipped and some that have been redirected
+  if (count($tos)) {
+    $message['to'] = implode(",", $tos);
+  }
+  
+  $not_skipped_list = implode(",", $not_skipped);
+
+  // set message to notify user what we did
+  drupal_set_message(t("The following TO address or list: %to has been redirected to the following TEST %type: %myredirect",
+    array('%to' => $not_skipped_list, '%type' => $type, '%myredirect' => $myredirect)));
+
+  if (\Drupal::config('mail_redirect.settings')->get('mail_redirect_nomail')) {
+    $message['send'] = FALSE;
+    drupal_set_message(t('However, since Mail Redirect is set to <em>discard redirects</em>; these emails will not be sent.'));
+  }
+  
+  // modify Subject to make it obvious who the original emails were intended for
+  // NOTE: this may fail if we have a long list as Subject field is likely limited length - maybe original idea of embedding into Body makes more sense??
+  $message['subject']  = $message['subject'] . t(" [@to] ",array('@to' => $not_skipped_list));
+}
+    
+/**
+* Format an array of message recipients.
+*/
+function mail_redirect_recipients($message) {
+  // If we have a list.
+  if (stristr($message['to'], ",")) {
+    $tos = split(",", $message['to']);
+    array_walk($tos, '_mail_redirect_trim_array_values');
+  }
+  else {
+    $tos = (array) $message['to'];
+  }
+
+  return $tos;
+}
+
+/**
+* Implements hook_requirements(). 
+*    - To add to note if mail redirect is defined
+*/
+function mail_redirect_requirements($phase) {
+  $requirements = array();
+  if ($phase == 'runtime') {
+    if (\Drupal::config('mail_redirect.settings')->get('mail_redirect_opt') != 'none') {
+      if (\Drupal::config('mail_redirect.settings')->get('mail_redirect_opt') == 'domain') {
+        $msg = t('Site mail is being redirected to %domain', array('%domain' => \Drupal::config('mail_redirect.settings')->get('mail_redirect_domain')));
+      }
+      else {
+        $msg = t('Site mail is being redirected to %address', array('%address' => \Drupal::config('mail_redirect.settings')->get('mail_redirect_address')));
+      }
+      $severity = REQUIREMENT_WARNING;
+    }
+    else {
+      $msg = t('Mail redirect is installed but your mail is not set to be redirected.');
+      $severity = REQUIREMENT_OK;
+    }
+    $requirements['mail_redirect_status'] = array(
+      'title' => 'Mail Redirect',
+      'value' => $msg,
+      'severity' => $severity,
+    );
+  }
+  return $requirements;
+}
+
+function _mail_redirect_trim_array_values(&$value) {
+  $value = trim($value);
+}
