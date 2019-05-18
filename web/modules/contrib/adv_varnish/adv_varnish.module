@@ -1,0 +1,465 @@
+<?php
+/**
+ * @file
+ * Module hooks.
+ */
+
+use Drupal\Core\Form\FormState;
+use Drupal\Core\Logger\RfcLogLevel;
+use Drupal\Core\Template\Attribute;
+
+// Set header name.
+const ADV_VARNISH_HEADER_CACHE_TAG = 'X-TAG';
+const ADV_VARNISH_HEADER_GRACE = 'X-GRACE';
+const ADV_VARNISH_HEADER_RNDPAGE = 'X-RNDPAGE';
+const ADV_VARNISH_HEADER_CACHE_DEBUG = 'X-CACHE-DEBUG';
+const ADV_VARNISH_COOKIE_BIN = 'AVCEBIN';
+const ADV_VARNISH_COOKIE_INF = 'AVCEINF';
+const ADV_VARNISH_X_TTL = 'X-TTL';
+const ADV_VARNISH_HEADER_ETAG = 'ETag';
+const ADV_VARNISH_HEADER_DEFLATE_KEY = 'X-DEFLATE-KEY';
+const ADV_VARNISH_PER_PAGE = 1;
+const ADV_VARNISH_PER_ROLE = 2;
+const ADV_VARNISH_PER_USER = 3;
+const ADV_VARNISH_TAG_USER_BLOCKS = 'user_blocks';
+
+// ESI Types.
+const ADV_VARNISH_ESI_TYPE_USERBLOCKS = 'user_blocks';
+const ADV_VARNISH_ESI_TYPE_BLOCK = 'block';
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function adv_varnish_form_block_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+
+  // Remove forever option from block.
+  unset($form['settings']['cache']['max_age']['#options']['-1']);
+
+  // Alter block configuration form to add cache settings for varnish.
+  // Get block.
+  $id = $form['id']['#default_value'];
+  $block = \Drupal\block\Entity\Block::load($id);
+
+  // Get block configuration.
+  if ($block) {
+    $settings = $block->get('settings');
+
+    // Add ESI block support.
+    $form['settings']['cache']['esi'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('ESI block'),
+      '#default_value' => $settings['cache']['esi'] ?: FALSE,
+    );
+
+    $options = array(
+      ADV_VARNISH_PER_PAGE => t('Shared'),
+      ADV_VARNISH_PER_ROLE => t('Per User Roles'),
+      ADV_VARNISH_PER_USER => t('Per User ID'),
+    );
+
+    $form['settings']['cache']['cachemode'] = array(
+      '#title' => t('Cache granularity (Cache bin)'),
+      '#description' => t('Choosing those will increase cache relevance, but reduce performance.'),
+      '#type' => 'select',
+      '#options' => $options,
+      '#default_value' =>  $settings['cache']['cachemode'] ?: ADV_VARNISH_PER_ROLE,
+    );
+  }
+}
+
+/**
+ * Implements hook_block_view_alter().
+ */
+function adv_varnish_block_view_alter(array &$build, \Drupal\Core\Block\BlockPluginInterface $block) {
+
+  $block = $build['#block'];
+
+  // Check if ESI for this block enabled and should we
+  // replace block content with ESI tag.
+  $controller = Drupal::service('adv_varnish.controller');
+  if (!$controller->cachingEnabled() || isset($block->_esi)) {
+    return;
+  }
+
+  // Get block configuration.
+  $conf = $build['#configuration'];
+  $esi = !empty($conf['cache']['esi']) ? TRUE : FALSE;
+  if (!$esi) {
+    return;
+  }
+
+  // If we need to replace block with ESI we
+  // change #pre_render callback to handle this.
+  $build['#theme'] = 'adv_varnish_esi_block';
+  $build['#pre_render'] = ['_adv_varnish_build_esi_block'];
+
+  // Prevent Drupal from caching ESI block.
+  $build['#cache']['max-age'] = 0;
+}
+
+/**
+ * Implements template_preprocess_adv_varnish_esi_block().
+ */
+function template_preprocess_adv_varnish_esi_block(&$variables) {
+  $elements = &$variables['elements'];
+  $variables['content'] = $elements['#content'];
+}
+
+/**
+ * Implements hook_theme().
+ */
+function adv_varnish_theme() {
+  return array(
+    'adv_varnish_esi_block' => array(
+      'render element' => 'elements',
+    ),
+  );
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function adv_varnish_form_page_manager_variant_edit_block_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+
+  // Remove forever option from block.
+  unset($form['settings']['cache']['max_age']['#options']['-1']);
+
+  // Get form storage.
+  $storage = $form_state->getStorage();
+
+  // Get page variant.
+  $variant = $form_state->getBuildInfo()['args'][0];
+
+  // Get current block from page variant.
+  $bid = $storage['block_id'];
+
+  // Get block settings.
+  $default = \Drupal::config('adv_varnish.settings');
+  if ($bid) {
+    $settings = $default->get($bid);
+  }
+
+  $form['settings']['cache']['esi'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('ESI block'),
+    '#default_value' => $settings['cache']['esi'] ?: FALSE,
+  );
+
+  $options = array(
+    ADV_VARNISH_PER_PAGE => t('Shared'),
+    ADV_VARNISH_PER_ROLE => t('Per User Roles'),
+    ADV_VARNISH_PER_USER => t('Per User ID'),
+  );
+
+  $form['settings']['cache']['cachemode'] = array(
+    '#title' => t('Cache granularity (Cache bin)'),
+    '#description' => t('Choosing those will increase cache relevance, but reduce performance.'),
+    '#type' => 'select',
+    '#options' => $options,
+    '#default_value' => $settings['cache']['cachemode'] ?: ADV_VARNISH_PER_ROLE,
+  );
+  $form['#submit'][] = 'adv_varnish_page_manager_variant_edit_block_form_submit';
+}
+
+/**
+ * Submit callback for panels page edit form
+ */
+function adv_varnish_page_manager_variant_edit_block_form_submit($form, \Drupal\Core\Form\FormStateInterface $form_state) {
+  // Get form storage.
+  $storage = $form_state->getStorage();
+  // Get current block from page variant.
+  $bid = $storage['block_id'];
+  $configFactory = \Drupal::service('config.factory');
+  $config = $configFactory->getEditable('adv_varnish.settings');
+
+  $config->set($bid, ['cache' => $form_state->getValue('settings')['cache']]);
+  $config->save();
+}
+
+  /**
+ * Implements hook_layout_alter().
+ */
+function adv_varnish_layout_alter(&$vars) {
+  foreach ($vars as &$layout) {
+    $layout['class'] = 'Drupal\adv_varnish\Plugin\Layout\CacheableLayout';
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function adv_varnish_form_page_variant_edit_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  $build = $form_state->getBuildInfo();
+  $varnish = \Drupal::service('adv_varnish.controller');
+  $page = $build['callback_object']->getEntity()->getPage();
+  $pageVariant = $build['callback_object']->getEntity();
+  $display_variant_id = $build['callback_object']->getEntity()->id();
+  $options = ['displayVariant' => $display_variant_id];
+
+  $cache_key_generator = $varnish->getCacheKeyGenerator($pageVariant, $options);
+
+  $default = \Drupal::config('adv_varnish.settings');
+  $form['cache_setting'] = [
+    '#type' => 'details',
+    '#title' => t('Cache settings'),
+    '#tree' => TRUE,
+  ];
+
+  $settings_key = $cache_key_generator->generateSettingsKey();;
+  $date_formatter = \Drupal::service('date.formatter');
+
+  // Cache time for Varnish.
+  $period = array(0, 60, 180, 300, 600, 900, 1800, 2700, 3600,
+    10800, 21600, 32400, 43200, 86400);
+  $period = array_map(array($date_formatter, 'formatInterval'), array_combine($period, $period));
+  $period[0] = t('no caching');
+  $form['cache_setting']['ttl'] = [
+    '#type' => 'select',
+    '#title' => t('Page cache maximum age'),
+    '#default_value' => $default->get($settings_key)['cache_settings']['ttl'],
+    '#options' => $period,
+    '#description' => t('The maximum time a page can be cached by varnish.'),
+  ];
+
+  $form['cache_setting']['purge_id'] = [
+    '#type' => 'textfield',
+    '#title' => t('Cache ID for manual purge'),
+    '#disabled' => TRUE,
+    '#default_value' => 'page_' . $page->id() . '_' . $display_variant_id . '_' . $pageVariant->uuid(),
+  ];
+
+  $form['cache_setting']['purge_now'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Purge this page cache now'),
+  ];
+
+  $form['cache_setting']['settings_key'] = [
+    '#type' => 'hidden',
+    '#value' => $settings_key
+  ];
+
+  array_unshift($form['actions']['submit']['#submit'], '_adv_varnish_panels_settings_submit');
+}
+
+/**
+ * Submit callback for panels page edit form
+ */
+function _adv_varnish_panels_settings_submit($form, \Drupal\Core\Form\FormStateInterface $form_state) {
+  $cache_settings = $form_state->getValue('cache_setting');
+  $configFactory = \Drupal::service('config.factory');
+  $config = $configFactory->getEditable('adv_varnish.settings');
+
+  $config->set($cache_settings['settings_key'], ['cache_settings' => $cache_settings]);
+  $config->save();
+}
+
+/**
+ * Implements hook_cron().
+ */
+function adv_varnish_cron() {
+  $account = \Drupal::currentUser();
+
+  // Prepare variables.
+  $varnish = Drupal::service('adv_varnish.handler');
+  $deflate_conf = \Drupal::config('adv_varnish.deflate');
+  $deflate_info = $deflate_conf->get('info');
+  $deflate_ids = $deflate_conf->get('ids');
+  $deflate_key = $deflate_info['key'];
+  $deflate_value_header = ADV_VARNISH_HEADER_ETAG;
+  $deflate_key_header = ADV_VARNISH_HEADER_DEFLATE_KEY;
+
+  // If we have something to deflate.
+  if (!empty($deflate_ids) && !empty($deflate_key)) {
+    for ($i = 0; $i < $deflate_info['step']; $i++) {
+
+      // Double check as we will reduce this array.
+      if (!empty($deflate_ids)) {
+
+        // Pick random key to deflate.
+        $key = mt_rand(0, count($deflate_ids) - 1);
+        $deflate_value = $deflate_ids[$key];
+
+        // Build and execte command.
+        $command_line = "ban obj.http.$deflate_value_header ~ \".{8}$deflate_value\" && obj.http.$deflate_key_header != \"$deflate_key\" ";
+
+        // Log action.
+        if ($varnish->getSetting('general', 'logging', FALSE)) {
+          \Drupal::logger('adv_varnish:deflate')->log(RfcLogLevel::DEBUG, 'u=@uid !percentage% !command_line', array(
+              '@uid' => $account->id(),
+              '!command_line' => $command_line,
+              '!percentage' => count($deflate_ids),
+            )
+          );
+        }
+
+        // Query Varnish.
+        $res = $varnish->varnishTerminalRun([$command_line]);
+
+        // Sleep a bit to save from spam.
+        usleep(10000);
+
+        // Update deflate array.
+        if (!empty($res)) {
+          unset($deflate_ids[$key]);
+          $deflate_ids = array_values($deflate_ids);
+        }
+      }
+
+      // Update deflate conf settings.
+      $config_factory = \Drupal::service('config.factory');
+      $config = $config_factory->getEditable('adv_varnish.deflate');
+      $config->set('ids', $deflate_ids)
+        ->save();
+    }
+
+  }
+}
+/**
+ * Generate ESI tag.
+ */
+function adv_varnish_esi_tag($esi_type, $esi_id, $cachemode = ADV_VARNISH_PER_USER, $esi_args = array(), $maxwait = 5000) {
+
+  // Generate ESI path.
+  $path = '/adv_varnish/esi/' . $esi_type . '/' . $esi_id;
+
+  // Build query.
+  $query['cachemode'] = $cachemode;
+  if (!empty($esi_args)) {
+    $query['a'] = $esi_args;
+  }
+  $url = \Drupal\Core\Url::fromUserInput($path, ['query' => $query]);
+
+  // Build tag.
+  $tag = "<!--esi\n" . '<esi:include src="' . $url->toString()  . '" maxwait="' . $maxwait . '"/>' . "\n-->";
+  $esi_tag = adv_varnish_wrap($tag);
+  return $esi_tag;
+}
+
+/**
+ * Wrap content with some info.
+ */
+function adv_varnish_wrap($content, $tag = TRUE, $comment = FALSE) {
+
+  // Wrap ESI content.
+  $attributes = array(
+    'class' => ($tag) ? 'adv_varnish_wrapper' : 'adv_varnish_wrapper',
+    'time'  => date('c'),
+    'stamp' => time(),
+  );
+
+  // Add origin if in debug mode.
+  $debug = \Drupal::config('adv_varnish.settings')->get('general.debug');
+  if ($debug) {
+    $attributes['origin'] = $_SERVER["REQUEST_URI"];
+    if ($tag) {
+      // Remove comments wrappers.
+      $source = strtr($content, array('<!--esi' => '', '-->' => ''));
+      $attributes['source'] = htmlentities($source);
+    }
+  }
+
+  if ($comment) {
+    $result = '<!-- <div ' . new Attribute($attributes) . '> -->' . $content . '<!-- </div> -->';
+  }
+  else {
+    $result = '<div ' . new Attribute($attributes) . '>' . $content . '</div>';
+  }
+  return $result;
+}
+
+/**
+ * #pre_render callback for building a ESI block.
+ *
+ * Replace block content with ESI tag.
+ */
+function _adv_varnish_build_esi_block($build) {
+  $id = $build['#block']->id();
+
+  // Remove the block entity from the render array, to ensure that blocks
+  // can be rendered without the block config entity.
+  unset($build['#block']);
+
+  $cache_conf = $build['#configuration']['cache'];
+  $cache_mode = $cache_conf['cachemode'];
+
+  $content = adv_varnish_esi_tag(ADV_VARNISH_ESI_TYPE_BLOCK, $id, $cache_mode);
+  $build['#content'] = $content;
+
+  // Set flag for varnish that we have ESI in the response.
+  $build['#attached']['http_header'] = [
+    ['X-DOESI', '1'],
+  ];
+
+  return $build;
+}
+
+/**
+ * #pre_render callback for building a ESI block.
+ *
+ * Replace block content with ESI tag.
+ */
+function _adv_varnish_build_panels_esi_block($build) {
+  $route = \Drupal::request()->get(\Symfony\Cmf\Component\Routing\RouteObjectInterface::ROUTE_OBJECT);
+  $defaults = $route->getDefaults();
+
+  $page = $defaults['page_manager_page'];
+  $dispaly_variant = $defaults['page_manager_page_variant'];
+  $conf = $build['#configuration'];
+  $block_id = $conf['uuid'];
+
+  $cache_conf = $build['#configuration']['cache'];
+  $query['cachemode'] = $cache_conf['cachemode'];
+
+  $maxwait = 5000;
+  $path = '/adv_varnish/esi/block/' . $page . '/' . $dispaly_variant . '/' . $block_id;
+  $url = \Drupal\Core\Url::fromUserInput($path, ['query' => $query]);
+  $content = "<!--esi\n" . '<esi:include src="' . $url->toString()  . '" maxwait="' . $maxwait . '"/>' . "\n-->";
+
+  $build['#content'] = $content;
+
+  // Set flag for varnish that we have ESI in the response.
+  $build['#attached']['http_header'] = [
+    ['X-DOESI', '1'],
+  ];
+
+  return $build;
+}
+
+/**
+ * Implements hook_user_logout().
+ *
+ * The user just logged out.
+ *
+ * @param $account
+ *   The user object on which the operation was just performed.
+ */
+function adv_varnish_user_logout($account) {
+
+  // Destroy user cookies.
+  $params = session_get_cookie_params();
+  setcookie(ADV_VARNISH_COOKIE_BIN, '', REQUEST_TIME - 3600, $params['path'], $params['domain']);
+  setcookie(ADV_VARNISH_COOKIE_INF, '', REQUEST_TIME - 3600, $params['path'], $params['domain']);
+}
+
+function  adv_varnish_preprocess_page(&$variables) {
+  $varnish_controller = Drupal::service('adv_varnish.controller');
+
+  if (!$varnish_controller->cachingEnabled()) {
+    return;
+  }
+
+  $account = \Drupal::currentUser();
+  $content = &$variables['page']['content'];
+  $attached = &$variables['#attached'];
+
+  $authenticated = $account->isAuthenticated();
+
+  // Only adds user blocks if we have an actual user.
+  if ($authenticated) {
+    $esi_tag = adv_varnish_esi_tag(ADV_VARNISH_ESI_TYPE_USERBLOCKS, '1', ADV_VARNISH_PER_USER);
+    $content['varnish_userblocks']['#theme'] = 'adv_varnish_esi_block';
+    $content['varnish_userblocks']['#content'] = $esi_tag;
+    $content['varnish_userblocks']['#weight'] = 99999;
+    $attached['library'][] = 'adv_varnish/adv_varnish';
+  }
+}
