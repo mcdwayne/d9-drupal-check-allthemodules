@@ -1,0 +1,251 @@
+<?php
+
+/**
+ * @file
+ * Module file for the past project.
+ */
+
+use Drupal\Component\Utility\Xss;
+use Drupal\Core\Logger\RfcLogLevel;
+use Drupal\Core\Site\Settings;
+use Drupal\Core\Url;
+use Drupal\past\PastEventInterface;
+use Drupal\past\PastEventNull;
+
+/**
+ * Creates and saves a past event.
+ *
+ * @param string $module
+ *   The name of the module which is logging the event.
+ * @param string $machine_name
+ *   The machine name of the event.
+ * @param string $message
+ *   A description of the event.
+ * @param array $arguments
+ *   An array of arguments to be saved with the event. They array key is used
+ *   as the argument key and the value is the argument data.
+ * @param array $options
+ *   An array of additional options. Any of the following:
+ *     - timestamp: Override the timestamp, defaults to REQUEST_TIME
+ *     - severity: One of RfcLogLevel::DEBUG, RfcLogLevel::INFO,
+ *         RfcLogLevel::WARNING and RfcLogLevel::ERROR.
+ *     - uid: Drupal user id.
+ *
+ * @return PastEventInterface
+ *   The event created.
+ *
+ * @see past_event_create()
+ */
+function past_event_save($module, $machine_name, $message, array $arguments = [], array $options = []) {
+  $event = past_event_create($module, $machine_name, $message, $options);
+
+  foreach ($arguments as $key => $argument) {
+    $event->addArgument($key, $argument);
+  }
+  $event->save();
+  return $event;
+}
+
+/**
+ * Creates a past event.
+ *
+ * @param string $module
+ *   The name of the module which is logging the event.
+ * @param string $machine_name
+ *   The machine name of the event.
+ * @param string $message
+ *   A description of the event.
+ * @param array $options
+ *   An array of additional options. Any of the following:
+ *     - timestamp: Override the timestamp, defaults to REQUEST_TIME
+ *     - severity: One of RfcLogLevel::DEBUG, RfcLogLevel::INFO,
+ *         RfcLogLevel::WARNING and RfcLogLevel::ERROR.
+ *     - uid: Drupal user id.
+ *     - session_id: Session ID.
+ *
+ * @return PastEventInterface
+ *   The event created.
+ *
+ * @see past_event_save()
+ */
+function past_event_create($module, $machine_name, $message = NULL, array $options = []) {
+  /** @var string $backend_factory */
+  $backend_factory = Settings::get('past_backend', 'past_db_create_event');
+  if (function_exists($backend_factory)) {
+    $event = $backend_factory($options);
+  }
+  if (empty($event)) {
+    // Misconfigured backend. This is covered by requirements hook; do not log.
+    return new PastEventNull();
+  }
+
+  /* @var $event PastEventInterface */
+  $event->setModule($module);
+  $event->setMachineName($machine_name);
+  if ($message) {
+    $event->setMessage($message);
+  }
+
+  // @todo move to PastEventController->create() or move other defaults here ?
+  if (\Drupal::config('past.settings')->get('log_session_id') &&
+    !array_key_exists('session_id', $options)) {
+    // Add session id if not in options.
+    $event->setSessionId(session_id());
+  }
+  // Set the location and referer.
+  if (\Drupal::hasRequest()) {
+    $event->setLocation(\Drupal::request()->getUri());
+    $event->setReferer(\Drupal::request()->headers->get('referer'));
+  }
+
+  foreach ($options as $key => $value) {
+    switch ($key) {
+      case 'timestamp':
+        $event->setTimestamp($value);
+        break;
+
+      case 'severity':
+        $event->setSeverity($value);
+        break;
+
+      case 'uid':
+        $event->setUid($value);
+        break;
+
+      case 'session_id':
+        $event->setSessionId($value);
+        break;
+    }
+  }
+  return $event;
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function past_form_system_logging_settings_alter(&$form, &$form_state) {
+  $form['past_info']['#prefix'] = t('See also <a href=":settings_url">past settings</a>',
+    [':settings_url' => Url::fromRoute('past.settings')->toString()]);
+  return $form;
+}
+
+/**
+ * Ported format_backtrace from D8 and customized.
+ *
+ * @param int $severity_level
+ *   The name of a Watchdog severity level.
+ * @param int $slice
+ *   How many entries to skip. Default is 5, because those will always be the
+ *   same.
+ *
+ * @return string
+ *   Plain-text backtrace.
+ */
+function _past_get_formatted_backtrace($severity_level, $slice = 5) {
+  $config = \Drupal::config('past.settings');
+  $log_backtrace = $config->get('backtrace_include');
+  if (!is_null($severity_level) && !in_array($severity_level, $log_backtrace)) {
+    return NULL;
+  }
+
+  // Skip the given entries (by default 5), as they'll always be the same.
+  $backtrace = array_slice(debug_backtrace(), $slice);
+  $return = '';
+  $i = 0;
+  foreach ($backtrace as $trace) {
+    $call = [
+      'function' => '',
+      'args' => [],
+    ];
+    if (isset($trace['class'])) {
+      $call['function'] = $trace['class'] . $trace['type'] . $trace['function'];
+    }
+    elseif (isset($trace['function'])) {
+      $call['function'] = $trace['function'];
+    }
+    else {
+      $call['function'] = 'main';
+    }
+    if (isset($trace['function'])) {
+      $call['args'][] = isset($trace['line']) ? $trace['line'] : 0;
+      $call['args'][] = $trace['function'];
+      $call['function'] = isset($trace['file']) ? $trace['file'] : '';
+    }
+    else {
+      foreach ($trace['args'] as $arg) {
+        if (is_scalar($arg)) {
+          $call['args'][] = is_string($arg) ? '\'' . Xss::filter($arg) . '\'' : $arg;
+        }
+        else {
+          $call['args'][] = ucfirst(gettype($arg));
+        }
+      }
+    }
+    $return .= '#' . $i . ' ' . $call['function'] . ' (' . implode(', ', $call['args']) . ")\n";
+    $i++;
+  }
+  return $return;
+}
+
+/**
+ * Prepare a watchdog error array for use as event argument.
+ *
+ * @param array $error
+ *   The error to process.
+ *
+ * @return array
+ *   The prepared argument array.
+ */
+function _past_error_array_to_event(array $error) {
+  // Make the output of the exception nicer (remove special chars).
+  if (isset($error['%type']) && isset($error['%function']) && isset($error['%file']) && isset($error['%line']) && isset($error['severity_level'])) {
+    $context = [];
+    $context['type'] = $error['%type'];
+    $context['function'] = $error['%function'];
+    $context['file_line'] = $error['%file'] . ':' . $error['%line'];
+    $context['severity_level'] = $error['severity_level'];
+    return $context;
+  }
+  else {
+    return NULL;
+  }
+}
+
+/**
+ * Past custom shutdown function.
+ *
+ * Attempts to deal with error types which error handler is not able to capture.
+ */
+function _past_shutdown_function() {
+
+  $error_types = [
+    E_ERROR,
+    E_CORE_ERROR,
+    E_CORE_WARNING,
+    E_COMPILE_ERROR,
+    E_COMPILE_WARNING,
+  ];
+
+  // Check if an error was thrown and it's one that can only be captured by a
+  // shutdown function.
+  if (!($error = error_get_last()) || !in_array($error['type'], $error_types)) {
+    return;
+  }
+
+  $severity = RfcLogLevel::CRITICAL;
+
+  // Create a event, add the error information.
+  $event = past_event_create('past', 'fatal_error', $error['message']);
+  $event->setSeverity($severity);
+  $event->setTimestamp(REQUEST_TIME);
+
+  $event->addArgument('error', $error);
+
+  try {
+    $event->save();
+  }
+  catch (Exception $exception) {
+    // If for some reason the saving fails here, log to the apache error log.
+    error_log('Failed to save past event with message ' . $error['message'] . ' in past shutdown handler.');
+  }
+}

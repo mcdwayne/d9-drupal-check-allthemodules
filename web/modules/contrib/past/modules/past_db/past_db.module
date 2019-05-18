@@ -1,0 +1,319 @@
+<?php
+
+/**
+ * @file
+ * Module file for the Past DB module.
+ */
+
+use \Drupal\Core\Logger\RfcLogLevel;
+use Drupal\Core\StringTranslation\TranslatableMarkup;
+use \Drupal\past_db\Entity\PastEvent;
+use Drupal\views\Views;
+
+/**
+ * Entity URI callback for image style.
+ *
+ * @param \Drupal\past_db\Entity\PastEvent $event
+ *
+ * @return array
+ */
+function past_event_entity_uri(PastEvent $event) {
+  return [
+    'path' => 'admin/reports/past/' . $event->id(),
+  ];
+}
+
+/**
+ * Menu argument loader; Load a event type by string.
+ *
+ * @param string $type
+ *   The machine-readable name of a event type to load.
+ *
+ * @return array
+ *   A event type array or FALSE if $type does not exist.
+ */
+function past_event_type_load($type) {
+  return past_event_get_types($type);
+}
+
+/**
+ * Implements hook_menu_links_discovered_alter().
+ */
+function past_db_menu_links_discovered_alter(&$links) {
+  // Display the menu item if one of the default past event views exists.
+  $view = NULL;
+  if (!$view = Views::getView('past_event_log')) {
+    $view = Views::getView('past_event_log_key_ext_search');
+  }
+  if ($view) {
+    $links['past_event.collection'] = [
+      'title' => $view->getTitle(),
+      'description' => new TranslatableMarkup('Reports of the past events.'),
+      'route_name' => $view->getUrl()->getRouteName(),
+      'parent' => 'system.admin_reports',
+    ];
+  }
+}
+
+/**
+ * Creates past event type entity.
+ *
+ * @param string $type
+ *   Event type.
+ * @param string $label
+ *   Event type label.
+ * @param array $values
+ *   Additional event type values.
+ *
+ * @return \Drupal\past_db\Entity\PastEventType
+ *   The Past Event Type crated.
+ */
+function past_event_type_create($type, $label, $values = []) {
+  $values['id'] = $type;
+  $values['label'] = $label;
+  return \Drupal::entityTypeManager()
+    ->getStorage('past_event_type')
+    ->create($values);
+}
+
+/**
+ * Gets an array of all past event types, keyed by the type name.
+ *
+ * @param string $type_name
+ *   If set, the type with the given name is returned.
+ *
+ * @return \Drupal\past_db\Entity\PastEventType[]
+ *   Depending whether $type isset,
+ *   an array of past event types or a single one.
+ */
+function past_event_get_types($type_name = NULL) {
+  $properties = [];
+  if (!empty($type_name)) {
+    $properties['id'] = $type_name;
+  }
+  $types = \Drupal::entityTypeManager()
+    ->getStorage('past_event_type')
+    ->loadByProperties($properties);
+  return isset($type_name) ? reset($types) : $types;
+}
+
+/**
+ * Access callback for the entity API.
+ *
+ * @param string $op
+ *   The performed operation - view, delete, create, update, customs...
+ * @param $type
+ *   (optional) The entity type on which $operation should be performed.
+ * @param \Drupal\Core\Session\AccountInterface $account
+ *   (optional) The account to check if it has access.
+ *
+ * @return bool
+ *    TRUE if $account can perform $operation on $entity
+ */
+function past_event_type_access($op, $type = NULL, $account = NULL) {
+  return $account->hasPermission('administer past');
+}
+
+/**
+ * Access callback implementation.
+ *
+ * @param string $op
+ *   The performed operation - view, delete, create, update, customs...
+ * @param $entity
+ *   (optional) The entity on which $operation should be performed.
+ * @param \Drupal\Core\Session\AccountInterface $account
+ *   (optional) The account to check if it has access.
+ *
+ * @return bool
+ *    TRUE if $account can perform $operation on $entity
+ */
+function past_db_access($op, $entity = NULL, $account = NULL) {
+  return $account->hasPermission('administer past');
+}
+
+/**
+ * Implements hook_cron().
+ */
+function past_db_cron() {
+  // Check if expiration is enabled.
+  if ($expire = \Drupal::config('past.settings')->get('events_expire')) {
+    // Fetch up to 100 past events to delete, delete oldest first.
+    $query = \Drupal::entityQuery('past_event');
+    $query->condition('timestamp', REQUEST_TIME - $expire, '<');
+    $query->sort('timestamp');
+    $query->range(0, 100);
+    $result = $query->execute();
+    if ($result) {
+      $controller = \Drupal::entityTypeManager()->getStorage('past_event');
+      $entities = $controller->loadMultiple(array_keys($result));
+      $controller->delete($entities);
+    }
+  }
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function past_db_views_api() {
+  return [
+    'api' => 3,
+    'template path' => drupal_get_path('module', 'past_db') . '/themes',
+  ];
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ *
+ * Display a view as a table style.
+ */
+function past_db_preprocess_views_view_table(&$vars) {
+  // Do this only for the Past views that have a severity field.
+  if (empty($vars['view']->field['severity'])) {
+    return;
+  }
+  $vars['attributes']['class'][] = 'past-severity-colors';
+  past_db_add_row_colors($vars);
+}
+
+/**
+ * Adds severity classes to rows.
+ *
+ * This works only if the field past_event_severity is added to the view.
+ *
+ * @param array $vars
+ *   The variables array as passed into the theme function.
+ */
+function past_db_add_row_colors(&$vars) {
+  // Add the corresponding class to the row.
+  $class_names = past_db_severity_css_classes_map();
+  foreach ($vars['rows'] as $num => $row) {
+    if (isset($vars['result'][$num]->_entity->severity->value) && !empty($class_names[$vars['result'][$num]->_entity->severity->value])) {
+      $vars['rows'][$num]['attributes']->addClass($class_names[$vars['result'][$num]->_entity->severity->value]);
+    }
+  }
+}
+
+/**
+ * Implements hook_views_pre_render().
+ */
+function past_db_views_pre_render(\Drupal\views\ViewExecutable $view) {
+  if (array_key_exists('past_event', $view->getBaseTables())) {
+    // Attach severity styling.
+    $view->element['#attached']['library'][] = 'past_db/default';
+  }
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ */
+function past_db_preprocess_views_view_field(&$vars) {
+  // @todo Would like to do this earlier than in preprocess hook! Where?
+  if ($vars['field']->field_alias == 'past_event_severity') {
+    $severities = RfcLogLevel::getLevels();
+    $vars['output'] = $severities[intval($vars['field']->original_value)];
+  }
+}
+
+/**
+ * Getter for the severity css classes.
+ *
+ * @return array
+ *   The map of severities to css classes.
+ */
+function past_db_severity_css_classes_map() {
+  return [
+    RfcLogLevel::EMERGENCY => 'past-emergency',
+    RfcLogLevel::ALERT => 'past-alert',
+    RfcLogLevel::CRITICAL => 'past-critical',
+    RfcLogLevel::ERROR => 'past-error',
+    RfcLogLevel::WARNING => 'past-warning',
+    RfcLogLevel::NOTICE => 'past-notice',
+    RfcLogLevel::INFO => 'past-info',
+    RfcLogLevel::DEBUG => 'past-debug',
+  ];
+}
+
+/**
+ * Implements hook_entity_insert().
+ */
+function past_db_entity_past_event_type_insert($entity) {
+  field_attach_create_bundle('past_event', $entity->type);
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function past_db_entity_past_event_type_update($entity) {
+  if ($entity->type != $entity->original->type) {
+    field_attach_rename_bundle('past_event', $entity->original->type, $entity->type);
+  }
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function past_db_entity_past_event_type_delete($entity) {
+  field_attach_delete_bundle('past_event', $entity->type);
+}
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function past_db_entity_extra_field_info() {
+  $extra = [];
+
+  foreach (past_event_get_types() as $key => $bundle) {
+    $extra['past_event'][$key] = [
+      'display' => [
+        'message' => [
+          'label' => t('Message'),
+          'description' => t('The event log message.'),
+          'weight' => 0,
+        ],
+        'module' => [
+          'label' => t('Module'),
+          'description' => t('Module which triggered the event.'),
+          'weight' => 1,
+        ],
+        'machine_name' => [
+          'label' => t('Machine name'),
+          'description' => t('The event machine name.'),
+          'weight' => 2,
+        ],
+        'timestamp' => [
+          'label' => t('Event time'),
+          'description' => t('The time when the event occurred.'),
+          'weight' => 3,
+        ],
+        'user' => [
+          'label' => t('User'),
+          'description' => t('The user that triggered the event.'),
+          'weight' => 4,
+        ],
+        'arguments' => [
+          'label' => t('Arguments'),
+          'description' => t('The event arguments.'),
+          'weight' => 5,
+        ],
+      ],
+    ];
+  }
+
+  return $extra;
+}
+
+/**
+ * Returns an event object.
+ *
+ * @param array $options
+ *   (optional) An array of values to set.
+ *
+ * @return \Drupal\past\PastEventInterface A new Past event instance.
+ *   A new Past event instance.
+ */
+function past_db_create_event(array $options = []) {
+  if (\Drupal::entityTypeManager()->hasDefinition('past_event')) {
+    return \Drupal::entityTypeManager()->getStorage('past_event')->create($options);
+  }
+  return new \Drupal\past\PastEventNull();
+}
