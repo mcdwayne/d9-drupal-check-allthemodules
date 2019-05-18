@@ -1,0 +1,146 @@
+<?php
+
+/**
+ * @file
+ * Contains the Mailing list module.
+ */
+
+use Drupal\Core\Url;
+use Drupal\Core\Render\Element;
+use Drupal\mailing_list\SubscriptionInterface;
+
+/**
+ * Implements hook_theme().
+ */
+function mailing_list_theme() {
+  return [
+    'subscription' => [
+      'render element' => 'elements',
+    ],
+    'subscription_add_list' => [
+      'variables' => ['content' => NULL],
+    ],
+  ];
+}
+
+/**
+ * Prepares variables for list of available mailing lists.
+ *
+ * Default template: subscription-add-list.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - content: An array of mailing lists.
+ */
+function template_preprocess_subscription_add_list(array &$variables) {
+  $variables['lists'] = [];
+  if (!empty($variables['content'])) {
+    foreach ($variables['content'] as $list) {
+      $variables['lists'][$list->id()] = [
+        'list' => $list->id(),
+        'label' => $list->label(),
+        'add_url' => Url::fromRoute('mailing_list.subscribe', ['mailing_list' => $list->id()]),
+        'description' => [
+          '#markup' => $list->getDescription(),
+        ],
+      ];
+    }
+  }
+}
+
+/**
+ * Prepares variables for subscription templates.
+ *
+ * Default template: subscription.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - elements: An array of elements to display in view entry.
+ *   - subscription: The subscription object.
+ *   - view_mode: View mode; e.g., 'full', 'teaser', etc.
+ */
+function template_preprocess_subscription(array &$variables) {
+  $variables['view_mode'] = $variables['elements']['#view_mode'];
+  $variables['subscription'] = $variables['elements']['#subscription'];
+  /** @var \Drupal\mailing_list\SubscriptionInterface $subscription */
+  $subscription = $variables['subscription'];
+  $variables['date'] = drupal_render($variables['elements']['created']);
+  unset($variables['elements']['created']);
+  $variables['author_name'] = drupal_render($variables['elements']['uid']);
+  unset($variables['elements']['uid']);
+
+  $variables['url'] = $subscription->url('canonical', [
+    'language' => $subscription->language(),
+  ]);
+  $variables['label'] = $variables['elements']['title'];
+  unset($variables['elements']['title']);
+  $variables['email'] = $variables['elements']['email'];
+  unset($variables['elements']['email']);
+
+  // Helpful $content variable for templates.
+  $variables += ['content' => []];
+  foreach (Element::children($variables['elements']) as $key) {
+    $variables['content'][$key] = $variables['elements'][$key];
+  }
+}
+
+/**
+ * Implements hook_mail().
+ */
+function mailing_list_mail($key, &$message, $params) {
+  /** @var \Drupal\mailing_list\SubscriptionInterface $subscription */
+  $subscription = isset($params['subscription']) ? $params['subscription'] : NULL;
+
+  switch ($key) {
+    // Notify the subscriber about subscription limit reached.
+    case 'subscription_limit_reached':
+      $list_name = $subscription->getList()->label();
+      $message['subject'] = t('Your subscription to the @list mailing list has failed', ['@list' => $list_name]);
+      $message['body'][] = t('It was not possible to complete your subscription to the @list mailing list because you have reached the maximum number of subscriptions allowed.', ['@list' => $list_name]);
+      $message['body'][] = t('You can modify or delete your existing subscriptions at the link below.');
+      $message['body'][] = Url::fromRoute('entity.mailing_list_subscription.manage')
+        ->setAbsolute()
+        ->toString();
+
+      break;
+
+    case 'anonymous_subscription_access':
+      $message['subject'] = t('Accessing your mailing list subscriptions');
+      $message['body'][] = t('According to your request, you can modify or delete your existing subscriptions at the link below.');
+      $message['body'][] = $params['manage_url'];
+
+      break;
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function mailing_list_cron() {
+  // Purge old subscriptions.
+  /** @var \Drupal\mailing_list\MailingListInterface $list */
+  foreach (\Drupal::entityTypeManager()->getStorage('mailing_list')->loadMultiple() as $list) {
+    $lifetime = $list->getInactiveLifetime();
+    if (empty($lifetime)) {
+      // No purge.
+      return;
+    }
+
+    $subscription_query = \Drupal::entityQuery('mailing_list_subscription');
+    $old_subscriptions = $subscription_query
+      ->condition('mailing_list', $list->id())
+      ->condition('status', SubscriptionInterface::INACTIVE)
+      ->condition('changed', REQUEST_TIME - $lifetime, '<')
+      ->execute();
+
+    $count = 0;
+    foreach ($old_subscriptions as $sid) {
+      \Drupal::entityTypeManager()->getStorage('mailing_list_subscription')->load($sid)->delete();
+      $count++;
+    }
+
+    if ($count > 0) {
+      \Drupal::logger('mailing_list')->info('Purged @count old inactive subscriptions.', ['@count' => $count]);
+    }
+  }
+}

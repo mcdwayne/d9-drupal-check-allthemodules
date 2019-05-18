@@ -1,0 +1,274 @@
+<?php
+
+/**
+ * @file
+ * Contains the Mailing list confirm module.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\mailing_list\SubscriptionInterface;
+use Drupal\email_confirmer\EmailConfirmationInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Core\Url;
+use Drupal\Core\Field\FieldDefinitionInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\Field\FieldItemListInterface;
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Form\FormStateInterface;
+
+/**
+ * Subscription email status: not confirmed.
+ */
+const MAILING_LIST_CONFIRM_NOT_CONFIRMED = 0;
+
+/**
+ * Subscription email status: to be confirmed.
+ */
+const MAILING_LIST_CONFIRM_TO_BE_CONFIRMED = 1;
+
+/**
+ * Subscription email status: confirmed.
+ */
+const MAILING_LIST_CONFIRM_CONFIRMED = 2;
+
+/**
+ * Subscription email status: confirmation cancelled by subscriber.
+ */
+const MAILING_LIST_CONFIRM_CANCELLED = 3;
+
+/**
+ * Subscription email status: skip confirmation.
+ */
+const MAILING_LIST_CONFIRM_SKIPPED = -1;
+
+/**
+ * Implements hook_entity_base_field_info_alter().
+ */
+function mailing_list_confirm_entity_base_field_info(EntityTypeInterface $entity_type) {
+  // Alter the mymodule_text field to use a custom class.
+  if ($entity_type->id() == 'mailing_list_subscription') {
+    $fields = [];
+
+    // Add email confirmation status field.
+    $values = [
+      MAILING_LIST_CONFIRM_NOT_CONFIRMED => t('Not confirmed'),
+      MAILING_LIST_CONFIRM_TO_BE_CONFIRMED => t('To be confirmed'),
+      MAILING_LIST_CONFIRM_CONFIRMED => t('Confirmed'),
+      MAILING_LIST_CONFIRM_CANCELLED => t('Cancelled'),
+      MAILING_LIST_CONFIRM_SKIPPED => t('Skipped'),
+    ];
+
+    $fields['email_confirmation_status'] = BaseFieldDefinition::create('list_integer')
+      ->setName('email_confirmation_status')
+      ->setLabel(t('Email confirmation status'))
+      ->setRequired(TRUE)
+      ->setDefaultValue(MAILING_LIST_CONFIRM_NOT_CONFIRMED)
+      ->setSetting('allowed_values', $values)
+      ->setDisplayOptions('form', [
+        'type' => 'options_buttons',
+        'weight' => 5,
+        'hidden' => TRUE,
+      ])
+      ->setDisplayConfigurable('form', TRUE);
+
+    return $fields;
+  }
+
+}
+
+/**
+ * Implements hook_entity_field_access().
+ */
+function mailing_list_confirm_entity_field_access($operation, FieldDefinitionInterface $field_definition, AccountInterface $account, FieldItemListInterface $items = NULL) {
+  // Only administrators have access to edit email confirmation status.
+  if ($field_definition->getName() == 'email_confirmation_status'
+    && $operation == 'edit') {
+    return AccessResult::forbiddenIf(!$account->hasPermission('administer mailing list subscriptions'));
+  }
+
+  return AccessResult::neutral();
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function mailing_list_confirm_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  if (strpos($form_id, 'mailing_list_subscription_') === 0
+    && isset($form['email_confirmation_status'])) {
+    $form['email_confirmation_status']['#group'] = 'subscription_status';
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ */
+function mailing_list_confirm_mailing_list_insert(EntityInterface $entity) {
+  // Remove the confirmation status field from block form display mode.
+  /** @var \Drupal\Core\Entity\Display\EntityFormDisplayInterface $block_display_mode */
+  if ($block_display_mode = \Drupal::entityTypeManager()->getStorage('entity_form_display')->load('mailing_list_subscription.' . $entity->id() . '.block')) {
+    $block_display_mode->removeComponent('email_confirmation_status');
+    $block_display_mode->save();
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_presave().
+ */
+function mailing_list_confirm_mailing_list_subscription_presave(EntityInterface $entity) {
+  /** @var \Drupal\mailing_list\SubscriptionInterface $entity */
+
+  // Act on active subscriptions.
+  if (!$entity->isActive()
+    || $entity->getOwner()->hasPermission('bypass ' . $entity->getListId() . ' mailing list subscription confirm')) {
+    return;
+  }
+
+  $status_field = $entity->get('email_confirmation_status');
+  switch ($status_field->value) {
+    case MAILING_LIST_CONFIRM_CONFIRMED:
+      // Confirm new email address on changes.
+      if (!isset($entity->original) || $entity->original->getEmail() == $entity->getEmail()) {
+        break;
+      }
+
+    case MAILING_LIST_CONFIRM_NOT_CONFIRMED:
+      // Deactivate subscription and mark it as to be confirmed.
+      $status_field->setValue(MAILING_LIST_CONFIRM_TO_BE_CONFIRMED);
+
+    case MAILING_LIST_CONFIRM_TO_BE_CONFIRMED:
+      /** @var \Drupal\email_confirmer\EmailConfirmationInterface $confirmation */
+      // If email is already confirmed by the user, confirm this subscription.
+      if ($entity->getOwner()->isAuthenticated()
+        && ($confirmation = \Drupal::service('email_confirmer')->getConfirmation($entity->getEmail(), 'confirmed'))
+        && $confirmation->get('uid')->target_id == $entity->getOwnerId()) {
+        $status_field->setValue(MAILING_LIST_CONFIRM_CONFIRMED);
+      }
+      else {
+        // Confirmation needed, set as inactive until confirmation is received.
+        $entity->setStatus(SubscriptionInterface::INACTIVE);
+      }
+
+      break;
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ */
+function mailing_list_confirm_mailing_list_subscription_insert(EntityInterface $entity) {
+  // Does exactly the same as when subscription is updated.
+  mailing_list_confirm_mailing_list_subscription_update($entity);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update().
+ */
+function mailing_list_confirm_mailing_list_subscription_update(EntityInterface $entity) {
+  /** @var \Drupal\mailing_list\SubscriptionInterface $entity */
+  $status_field = $entity->get('email_confirmation_status');
+
+  // Act only when email confirmation is needed.
+  if ($entity->isActive()
+    || $status_field->value != MAILING_LIST_CONFIRM_TO_BE_CONFIRMED
+    || $entity->getOwner()->hasPermission('bypass ' . $entity->getListId() . ' mailing list subscription confirm')) {
+    return;
+  }
+
+  /** @var \Drupal\mailing_list\SubscriptionInterface $entity */
+  $email = $entity->getEmail();
+  /** @var \Drupal\email_confirmer\EmailConfirmerManagerInterface $email_confirmer */
+  $email_confirmer = \Drupal::service('email_confirmer');
+
+  /** @var \Drupal\email_confirmer\EmailConfirmationInterface $confirmation */
+  $realm = 'mailing_list_confirm_' . $entity->getListId();
+  if (!($confirmation = $email_confirmer->getConfirmation($email, 'pending', $realm))
+    || $confirmation->getProperty('mailing_list_sid') != $entity->id()) {
+    // No pending confirmation found for this subscription; creating new one.
+
+    // Sets subscription access as confirmation response URL for anonymous user
+    // to follow the standard subscription behaviour.
+    $response_url = $entity->getOwnerId() > 0 ? $entity->toUrl('form-destination') : Url::fromRoute('mailing_list.access_subscription', [
+      'sid' => $entity->id(),
+      'hash' => $entity->getAccessHash(),
+      'rel' => 'form-destination',
+    ]);
+
+    $confirmation = $email_confirmer->createConfirmation($email)
+      ->setProperty('mailing_list_sid', $entity->id())
+      ->setRealm($realm)
+      ->setResponseUrl($response_url, 'confirm');
+  }
+
+  $confirmation->sendRequest();
+  $confirmation->save();
+}
+
+/**
+ * Implements hook_email_confirmer().
+ */
+function mailing_list_confirm_email_confirmer($op, EmailConfirmationInterface $confirmation) {
+  if ($sid = $confirmation->getProperty('mailing_list_sid')) {
+    /** @var \Drupal\mailing_list\SubscriptionInterface $subscription */
+    $subscription = \Drupal::entityTypeManager()->getStorage('mailing_list_subscription')->load($sid);
+    if (!$subscription
+      || $subscription->getEmail() != $confirmation->getEmail()
+      || $subscription->get('email_confirmation_status')->value != MAILING_LIST_CONFIRM_TO_BE_CONFIRMED) {
+      return;
+    }
+
+    switch ($op) {
+      case 'confirm':
+        // Successful email confirmation, set subscription as active.
+        $subscription->get('email_confirmation_status')->setValue(MAILING_LIST_CONFIRM_CONFIRMED);
+        $subscription->setStatus(SubscriptionInterface::ACTIVE);
+        $subscription->save();
+        // Grant session access to the confirmed subscription.
+        \Drupal::service('mailing_list.manager')->grantSessionAccess($subscription);
+        break;
+
+      case 'cancel':
+        // Email confirmation cancelled, set subscription as inactive.
+        $subscription->get('email_confirmation_status')->setValue(MAILING_LIST_CONFIRM_CANCELLED);
+        $subscription->setStatus(SubscriptionInterface::INACTIVE);
+        $subscription->save();
+        break;
+    }
+  }
+}
+
+/**
+ * Implements hook_mail_alter().
+ */
+function mailing_list_confirm_mail_alter(&$message) {
+  if ($message['id'] == 'email_confirmer_confirmation_request') {
+    $params = $message['params'];
+    /** @var \Drupal\email_confirmer\EmailConfirmationInterface $confirmation */
+    $confirmation = $params['context']['email_confirmer_confirmation'];
+
+    if ($sid = $confirmation->getProperty('mailing_list_sid')) {
+      /** @var \Drupal\mailing_list\SubscriptionInterface $subscription */
+      $subscription = \Drupal::entityTypeManager()->getStorage('mailing_list_subscription')->load($sid);
+      $list = $subscription->getList();
+
+      // Alter the confirmation subject.
+      $message['subject'] = t('Confirm your subscription to @list on @site', [
+        '@list' => $list->label(),
+        '@site' => \Drupal::config('system.site')->get('name'),
+      ]);
+
+      // Alter the confirmation body.
+      $message['body'] = [
+        t("We have received a request to subscribe @email to the @list mailing list on @site website at @site_url. Please, reply to this request using the link below.", [
+          '@email' => $subscription->getEmail(),
+          '@list' => $list->label(),
+          '@site' => \Drupal::config('system.site')->get('name'),
+          '@site_url' => Url::fromRoute('<front>')->setAbsolute()->toString(),
+        ]),
+        Url::fromRoute(
+          'entity.email_confirmer_confirmation.response_form',
+          ['email_confirmer_confirmation' => $confirmation->uuid(), 'hash' => $confirmation->getHash()])->setAbsolute()->toString(),
+      ];
+    }
+  }
+}
