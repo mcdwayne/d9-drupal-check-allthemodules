@@ -1,0 +1,585 @@
+<?php
+
+/**
+ * @file
+ * Unlock achievements and earn points based on milestones.
+ */
+
+use Drupal\user\UserInterface;
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_theme().
+ */
+function achievements_theme() {
+  $path = drupal_get_path('module', 'achievements') . '/templates';
+
+  return [
+    'achievement' => [
+      'variables'       => ['achievement_entity' => NULL, 'unlock' => NULL],
+      'template'        => 'achievement',
+      'path'            => $path,
+    ],
+    'achievement_notification' => [
+      'variables'       => ['achievement_entity' => NULL, 'unlock' => NULL],
+      'template'        => 'achievement-notification',
+      'path'            => $path,
+    ],
+    'achievement_latest_unlock' => [
+      'variables'       => ['achievement_entity' => NULL, 'unlock' => NULL],
+      'template'        => 'achievement-latest-unlock',
+      'path'            => $path,
+    ],
+    'achievement_user_stats' => [
+      'variables'       => ['stats' => NULL],
+    ],
+  ];
+}
+
+/**
+ * Process variables for achievement.tpl.php.
+ */
+function template_preprocess_achievement(&$variables) {
+  achievements_template_shared_variables($variables);
+}
+
+/**
+ * Process variables for achievement-notification.tpl.php.
+ */
+function template_preprocess_achievement_notification(&$variables) {
+  achievements_template_shared_variables($variables);
+  $variables['classes'][] = 'element-hidden';
+  $variables['classes'][] = 'achievement-notification';
+}
+
+/**
+ * Process variables for achievement-latest-unlock.tpl.php.
+ */
+function template_preprocess_achievement_latest_unlock(&$variables) {
+  achievements_template_shared_variables($variables);
+}
+
+/**
+ * Default theme implementation for a user's achievement stats.
+ *
+ * @param variables
+ *   An associative array containing:
+ *   - stats: An array which contains the following keys:
+ *     name, rank, points, unlocks_count, and total_count.
+ */
+function template_preprocess_achievement_user_stats(&$variables) {
+  $variables['message'] = t('@name is ranked #@rank with @points points. @unlocks_count of @total_count achievements have been unlocked.', [
+    '@name'           => $variables['stats']['name'],
+    '@rank'           => $variables['stats']['rank'],
+    '@points'         => $variables['stats']['points'],
+    '@unlocks_count'  => $variables['stats']['unlocks_count'],
+    '@total_count'    => $variables['stats']['total_count'],
+  ]);
+}
+
+/**
+ * Standard variables used in our achievement templates.
+ *
+ * All our achievement templates send in $achievement and $unlock, but display
+ * some or all of the data in different ways. This is a centralized collection
+ * of the various helper $variables needed for theme display.
+ */
+function achievements_template_shared_variables(&$variables) {
+  /** @var \Drupal\achievements\Entity\AchievementEntity $achievement */
+  $achievement = $variables['achievement_entity'];
+  $variables['state'] = isset($variables['unlock']) ? 'unlocked' : 'locked';
+  $variables['classes'][] = 'achievement';
+  $variables['classes'][] = 'achievement-' . $variables['state'];
+  // Add rounded rects for tabs.
+  $variables['classes'][] = 'ui-corner-all';
+  $variables['achievement_url'] = $url = Url::fromUri('internal:/achievements/leaderboard/' . $achievement->id());
+  $already_unlocked = achievements_unlocked_already($achievement->id());
+  $image_type = $already_unlocked ? 'unlocked' : 'locked';
+
+  if ($achievement->isSecret()
+    && !$already_unlocked) {
+    $achievement->set('points', t('???'));
+    $achievement->set('title', t('Secret achievement'));
+    $achievement->set('description', t('Continue playing to unlock this secret achievement.'));
+    $variables['state'] = 'secret';
+    $image_type = 'secret';
+  }
+
+  $variables['image'] = [
+    '#theme' => 'image_formatter',
+    '#item' => (object) [
+      'uri'   => $achievement->getImagePath($image_type),
+      'alt'   => $achievement->label(),
+      'title' => $achievement->label(),
+      'width' => 70,
+      'height' => 70,
+      'entity' => FALSE,
+      'attributes' => [],
+    ],
+    '#path' => [
+      'path'    => 'achievements/leaderboard/' . $achievement->id(),
+      'options' => ['html' => TRUE],
+    ],
+  ];
+
+  $variables['achievement_title'] = [
+    '#type'   => 'link',
+    '#title'  => $achievement->label(),
+    '#url'   => Url::fromUri('internal:/achievements/unlocks/' . $achievement->id()),
+  ];
+  $variables['achievement_points'] = [
+    '#markup' => t('@points points', ['@points' => $achievement->getPoints()]),
+  ];
+  $variables['unlocked_date'] = [
+    '#markup' => isset($variables['unlock']['timestamp'])
+    ? format_date($variables['unlock']['timestamp'], 'custom', 'Y/m/d')
+    : '',
+  ];
+  $variables['unlocked_rank'] = [
+    '#markup' => isset($variables['unlock']['rank'])
+    ? t('Rank #@rank', ['@rank' => $variables['unlock']['rank']])
+    : '',
+  ];
+}
+
+/**
+ * @param int $achievement_id
+ *
+ * @return \Drupal\achievements\Entity\AchievementEntity
+ */
+function achievements_load($achievement_id) {
+  $achievements = achievements_load_all();
+  return $achievements[$achievement_id];
+}
+
+/**
+ *
+ */
+function achievements_load_all($reset = FALSE) {
+  $achievements = &drupal_static(__FUNCTION__);
+  if (!isset($achievements) || $reset) {
+    /** @var \Drupal\achievements\Entity\AchievementEntity[] $achievements */
+    $achievements = \Drupal::entityTypeManager()
+      ->getStorage('achievement_entity')
+      ->loadMultiple();
+  }
+
+  return $achievements;
+}
+
+/**
+ * Logs a user as having unlocked an achievement.
+ *
+ * @param string $achievement_id
+ *   The achievement this request applies against.
+ * @param int $uid
+ *   The user to unlock an achievement for (defaults to current user).
+ * @param int $timestamp
+ *   Optional; the timestamp when this achievement was unlocked.
+ *
+ * @return bool|void
+ */
+function achievements_unlocked($achievement_id, $uid = NULL, $timestamp = REQUEST_TIME) {
+  list($uid, $access) = achievements_user_is_achiever($uid);
+  if (!$access) {
+    return FALSE;
+  }
+
+  $achievement = achievements_load($achievement_id);
+
+  if (is_null($achievement)) {
+    \Drupal::logger('achievements')
+      ->error('%achievement_id is not a valid achievement ID.', ['%achievement_id' => $achievement_id]);
+    return FALSE;
+  }
+
+  if (!achievements_unlocked_already($achievement_id, $uid)) {
+    // If a user is rank 2, that means they were the second person to unlock it.
+    $connection = \Drupal::database();
+    $last_rank = $connection->select('achievement_unlocks', 'au')
+      ->fields('au', ['rank'])
+      ->condition('achievement_id', $achievement_id)
+      ->orderBy('rank', 'DESC')
+      ->range(0, 1)
+      ->execute()
+      ->fetchField();
+
+    $connection->insert('achievement_unlocks')
+      ->fields([
+        'achievement_id'  => $achievement_id,
+        'uid'             => $uid,
+        'rank'            => $last_rank ? $last_rank + 1 : 1,
+        'timestamp'       => $timestamp,
+        'seen'            => 0,
+      ])
+      ->execute();
+
+    $connection->merge('achievement_totals')
+      ->key('uid', $uid)
+      ->fields([
+        'points'          => $achievement->getPoints(),
+        'unlocks'         => 1,
+        'timestamp'       => $timestamp,
+        // This is recording the latest achievement.
+        'achievement_id'  => $achievement_id,
+      ])
+      ->expression('points', 'points + :points', [':points' => $achievement->getPoints()])
+      ->expression('unlocks', 'unlocks + :increment', [':increment' => 1])
+      ->execute();
+
+    // Update the unlocked_already static cache so that it returns accurate
+    // unlocks for the rest of the page load. we could have just reset the
+    // cache entirely but that would cost us additional database queries
+    // based on the number of unique unlocks in this page load.
+    $unlocks = &drupal_static('achievements_unlocked_already');
+    $unlocks[$uid][$achievement_id] = [
+      'achievement_id'  => $achievement_id,
+      'rank'            => $last_rank ? $last_rank + 1 : 1,
+      'timestamp'       => $timestamp,
+    ];
+
+    \Drupal::moduleHandler()->invokeAll('achievements_unlocked', [$achievement, $uid]);
+
+    \Drupal::logger('achievements')
+      ->info('Unlocked: @achievement (+@points), user @uid', [
+        '@achievement' => $achievement->label(),
+        '@points' => $achievement->getPoints(),
+        '@uid' => $uid,
+      ]
+    );
+  }
+}
+
+/**
+ * Return data about a user's unlocked achievements.
+ *
+ * @param $achievement_id
+ *   A specific achievement to check the unlock status of.
+ * @param $uid
+ *   The user this request applies against (defaults to current user).
+ *
+ * @return array|NULL or $unlocked or $unlocks
+ *   One of the following, based on the passed parameters:
+ *   - If the $uid has not unlocked $achievement_id, return NULL.
+ *   - If $achievement_id is unlocked, return an array of rank and timestamp.
+ *   - If no $achievement_id is passed, an array of all $uid's unlocks.
+ */
+function achievements_unlocked_already($achievement_id = NULL, $uid = NULL) {
+  list($uid, $access) = achievements_user_is_achiever($uid);
+  if (!$access) {
+    return;
+  }
+  $unlocks = &drupal_static(__FUNCTION__, []);
+
+  if (!array_key_exists($uid, $unlocks)) {
+    // We grab all unlocks and cache per page load.
+    // It's better than lots of per-achievement lookups.
+    $connection = \Drupal::database();
+    $unlocks[$uid] = $connection->select('achievement_unlocks', 'au')
+      ->fields('au', ['achievement_id', 'rank', 'timestamp'])
+      ->condition('uid', $uid)
+      ->execute()
+      ->fetchAllAssoc('achievement_id', PDO::FETCH_ASSOC);
+  }
+
+  if (isset($achievement_id)) {
+    return isset($unlocks[$uid][$achievement_id]) ? $unlocks[$uid][$achievement_id] : NULL;
+  }
+  else {
+    return $unlocks[$uid];
+  }
+}
+
+/**
+ * Returns list of achievements for a given user.
+ *
+ * @param $uid
+ *   The user to return achievement info for (defaults to current user).
+ *
+ * @return array
+ *   Either an empty array (for users who have yet to unlock anything) or
+ *   or an array of achievements.
+ */
+function achievements_totals_user($uid = NULL) {
+  list($uid, $access) = achievements_user_is_achiever($uid);
+
+  $achievers = &drupal_static(__FUNCTION__);
+  if (!isset($achievers[$uid])) {
+    $connection = \Drupal::database();
+    $query = $connection->select('achievement_totals', 'at');
+    $query->addTag('achievement_totals_user')
+      ->join('users_field_data', 'u', 'u.uid = at.uid');
+    $query->fields('at', [
+      'uid',
+      'points',
+      'unlocks',
+      'timestamp',
+      'achievement_id',
+    ])
+      ->fields('u', ['name']);
+    $achievers[$uid] = $query->condition('at.uid', $uid)
+      ->execute()
+      ->fetchObject();
+
+    // Get user's ovearll rank.
+    if (isset($achievers[$uid]->points)) {
+      // Only if they've unlocked something.
+      // To find the user's rank: count all the users with greater points, add
+      // all the users with equal points but earlier timestamps, and then add 1.
+      $better_points = $connection->select('achievement_totals')
+        ->condition('points', $achievers[$uid]->points, '>')
+        ->countQuery()
+        ->execute()
+        ->fetchField();
+      $earlier_times = $connection->select('achievement_totals')
+        ->condition('points', $achievers[$uid]->points)
+        ->condition('timestamp', $achievers[$uid]->timestamp, '<')
+        ->countQuery()
+        ->execute()
+        ->fetchField();
+      $achievers[$uid]->rank = $better_points + $earlier_times + 1;
+    }
+  }
+
+  return isset($achievers[$uid]->points) ? $achievers : [];
+}
+
+/**
+ * Relocks (or "takes away") an achievement from a user.
+ *
+ * @param $achievement_id
+ *   The achievement this request applies against.
+ * @param $uid
+ *   The user to relock an achievement for (defaults to current user).
+ */
+function achievements_locked($achievement_id, $uid = NULL) {
+  list($uid, $access) = achievements_user_is_achiever($uid);
+  if (!$access) {
+    return;
+  }
+
+  // Only remove the achievement if the user has unlocked it.
+  if (achievements_unlocked_already($achievement_id, $uid)) {
+    $connection = \Drupal::database();
+    // We need the full thing so we know how many points to take away.
+    $achievement = achievements_load($achievement_id);
+    $connection->delete('achievement_unlocks')
+      ->condition('achievement_id', $achievement['id'])
+      ->condition('uid', $uid)
+      ->execute();
+
+    // Load up a previous unlock if they've got one.
+    $previous_unlock = $connection->select('achievement_unlocks')
+      ->fields('achievement_unlocks', ['achievement_id'])
+      ->condition('uid', $uid)
+      ->orderBy('timestamp', 'DESC')
+      ->range(0, 1)
+      ->execute()
+      ->fetchField();
+
+    if ($previous_unlock) {
+      // Subtract points and set the previous unlock as their latest.
+      $connection->update('achievement_totals')
+        ->fields(['uid' => $uid, 'timestamp' => REQUEST_TIME, 'achievement_id' => $previous_unlock])
+        ->expression('points', 'points - :points', [':points' => $achievement['points']])
+        ->expression('unlocks', 'unlocks - :decrement', [':decrement' => 1])
+        ->condition('uid', $uid)
+        ->execute();
+    }
+    // With no previous unlock, remove from leaderboard entirely.
+    else {
+      $connection->delete('achievement_totals')
+        ->condition('uid', $uid)
+        ->execute();
+    }
+
+    // Remove any storage associated with this achievement.
+    achievements_storage_del($achievement['id'], $uid);
+    \Drupal::moduleHandler()->invokeAll('achievements_locked', [$achievement, $uid]);
+  }
+}
+
+/**
+ * Retrieve data needed by an achievement.
+ *
+ * @param $achievement_id
+ *   An identifier for the achievement whose data is being collected.
+ * @param $uid
+ *   The user this stored data applies to (defaults to current user).
+ *
+ * @return object|bool
+ *   The data stored for this achievement and user (unserialized).
+ */
+function achievements_storage_get($achievement_id = NULL, $uid = NULL) {
+  list($uid, $access) = achievements_user_is_achiever($uid);
+  if (!$access) {
+    return FALSE;
+  }
+  $connection = \Drupal::database();
+  return unserialize($connection->select('achievement_storage')
+    ->fields('achievement_storage', ['data'])
+    ->condition('achievement_id', $achievement_id)
+    ->condition('uid', $uid)
+    ->execute()
+    ->fetchField());
+}
+
+/**
+ * Save data needed by an achievement.
+ *
+ * @param $achievement_id
+ *   An identifier for the achievement whose data is being collected.
+ * @param $uid
+ *   The user this stored data applies to (defaults to current user).
+ * @param $data
+ *   The data being saved (of any type; serialization occurs).
+ */
+function achievements_storage_set($achievement_id = NULL, $data = NULL, $uid = NULL) {
+  list($uid, $access) = achievements_user_is_achiever($uid);
+  if (!$access) {
+    return;
+  }
+
+  $connection = \Drupal::database();
+  $connection->merge('achievement_storage')
+    ->keys([
+      'uid' => $uid,
+      'achievement_id' => $achievement_id,
+    ])
+    ->fields(['data' => serialize($data)])
+    ->execute();
+}
+
+/**
+ * Delete data stored by an achievement.
+ *
+ * @param $achievement_id
+ *   An identifier for the achievement whose data is being collected.
+ * @param $uid
+ *   The user this stored data applies to (defaults to current user).
+ */
+function achievements_storage_del($achievement_id = NULL, $uid = NULL) {
+  list($uid, $access) = achievements_user_is_achiever($uid);
+  if (!$access) {
+    return;
+  }
+
+  $achievement = achievements_load($achievement_id);
+  $storage = isset($achievement['storage']) ? $achievement['storage'] : $achievement['id'];
+  $connection = \Drupal::database();
+  $connection->delete('achievement_storage')
+    ->condition('achievement_id', $storage)
+    ->condition('uid', $uid)
+    ->execute();
+}
+
+/**
+ * Determine if a user is able to earn achievements.
+ *
+ * This is a general helper around the core achievements functions and allows
+ * us to default to the global user if a $uid is not passed, but also check
+ * permissions against a user who is not the global user. This allows us to
+ * a) define roles of users that can not earn achievements and b) manually
+ * unlock achievements for a non-current user.
+ *
+ * @param $uid
+ *   The user to check for "earn achievements" (defaults to current user).
+ *
+ * @return results
+ *   An array with values of:
+ *   - $uid is the determined user (default: the global user).
+ *   - $access is a TRUE or FALSE determined by user_access() and hooks.
+ */
+function achievements_user_is_achiever($uid = NULL) {
+  $is_achiever = &drupal_static(__FUNCTION__, []);
+  $uid = isset($uid) ? $uid : \Drupal::currentUser()->id();
+
+  if (!array_key_exists($uid, $is_achiever)) {
+    // If $uid is current user, check normally.
+    if ($uid == \Drupal::currentUser()->id()) {
+      $is_achiever[$uid] = [\Drupal::currentUser()->id(), \Drupal::currentUser()->hasPermission('earn achievements')];
+    }
+    // If it's not the global user, we need to load them fully, then check.
+    else {
+      $is_achiever[$uid] = [$uid, \Drupal::currentUser()->hasPermission('earn achievements')];
+    }
+
+    // Let other modules decide if this user can earn achievements. Hook
+    // results take precedence over the standard user_access() because we
+    // treat code prowess as stronger rationale than simplistic UI clicking.
+    $module_access = \Drupal::moduleHandler()->invokeAll('achievements_access_earn', [$uid]);
+
+    if (in_array(TRUE, $module_access, TRUE)) {
+      $is_achiever[$uid] = [$uid, TRUE];
+    }
+    elseif (in_array(FALSE, $module_access, TRUE)) {
+      $is_achiever[$uid] = [$uid, FALSE];
+    }
+  }
+
+  return $is_achiever[$uid];
+}
+
+/**
+ * Implements hook_user_cancel().
+ */
+function achievements_user_cancel($edit, $account, $method) {
+  // No stats for non-players.
+  achievements_user_delete($account);
+}
+
+/**
+ * Implements hook_user_delete().
+ */
+function achievements_user_delete(UserInterface $account) {
+  $connection = \Drupal::database();
+  $connection->delete('achievement_totals')->condition('uid', $account->id())->execute();
+  $connection->delete('achievement_unlocks')->condition('uid', $account->id())->execute();
+  $connection->delete('achievement_storage')->condition('uid', $account->id())->execute();
+}
+
+/**
+ * Implements hook_page_alter().
+ */
+function achievements_page_bottom(array &$page_bottom) {
+  // Achievement popups won't show if the overlay is active, so we'll defer until it isn't.
+  // See http://drupal.stackexchange.com/questions/35382/hide-module-when-path-is-overlay.
+  if (achievements_user_is_achiever()) {
+    $connection = \Drupal::database();
+    $unlocks = $connection->select('achievement_unlocks', 'au')
+      ->fields('au', [
+        'achievement_id',
+        'rank',
+        'timestamp',
+      ])
+      ->orderBy('timestamp')
+      ->condition('uid', \Drupal::currentUser()->id())
+      ->condition('seen', 0)
+      ->execute()
+      ->fetchAllAssoc('achievement_id', PDO::FETCH_ASSOC);
+
+    // If unseen unlocks are available, load in our JS libraries,
+    // display our achievement notification, and flag 'em as seen.
+    if (count($unlocks)) {
+      foreach ($unlocks as $unlock) {
+        $achievement = achievements_load($unlock['achievement_id']);
+        $page_bottom['achievements'][$unlock['achievement_id']] = [
+          '#theme'        => 'achievement_notification',
+          '#achievement_entity'  => $achievement,
+          '#unlock'       => $unlock,
+          '#attached'     => [
+            'library'     => [
+              'achievements/achievements',
+            ],
+          ],
+        ];
+      }
+
+      $connection->update('achievement_unlocks')
+        ->fields(['seen' => 1])
+        ->condition('uid', \Drupal::currentUser()->id())
+        ->condition('seen', 0)
+        ->execute();
+    }
+  }
+}
