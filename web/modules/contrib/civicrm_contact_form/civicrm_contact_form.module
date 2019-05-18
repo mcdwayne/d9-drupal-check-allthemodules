@@ -1,0 +1,142 @@
+<?php
+
+use Drupal\Core\Form\FormStateInterface;
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function civicrm_contact_form_entity_extra_field_info() {
+  $extra = [];
+
+  $contact_forms = \Drupal::entityTypeManager()
+    ->getStorage('contact_form')
+    ->loadMultiple();
+  foreach ($contact_forms as $contact_form) {
+    // Skip the per-user personal contact form.
+    if ($contact_form->id() == 'personal') {
+      continue;
+    }
+
+    $extra['contact_message'][$contact_form->id()]['form']['last_name'] = [
+      'label' => t('Sender last name'),
+      'weight' => -45,
+    ];
+  }
+
+  return $extra;
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function civicrm_contact_form_form_contact_message_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+  // Skip the per-user personal contact form.
+  if ($form_id == 'contact_message_personal_form') {
+    return;
+  }
+
+  $user = \Drupal::currentUser();
+
+  if ($user->isAnonymous()) {
+    // Break Name field into separate First and Last Name fields.
+    $form['name']['#title'] = t('First name');
+
+    // Insert last_name form element
+    $form['last_name'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Last name'),
+      '#maxlength' => 255,
+      '#required' => TRUE,
+    );
+  }
+
+  // Add submit handler.
+  $index = array_search('::submitForm', $form['actions']['submit']['#submit']);
+  array_splice($form['actions']['submit']['#submit'], $index + 1, 0, 'civicrm_contact_form_sitewide_form');
+}
+
+/**
+ * Callback for sitewide contact form.
+ */
+function civicrm_contact_form_sitewide_form($form, FormStateInterface $form_state) {
+  $vals = $form_state->getValues();
+  /** @var \Drupal\Core\Entity\EntityFormInterface $form_obj */
+  $form_obj = $form_state->getFormObject();
+  /** @var \Drupal\contact\MessageInterface $message */
+  $message = $form_obj->getEntity();
+  $contact_form = $message->getContactForm();
+  $category = $contact_form->label();
+
+  \Drupal::service('civicrm')->initialize();
+
+  // Get contact form recipient(s) from drupal api.
+  $recipients = $contact_form->getRecipients();
+  $target_ids = array();
+
+  // Get recipient contact ids.
+  foreach ($recipients as $email) {
+    $result = civicrm_api('email', 'get', array('email' => $email, 'version' => 3));
+    if (!empty($result['values'])) {
+      foreach ($result['values'] as $recipient) {
+        $target_ids[$recipient['contact_id']] = $recipient['contact_id'];
+      }
+    }
+  }
+
+  // Process contact form sender.
+  $params = array(
+    'check_permission' => FALSE,
+    'civicrm_contact' => array(
+      'contact_type' => 'Individual',
+      'first_name' => $vals['name'],
+      'last_name' => !empty($vals['last_name']) ? $vals['last_name'] : '',
+      'email' => $vals['mail'],
+      'version' => 3,
+    ),
+    'civicrm_email' => array(
+      'email' => $vals['mail'],
+    ),
+  );
+  $user = \Drupal::currentUser();
+  if ($user->isAuthenticated()) {
+    $cid = $_SESSION['CiviCRM']['userID'];
+  }
+  else {
+    require_once 'CRM/Dedupe/Finder.php';
+    if ($dupes = CRM_Dedupe_Finder::dupesByParams($params, 'Individual')) {
+      $cid = $dupes[0];
+    }
+    else {
+      $params['civicrm_contact']['source'] = t('Contact Form [@category]', ['@category' => $category]);
+      $result = civicrm_api('contact', 'create', $params['civicrm_contact']);
+      $cid = $result['id'];
+    }
+  }
+  $target_ids[$cid] = $cid;
+  // Lookup activity type
+  $result = civicrm_api('activity_type', 'get', array('version' => 3));
+  $types = array_flip($result['values']);
+  if (!($type = CRM_Utils_Array::value('Inbound Email', $types))) {
+    if (!($type = CRM_Utils_Array::value('Email', $types))) {
+      // If we can't find an email type, at least fetch some valid activity type
+      $type = array_shift($result['values']);
+    }
+  }
+  // Create email activity.
+  $params = array(
+    'version' => 3,
+    'activity_type_id' => $type,
+    'source_contact_id' => $cid,
+    'target_contact_id' => $target_ids,
+    'subject' => '[' . $category . '] ' . $vals['subject'][0]['value'],
+    'status_id' => 2,
+    'activity_date_time' => date('YmdHis'),
+    'details' => $vals['message'][0]['value'],
+  );
+  civicrm_api('activity', 'create', $params);
+
+  // Merge first and last name into a single field for the sake of contact_mail_page_submit.
+  if (!empty($vals['last_name'])) {
+    $form_state->setValue('name', $vals['name'] . ' ' . $vals['last_name']);
+  }
+}
