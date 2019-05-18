@@ -1,0 +1,151 @@
+<?php
+
+/**
+ * @file
+ * Contains entity_reference_inline.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Entity\ContentEntityFormInterface;
+use Drupal\Core\Entity\ContentEntityInterface;
+use Drupal\Core\Entity\EntityFormInterface;
+
+/**
+ * Implements hook_help().
+ */
+function entity_reference_inline_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the entity_reference_inline module.
+    case 'help.page.entity_reference_inline':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Field and Widget for inline editing of entity references') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Prepares variables for individual form element templates for forms generated
+ * by the EntityReferenceInlineWidget widget. It runs after the main preprocess
+ * function template_preprocess_field_multiple_value_form has already prepared
+ * the table.
+ *
+ * We only add custom ids to the rows as specified by the widget in
+ * order to support removal and new rows will also have as an attribute the
+ * table id they belong to so that our js library can register them in
+ * tabledrag and make the new rows draggable as well.
+ *
+ * Default template: field-multiple-value-form.html.twig.
+ *
+ * Combines multiple values into a table with drag-n-drop reordering.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - element: A render element representing the form element.
+ *   - table: A table render element as prepared by
+ *            template_preprocess_field_multiple_value_form.
+ */
+function entity_reference_inline_preprocess_field_multiple_value_form(&$variables) {
+  if (isset($variables['element']['#base_widget']) && ($variables['element']['#base_widget'] == 'entity_reference_inline')) {
+
+    // If we are dealing with unlimited cardinality we have to add a custom id
+    // as given by the widget to support items removal. If we come upon a new
+    // row which has been added through an ajax callback we need to attach to
+    // it the corresponding class and the table id which are needed by our js
+    // library in order to turn the new rows draggable for which they have to
+    // be registered in tabledrag.
+    if (isset($variables['element']['#is_cardinality_unlimited'])) {
+
+      foreach ($variables['table']['#rows'] as $key => &$row) {
+        $item = $variables['table']['#rows'][$key]['data'][1]['data'];
+        $row['id'] = $item['#row_id'];
+        if (isset($item['#new_ajax_row']) && $item['#new_ajax_row']) {
+          // We need the class and the table-id attribute in our js library to
+          // detect new rows and make them draggable.
+          $row['class'][] = 'entity-reference-inline-new-ajax-row';
+          $row['class'][] = 'ajax-new-content';
+          $row['table-id'] = $variables['element']['#table_id'];
+        }
+      }
+      $variables['table']['#attributes']['id'] = $variables['element']['#table_id'];
+    }
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Does the same as content_translation_form_alter but for inline referenced
+ * entities.
+ */
+function entity_reference_inline_entity_reference_inline_form_alter(array &$form, FormStateInterface $form_state, array $context) {
+  if (\Drupal::getContainer()->has('content_translation.manager') && ($form_object = $form_state->getFormObject()) && ($form_object instanceof ContentEntityFormInterface)) {
+
+    $op = $form_object->getOperation();
+    $entity = $context['entity'];
+
+    // Let the content translation handler alter the content entity edit form.
+    $content_translation_manager = \Drupal::service('content_translation.manager');
+    if ($entity instanceof ContentEntityInterface && $entity->isTranslatable() && $content_translation_manager->isEnabled($entity->getEntityTypeId(), $entity->bundle()) && count($entity->getTranslationLanguages()) > 1 && ($op == 'edit' || $op == 'default')) {
+      $controller = \Drupal::entityTypeManager()
+        ->getHandler($entity->getEntityTypeId(), 'translation');
+
+      $form['actions'] = [];
+      $controller->entityFormAlter($form, $form_state, $entity);
+      unset($form['actions']);
+
+      // @todo Move the following lines to the code generating the property form
+      //   elements once we have an official #multilingual FAPI key.
+      $translations = $entity->getTranslationLanguages();
+      $form_langcode = $form_object->getFormLangcode($form_state);
+
+      // Handle fields shared between translations when there is at least one
+      // translation available or a new one is being created.
+      if (!$entity->isNew() && (!isset($translations[$form_langcode]) || count($translations) > 1)) {
+        $langcode_key = $entity->getEntityType()->getKey('langcode');
+        foreach ($entity->getFieldDefinitions() as $field_name => $definition) {
+          if (isset($form[$field_name]) && $field_name != $langcode_key) {
+            $form[$field_name]['#multilingual'] = $definition->isTranslatable();
+          }
+        }
+      }
+    }
+  }
+
+  // Support conflict resolution.
+  $form_object = $form_state->getFormObject();
+  if (!($form_object instanceof EntityFormInterface)) {
+    return;
+  }
+  // Currently conflict resolution is supported only on entity form routes so
+  // we have to perform the form alterations only in this case. If the form is
+  // not yet cached the flag will not be set, but on rebuilding an already
+  // cached form the flag will be stored in the form state.
+  if (!($conflict_supported = $form_state->get('conflict.supported'))) {
+    if (is_null($conflict_supported)) {
+      $route =  \Drupal::routeMatch()->getRouteObject();
+      if (!($route && ($route_defaults = $route->getDefaults()) && isset($route_defaults['_entity_form']))) {
+        $form_state->set('conflict.supported', FALSE);
+        return;
+      }
+    }
+    else {
+      return;
+    }
+  }
+
+  // We retrieve the inline entity from the context and alter its sub-form to
+  // support conflict resolution if its entity type has registered a conflict
+  // resolution handler.
+  $entity = $context['entity'];
+  $entity_type_id = $entity->getEntityTypeId();
+  $entity_type_manager = \Drupal::entityTypeManager();
+  if ($entity_type_manager->hasHandler($entity_type_id, 'conflict.resolution_handler')) {
+    /** @var \Drupal\conflict\Entity\EntityConflictHandlerInterface $entity_conflict_resolution_handler */
+    $entity_conflict_resolution_handler = $entity_type_manager->getHandler($entity_type_id, 'conflict.resolution_handler');
+    $entity_conflict_resolution_handler->entityFormAlter($form, $form_state, $entity, TRUE);
+  }
+}
