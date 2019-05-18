@@ -1,0 +1,265 @@
+<?php
+
+/**
+ * @file
+ * Module hook implementations.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Menu\MenuLinkInterface;
+use Drupal\Component\Plugin\Exception\PluginNotFoundException;
+
+/**
+ * Implements hook_theme().
+ */
+function menu_notifications_theme() {
+  $theme = array();
+
+  $theme['menu_notifications'] = array(
+    'variables' => array(
+      'link_title' => NULL,
+      'link_classes' => NULL,
+      'link_prefix' => NULL,
+      'link_value' => NULL,
+    ),
+  );
+
+  return $theme;
+}
+
+/**
+ * Implements hook_menu_notifications_info().
+ */
+function menu_notifications_menu_notifications_info() {
+  $info = array();
+
+  $info['default'] = array(
+    '#title' => 'Default',
+    'value' => array(
+      'label' => t('Value'),
+      'description' => t('Use "+" to calculate values. You can use any tokens here.'),
+      'default' => '',
+    ),
+    'prefix' => array(
+      'label' => t('Prefix'),
+      'description' => t('Allows add a prefix to the value.'),
+      'default' => '',
+    ),
+  );
+
+  return $info;
+}
+
+/**
+ * Fetch an array of menu notification.
+ */
+function menu_notifications_get_menu_notifications_info() {
+  $notifications = \Drupal::moduleHandler()->invokeAll('menu_notifications_info');
+
+  // Merge in default values.
+  $info = array();
+  foreach ($notifications as $notification => $settings) {
+    $info[$notification]['#title'] = isset($settings['#title']) ? $settings['#title'] : '';
+    foreach (array_intersect_key($settings, array_flip(Element::children($settings))) as $setting => $values) {
+      $values += array(
+        'form' => array(),
+      );
+      $values['form'] += array(
+        '#type' => 'textfield',
+        '#title' => $values['label'],
+        '#description' => isset($values['description']) ? $values['description'] : '',
+        '#default_value' => isset($values['default']) ? $values['default'] : '',
+      );
+      $info[$notification][$setting] = $values['form'];
+    }
+  }
+
+  \Drupal::moduleHandler()->alter('menu_notifications_info', $info);
+  return $info;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function menu_notifications_form_menu_link_content_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+  _menu_notifications_form_alter($form, $form_state);
+}
+
+/**
+ * Add the menu notifications to a menu item edit form.
+ */
+function _menu_notifications_form_alter(array &$form, FormStateInterface $form_state) {
+  $menu_link = $form_state->getFormObject()->getEntity();
+  $menu_link_options = $menu_link->link->first()->options ?: [];
+  $menu_link_notifications = isset($menu_link_options['notifications']) ? $menu_link_options['notifications'] : [];
+
+  $form['options']['notifications'] = [
+    '#type' => 'details',
+    '#title' => t('Menu link notifications'),
+    '#weight' => -3,
+    '#tree' => TRUE,
+  ];
+
+  $notifications = menu_notifications_get_menu_notifications_info();
+  foreach ($notifications as $notification => $info) {
+    // Merge in the proper default value.
+    if (isset($menu_link_notifications[$notification])) {
+      // If the menu link already has this notifications, use it.
+      foreach ($menu_link_notifications[$notification] as $option => $value) {
+        $info['#prefix'] = '<fieldset class="fieldset-wrapper ' . $notification . '">';
+        if (!empty($info['#title'])) {
+          $info['#prefix'] .= '<div class="title">' . $info['#title'] . '</div>';
+        }
+        $info['#suffix'] = '</fieldset>';
+        $info[$option]['#default_value'] = $value;
+      }
+    }
+    $form['options']['notifications'][$notification] = $info;
+  }
+
+  $form['actions']['submit']['#submit'][] = 'menu_notifications_menu_link_content_form_submit';
+
+  // Restrict access to the new form elements.
+  $user_has_access = \Drupal::currentUser()->hasPermission('administer menu notification');
+  $form['options']['notifications']['#access'] = $user_has_access;
+}
+
+/**
+ * Submit function for menu add / edit form.
+ */
+function menu_notifications_menu_link_content_form_submit($form, FormStateInterface $form_state) {
+  $menu_link = $form_state->getFormObject()->getEntity();
+  $options = ['notifications' => $form_state->getValue('notifications')];
+  $menu_link_options = $menu_link->link->first()->options;
+
+  $menu_link->link->first()->options = array_merge($menu_link_options, $options);
+  $menu_link->save();
+}
+
+/**
+ * Implements hook_preprocess_menu().
+ */
+function menu_notifications_preprocess_menu(&$variables) {
+  foreach ($variables['items'] as &$item) {
+    menu_notifications_menu_link_alter($item);
+  }
+}
+
+/**
+ * Process alter for a menu link.
+ */
+function menu_notifications_menu_link_alter(&$item) {
+  $notifications = menu_notifications_get_notifications($item['original_link']);
+  if (empty($notifications)) {
+    return;
+  }
+
+  $data = array();
+  $options['clear'] = TRUE;
+  $options['sanitize'] = FALSE;
+  $tokens = array('data' => $data, 'options' => $options);
+  $original_title = $item['title'];
+  $title = $item['title'];
+
+  menu_notifications_handler($title, $notifications['default'], $tokens);
+
+  // Invoke all hooks.
+  foreach ($notifications as $type => $settings) {
+    $data = array(
+      'settings' => $settings,
+      'type' => $type,
+      'original_title' => $original_title,
+      'tokens' => $tokens,
+    );
+
+    foreach (\Drupal::moduleHandler()->getImplementations('menu_notifications_handler') as $module) {
+      $function = $module . '_menu_notifications_handler';
+      $function($title, $data);
+    }
+  }
+
+  $item['title'] = $title;
+}
+
+/**
+ * Get menu link notifications.
+ *
+ * @param \Drupal\Core\Menu\MenuLinkInterface $menu_link_content_plugin
+ *   A menu link content plugin.
+ *
+ * @return array
+ *   An array with the notifications.
+ */
+function menu_notifications_get_notifications(MenuLinkInterface $menu_link_content_plugin) {
+  $notifications = [];
+
+  try {
+    $plugin_id = $menu_link_content_plugin->getPluginId();
+  }
+  catch (PluginNotFoundException $e) {
+    return $notifications;
+  }
+
+  if (strpos($plugin_id, ':') === FALSE) {
+    return $notifications;
+  }
+
+  list($entity_type, $uuid) = explode(':', $plugin_id, 2);
+
+  if ($entity_type == 'menu_link_content') {
+    try {
+      $entity = \Drupal::getContainer()->get('entity.manager')->loadEntityByUuid($entity_type, $uuid);
+
+      $options = $entity->link->first()->options;
+      $notifications = isset($options['notifications']) ? $options['notifications'] : [];
+    } catch (PluginNotfoundException $e) {
+      // Make sure we catch failed entity loadings.
+    }
+  }
+
+  return $notifications;
+}
+
+/**
+ * Provides the default notification output.
+ */
+function menu_notifications_handler(&$title, $info, $tokens) {
+  $token_service = \Drupal::token();
+  $prefix = isset($info['prefix']) ? $info['prefix'] : '';
+  $value = isset($info['value']) ? $token_service->replace($info['value'], $tokens['data'], $tokens['options']) : '';
+  if (empty($value)) {
+    return;
+  }
+
+  $elements = explode('+', $value);
+  $to_sum = TRUE;
+  foreach ($elements as $count) {
+    if (!is_numeric($count)) {
+      $to_sum = FALSE;
+      break;
+    }
+  }
+
+  $result = 0;
+  if ($to_sum) {
+    foreach ($elements as $count) {
+      $result += intval($count);
+    }
+  }
+  else {
+    $result = $value;
+  }
+
+  if (!empty($result)) {
+    $elements = array(
+      '#theme' => 'menu_notifications',
+      '#link_title' => $title,
+      '#link_classes' => 'notification-default',
+      '#link_prefix' => $prefix,
+      '#link_value' => $result,
+    );
+
+    $title = \Drupal::service('renderer')->render($elements);
+  }
+}
