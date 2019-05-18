@@ -1,0 +1,200 @@
+<?php
+
+/**
+ * @file
+ * Provides the Mobile Detect PHP library.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+
+$autoloader = require_once __DIR__ . '/autoload.php';
+
+/**
+ * The Mobile Detect PHP library vendor website URL.
+ */
+define('MOBILEDETECT_WEBSITE_URL', 'http://mobiledetect.net');
+
+/**
+ * The Mobile Detect PHP library vendor download URL.
+ */
+define('MOBILEDETECT_DOWNLOAD_URL', 'https://github.com/serbanghita/Mobile-Detect');
+
+/**
+ * The Mobile Detect PHP library source URL.
+ */
+define ('MOBILEDETECT_LIBRARY_SOURCE_URL', 'https://raw.githubusercontent.com/serbanghita/Mobile-Detect/master/Mobile_Detect.php');
+
+/**
+ * Mobile Detect PHP library version pattern.
+ */
+define('MOBILEDETECT_LIBRARY_VERSION_PATTERN', '@version\s+([0-9a-zA-Z\.-]+)@');
+
+/**
+ * Mobile Detect PHP library; Path to the local library directory.
+ */
+define('MOBILEDETECT_LIBRARY_LOCAL_PATH', DRUPAL_ROOT . DIRECTORY_SEPARATOR . 'libraries' . DIRECTORY_SEPARATOR . 'mobiledetect');
+
+/**
+ * Implements hook_help().
+ */
+function mobiledetect_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.mobiledetect':
+      $readme = check_markup(file_get_contents(dirname(__FILE__) . DIRECTORY_SEPARATOR . 'README.txt'), 'plain_text');
+
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= $readme;
+
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function mobiledetect_cron() {
+  $mobiledetect_config = \Drupal::config('mobiledetect.settings');
+
+  $frequency = $mobiledetect_config->get('interval_days') ?: 14;
+  $interval = 60 * 60 * 24 * $frequency;
+
+  $last_check = $mobiledetect_config->get('last_check') ?: 0;
+  if ((REQUEST_TIME - $last_check) > $interval) {
+    // Local Mobile Detect library.
+    $lib_local_version = mobiledetect_get_local_library_version();
+
+    // Update setting for the local version.
+    if ($lib_local_version > 0 && version_compare($lib_local_version, $mobiledetect_config->get('local_version'), '>')) {
+      \Drupal::config('mobiledetect.settings')->set('local_version', $lib_local_version)->save();
+    }
+
+    // Current Mobile Detect library.
+    $current_version = 0;
+    // Get the current library file from vendor.
+    $data = mobiledetect_retrieve_file();
+
+    if ($data) {
+      // Get the version from the current vendor file.
+      $current_version = mobiledetect_get_version($data, 25);
+
+      // Update setting last check
+      // only if exist data from the current vendor version check action.
+      \Drupal::config('mobiledetect.settings')->set('last_check', REQUEST_TIME)->save();
+
+      // Inform watchdog if a newer vendor version detected.
+      if (\Drupal::moduleHandler()->moduleExists('dblog')) {
+        if (version_compare($mobiledetect_config->get('local_version'), $current_version, '<')) {
+          $message = t('Mobile Detect library, new version %version available. See Mobile Detect module README.txt or the Mobile Detect help content for install instructions.', array('%version' => $current_version));
+          $context = array('channel' => 'Mobile Detect');
+          \Drupal::logger('dblog')->log(Drupal\Core\Logger\RfcLogLevel::INFO, $message, $context);
+        }
+      }
+
+      // Update checked version for later use with better performance.
+      if (version_compare($mobiledetect_config->get('local_version'), $current_version, '<=')) {
+        \Drupal::config('mobiledetect.settings')->set('checked_version', $current_version)->save();
+      }
+
+      // The version $mobiledetect_config->get('checked_version') is the
+      // available vendor version, detected on last succesful cron action.
+    }
+  }
+}
+
+/**
+ * Attempts to get a file using a HTTP request.
+ *
+ * @param string $url
+ *   (optional) String contains the URL to get the file.
+ *
+ * @return string|bool
+ *   String contains the file data on success. FALSE on failure.
+ *
+ * @see mobiledetect_cron()
+*/
+function mobiledetect_retrieve_file($url = FALSE) {
+  $url = $url ? $url : MOBILEDETECT_LIBRARY_SOURCE_URL;
+
+  try {
+    $ch = curl_init();
+
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_POST, 1);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, TRUE);
+    curl_setopt($ch, CURLOPT_CRLF, TRUE);
+
+    $data = curl_exec($ch);
+    curl_close($ch);
+
+    if (empty($data)) {
+      return FALSE;
+    }
+  }
+  catch (Exception $ex) {
+    return FALSE;
+  }
+
+  return $data;
+}
+
+/**
+ * Get the version from the local installed Mobile Detect library.
+ *
+ * @return int
+ *   The version number. The number is 0 if the library file is not found or
+ *   if the version number is not found in the data.
+ *
+ * @see mobiledetect_cron()
+ */
+function mobiledetect_get_local_library_version() {
+  $lib_local_version = 0;
+
+  $lib_local_path = MOBILEDETECT_LIBRARY_LOCAL_PATH;
+  $lib_local_path .= DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR . 'MobileDetect.php';
+
+  if (file_exists($lib_local_path)) {
+    $lib_local_data = file_get_contents($lib_local_path, NULL, NULL, 800, 360);
+    if ($lib_local_data) {
+      $lib_local_version = mobiledetect_get_version($lib_local_data);
+    }
+  }
+
+  return $lib_local_version;
+}
+
+/**
+ * Get the version number of a file content.
+ *
+ * @param string $data
+ *   The string contains text data to get the version.
+ *
+ * @param int $lines
+ *   (optional) Line numbers to finish the version matching.
+ *
+ * @return string|int
+ *   String contains a version number. 0, no version found.
+ *
+ * @see mobiledetect_get_local_library_version()
+ * @see mobiledetect_cron()
+ */
+function mobiledetect_get_version($data, $lines = 10) {
+  $version = str_replace(array("\r\n", "\n", "\r"), '|', $data);
+  $version_arr = explode("|", $version);
+  $the_version = 0;
+
+  $i = 0;
+  foreach ($version_arr as $val) {
+    if ($i > $lines) {
+      break;
+    }
+    $matches = array();
+    if (preg_match(MOBILEDETECT_LIBRARY_VERSION_PATTERN, $val, $matches)) {
+      $the_version = $matches[1];
+      break;
+    }
+    ++$i;
+  }
+
+  return $the_version;
+}
