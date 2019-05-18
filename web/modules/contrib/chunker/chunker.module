@@ -1,0 +1,965 @@
+<?php
+
+/**
+ * @file
+ * Provides configs and hooks for attaching chunker behavior.
+ */
+
+use Drupal\Core\Entity\Entity\EntityViewDisplay;
+use Drupal\Component\Utility\Xss;
+use Drupal\Core\Field\FormatterInterface;
+use Drupal\Core\Field\FieldDefinitionInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Component\Utility\Html;
+
+include 'chunker.filter.inc';
+
+/**
+ * Actually chunk the text, starting with HTML, ending with HTML.
+ *
+ * Goes in and out of XML, so may add some artifacts, but uses the methods
+ * from filter.module so we expect it to be safe.
+ *
+ * @param string $text
+ *   HTML to be chunked.
+ * @param array $settings
+ *   Additional parameters, such as depth or classnames.
+ *
+ * @return string
+ *   Rebuilt markup.
+ */
+function chunker_chunk_text($text, array $settings) {
+  // Ensure a valid default.
+  $settings += ['start_level' => 3];
+
+  $dom = Html::load($text);
+  $bodies = $dom->getElementsByTagName('body');
+  /** @var $scope DOMElement */
+  $scope = $bodies->item(0);
+  // $start_level is the _deepest_ heading to process.
+  $start_level = $settings['start_level'];
+  // To get it all sorted, recursively re-run the process for several depths.
+  // First enwrap the h3s, then the h2s, then the h1s.
+  for ($recurse = $start_level; $recurse > 1; $recurse--) {
+    chunker_enwrap($scope, $recurse, $settings);
+  }
+
+  // Optionally add a full outer wrapper element also.
+  // Some methods (accordion) want this.
+  if (!empty($settings['wrapper_tag'])) {
+    $dom = $scope->ownerDocument;
+    $wrapper = $dom->createElement($settings['wrapper_tag']);
+    $wrapper->setAttribute('class', $settings['wrapper_class']);
+    if (!empty($settings['wrapper_attributes'])) {
+      foreach ($settings['wrapper_attributes'] as $att => $val) {
+        $wrapper->setAttribute($att, $val);
+      }
+    }
+    while ($child = $scope->firstChild) {
+      $wrapper->appendChild($child);
+    }
+    // A special anonymous first chunk (intro text stuff)
+    // probably deserves to be left out of the wrapper.
+    if (strstr($wrapper->firstChild->getAttribute('class'), 'first')) {
+      $scope->appendChild($wrapper->firstChild);
+    }
+    $scope->appendChild($wrapper);
+  }
+
+  $html = Html::serialize($dom);
+  return $html;
+}
+
+/**
+ * Place appropriate element wrappers around the chunks of the document.
+ *
+ * This will wrap all content *following* a heading of a given depth into a
+ * content block container, and the heading+content into a block of its own
+ * that binds the two together. This is a section.
+ * The section wrapper will be given an ID that reflects the section title.
+ *
+ * Acts directly on the DOM. Calls itself recursively.
+ *
+ * @param DOMNode $scope
+ *   The content to be worked on.
+ * @param int $start_level
+ *   The depth of heading levels to descend to.
+ * @param array $settings
+ *   Additional options. The $settings may define or override the tag names
+ *   and classes used to spice up the markup.
+ */
+function chunker_enwrap(DOMNode $scope, $start_level, array $settings) {
+  // The tags and classes used may be defined by the method.
+  // Otherwise, use these element identifiers.
+  $defaults = [
+    'section_class' => 'chunker__section',
+    'section_tag' => 'div',
+    'content_class' => 'chunker__content',
+    'content_tag' => 'div',
+  ];
+  $settings += $defaults;
+
+  $settings['section_class'] .= ' depth-' . $start_level;
+  $settings['content_class'] .= ' depth-' . $start_level;
+
+  $dom = $scope->ownerDocument;
+
+  $heading_tag = "h$start_level";
+  // Need to make sure I don't chunk above my requested level.
+  // List things that should break my flow.
+  $higher_tags = [];
+  for ($t = $start_level - 1; $t > 0; $t--) {
+    $higher_tags["h$t"] = "h$t";
+  }
+
+  // Check each element that is a direct child of the scope.
+  // Pick them off one by one and sort them into more organized boxes.
+  $current_section_content = $scope;
+
+  // Jiggling the domnodelist in realtime confuses PHP tragically.
+  // Enumerate the childnodes into a simpler array before moving them around.
+  $child_nodes = [];
+  foreach ($scope->childNodes as $item) {
+    $child_nodes[] = $item;
+  }
+
+  if (!empty($settings['enwrap_first_elements'])) {
+    // We may need to manage the floaty tags at the beginning of the document.
+    // Put them in an untitled chunk of their own.
+    // In most cases this will be intro text that should not participate in
+    // fancy chunking, so it needs to be isolated.
+    if (!strstr($scope->firstChild->getAttribute('class'), 'first')) {
+      // Don't do this trick more than once.
+      $current_section_content = $dom->createElement($settings['content_tag']);
+      $current_section_content->setAttribute('class', $settings['content_class'] . ' first');
+      $scope->insertBefore($current_section_content, $scope->firstChild);
+      // Though this may end up empty in the end.
+    }
+  }
+
+  // All this first stuff is just trying to tame accordion.
+  if (!empty($settings['fake_first_heading_tag'])) {
+    $fake_header = $dom->createElement($settings['fake_first_heading_tag']);
+    $fake_header->setAttribute('class', $settings['heading_class'] . ' fake active');
+    $fake_header_inner = $dom->createElement($settings['heading_inner_tag']);
+    $fake_header_inner->setAttribute('class', $settings['heading_inner_class']);
+    $fake_header->appendChild($fake_header_inner);
+    $scope->insertBefore($fake_header, $scope->firstChild);
+  }
+
+  /** @var $item DOMElement */
+  foreach ($child_nodes as $item) {
+    if (!empty($higher_tags[$item->nodeName])) {
+      // If I find higher tags than expected, stop what I'm doing and
+      // close the current container. That prevents H2s from swallowing H1s
+      // etc. This makes it safe to run through twice to create nesting.
+      $current_section_content = $scope;
+      $current_section_content->appendChild($item);
+    }
+    else {
+      if ($item->nodeName == $heading_tag) {
+        // So we have found $item is a heading.
+        // Here is a clue: name the SECTION after the heading - not the h tag.
+        $section_id = Html::getId($item->nodeValue);
+        // If the editor chose their own ID, respect that.
+        if (($existing_id = $item->getAttribute('id')) || $existing_id = $item->getAttribute('name')) {
+          $section_id = $existing_id;
+          $item->removeAttribute('id');
+          $item->removeAttribute('name');
+        }
+
+        if (!empty($settings['section_tag'])) {
+          $current_section = $dom->createElement($settings['section_tag']);
+          $current_section->setAttribute('class', $settings['section_class']);
+          $current_section->setAttribute('id', $section_id);
+          $scope->appendChild($current_section);
+        }
+        else {
+          // An empty section tag means skip the section wrapper.
+          // This also means that the current section remains just the scope,
+          // as that's where things get added.
+          $current_section = $scope;
+          // And in this case, the heading is the only place the id (if any)
+          // gets defined or used. Put it back.
+          $item->setAttribute('id', $section_id);
+        }
+
+        $current_section->appendChild($item);
+
+        $current_section_content = $dom->createElement($settings['content_tag']);
+        $current_section_content->setAttribute('class', $settings['content_class']);
+        $current_section->appendChild($current_section_content);
+
+        // Optionally, add an anchor link to the heading.
+        // For this to work, the headings or the section must have IDs.
+        if (!empty($settings['permalink_string'])) {
+          $permalink = $dom->createElement('a', $settings['permalink_string']);
+          $permalink->setAttribute('href', '#' . $section_id);
+          $item->appendChild($dom->createTextNode(' '));
+          $item->appendChild($permalink);
+          $permalink->setAttribute('class', 'permalink');
+        }
+
+        if (!empty($settings['heading_class'])) {
+          $heading_class = implode(' ', [$settings['heading_class'], $item->getAttribute('class')]);
+          $item->setAttribute('class', $heading_class);
+        }
+
+        // Optionally, change the type of the heading tag.
+        // This is required if converting to fieldsets, which get a 'legend'.
+        if (!empty($settings['heading_tag'])) {
+          // Cannot just change the nodeName (Why?) so boring XML stuff again.
+          // usually headingnode and headingcontent are the same thing,
+          // but they *may* need to be nested due to Drupal FAPI.
+          /** @var $headingnode DOMElement */
+          $headingnode = $headingcontent = $dom->createElement($settings['heading_tag']);
+          // Transfer all attributes from the old heading into the new heading.
+          foreach ($item->attributes as $attname => $attnode) {
+            $headingnode->setAttribute($attname, $attnode->value);
+          }
+
+          // collapse.js has some specific and fatal markup requirements.
+          // But even other stuff (fieldgroup accordion) needs additional
+          // markup here sometimes.
+          if (!empty($settings['heading_inner_tag'])) {
+            $headingcontent = $dom->createElement($settings['heading_inner_tag']);
+            $headingcontent->setAttribute('class', $settings['heading_inner_class']);
+            $headingnode->appendChild($headingcontent);
+          }
+
+          // Transfer all contents from the old heading into the new heading.
+          while ($child = $item->firstChild) {
+            $headingcontent->appendChild($child);
+          }
+          // Finally, replace into the DOM.
+          $item->parentNode->replaceChild($headingnode, $item);
+        }
+
+      }
+      else {
+        // It's just content, add it to the current context.
+        $current_section_content->appendChild($item);
+      }
+    }
+  }
+}
+
+/**
+ * Options used by the chunker methods.
+ *
+ * @return array
+ *   The default settings used by 'custom' method.
+ */
+function chunker_default_settings() {
+  return [
+    'start_level' => 3,
+    'section_tag' => 'div',
+    'section_class' => 'chunker__section',
+    'content_tag' => 'div',
+    'content_class' => 'chunker__content',
+    'wrapper_tag' => '',
+    'wrapper_class' => '',
+    'enwrap_first_element' => FALSE,
+    'heading_tag' => '',
+    'heading_class' => '',
+    'heading_inner_tag' => '',
+    'heading_inner_class' => '',
+    'enwrap_first_elements' => TRUE,
+    'reset' => FALSE,
+    'permalink_string' => '',
+    'fieldsets' => [
+      'section_class' => '',
+    ],
+  ];
+}
+
+/**
+ * Return the bits that describe a chunker method.
+ *
+ * Could become plugins, but that's overkill for now.
+ * Generally it should just be a matter of choosing which library and
+ * classnames to use, so it's one big config array.
+ *
+ * Parameters in the settings.
+ *
+ * - section_tag : 'div'
+ * Set this to empty string if you don't want sections wrapped.
+ *
+ * - content_tag : 'div'
+ *
+ * - content_class : 'content'
+ *
+ * - section_class : 'section'
+ *
+ * - heading_tag : undefined
+ * Optional. Only set if you want to override the actual heading tag level.
+ *
+ * - start_level : 3
+ * How many layers of heading to process.
+ * Set this to false to totally skip the XML chunking.
+ *
+ * - enwrap_first_elements :
+ * What to do with loose content found before the first heading. Either leave
+ * it alone, or manage it as an (untitled) block of its own.
+ *
+ * - settings_form : callback
+ * Function that returns a FAPI form that can be merged into the
+ * field_formatter_settings as a subsettings array.
+ *
+ * @param string $name
+ *   If empty, returns *all* methods.
+ *
+ * @return object|array
+ *   A chunker method description. Similar to a plugin.
+ *   Contains the settings we need to know about a method.
+ *   If no $name is requested, returns an array of all them.
+ */
+function chunker_method_load($name = NULL) {
+
+  $type = \Drupal::service('plugin.manager.chunker');
+  $plugin_definitions = $type->getDefinitions();
+
+  //
+  // For each method, the 'settings' are passed in to the deeper processes,
+  // (string and tag stuff)
+  // while the higher parameters are administrative (description)
+  // or operating at the Drupal render layer (library #attachments).
+  //
+  $chunker_methods = [
+
+    'nested' => (object) [
+      'name' => t('Nested'),
+      'description' => t('Simple hierarchical chunking, with each section containing its children.'),
+      'settings' => [
+        'start_level' => 4,
+        'permalink_string' => '#',
+      ],
+      'attached' => [
+        'library' => ['chunker/chunker.permalink'],
+      ],
+    ],
+
+    'flat' => (object) [
+      'name' => t('Flat/inline'),
+      'description' => t('Ensure that the section content is enwrapped, but do not place a container around the title+content. Produces [ heading, content div, heading, content div ] etc.'),
+      'settings' => [
+        'section_tag' => '',
+        'permalink_string' => 'X',
+      ],
+    ],
+
+    // Abuse fieldsets inappropriately... Looks cool though.
+    'fieldsets' => (object) [
+      'name' => t('Fieldsets'),
+      'description' => t('Really should not use fieldsets for content - this is just a demo.'),
+      'settings' => [
+        'section_tag' => 'fieldset',
+        'section_class' => 'collapsible',
+        'content_class' => 'fieldset-wrapper',
+        'heading_tag' => 'legend',
+        'heading_inner_tag' => 'span',
+        'heading_inner_class' => 'fieldset-legend',
+      ],
+      // D8 html validation will not even let us abuse fieldsets the old way
+      // Due to \Drupal\Component\Utility\Xss::filterAdmin() sanitizing.
+      // This terribleness is reminding us we are being evil.
+      'allowed_tags' => array_merge(['fieldset', 'legend'], Xss::getAdminTagList()),
+      'attached' => [
+        'library' => ['system/drupal.collapse'],
+      ],
+      'settings_form' => 'chunker_fieldsets_settings_form',
+    ],
+
+    // Stop abusing fieldsets. Use html5 details instead.
+    'details' => (object) [
+      'name' => t('Details'),
+      'description' => t('Use HTML5 details and summary to show and hide sections'),
+      'settings' => [
+        'section_tag' => 'details',
+        'content_class' => 'details-wrapper',
+        'heading_tag' => 'summary',
+      ],
+      'attached' => [
+        'library' => [
+          'system/drupal.collapse',
+        ],
+      ],
+    ],
+
+    // Use the available vertical tabs library.
+    // To use the core library as-is, we again have to abuse fieldsets.
+    'vertical_tabs' => (object) [
+      'name' => t('Vertical tabs (stand-alone)'),
+      'description' => t('Headings become tabs beside the content.'),
+      'settings' => [
+        'wrapper_tag' => 'div',
+        'wrapper_class' => 'vertical-tabs',
+        'wrapper_attributes' => ['data-vertical-tabs-panes' => ''],
+        'section_tag' => 'details',
+        'section_class' => '',
+        'heading_tag' => 'summary',
+          // Only one level of tabs makes sense, so set the depth to h2.
+        'start_level' => 2,
+        'enwrap_first_elements' => TRUE,
+      ],
+      'attached' => [
+        'library' => [
+          'core/drupal.vertical-tabs',
+        ],
+      ],
+    ],
+
+    'teaser' => (object) [
+      'name' => t('Teaser'),
+      'description' => t('Content chunks are mostly hidden but show the first few lines, which can be expanded'),
+      'settings' => [
+        'start_level' => 2,
+        'section_tag' => 'div',
+        'section_class' => 'chunker__section section-alpha-teaser',
+      ],
+      // Need to run some js to trigger it.
+      'attached' => [
+        'library' => ['chunker/chunker.alpha-teaser'],
+      ],
+    ],
+
+    // Now start playing with jquery UI.
+    // This one requires a small trigger script, but nothing too tricky.
+    'accordion' => (object) [
+      'name' => t('Accordion (stand-alone)'),
+      'description' => t('Content chunks are collapsed, and revealed only one at a time. This version uses jquery ui accordion (core), and does not require or use the fieldgroup accordion method.'),
+      'settings' => [
+        'enwrap_first_elements' => TRUE,
+        'wrapper_tag' => 'div',
+        'wrapper_class' => 'accordion-wrapper',
+        'start_level' => 2,
+          // Setting section_tag to empty will create a flatter list, which
+          // Accordion js works with.
+        'section_tag' => '',
+      ],
+      // Use the jquery UI library.
+      'attached' => [
+        'library' => [
+          'core/jquery.ui.accordion',
+          'chunker/chunker.accordion',
+        ],
+      ],
+    ],
+
+    'field_group_sections' => (object) [
+      'name' => t('Field group: sections'),
+      'description' => t('This can be placed in a fieldgroup "Vertical tabs" or "Horizontal tabs" layout, with each chunk becoming a new section'),
+      'settings' => [
+        'start_level' => 2,
+        'section_tag' => 'fieldset',
+        'section_class' => 'field-group-tab',
+        'heading_tag' => 'legend',
+        'content_class' => 'fieldset-wrapper',
+          // Generally, as this usage expects distinct chunks, and paragraphs
+          // floating around at the beginning would be wrong, chunk the intro.
+        'enwrap_first_elements' => TRUE,
+          // Setting this lets us influence the themeing of the field wrapper,
+          // not just the content rendering.
+          // In this case, we want it unwrapped altogether.
+        'reset' => TRUE,
+      ],
+      'summary' => t('This method needs to be placed <em>directly inside</em> a field_group vertical or horizontal tabs group container (not inside a tab item)'),
+    ],
+
+    'field_group_accordion_items' => (object) [
+      'name' => t('Field group: accordion items'),
+      'description' => t('Sections can be used as part of a field_group accordion'),
+      'settings' => [
+          // Unset the section wrapper, jquery.ui.accordion expects flat lists.
+        'section_tag' => '',
+          // Need to mess around with headings to make them behave.
+        'heading_tag' => 'h3',
+        'heading_class' => 'field-group-format-toggler accordion-item',
+        'heading_inner_tag' => 'a',
+        'heading_inner_class' => '',
+          // Need to take special care of floating stuff at the top.
+        'enwrap_first_elements' => TRUE,
+          // Accordion requires an odd-even pattern to work right.
+        'fake_first_heading_tag' => 'h2',
+      ],
+      'summary' => t('This method needs to be placed <em>directly inside</em> a field_group accordion group container (not inside a tab item)'),
+    ],
+
+    'paginate' => (object) [
+      'name' => t('Paginate (numeric)'),
+      'description' => t('Content chunks are paginated, allowing the user to step through pages. Elemental Pagination (ePaginate)'),
+      'settings' => [
+        'enwrap_first_elements' => TRUE,
+        'wrapper_tag' => 'div',
+        'wrapper_class' => 'ePaginate-wrapper',
+        'start_level' => 4,
+        'section_tag' => 'section',
+      ],
+      'attached' => [
+        'library' => [
+          'chunker/chunker.paginate',
+        ],
+      ],
+    ],
+
+    'custom' => (object) [
+      'name' => t('Custom'),
+      'description' => t('Set each of the chunking options yourself'),
+      'settings' => [],
+      'settings_form' => 'chunker_custom_settings_form',
+    ],
+
+  ];
+
+  if ($name) {
+    return $chunker_methods[$name];
+  }
+  return $chunker_methods;
+}
+
+/**
+ * Returns the named chunker method plugin.
+ *
+ * @param null $name
+ *   Method ID.
+ *
+ * @return \Drupal\chunker\ChunkerMethodInterface
+ */
+function chunker_plugin_load($name = NULL) {
+  $type = \Drupal::service('plugin.manager.chunker');
+  if ($name) {
+    return $type->getDefinition($name);
+  }
+  return $type->getDefinitions();
+}
+
+
+/**
+ * Displays the formatter setting on the manage field display overview.
+ *
+ * Implements hook_field_formatter_settings_summary_alter().
+ *
+ * @inheritdoc
+ */
+function chunker_field_formatter_settings_summary_alter(&$summary, $context) {
+  if (!chunker_target_field_type($context['field_definition']->getType())) {
+    return;
+  }
+  $method = $context['formatter']->getThirdPartySetting('chunker', 'chunker_method');
+  if (empty($method)) {
+    return;
+  }
+  $chunker_method = chunker_method_load($method);
+  if (!is_object($chunker_method)) {
+    drupal_set_message('Failed to load chunker method info: ' . $method, 'error');
+    return;
+  }
+  $summary[] = t('Chunked by: <span title="@chunker_description">@chunker_name</span>.', ['@chunker_name' => $chunker_method->name, '@chunker_description' => $chunker_method->description]);
+  if (!empty($chunker_method->summary)) {
+    $summary[] = $chunker_method->summary;
+  }
+}
+
+/**
+ * Adds our option to the field formatter settings UI.
+ *
+ * Info provided by our method plugins may have extra info about
+ * additional subsettings exposed by a custom subform.
+ *
+ * Implements hook_field_formatter_third_party_settings_form().
+ *
+ * @inheritdoc
+ */
+function chunker_field_formatter_third_party_settings_form(FormatterInterface $plugin, FieldDefinitionInterface $field_definition, $view_mode, $form, FormStateInterface $form_state) {
+  // Is this field eligible for chunking?
+  // That is, is its storage method longtext?
+  // Only offer this option to text formatters.
+  if (!chunker_target_field_type($field_definition->getType())) {
+    return NULL;
+  }
+
+  $method = $plugin->getThirdPartySetting('chunker', 'chunker_method');
+  if (!is_string($method)) {
+    $method = "";
+  }
+  $settings = (array) $plugin->getThirdPartySetting('chunker', 'chunker');
+  $settings += chunker_default_settings();
+  $settings_form = [];
+
+  $chunker_methods = chunker_method_load();
+  $chunker_method_options[''] = '<none>';
+
+  foreach (chunker_method_load() as $method_id => $method_def) {
+    $chunker_method_options[$method_id] = $method_def->name;
+  }
+  $description = t('This text can be broken into sections, tabs or columns based on inline headings or other rules.');
+  if (!empty($method)) {
+    $description = $chunker_methods[$method]->description;
+  }
+
+  $settings_form['chunker_method'] = [
+    '#type'          => 'select',
+    '#title'         => t('Chunk text'),
+    '#options'       => $chunker_method_options,
+    '#default_value' => $method,
+    '#description'   => !empty($description) ? Xss::filter($description) : '',
+  ];
+
+  // Additional config options injected inline here.
+  // These are hidden via #states (not reloaded via AJAX).
+  //
+  $switcher_id = 'fields[' . $field_definition->getName() . '][settings_edit_form][third_party_settings][chunker][chunker_method]';
+  // EG: fields[body][settings_edit_form][third_party_settings][chunker][chunker_method].
+  // For plugins to extend here in arbitrary ways:
+  // If the method defines its own settings_form, merge that in here.
+  foreach (chunker_method_load() as $method_id => $method) {
+    $chunker_method_options[$method_id] = $method->name;
+    if (isset($method->settings_form)) {
+      $subsettings_form_callback = $method->settings_form;
+      $settings_form['chunker'][$method_id] = $subsettings_form_callback((array)$settings);
+      // Conditionally hide the subform,
+      // depending on the chunker_method selection.
+      $settings_form['chunker'][$method_id]['#states'] = [
+        'visible' => [
+          ":input[name=\"$switcher_id\"]" => ['value' => $method_id],
+        ],
+      ];
+    }
+  }
+
+  return $settings_form;
+}
+
+/**
+ * Return a subform that exposes the 'fieldsets' subsettings.
+ *
+ * Invoked by chunker_field_formatter_info_alter()
+ *
+ * @param array $settings
+ *   Current field_formatter_settings (complete).
+ *
+ * @return array
+ *   FAPI subform.
+ */
+function chunker_fieldsets_settings_form(array $settings) {
+  $form = [
+    '#tree' => TRUE,
+    '#type' => 'container',
+  ];
+  // All we want the checkbox to do is to set the section_class.
+  $form['section_class'] = [
+    '#type'          => 'checkbox',
+    '#title'         => t('Collapsed'),
+    '#return_value'  => 'collapsible collapsed',
+    '#default_value' => $settings['fieldsets']['section_class'],
+    '#description' => t('When "Collapsed", each heading is collapsed, showing no content under it until clicked (Useful for mobile). This uses Drupal core fieldset behaviour, so is not extremely semantic.'),
+  ];
+  return $form;
+}
+
+/**
+ * Return a subform that exposes the 'custom' subsettings.
+ *
+ * Invoked by chunker_field_formatter_info_alter()
+ *
+ * @param array $settings
+ *   Current field_formatter_settings (complete).
+ *
+ * @return array
+ *   FAPI subform.
+ */
+function chunker_custom_settings_form(array $settings) {
+  // Custom subsettings.
+  $form = [
+    '#tree' => TRUE,
+    '#type' => 'fieldset',
+    'help' => [
+      '#markup' => t('Each of the provided chunker methods are variations of the following settings. If you really know the markup you are trying to achieve, you may be able to change these settings to make it work. YMMV.'),
+    ],
+  ];
+  if (empty($settings['custom'])) {
+    $settings['custom'] = array();
+  }
+  $custom = (array) $settings['custom'] + chunker_default_settings();
+
+  // Load my method settings Schema, and auto-build a settings form from that?
+  // $config_schema = $this->configInspectorManager->getConfigSchema($name);
+  $form['start_level'] = [
+    '#type'          => 'textfield',
+    '#size'          => 16,
+    '#title'         => t('Start level'),
+    '#default_value' => $custom['start_level'],
+    '#description'   => t('How many layers of heading to process. Default: <code>3</code> (h3 and up)'),
+  ];
+  $form['content_tag'] = [
+    '#type'          => 'textfield',
+    '#size'          => 16,
+    '#title'         => t('Content tag'),
+    '#default_value' => $custom['content_tag'],
+    '#description'   => t('Element to wrap the content (text) with. Default: <code>div</code>'),
+  ];
+  $form['content_class'] = [
+    '#type'          => 'textfield',
+    '#size'          => 16,
+    '#title'         => t('Content class'),
+    '#default_value' => $custom['content_class'],
+    '#description'   => t('Class to apply to the content element. Default: <code>chunker-content</code>'),
+  ];
+  $form['section_tag'] = [
+    '#type'          => 'textfield',
+    '#size'          => 16,
+    '#title'         => t('Section tag'),
+    '#default_value' => $custom['section_tag'],
+    '#description'   => t('Element to wrap the title+content with. Default: <code>div</code>. Example: <code>section</code>. Set it to blank to prevent this behavior and prevent nesting.'),
+  ];
+  $form['section_class'] = [
+    '#type'          => 'textfield',
+    '#size'          => 16,
+    '#title'         => t('Section class'),
+    '#default_value' => $custom['section_class'],
+    '#description'   => t('Class to apply to the section element. Default: <code>chunker-section</code>'),
+  ];
+  $form['heading_tag'] = [
+    '#type'          => 'textfield',
+    '#size'          => 16,
+    '#title'         => t('Heading tag'),
+    '#default_value' => $custom['heading_tag'],
+    '#description'   => t('Optional. Only set if you want to override the actual heading tag level. Example: <code>legend</code>. You probably do NOT want to do this if using multi-level docs, as it wil flatten h2,h3 etc to be the same.'),
+  ];
+  $form['heading_class'] = [
+    '#type'          => 'textfield',
+    '#size'          => 16,
+    '#title'         => t('Heading class'),
+    '#default_value' => $custom['heading_class'],
+    '#description'   => t('Class to add to each heading. Default: <em>none</em>. Example: <code>section-heading</code>'),
+  ];
+  $form['heading_inner_tag'] = [
+    '#type'          => 'textfield',
+    '#size'          => 16,
+    '#title'         => t('Heading inner tag'),
+    '#default_value' => $custom['heading_inner_tag'],
+    '#description'   => t('Advanced. Some methods require an additional element <em>inside</em> the heading to behave as expected. Example: an additional <code>span</code> is necessary for collapsed fieldsets'),
+  ];
+  $form['heading_inner_class'] = [
+    '#type'          => 'textfield',
+    '#size'          => 16,
+    '#title'         => t('Heading inner class'),
+    '#default_value' => $custom['heading_inner_class'],
+    '#description'   => t('Advanced. Some methods require an additional element and class inside the heading to behave as expected. Example: an additional <code>fieldset-legend</code> is necessary for collapsed fieldsets'),
+  ];
+  $form['wrapper_tag'] = [
+    '#type'          => 'textfield',
+    '#size'          => 16,
+    '#title'         => t('Wrapper tag'),
+    '#default_value' => $custom['wrapper_tag'],
+    '#description'   => t('Optional. In some cases you may need an additional wrapper around the whole chunked content. The "tabs" and "accordion" methods both require this. Example: <code>div</code>. Leave blank for no extra wrapper. "first elements" will be left outside of the wrapper.'),
+  ];
+  $form['wrapper_class'] = [
+    '#type'          => 'textfield',
+    '#size'          => 16,
+    '#title'         => t('Wrapper class'),
+    '#default_value' => $custom['wrapper_class'],
+    '#description'   => t('Only used if using a wrapper tag. Default <em>none</em>; Example <code>vertical-tabs-panes</code>'),
+  ];
+  $form['permalink_string'] = [
+    '#type'          => 'textfield',
+    '#size'          => 16,
+    '#title'         => t('Permalink string'),
+    '#default_value' => $custom['permalink_string'],
+    '#description'   => t('Choose a character or string to bookmark anchors alongside the headings. Example <code>#</code>'),
+  ];
+
+  $form['reset'] = [
+    '#type'          => 'checkbox',
+    '#title'         => t('Reset field template'),
+    '#default_value' => $custom['reset'],
+    '#description'   => t('Use a blank field template (no default Drupal divs). This is useful/necessary if merging chunked content with field_group containers.'),
+  ];
+
+  $form['enwrap_first_elements'] = [
+    '#type'          => 'checkbox',
+    '#title'         => t('Wrap first elements'),
+    '#default_value' => $custom['enwrap_first_elements'],
+    '#description'   => t('What to do with content (freetext or stuff) that appears before the first heading. You probably want to keep it out of the chunking process, so enwrap it and it will be kept separate.'),
+  ];
+  return $form;
+}
+
+/**
+ * Chunks the text semantically.
+ *
+ * Adds classes, wrappers and includes the required layout libraries.
+ *
+ * hook_preprocess field is right down close to the theme phase.
+ * There may be an earlier point to catch this.
+ * #markup was set when it hit text_field_formatter_view
+ *
+ * Adding things via #attached to the element does not work here either.
+ *
+ * Implements hook_preprocess_field().
+ *
+ * @inheritdoc
+ */
+function chunker_preprocess_field(&$variables, $hook) {
+  // Early exit if this processor does not even apply.
+  $element = $variables['element'];
+  // Only process recognised text formatters.
+  if (!chunker_target_field_type($element['#field_type'])) {
+    return;
+  }
+
+  // Get a few convenient handles.
+  /* @var $entity \Drupal\Core\Entity\FieldableEntityInterface */
+  $entity      = $variables['element']['#object'];
+  $entity_type = $variables['element']['#entity_type'];
+  $field_name  = $variables['element']['#field_name'];
+  $bundle      = $variables['element']['#bundle'];
+  $view_mode   = $variables['element']['#view_mode'];
+
+  // Drill down to field formatter settings.
+  $render_display = EntityViewDisplay::collectRenderDisplay($entity, $view_mode);
+  $field_display = $render_display->getComponent($field_name);
+  if (empty($field_display['third_party_settings']['chunker']['chunker_method'])) {
+    // No chunker method set.
+    return;
+  }
+
+  $formatter_info = $field_display['third_party_settings']['chunker'];
+
+  $method_id = $formatter_info['chunker_method'];
+  $chunker_method = chunker_method_load($method_id);
+
+  // Normally each method will probably introduce some settings to pass through.
+  $settings = array_merge(chunker_default_settings(), isset($chunker_method->settings) ? $chunker_method->settings : []);
+
+  // Extra style-able classes.
+  $variables['attributes']['class'][] = 'chunker';
+  $variables['attributes']['class'][] = 'chunker-' . $method_id;
+
+  // Note - using a handle on the &$item in the $variables.
+  foreach ($variables['items'] as $delta => &$item) {
+    // Digging this deep into the render array to find the already-formatted
+    // text is probably not correct at this point.
+    if (empty($item['content']) || empty($item['content']['#text'])) {
+      // Unexpected structure here. Need to see if there is cleverness needed.
+      continue;
+    }
+    // Do the chunking.
+    $item['content']['#text'] = chunker_chunk_text($item['content']['#text'], $settings);
+
+    // Add the javascript or css.
+    // This does not seem to work if added to the element or the item,
+    // only right into the $variables at the top. This feels odd.
+    if (isset($chunker_method->attached)) {
+      $variables['#attached'] = $chunker_method->attached;
+    }
+    if (isset($chunker_method->allowed_tags)) {
+      // Drupal render will filter with Xss::getAdminTagList()
+      // unless told not to. This excludes fieldsets.
+      $variables['#allowed_tags)'] = $chunker_method->allowed_tags;
+    }
+    if (\Drupal::config('chunker.settings')->get('chunker_debuglevel')) {
+      // Add some sketchy markup to the page to illustrate chunker.
+      $variables['#attached']['library'][] = "chunker/chunker.debug";
+      $variables['attributes']['class'][] = 'section';
+      $variables['attributes']['class'][] = 'depth-1';
+    }
+  }
+
+  // I also may want to influence the template used to wrap this item.
+  // Based on the way that ds_extras inserts field_templates...
+  if (!empty($settings['reset'])) {
+    $variables['theme_hook_suggestions'] = ['chunker_unwrapped'];
+  }
+  if (isset($chunker_method->theme_hook_suggestions)) {
+    $variables['theme_hook_suggestions'] = $chunker_method->theme_hook_suggestions;
+  }
+}
+
+/**
+ * Returns true if the field type is chunkable.
+ *
+ * Internal utility.
+ *
+ * @param string $type
+ *   Field type.
+ *
+ * @return bool
+ *   Is this a filterable field type.
+ */
+function chunker_target_field_type($type) {
+  return in_array($type, chunker_eligible_field_types());
+}
+
+/**
+ * Return a list of field storage types that can be chunked.
+ */
+function chunker_eligible_field_types() {
+  // Currently, these is the only long text sort of fields in core,
+  // but I imagine others.
+  return [
+    'text_long',
+    'text_with_summary',
+  ];
+}
+
+/**
+ * Implements hook_theme().
+ */
+function chunker_theme() {
+  return [
+    'chunker_unwrapped' => [
+      'render element' => 'element',
+    ],
+  ];
+}
+
+/**
+ * Render element content with no wrappers at all, no label.
+ *
+ * An alternative field formatter,
+ * Used for the tabs method, designed to be dropped into a fieldgroup so that
+ * the content, made up of several chunks, is presented inline without a
+ * wrapper..
+ *
+ * Based on theme_ds_field_reset() from display_suite.
+ */
+function theme_chunker_unwrapped($variables) {
+  $output = '';
+  // Render the items.
+  foreach ($variables['items'] as $delta => $item) {
+    $output .= \Drupal::service("renderer")->render($item);
+  }
+  return $output;
+}
+
+/**
+ * Implements hook_help().
+ *
+ * @inheritdoc
+ */
+function chunker_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'admin/modules/chunker':
+      return t("Formats large amount of text into semantic sections");
+
+    case 'help.page.chunker':
+      $help_dir = drupal_get_path('module', 'chunker') . '/help';
+      $text = file_get_contents($help_dir . "/index.html");
+      // My README is true HTML, but I don't want to fight with your theme.
+      $text = preg_replace('/<\/?(html|body)>/', '', $text);
+      $text = preg_replace('/<head>[\s\S]*<\/head>/', '', $text);
+      // @FIXME
+      // Rewrite the URLs and imge SRC to work relative to the help page.
+      // url() expects a route name or an external URI.
+      // $text = preg_replace('/(src|href)="([^\\/][^"]+)"/',
+      // '$1="' . \Drupal::url($help_dir) . '/$2"', $text);
+      // $help_dir_url = \Drupal\Core\Url::fromUri($help_dir);
+      // $text = preg_replace('/(src|href)="([^\\/][^"]+)"/',
+      // '$1="' . $help_dir_url . '/$2"', $text);
+      return $text;
+
+  }
+  return FALSE;
+}
