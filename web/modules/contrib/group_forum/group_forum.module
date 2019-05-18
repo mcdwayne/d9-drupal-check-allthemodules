@@ -1,0 +1,383 @@
+<?php
+
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Access\AccessResultForbidden;
+use Drupal\Core\Access\AccessResultNeutral;
+use Drupal\Core\Database\Query\AlterableInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\group\Entity\GroupContentInterface;
+use Drupal\group\Entity\GroupContentType;
+use Drupal\group\Entity\GroupInterface;
+use Drupal\group\GroupMembershipLoaderInterface;
+use Drupal\group\GroupRoleSynchronizerInterface;
+use Drupal\node\NodeInterface;
+use Drupal\taxonomy\TermInterface;
+
+/**
+ * Internal callback to temporarily turn off access control for terms in order
+ * to retrieve terms to check for node access.
+ *
+ * @param bool $flag
+ *
+ * @return bool
+ */
+function _group_forum_term_access_switch($flag = NULL) {
+  static $switch;
+
+  if (!isset($switch)) {
+    $switch = TRUE;
+  }
+  if (isset($flag)) {
+    $switch = $flag;
+  }
+
+  return $switch;
+}
+
+/**
+ * Implements hook_query_TAG_alter().
+ */
+function group_forum_query_vocabulary_node_count_alter(AlterableInterface $query) {
+  group_forum_query_taxonomy_term_access_alter($query);
+}
+
+/**
+ * Implements hook_query_TAG_alter().
+ */
+function group_forum_query_taxonomy_term_access_alter(AlterableInterface $query) {
+  static $exclude_tids;
+
+  if (!_group_forum_term_access_switch()) {
+    return;
+  }
+  if (!isset($exclude_tids)) {
+    $exclude_parents = $exclude_tids = [];
+    $group_content_types = GroupContentType::loadByContentPluginId('group_forum');
+    if (empty($group_content_types)) {
+      return;
+    }
+    $group_contents = \Drupal::entityTypeManager()
+      ->getStorage('group_content')
+      ->loadByProperties([
+        'type' => array_keys($group_content_types),
+      ]);
+    if (empty($group_contents)) {
+      return;
+    }
+
+    $tids = \Drupal::database()->select('taxonomy_term_hierarchy', 'h')
+      ->fields('h', ['tid', 'parent'])
+      ->execute()
+      ->fetchAllKeyed(0, 1);
+
+    $account = \Drupal::currentUser();
+    foreach ($group_contents as $group_content) {
+      /** @var GroupContentInterface $group_content */
+      /** @var TermInterface $term */
+      $term = $group_content->getEntity();
+      if (group_forum_taxonomy_term_access($term, 'view', $account) instanceof AccessResultForbidden) {
+        $exclude_parents[] = $term->id();
+      }
+    }
+
+    while (count($exclude_parents)) {
+      $parent = array_pop($exclude_parents);
+      $exclude_tids[] = $parent;
+      foreach (array_keys($tids, $parent) as $tid) {
+        $exclude_parents[] = $tid;
+      }
+    }
+  }
+
+  if (!empty($exclude_tids)) {
+    $tables = $query->getTables();
+    $table = array_shift($tables);
+    $query->condition($table['alias'] . '.tid', $exclude_tids, 'NOT IN');
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_access().
+ */
+function group_forum_taxonomy_term_access(TermInterface $term, $operation, AccountInterface $account) {
+  if (!in_array($operation, ['view', 'update', 'delete'])) {
+    return AccessResult::neutral();
+  }
+  if ($term->isNew()) {
+    return AccessResult::neutral();
+  }
+
+  $plugin_id = 'group_forum';
+
+  $group_content_types = GroupContentType::loadByContentPluginId($plugin_id);
+  if (empty($group_content_types)) {
+    return AccessResult::neutral();
+  }
+
+  // Load all the group content for this term.
+  $group_contents = \Drupal::entityTypeManager()
+    ->getStorage('group_content')
+    ->loadByProperties([
+      'type' => array_keys($group_content_types),
+      'entity_id' => $term->id(),
+    ]);
+
+  if (empty($group_contents)) {
+    _group_forum_term_access_switch(FALSE);
+    $parents = \Drupal::entityTypeManager()->getStorage('taxonomy_term')->loadParents($term->id());
+    _group_forum_term_access_switch(TRUE);
+    foreach ($parents as $parent) {
+      $access = group_forum_taxonomy_term_access($parent, $operation, $account);
+      if (!$access instanceof AccessResultNeutral) {
+        return $access;
+      }
+    }
+    return AccessResult::neutral();
+  }
+
+  /** @var GroupInterface[] $groups */
+  $groups = [];
+  foreach ($group_contents as $group_content) {
+    /** @var GroupContentInterface $group_content */
+    $group = $group_content->getGroup();
+    $groups[$group->id()] = $group;
+  }
+
+  switch ($operation) {
+    case 'view':
+      foreach ($groups as $group) {
+        if ($group->hasPermission("view $plugin_id content", $account)) {
+          return AccessResult::allowed();
+        }
+      }
+      break;
+
+    case 'update':
+    case 'delete':
+      foreach ($groups as $group) {
+        if ($group->hasPermission("$operation any $plugin_id entity", $account)) {
+          return AccessResult::allowed();
+        }
+      }
+      break;
+  }
+
+  return AccessResult::forbidden();
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_access().
+ */
+function group_forum_node_access(NodeInterface $node, $operation, AccountInterface $account) {
+  if (!in_array($operation, ['view', 'update', 'delete'])) {
+    return AccessResult::neutral();
+  }
+  if ($node->isNew()) {
+    return AccessResult::neutral();
+  }
+
+  $vid = \Drupal::config('forum.settings')->get('vocabulary');
+  _group_forum_term_access_switch(FALSE);
+  $terms = \Drupal::entityTypeManager()->getStorage('taxonomy_term')->getNodeTerms([$node->id()], [$vid], $node->language()->getId());
+  _group_forum_term_access_switch(TRUE);
+  if (!empty($terms[$node->id()])) {
+    foreach ($terms[$node->id()] as $term) {
+      if (group_forum_taxonomy_term_access($term, $operation, $account) instanceof AccessResultForbidden) {
+        return AccessResult::forbidden();
+      }
+    }
+  }
+
+  return AccessResult::neutral();
+}
+
+/**
+ * Implements hook_node_grants().
+ */
+function group_forum_node_grants(AccountInterface $account, $operation) {
+  if ($account->hasPermission('bypass group access')) {
+    return ['group_forum_bypass' => [1986]];
+  }
+
+  // Initialize a grant array for members and one for anonymous/outsider users.
+  $grants_m = $grants_ao = [];
+
+  // Get the roles of the account
+  $account_roles = $account->getRoles();
+
+  /** @var GroupRoleSynchronizerInterface $group_role_synchronizer */
+  $group_role_synchronizer = \Drupal::service('group_role.synchronizer');
+
+  // If the user could not bypass group access, we need to check their access
+  // for every single group. Because loading every group would incur a massive
+  // performance hit, we only load those groups the user is a member of.
+  /** @var GroupMembershipLoaderInterface $membership_loader */
+  $membership_loader = \Drupal::service('group.membership_loader');
+  foreach ($membership_loader->loadByUser($account) as $group_membership) {
+    $group = $group_membership->getGroup();
+
+    // Add the groups the user is a member of to use later on.
+    $member_gids[] = $gid = $group->id();
+
+    switch ($operation) {
+      case 'view':
+        if ($group->hasPermission('view group_forum content', $account)) {
+          $grants_m['group_forum'][] = $gid;
+        }
+        break;
+    }
+  }
+
+  // All other groups have the benefit of sharing the same permission set among
+  // all anonymous or authenticated users per group type. We can therefore know
+  // the user's permissions for all groups of the same type they aren't part of.
+  /** @var \Drupal\group\Entity\GroupTypeInterface[] $group_types */
+  $group_types = \Drupal::entityTypeManager()->getStorage('group_type')->loadMultiple();
+  foreach ($group_types as $group_type) {
+    // Get the IDs of all the groups the user is not part of for the group type.
+    $query = \Drupal::entityTypeManager()->getStorage('group')->getQuery();
+    $query->condition('type', $group_type->id());
+    if (!empty($member_gids)) {
+      $query->condition('id', $member_gids, 'NOT IN');
+    }
+    $gids = $query->execute();
+
+    // If we could not retrieve any group IDs, skip to the next group type.
+    if (empty($gids)) {
+      continue;
+    }
+
+    // Grab the anonymous or outsider role for the group type depending on the
+    // user's account status (anonymous or authenticated).
+    $group_role = $account->isAnonymous()
+      ? $group_type->getAnonymousRole()
+      : $group_type->getOutsiderRole();
+
+    switch ($operation) {
+      case 'view':
+        if ($group_role->hasPermission('view group_forum content')) {
+          $grants_ao['group_forum'][] = $gids;
+        }
+        else {
+          $group_roles = $group_type->getRoles();
+          foreach ($account_roles as $role_id) {
+            $group_role_id = $group_role_synchronizer->getGroupRoleId($group_type->id(), $role_id);
+            if (isset($group_roles[$group_role_id])) {
+              $role = $group_roles[$group_role_id];
+              if ($role->id() == $group_role_id) {
+                if ($role->hasPermission('view group_forum content')) {
+                  $grants_ao['group_forum'][] = $gids;
+                  break;
+                }
+              }
+            }
+          }
+        }
+        break;
+    }
+  }
+
+  // The code above populated the anonymous/outsider grants by adding the group
+  // IDs per group type. We need to combine this into one big list of group IDs
+  // per entry in the $grants_ao array.
+  foreach ($grants_ao as $key => $gids_per_group_type) {
+    $grants_ao[$key] = array_reduce($gids_per_group_type, 'array_merge', []);
+  }
+
+  // Recursively merge the member grants with the anonymous/outsider grants.
+  return array_merge_recursive($grants_m, $grants_ao);
+}
+
+/**
+ * Implements hook_node_access_records().
+ */
+function group_forum_node_access_records(NodeInterface $node) {
+  $records = [];
+
+  // Only act if there are group content types for this node type.
+  $group_content_types = GroupContentType::loadByContentPluginId('group_forum');
+  if (empty($group_content_types)) {
+    return $records;
+  }
+
+  // Find all group related term ids for the given node
+  $vid = \Drupal::config('forum.settings')->get('vocabulary');
+  _group_forum_term_access_switch(FALSE);
+  $terms = \Drupal::entityTypeManager()->getStorage('taxonomy_term')->getNodeTerms([$node->id()], [$vid], $node->language()->getId());
+  _group_forum_term_access_switch(TRUE);
+  if (empty($terms[$node->id()])) {
+    return $records;
+  }
+  $node_tids = [];
+  foreach ($terms[$node->id()] as $term) {
+    /** @var TermInterface $term */
+    $node_tids[] = $term->id();
+  }
+
+  static $cache_tid;
+  if (!isset($cache_tid)) {
+    $cache_tid = [
+      'tree' => \Drupal::database()->select('taxonomy_term_hierarchy', 'h')
+        ->fields('h', ['tid', 'parent'])
+        ->execute()
+        ->fetchAllKeyed(0, 1),
+      'tids' => [],
+    ];
+
+  }
+  foreach ($node_tids as $node_tid) {
+    if (!isset($cache_tid['tids'][$node_tid])) {
+      $cache_tid['tids'][$node_tid] = [];
+      $pool = [$node_tid];
+      while (count($pool)) {
+        $tid = array_pop($pool);
+        $cache_tid['tids'][$node_tid][] = $tid;
+        if (isset($cache_tid['tree'][$tid])) {
+          $pool[] = $cache_tid['tree'][$tid];
+        }
+      }
+    }
+    $tids = $cache_tid['tids'][$node_tid];
+  }
+  if (empty($tids)) {
+    return $records;
+  }
+
+  // Load all of the group content for this node.
+  $group_contents = \Drupal::entityTypeManager()
+    ->getStorage('group_content')
+    ->loadByProperties([
+      'type' => array_keys($group_content_types),
+      'entity_id' => $tids,
+    ]);
+
+  // Only act if there are group content entities for this node.
+  if (empty($group_contents)) {
+    return $records;
+  }
+
+  // Set records for every group the node belongs to.
+  foreach ($group_contents as $group_content) {
+    /** @var GroupContentInterface $group_content */
+    $records[] = [
+      'gid' => $group_content->getGroup()->id(),
+      'realm' => 'group_forum',
+      'grant_view' => 1,
+      'grant_update' => 1,
+      'grant_delete' => 1,
+      'priority' => 0,
+    ];
+  }
+
+  // Add the general access bypass record.
+  $records[] = [
+    'gid' => 1986,
+    'realm' => 'group_forum_bypass',
+    'grant_view' => 1,
+    'grant_update' => 1,
+    'grant_delete' => 1,
+    'priority' => 0,
+  ];
+
+  return $records;
+}
