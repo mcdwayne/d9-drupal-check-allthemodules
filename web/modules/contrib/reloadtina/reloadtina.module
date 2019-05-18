@@ -1,0 +1,193 @@
+<?php
+/**
+ * @file
+ * ReloadTina!
+ *
+ * ReloadTina alters image-tags referencing reloadtina-enabled image-styles
+ * to offer multiple resolutions of the image-style via the
+ * srcset IMG-attributes.
+ *
+ * The image-tag is altered via a hook_preprocess_image implementation.
+ *
+ * The multiple resolutions are offered via image_style_deliver replacement that
+ * detects requests for a dynamic "multiplier"-path (eg.
+ * sites/default/files/styles/someimagestyle/public/2x/...) and on-the-fly
+ * modifies the image-style to deliver the requested resolution of the original
+ * image-style.
+ *
+ * ReloadTina alters the setting-form of supported image-effects to allow the
+ * user to enable dynamic scaling of these effects.
+ *
+ * SVG-files are ignored as scaling won't increase their resolution.
+ */
+
+use Drupal\image\Entity\ImageStyle;
+use Drupal\Core\StreamWrapper\StreamWrapperInterface;
+use Drupal\Core\Routing\RequestHelper;
+use Drupal\Core\Url;
+use Drupal\Component\Utility\UrlHelper;
+use Symfony\Component\DependencyInjection\Exception\ServiceNotFoundException;
+
+/**
+ * Build derivative uri for retina image style.
+ *
+ * @param \Drupal\image\ImageStyleInterface $image_style
+ *   The image style.
+ * @param $image_uri
+ *   The image URI.
+ * @param int $multiplier
+ *   The multiplier.
+ *
+ * @return string
+ *   Derivative URI.
+ */
+function reloadtina_build_uri($image_style, $image_uri, $multiplier = 1) {
+  $reloadtina_image_style_name = $multiplier == 1 ? $image_style->id() : $image_style->id() . '-' . $multiplier;
+  $derivative_uri = $image_style->buildUri($image_uri);
+  $derivative_uri = str_replace('://styles/' . $image_style->id(), '://styles/' . $reloadtina_image_style_name, $derivative_uri);
+  return $derivative_uri;
+}
+
+function reloadtina_build_url($image_style, $image_uri, $multiplier = 1, $clean_urls = NULL) {
+  $uri = reloadtina_build_uri($image_style, $image_uri, $multiplier);
+
+  // The token query is added even if the
+  // 'image.settings:allow_insecure_derivatives' configuration is TRUE, so
+  // that the emitted links remain valid if it is changed back to the default
+  // FALSE. However, sites which need to prevent the token query from being
+  // emitted at all can additionally set the
+  // 'image.settings:suppress_itok_output' configuration to TRUE to achieve
+  // that (if both are set, the security token will neither be emitted in the
+  // image derivative URL nor checked for in
+  // \Drupal\image\ImageStyleInterface::deliver()).
+  $token_query = array();
+  if (!\Drupal::config('image.settings')->get('suppress_itok_output')) {
+    // The passed $path variable can be either a relative path or a full URI.
+    $token_query = array(IMAGE_DERIVATIVE_TOKEN => $image_style->getPathToken($image_uri));
+  }
+
+  if ($clean_urls === NULL) {
+    // Assume clean URLs unless the request tells us otherwise.
+    $clean_urls = TRUE;
+    try {
+      $request = \Drupal::request();
+      $clean_urls = RequestHelper::isCleanUrl($request);
+    }
+    catch (ServiceNotFoundException $e) {
+    }
+  }
+
+  // If not using clean URLs, the image derivative callback is only available
+  // with the script path. If the file does not exist, use Url::fromUri() to
+  // ensure that it is included. Once the file exists it's fine to fall back
+  // to the actual file path, this avoids bootstrapping PHP once the files are
+  // built.
+  if ($clean_urls === FALSE && file_uri_scheme($uri) == 'public' && !file_exists($uri)) {
+    $directory_path = \Drupal::service('stream_wrapper_manager')->getViaUri($uri)->getDirectoryPath();
+    return Url::fromUri('base:' . $directory_path . '/' . file_uri_target($uri), array('absolute' => TRUE, 'query' => $token_query))->toString();
+  }
+
+  $file_url = file_create_url($uri);
+  // Append the query string with the token, if necessary.
+  if ($token_query) {
+    $file_url .= (strpos($file_url, '?') !== FALSE ? '&' : '?') . UrlHelper::buildQuery($token_query);
+  }
+
+  return $file_url;
+}
+
+/**
+ * Apply multiplication to image_style effects.
+ *
+ * @param \Drupal\image\ImageStyleInterface $image_style
+ *   The image style.
+ * @param float $multiplier
+ *   The multiplier.
+ */
+function reloadtina_apply_multiplication_to_effects($image_style, $multiplier) {
+  $multiplied = FALSE;
+  foreach ($image_style->getEffects() as $effect) {
+    switch ($effect->getPluginId()) {
+      case 'image_resize':
+      case 'image_scale':
+      case 'image_scale_and_crop':
+        reloadtina_apply_multiplication_to_effect($effect, $multiplier);
+        $multiplied = TRUE;
+        break;
+
+      case 'image_crop':
+        if ($multiplied) {
+          reloadtina_apply_multiplication_to_effect($effect, $multiplier);
+        }
+        break;
+    }
+  }
+}
+
+/**
+ * Apply multiplication to effect.
+ *
+ * @param \Drupal\image\ImageEffectInterface $effect
+ *   The effect.
+ * @param $multiplier
+ *   The multiplier
+ */
+function reloadtina_apply_multiplication_to_effect($effect, $multiplier) {
+  $configuration = $effect->getConfiguration();
+  if (isset($configuration['data']['width'])) {
+    $configuration['data']['width'] *= $multiplier;
+  }
+  if (isset($configuration['data']['height'])) {
+    $configuration['data']['height'] *= $multiplier;
+  }
+  $effect->setConfiguration($configuration);
+}
+
+/**
+ * Implements hook_preprocess_image_style().
+ */
+function reloadtina_preprocess_image_style(&$variables) {
+  $multipliers = \Drupal::config('reloadtina.settings')
+    ->get('multipliers');
+
+  // Always allow multiplier "1".
+  $multipliers[] = 1;
+
+  $image_style = ImageStyle::load($variables['style_name']);
+
+  foreach ($multipliers as $multiplier) {
+    $variables['image']['#srcset'][] = [
+      'uri' => reloadtina_build_url($image_style, $variables['uri'], $multiplier),
+      'multiplier' => "{$multiplier}x",
+    ];
+  }
+}
+
+/**
+ * Implements hook_image_style_flush().
+ */
+function reloadtina_image_style_flush($image_style, $path = NULL) {
+  $multipliers = \Drupal::config('reloadtina.settings')
+    ->get('multipliers');
+
+  if (isset($path)) {
+    foreach ($multipliers as $multiplier) {
+      $derivative_uri = reloadtina_build_uri($image_style, $path, $multiplier);
+      if (file_exists($derivative_uri)) {
+        file_unmanaged_delete($derivative_uri);
+      }
+    }
+  }
+  else {
+    foreach ($multipliers as $multiplier) {
+      // Delete the style directory in each registered wrapper.
+      $wrappers = \Drupal::service('stream_wrapper_manager')
+        ->getWrappers(StreamWrapperInterface::WRITE_VISIBLE);
+      foreach ($wrappers as $wrapper => $wrapper_data) {
+        if (file_exists($directory = $wrapper . '://styles/' . $image_style->id() . '-' . $multiplier)) {
+          file_unmanaged_delete_recursive($directory);
+        }
+      }
+    }
+  }
+}
