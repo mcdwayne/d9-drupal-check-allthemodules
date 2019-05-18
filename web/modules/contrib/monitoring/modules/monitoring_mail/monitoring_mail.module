@@ -1,0 +1,205 @@
+<?php
+
+/**
+ * @file
+ * Monitoring Mail bootstrap file.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Url;
+use Drupal\monitoring\Result\SensorResult;
+use Drupal\monitoring\Result\SensorResultInterface;
+
+/**
+ * Implements hook_mail().
+ *
+ * Send monitoring result status transition mail.
+ */
+function monitoring_mail_mail($key, &$message, $params) {
+  // Get values to build the mail data.
+  /** @var \Drupal\monitoring\Result\SensorResultInterface $result */
+  $result = $params['result'];
+  /** @var \Drupal\monitoring\SensorConfigInterface $sensor_config */
+  $sensor_config = $params['sensor_config'];
+
+  $site_config = \Drupal::config('system.site');
+  $site_mail = $site_config->get('mail');
+  $site_name = $site_config->get('name');
+
+  $status_old = $params['status_old'];
+  $status_new = $params['status_new'];
+  $status = $result->getStatusLabel();
+
+  $storage = \Drupal::keyValue('monitoring_mail_key');
+
+  // Set the mail subject.
+  $subject = strtoupper($status) . ': ' . $result->getValue() . ' ' . $sensor_config->getLabel();
+  $message['subject'] = $subject;
+
+  // Set the mail body.
+  $body = [];
+  $body[] = $result->getMessage();
+  $body[] = '';
+
+  $url = Url::fromRoute('entity.monitoring_sensor_config.details_form', ['monitoring_sensor_config' => $result->getSensorId()]);
+  $body[] = 'Sensor: ' . $url->toString();
+  $body[] = '';
+
+  $body[] = 'Status: ' . $status_old . ' > ' . $status_new;
+  $body[] = '';
+
+  $message['body'] = $body;
+
+  // Set the mail sender.
+  $message['from'] = 'MONITORING ' . $site_name . ' <' . $site_mail . '>';
+
+  // @todo Set header to build a per-sensor thread.
+  // Set the mail header.
+  $message['headers']['From'] = $message['from'];
+  // Set the header Message-ID.
+  $message_id = '<' . $result->getSensorId() . '.' . time() . '@' . \Drupal::request()->getHost() . '>';
+  $message['headers']['Message-ID'] = $message_id;
+  // Set the header References, if there is a previous transition.
+  if ($references = $storage->get($result->getSensorId())) {
+    $message['headers']['References'] = $references;
+  }
+
+  // Store the Message-ID of the current sensor transition.
+  $storage->set($result->getSensorId(), $message_id);
+}
+
+/**
+ * Implements hook_monitoring_run_sensors().
+ */
+function monitoring_mail_monitoring_run_sensors(array $results) {
+  // Check configured mail recipient.
+  $config = \Drupal::config('monitoring_mail.settings');
+  $recipient = $config->get('mail');
+  $severities = $config->get('severities');
+
+  // Skip if no recipient is defined.
+  if (!$recipient) {
+    return;
+  }
+
+  // Send a mail if a status change has been detected.
+  /** @var \Drupal\monitoring\Result\SensorResultInterface $result */
+  foreach ($results as $result) {
+    // @todo Make mail configurable per sensor.
+
+    // Cached result can not be different that the last result.
+    if ($result->isCached()) {
+      continue;
+    }
+
+    // Try to load the previous log result for this sensor.
+    $status_old = SensorResultInterface::STATUS_UNKNOWN;
+    if ($previous_result = $result->getPreviousResult()) {
+      $status_old = $previous_result->getStatus();
+    }
+
+    $status_new = $result->getStatus();
+    if (monitoring_mail_needs_mail($result, $severities, $status_old, $status_new)) {
+      // Prepare mail contexts.
+      $params = [
+        'result' => $result,
+        'sensor_config' => $result->getSensorConfig(),
+        'status_old' => $status_old,
+        'status_new' => $status_new,
+      ];
+
+      // Trigger result transition mail.
+      $mail_manager = \Drupal::service('plugin.manager.mail');
+      $mail_manager->mail('monitoring_mail', 'sensor_notification', $recipient, \Drupal::languageManager()->getDefaultLanguage()->getId(), $params);
+    }
+  }
+}
+
+/**
+ * Checks if sensor results should send mail.
+ *
+ * @param \Drupal\monitoring\Result\SensorResultInterface $result
+ *   The sensor result.
+ * @param array $severities
+ *   The sensor severities.
+ * @param string $status_old
+ *   The old sensor status.
+ * @param string $status_new
+ *   Thew new sensor status.
+ *
+ * @return bool
+ *   TRUE if the result should be logged, FALSE if not.
+ */
+function monitoring_mail_needs_mail(SensorResultInterface $result, array $severities, $status_old = NULL, $status_new = NULL) {
+  $config = \Drupal::config('monitoring.settings');
+
+  if ($config->get('sensor_call_logging') == 'none') {
+    // If logging is disabled, we can't track changes. A mail is not triggered.
+    return FALSE;
+  }
+
+  // Check if transition applies.
+  if (!in_array($status_new, $severities)) {
+    // Skip unselected status.
+    return FALSE;
+  }
+
+  // Send mail for all changes.
+  return ($status_old != $status_new);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function monitoring_mail_form_monitoring_settings_alter(&$form, FormStateInterface $form_state) {
+  $config = \Drupal::config('monitoring_mail.settings');
+
+  // Notification mail recipient.
+  $form['mail'] = [
+    '#type' => 'fieldset',
+    '#title' => t('Mail notifications'),
+    '#description' => t('Notify on sensor status change.'),
+  ];
+  $form['mail']['mail'] = [
+    '#type' => 'email',
+    '#title' => t('Mail recipient'),
+    '#maxlength' => 255,
+    '#default_value' => $config->get('mail'),
+  ];
+
+  // Show warning if there is no logging.
+  if(\Drupal::config('monitoring.settings')->get('sensor_call_logging') == 'none') {
+    // If logging is disabled, we can't track changes. A mail is not triggered.
+    $form['mail']['message'] = [
+      '#type' => 'container',
+      '#markup' => t('With logging disabled, mails are not triggered.'),
+      '#attributes' => [
+        'class' => ['messages messages--warning'],
+      ],
+    ];
+  }
+
+  // Severity checkboxes.
+  $options = SensorResult::getStatusLabels();
+  $form['mail']['severities'] = [
+    '#type' => 'checkboxes',
+    '#default_value' => (array) $config->get('severities'),
+    '#options' => $options,
+    '#title' => t('Mail on status change from / to'),
+    '#description' => t('A backtrace is logged for all severities that are checked.'),
+  ];
+
+  $form['#submit'][] = 'monitoring_mail_form_monitoring_settings_submit';
+}
+
+/**
+ * Submits callback for Monitoring settings form.
+ */
+function monitoring_mail_form_monitoring_settings_submit(&$form, FormStateInterface $form_state) {
+  $config_factory = \Drupal::configFactory();
+  $config = $config_factory->getEditable('monitoring_mail.settings');
+  $config
+    ->set('mail', $form_state->getValue('mail'))
+    ->set('severities', array_values(array_filter($form_state->getValue('severities'))))
+    ->save();
+}

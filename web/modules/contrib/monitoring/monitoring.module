@@ -1,0 +1,709 @@
+<?php
+/**
+ * @file
+ * Monitoring bootstrap file.
+ */
+use Drupal\Component\Render\FormattableMarkup;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Template\Attribute;
+use Drupal\Core\Url;
+use Drupal\monitoring\Entity\SensorConfig;
+use Drupal\monitoring\Result\SensorResultInterface;
+use Drupal\node\NodeTypeInterface;
+use Drupal\search_api\IndexInterface;
+
+/**
+ * Returns an instance of the sensor manager.
+ *
+ * @return \Drupal\monitoring\Sensor\SensorManager
+ *   The sensor manager.
+ */
+function monitoring_sensor_manager() {
+  return \Drupal::service('monitoring.sensor_manager');
+}
+
+/**
+ * Returns monitoring sensor config.
+ *
+ * @return \Drupal\monitoring\Entity\SensorConfig[]
+ *   List of SensorConfig instances.
+ *
+ * @throws \Drupal\monitoring\Sensor\NonExistingSensorException
+ *   In case a sensor name is provided, which does not exists.
+ *
+ * @see \Drupal\monitoring\Sensor\SensorManager
+ */
+function monitoring_sensor_config() {
+  return monitoring_sensor_manager()->getAllSensorConfig();
+}
+
+/**
+ * Gets sensor config grouped by categories.
+ *
+ * @param bool $enabled
+ *   Sensor isEnabled flag.
+ *
+ * @return \Drupal\monitoring\Entity\SensorConfig[]
+ *   Sensor config.
+ */
+function monitoring_sensor_config_by_categories($enabled = TRUE) {
+  return monitoring_sensor_manager()->getSensorConfigByCategories($enabled);
+}
+
+/**
+ * Implements hook_modules_installed().
+ */
+function monitoring_modules_installed($modules) {
+  // Update the installed modules.
+  foreach ($modules as $module) {
+    // Check for dependencies that are not initialized.
+    if(\Drupal::moduleHandler()->implementsHook($module, 'requirements') && !SensorConfig::load('core_requirements_' . $module)) {
+      initialize_requirements_sensors($module);
+    }
+  }
+}
+
+/**
+ * Initialize core requirements sensors.
+ *
+ * @param string $module
+ *   Name of the module to create a requirements sensor for.
+ *
+ * @return bool
+ *   TRUE if a sensor was created, FALSE otherwise.
+ */
+function initialize_requirements_sensors($module) {
+  // Skip update module as there is a separate sensors for core and contrib.
+  if ($module == 'update') {
+    return FALSE;
+  }
+  $sensor = SensorConfig::create(array(
+    'id' => 'core_requirements_' . $module,
+    'label' => new FormattableMarkup('Module @module', array('@module' => $module)),
+    'description' => new FormattableMarkup('Requirements of the @module module', array('@module' => $module)),
+    'plugin_id' => 'core_requirements',
+    'value_type' => 'no_value',
+    'category' => 'Requirements',
+    'caching_time' => 3600,
+    'status' => TRUE,
+    'settings' => array(
+      'module' => $module,
+      // List requirements keys which reports will be suppressed.
+      'exclude_keys' => array(),
+    ),
+    'dependencies' => array('module' => $module),
+  ));
+  // Ignore the cron key for system requirements, as we have a separate
+  // sensor for this.
+  if ($module == 'system') {
+    $sensor->settings['exclude_keys'][] = 'cron';
+  }
+  $sensor->save();
+  return TRUE;
+}
+
+/**
+ * The sensor runner function.
+ *
+ * Note that in case there is a cached result for given sensor name, the sensor
+ * will not run and the cached result will be returned.
+ *
+ * @param string $sensor_name
+ *   The name of the sensor that is to be run.
+ * @param bool $force_run
+ *   Set to TRUE to force the run. Defaults to FALSE.
+ * @param bool $verbose
+ *   (optional) Set to TRUE to enable verbose execution, defaults to FALSE.
+ *
+ * @return \Drupal\monitoring\Result\SensorResultInterface
+ *   A single result object.
+ *
+ * @throws \Drupal\monitoring\Sensor\NonExistingSensorException
+ *   Thrown if the requested sensor does not exist.
+ * @throws \Drupal\monitoring\Sensor\DisabledSensorException
+ *   Thrown if any of the passed sensor names is not enabled.
+ */
+function monitoring_sensor_run($sensor_name, $force_run = FALSE, $verbose = FALSE) {
+  $results = monitoring_sensor_run_multiple(array($sensor_name), $force_run, $verbose);
+  return reset($results);
+}
+
+/**
+ * Runs sensors.
+ *
+ * @param array $sensor_names
+ *   Sensor names to run.
+ * @param bool $force_run
+ *   Flag to force run.
+ * @param bool $verbose
+ *   (optional) Set to TRUE to enable verbose execution, defaults to FALSE.
+ *
+ * @return \Drupal\monitoring\Result\SensorResultInterface[]
+ *   List of result objects.
+ *
+ * @throws \Drupal\monitoring\Sensor\NonExistingSensorException
+ *   Thrown if the requested sensor does not exist.
+ * @throws \Drupal\monitoring\Sensor\DisabledSensorException
+ *   Thrown if any of the passed sensor names is not enabled.
+ *
+ * @see \Drupal\monitoring\Sensor\SensorManager
+ * @see \Drupal\monitoring\SensorRunner
+ */
+function monitoring_sensor_run_multiple($sensor_names = array(), $force_run = FALSE, $verbose = FALSE) {
+  $sensors_config = array();
+  if (empty($sensor_names)) {
+    foreach (monitoring_sensor_manager()->getEnabledSensorConfig() as $sensor_name => $sensor_config) {
+      $sensors_config[$sensor_name] = $sensor_config;
+    }
+  }
+  else {
+    foreach ($sensor_names as $sensor_name) {
+      $sensors_config[$sensor_name] = monitoring_sensor_manager()->getSensorConfigByName($sensor_name);
+    }
+  }
+
+  /** @var \Drupal\Monitoring\SensorRunner $runner */
+  $runner = \Drupal::service('monitoring.sensor_runner');
+  $results = $runner->runSensors($sensors_config, $force_run, $verbose);
+  return $results;
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ *
+ * Display a view as a table style.
+ *
+ * @todo - this needs review.
+ *    Is it the right way how to inject custom css classes?
+ */
+function monitoring_preprocess_views_view_table(&$vars) {
+  /** @var \Drupal\views\ViewExecutable $view */
+  $view = $vars['view'];
+  // We want to alter only the monitoring sensor results view.
+  // @todo - really?? we do not have the view machine name available here?
+  if (!in_array('monitoring_sensor_results', $view->getBaseTables())) {
+    return;
+  }
+
+  foreach ($vars['rows'] as $num => $row) {
+    if (isset($vars['result'][$num]->_entity->sensor_status->value)) {
+      $vars['rows'][$num]['attributes'] = new Attribute(array(
+        'class' => 'monitoring-' . strtolower($vars['result'][$num]->_entity->sensor_status->value),
+      ));
+    }
+  }
+
+  $vars['#attached']['library'][] = 'monitoring/monitoring';
+}
+
+/**
+ * Sensor pages title callback.
+ *
+ * @param string $action
+ *   View/page action.
+ * @param \Drupal\monitoring\Entity\SensorConfig $sensor_config
+ *   Sensor config.
+ *
+ * @return string
+ *   Title.
+ */
+function monitoring_sensor_action_title($action, SensorConfig $sensor_config) {
+  $placeholders = array('@category' => $sensor_config->getCategory(), '@label' => $sensor_config->getLabel());
+  switch ($action) {
+    case 'log':
+      return t('@label (@category)', $placeholders);
+  }
+
+  return '';
+}
+
+/**
+ * Saves the sensor result.
+ *
+ * @param \Drupal\monitoring\Result\SensorResultInterface $result
+ *   Sensor call result.
+ *
+ * @return \Drupal\monitoring\Entity\SensorResultEntity
+ *   Sensor result entity.
+ */
+function monitoring_sensor_result_save(SensorResultInterface $result) {
+  $values = array(
+    'sensor_name' => $result->getSensorId(),
+    'sensor_status' => $result->getStatus(),
+    'sensor_message' => $result->getMessage(),
+    'sensor_value' => $result->getValue(),
+    'timestamp' => $result->getTimestamp(),
+    'execution_time' => $result->getExecutionTime(),
+  );
+  $result_entity = entity_create('monitoring_sensor_result', $values);
+  $result_entity->save();
+  return $result_entity;
+}
+
+/**
+ * Gets last sensor result.
+ *
+ * @param string $sensor_name
+ *   The name of the sensor.
+ *
+ * @return \Drupal\monitoring\Entity\SensorResultEntity|null
+ *   A SensorResultEntity representing the last sensor result.
+ */
+function monitoring_sensor_result_last($sensor_name) {
+  $result = \Drupal::entityQuery('monitoring_sensor_result')
+    ->condition('sensor_name', $sensor_name)
+    ->sort('timestamp', 'DESC')
+    ->sort('record_id', 'DESC')
+    ->range(0, 1)
+    ->execute();
+
+  if (!empty($result)) {
+    return entity_load('monitoring_sensor_result', reset($result));
+  }
+
+  return NULL;
+}
+
+/**
+ * Gets second last sensor result.
+ *
+ * @deprecated in 8.x-1.x, remove before 8.x-2.0.
+ *
+ * @param string $sensor_name
+ *   The name of the sensor.
+ *
+ * @return \Drupal\monitoring\Entity\SensorResultEntity|null
+ *   A SensorResultEntity representing the second last sensor result.
+ */
+function monitoring_sensor_result_second_last($sensor_name) {
+  $result = \Drupal::entityQuery('monitoring_sensor_result')
+    ->condition('sensor_name', $sensor_name)
+    ->sort('timestamp', 'DESC')
+    ->sort('record_id', 'DESC')
+    ->range(1, 1)
+    ->execute();
+
+  if (!empty($result)) {
+    return entity_load('monitoring_sensor_result', reset($result));
+  }
+
+  return NULL;
+}
+
+/**
+ * Implements hook_views_pre_render().
+ *
+ * Alters the views page title.
+ */
+//function monitoring_views_pre_render(View $view) {
+//  if ($view->name == 'monitoring_sensor_results' && !empty($view->args)) {
+//    $view->build_info['title'] = monitoring_sensor_action_title('log', monitoring_sensor_info_load($view->args[0]));
+//  }
+//}
+
+/**
+ * Implements hook_theme().
+ */
+function monitoring_theme() {
+  return array(
+    'monitoring_config_box' => array(
+      'variables' => array(
+        'title' => NULL,
+        'description' => NULL,
+        'code' => NULL,
+        'code_height' => NULL,
+      ),
+      'function'   => 'theme_monitoring_config_box',
+    ),
+    'monitoring_overview_summary' => array(
+      'variables' => array(
+        'status_overview'           => array(),
+        'total_execution_time'      => NULL,
+        'non_cached_execution_time' => NULL,
+        'oldest_sensor_label'       => NULL,
+        'oldest_sensor_category'       => NULL,
+        'oldest_sensor_called_before' => NULL,
+      ),
+      'function' => 'theme_monitoring_overview_summary',
+    ),
+  );
+}
+
+/**
+ * Monitoring config code box theme.
+ *
+ * @param array $variables
+ *   Theme variables.
+ *
+ * @return string
+ *   Formatted output.
+ */
+function theme_monitoring_config_box($variables) {
+  $output = '';
+
+  if (!empty($variables['title'])) {
+    $output .= '<h3>' . check_plain($variables['title']) . '</h3>';
+  }
+
+  if (!empty($variables['description'])) {
+    $output .= '<p>' . check_plain($variables['description']) . '</p>';
+  }
+
+  if (!empty($variables['code'])) {
+    $variables['code_height'] = !empty($variables['code_height']) ? $variables['code_height'] : '100';
+    $output .= '<pre style="border:1px solid silver;padding:4px;height:' . $variables['code_height'] . 'px;overflow:auto;">' . check_plain($variables['code']) . '</pre>';
+  }
+
+  return $output;
+}
+
+/**
+ * Get config code with dynamic variables.
+ *
+ * @param string $module
+ *   Module name.
+ * @param string $type
+ *   Config type.
+ * @param array $variables
+ *   Dynamic values.
+ *
+ * @return string
+ *   Config code.
+ */
+function monitoring_config_code($module, $type, $variables = array()) {
+  $code = file_get_contents(drupal_get_path('module', $module) . '/config_tpl/' . $type . '.txt');
+  return new FormattableMarkup($code, $variables);
+}
+
+/**
+ * Monitoring overview page summary.
+ *
+ * @param array $variables
+ *   Theme variables.
+ *
+ * @return string
+ *   Formatted output.
+ */
+function theme_monitoring_overview_summary($variables) {
+  $output = '<div class="monitoring-overview-summary">';
+  $output .= t('<span class="monitoring-summary-time">Request execution time: <strong>@time_non_cachedms</strong> (including cached <strong>@time_totalms</strong>)</span>, <span class="monitoring-summary-ok">&nbsp;</span> @ok OK, <span class="monitoring-summary-info">&nbsp;</span> @info Info, <span class="monitoring-summary-warning">&nbsp;</span> @warning Warning, <span class="monitoring-summary-critical">&nbsp;</span> @critical Critical, <span class="monitoring-summary-unknown">&nbsp;</span> @unknown Unknown',
+    array(
+      '@time_total' => $variables['total_execution_time'],
+      '@time_non_cached' => $variables['non_cached_execution_time'],
+      '@ok' => $variables['status_overview'][SensorResultInterface::STATUS_OK],
+      '@info' => $variables['status_overview'][SensorResultInterface::STATUS_INFO],
+      '@warning' => $variables['status_overview'][SensorResultInterface::STATUS_WARNING],
+      '@critical' => $variables['status_overview'][SensorResultInterface::STATUS_CRITICAL],
+      '@unknown' => $variables['status_overview'][SensorResultInterface::STATUS_UNKNOWN],
+    ));
+  $output .= '</div>';
+  if (\Drupal::currentUser()->hasPermission('monitoring force run')) {
+    $link = '<a href="' . Url::fromRoute('monitoring.force_run_all')->toString() . '" class="button button-action button--primary button--small"> ' . t('Force execute all') . '</a>';
+    $output .= '<div class="monitoring-overview-summary-actions-right">' . $link . '</div>';
+  }
+  if (!empty($variables['oldest_sensor_label'])) {
+    $output .= '<div class="monitoring-overview-summary-actions-right">' . t('Sensor %sensor (%category) cached before %before.', array('%sensor' => $variables['oldest_sensor_label'], '%before' => $variables['oldest_sensor_called_before'], '%category' => $variables['oldest_sensor_category'])) . '</div>';
+  }
+  else {
+    $output .= '<div class="monitoring-overview-summary-actions-right">' . t('No sensor cached.') . '</div>';
+  }
+  return $output;
+}
+
+/**
+ * Gets current site host.
+ *
+ * @return string
+ *   Site url.
+ */
+function monitoring_host() {
+  global $base_url;
+  return preg_replace('/^http(s)?:\/\//', '', $base_url);
+}
+
+function monitoring_host_key() {
+  return str_replace('.', '_', monitoring_host());
+}
+
+/**
+ * Submit callback to clear the disappeared sensors list.
+ *
+ * @see \Drupal\monitoring\Sensor\SensorDisappearedSensors::buildConfigurationForm()
+ */
+function monitoring_clear_missing_sensor_submit($form, FormStateInterface $form_state) {
+  $available_sensors = array();
+  foreach (monitoring_sensor_manager()->getAllSensorConfig() as $key => $sensor_config) {
+    $available_sensors[$key] = array(
+      'name' => $key,
+      'label' => $sensor_config->getLabel(),
+      'enabled' => $sensor_config->isEnabled(),
+    );
+  }
+  \Drupal::state()->set('monitoring.available_sensors', $available_sensors);
+  drupal_set_message(t('All missing sensors have been cleared.'));
+}
+
+/**
+ * Gets available value types definitions.
+ *
+ * @return array
+ *   Value type definitions, consisting of a label and an optional
+ *   formatter_callback.
+ */
+function monitoring_value_types() {
+  // @todo Allow extension of those types through a hook or plugin system.
+  return array(
+    'no_value' => array(
+      'label' => '- No value -',
+      'numeric' => FALSE,
+    ),
+    'number' => array(
+      'label' => 'Number',
+      'numeric' => TRUE,
+    ),
+    'string' => array(
+      'label' => 'Text',
+      'numeric' => FALSE,
+    ),
+    'time_interval' => array(
+      'label' => 'Time interval',
+      'value_label' => 'Seconds',
+      'formatter_callback' => 'monitoring_value_label_callback_interval',
+      'numeric' => TRUE,
+    ),
+    'bool' => array(
+      'label' => 'Boolean',
+      'formatter_callback' => 'monitoring_value_label_callback_bool',
+      'numeric' => FALSE,
+    ),
+    'commerce_currency' => array(
+      'label' => 'Commerce currency',
+      'formatter_callback' => 'monitoring_value_label_callback_commerce_currency',
+      'numeric' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Formatter for time interval value.
+ *
+ * @param \Drupal\monitoring\Result\SensorResultInterface $result
+ *   Result object for which to get the formatted value.
+ *
+ * @return string
+ *   Formatted time interval.
+ *
+ * @see \Drupal::service('date.formatter')->formatInterval()
+ */
+function monitoring_value_label_callback_interval(SensorResultInterface $result) {
+  return \Drupal::service('date.formatter')->formatInterval($result->getValue());
+}
+
+/**
+ * Formatter for boolean value (TRUE, FALSE).
+ *
+ * @param \Drupal\monitoring\Result\SensorResultInterface $result
+ *   Result object for which to get the formatted value.
+ *
+ * @return string
+ *   TRUE or FALSE strings.
+ */
+function monitoring_value_label_callback_bool(SensorResultInterface $result) {
+  return $result->getValue() ? 'TRUE' : 'FALSE';
+}
+
+/**
+ * Formatter for commerce currency amount value.
+ *
+ * @param \Drupal\monitoring\Result\SensorResultInterface $result
+ *   Result object for which to get the formatted value.
+ *
+ * @return string
+ *   Formatted amount.
+ *
+ * @see commerce_default_currency()
+ * @see commerce_currency_format()
+ */
+function monitoring_value_label_callback_commerce_currency(SensorResultInterface $result) {
+  if (\Drupal::moduleHandler()->moduleExists('commerce')) {
+    $currency = $result->getSensorConfig()->getSetting('currency_code');
+    if (empty($currency)) {
+      $currency = commerce_default_currency();
+    }
+    // commerce_currency_format() uses @placeholders and runs the price through
+    // check_plain(), that can cause double encoding, so decode entities again.
+    return html_entity_decode(commerce_currency_format($result->getValue(), $currency, NULL, FALSE), ENT_QUOTES);
+  }
+
+  return $result->getValue();
+}
+
+/*
+ * Implements hook_node_type_insert().
+ *
+ * Inserts new node sensor config entities on creation of new node types.
+ */
+function monitoring_node_type_insert(NodeTypeInterface $type) {
+
+  // Don't do anything if we are syncing or if the sensor already exists.
+  $config_id = 'node_new_' . $type->id();
+  if ($type->isSyncing() || SensorConfig::load($config_id)) {
+    return;
+  }
+  $sensor = SensorConfig::create(array(
+    'id' => $config_id,
+    'label' => new FormattableMarkup('New @type nodes', array('@type' => $type->label())),
+    'description' => new FormattableMarkup('New nodes of type @type', array('@type' => $type->label())),
+    'plugin_id' => 'entity_aggregator',
+    'value_label' => new FormattableMarkup('@type nodes', array('@type' => $type->label())),
+    'category' => 'Content',
+    'status' => FALSE,
+    'caching_time' => 600,
+    'settings' => array(
+      'entity_type' => 'node',
+      'conditions' => array(
+        array('field' => 'type', 'value' => $type->id()),
+      ),
+      'time_interval_field' => 'created',
+      'time_interval_value' => 60 * 60 * 24,
+    ),
+  ));
+  $sensor->save();
+}
+
+/*
+ * Implements hook_node_type_delete().
+ *
+ * Deletes node sensor config entities on deletion of node types.
+ */
+function monitoring_node_type_delete(NodeTypeInterface $type) {
+  // Don't do anything if we are syncing or if the sensor does not exists.
+  $config_id = 'node_new_' . $type->id();
+  if ($type->isSyncing() || !SensorConfig::load($config_id)) {
+    return;
+  }
+  $sensor = SensorConfig::load($config_id);
+  $sensor->delete();
+}
+
+/*
+ * Implements hook_node_type_update().
+ *
+ * Updates node sensor config entities on update of node types.
+ */
+function monitoring_node_type_update(NodeTypeInterface $type) {
+  // Don't do anything if we are syncing, the sensor does not exists or if the
+  // type was not renamed.
+  $config_id = 'node_new_' . $type->id();
+  $new_config_id = 'node_new_' . $type->original->id();
+  if ($config_id == $new_config_id || $type->isSyncing() || !SensorConfig::load($config_id)) {
+    return;
+  }
+  $sensor = SensorConfig::load($config_id);
+
+  // If the new sensor already exists, just drop this one.
+  if (SensorConfig::load($new_config_id)) {
+    $sensor->delete();
+  }
+  else {
+    $sensor->id = $new_config_id;
+    $sensor->label = new FormattableMarkup(
+      'New @type nodes',
+      array('@type' => $type->label())
+    );
+    $sensor->description = new FormattableMarkup(
+      'New nodes of type @type',
+      array('@type' => $type->label())
+    );
+    $sensor->value_label = new FormattableMarkup(
+      '@type nodes',
+      array('@type' => $type->label())
+    );
+    $sensor->settings['conditions'][0]['value'] = $type->id();
+    $sensor->save();
+  }
+}
+
+/*
+ * Implements hook_search_api_index_insert().
+ *
+ * Inserts new search api index  sensor config entities on creation of new
+ * search api indexes.
+ */
+function monitoring_search_api_index_insert(IndexInterface $index) {
+  // Don't do anything if we are syncing or if the sensor already exists.
+  $config_id = 'search_api_' . $index->id();
+  if ($index->isSyncing() || SensorConfig::load($config_id)) {
+    return;
+  }
+  $sensor = SensorConfig::create(array(
+    'id' => $config_id,
+    'label' => new FormattableMarkup('Search index queue size of @index', array('@index' => $index->label())),
+    'plugin_id' => 'search_api_unindexed',
+    'value_label' => 'Unindexed items',
+    'value_type' => 'number',
+    'category' => 'Search API',
+    'caching_time' => 900,
+    'status' => TRUE,
+    'settings' => array(
+      'index_id' => $index->id(),
+    ),
+  ));
+  $sensor->save();
+}
+
+/*
+ * Implements hook_search_api_index_delete().
+ *
+ * Deletes search api index sensor config entities on deletion of search api
+ * index.
+ */
+function monitoring_search_api_index_delete(IndexInterface $index) {
+  // Don't do anything if we are syncing or if the sensor does not exists.
+  $config_id = 'search_api_' . $index->id();
+  if ($index->isSyncing() || !SensorConfig::load($config_id)) {
+    return;
+  }
+  $sensor = SensorConfig::load($config_id);
+  $sensor->delete();
+}
+
+/*
+ * Implements hook_search_api_index_update().
+ *
+ * Updates search api index sensor config entities on updates of search api
+ * index.
+ */
+function monitoring_search_api_index_update(IndexInterface $index) {
+  // Don't do anything if we are syncing, the sensor does not exists or the
+  // index has not/ been renamed.
+  $config_id = 'search_api_' . $index->id();
+  $new_config_id = 'search_api_' . $index->original->id();
+  if ($config_id == $new_config_id || $index->isSyncing() || !SensorConfig::load($config_id)) {
+    return;
+  }
+  $sensor = SensorConfig::load($config_id);
+
+  // If the new sensor already exists, just drop this one.
+  if (SensorConfig::load($new_config_id)) {
+    $sensor->delete();
+  }
+  else {
+    $sensor->id = $new_config_id;
+    $sensor->label = new FormattableMarkup('Search index queue size of @index', array('@index' => $index->id()));
+    $sensor->settings['index_id'] = $index->id();
+    $sensor->save();
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function monitoring_cron() {
+  // Run sensors to collect data for each of them, if the setting allows it.
+  if (\Drupal::config('monitoring.settings')->get('cron_run_sensors')) {
+    // The result data can be captured through hook_monitoring_sensor_run.
+    \Drupal::service('monitoring.sensor_runner')->runSensors();
+  }
+
+}
