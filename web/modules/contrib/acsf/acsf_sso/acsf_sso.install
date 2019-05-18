@@ -1,0 +1,173 @@
+<?php
+
+/**
+ * @file
+ * The install tasks of the acsf_sso module.
+ */
+
+use Drupal\acsf\AcsfSite;
+
+/**
+ * Implements hook_requirements().
+ */
+function acsf_sso_requirements($phase) {
+  $requirements = [];
+  if ($phase == 'install') {
+    // Group all technical-sounding errors under one more user friendly header,
+    // so most users don't get confused but in the event something really goes
+    // wrong, the detailed errors are still available.
+    $errors = [];
+    if (!isset($_ENV['AH_SITE_GROUP'])) {
+      $errors[] = t("Environment variable '@var' is not available.", ['@var' => 'AH_SITE_GROUP']);
+    }
+    if (!isset($_ENV['AH_SITE_ENVIRONMENT'])) {
+      $errors[] = t("Environment variable '@var' is not available.", ['@var' => 'AH_SITE_ENVIRONMENT']);
+    }
+    if (!isset($GLOBALS['gardens_site_settings']['conf']['acsf_site_id'])) {
+      $errors[] = t("Global variable '@var' is not set.", ['@var' => 'gardens_site_settings][conf][acsf_site_id']);
+    }
+
+    if (isset($_ENV['AH_SITE_GROUP']) && isset($_ENV['AH_SITE_ENVIRONMENT'])) {
+      $creds_path = "/mnt/files/{$_ENV['AH_SITE_GROUP']}.{$_ENV['AH_SITE_ENVIRONMENT']}/nobackup/sf_shared_creds.ini";
+      if (!file_exists($creds_path)) {
+        $errors[] = t("The shared credentials file '@file' is not present.", ['@file' => $creds_path]);
+      }
+      else {
+        // Unlike the above/below, which are very unlikely to happen except when
+        // enabling this module on non-ACSF environments, this condition can
+        // happen on ACSF... if the factory is not updated yet. So we make an
+        // extra, readable, message for that purpose.
+        $credentials = file_get_contents($creds_path);
+        $parsed_ini = parse_ini_string($credentials, TRUE);
+        if (!isset($parsed_ini['saml']['tangle_key']) && !isset($parsed_ini['saml']['factory_cert']) && !isset($parsed_ini['saml']['tangle_cert'])) {
+          $errors[] = t('No keys/certs can be found to enable SAML SSO. (The most likely cause is the Site Factory needing to be updated.)');
+        }
+        else {
+          if (!isset($parsed_ini['saml']['tangle_key'])) {
+            $errors[] = t("'@value' value not found in a 'saml' section of the shared credentials file '@file'.", ['@value' => 'tangle_key', '@file' => $creds_path]);
+          }
+          if (!isset($parsed_ini['saml']['tangle_cert'])) {
+            $errors[] = t("'@value' value not found in a 'saml' section of the shared credentials file '@file'.", ['@value' => 'tangle_cert', '@file' => $creds_path]);
+          }
+          if (!isset($parsed_ini['saml']['factory_cert'])) {
+            $errors[] = t("'@value' value not found in a 'saml' section of the shared credentials file '@file'.", ['@value' => 'factory_cert', '@file' => $creds_path]);
+          }
+        }
+      }
+    }
+
+    if ($errors) {
+      // One space for indents can be nice for terminals.
+      $requirements['acsf_sso'] = [
+        'title' => t('Missing data for acsf_sso'),
+        'description' => t("This module only functions on Acquia Cloud Site Factory infrastructure; some required environment data is missing. When on ACSF and unsure how to proceed, please contact Acquia Support, providing the following error(s):")
+        . "\n " . implode("\n ", $errors),
+        'severity' => REQUIREMENT_ERROR,
+      ];
+    }
+  }
+  return $requirements;
+}
+
+/**
+ * Implements hook_install().
+ */
+function acsf_sso_install() {
+  $common_config = [
+    'sp_name_id_format' => 'urn:oasis:names:tc:SAML:2.0:nameid-format:transient',
+    'unique_id_attribute' => 'urn:oid:2.5.4.45',
+    'create_users' => 1,
+    'map_users' => 1,
+    'sync_name' => 1,
+    'sync_mail' => 1,
+    'user_name_attribute' => 'urn:oid:2.5.4.41',
+    'user_mail_attribute' => 'urn:oid:0.9.2342.19200300.100.1.3',
+    'security_authn_requests_sign' => 1,
+    'security_messages_sign' => 1,
+    'strict' => 1,
+    // Options not mentioned here are fine as having default NULL, and also it
+    // does not matter if they're set to a different value.
+  ];
+
+  $config = \Drupal::configFactory()->getEditable('samlauth.authentication');
+  foreach ($common_config as $key => $sso_config) {
+    $config->set($key, $sso_config);
+  }
+  $config->save();
+
+  acsf_sso_install_set_env_dependent_config();
+}
+
+/**
+ * Changes and saves 'environment' dependent config; not other standard config.
+ *
+ * This can get called when a site changes 'environment' (e.g. on staging,
+ * duplication, restore from backup). Which means anything could be new:
+ * factory, site ID, sitegroup/env.
+ *
+ * Implication: we effectively take control away from the site owners by forcing
+ * these values, as long as acsf_sso is enabled. The below are not all the
+ * required values; if site owners mess with static settings on a live site,
+ * they can still destroy the SSO process.
+ */
+function acsf_sso_install_set_env_dependent_config() {
+  $sitegroup = $_ENV['AH_SITE_GROUP'];
+  $env = $_ENV['AH_SITE_ENVIRONMENT'];
+  $site_id = $GLOBALS['gardens_site_settings']['conf']['acsf_site_id'];
+  $creds_path = "/mnt/files/$sitegroup.$env/nobackup/sf_shared_creds.ini";
+
+  $site = AcsfSite::load();
+
+  $credentials = file_get_contents($creds_path);
+  $parsed_ini = parse_ini_string($credentials, TRUE);
+  $config = \Drupal::configFactory()->getEditable('samlauth.authentication');
+
+  $values = [
+    'idp_entity_id' => $site->factory_url . '/sso/saml2/idp/metadata.php',
+    'sp_entity_id' => "urn:acquia:acsf:saml:sp:$sitegroup:$env:$site_id",
+    'idp_single_sign_on_service' => $site->factory_url . '/sso/saml2/idp/SSOService.php',
+    'idp_single_log_out_service' => $site->factory_url . '/sso/saml2/idp/SingleLogoutService.php',
+  ];
+  foreach ($values as $key => $sso_config) {
+    $config->set($key, $sso_config);
+  }
+
+  if (isset($parsed_ini['saml']['tangle_key'])) {
+    $config->set('sp_private_key', $parsed_ini['saml']['tangle_key']);
+  }
+  else {
+    $config->clear('sp_private_key');
+  }
+  if (isset($parsed_ini['saml']['tangle_cert'])) {
+    $config->set('sp_x509_certificate', $parsed_ini['saml']['tangle_cert']);
+  }
+  else {
+    $config->clear('sp_x509_certificate');
+  }
+  if (isset($parsed_ini['saml']['factory_cert'])) {
+    $config->set('idp_x509_certificate', $parsed_ini['saml']['factory_cert']);
+  }
+  else {
+    $config->clear('idp_x509_certificate');
+  }
+
+  $config->save();
+}
+
+/**
+ * Updates settings.
+ */
+function acsf_sso_update_8001() {
+  $site = AcsfSite::load();
+  $config = \Drupal::configFactory()->getEditable('samlauth.authentication');
+  $update = [
+    'sync_name' => 1,
+    'sync_mail' => 1,
+    'strict' => 1,
+    'idp_entity_id' => $site->factory_url . '/sso/saml2/idp/metadata.php',
+  ];
+  foreach ($update as $key => $sso_config) {
+    $config->set($key, $sso_config);
+  }
+  $config->save();
+}
