@@ -1,0 +1,144 @@
+<?php
+
+namespace Drupal\feeds_ical\Feeds\Parser;
+
+require_once drupal_get_path('module', 'feeds_ical').DIRECTORY_SEPARATOR.'vendor'.DIRECTORY_SEPARATOR.'autoload.php';
+
+use Drupal\feeds\Component\XmlParserTrait;
+use Drupal\feeds\Exception\EmptyFeedException;
+use Drupal\feeds\FeedInterface;
+use Drupal\feeds\Plugin\Type\Parser\ParserInterface;
+use Drupal\feeds\Plugin\Type\PluginBase;
+use Drupal\feeds\Result\FetcherResultInterface;
+use Drupal\feeds\Result\ParserResult;
+use Drupal\feeds\StateInterface;
+use Drupal\feeds_ical\Feeds\Item\IcalItem;
+use ICal\ICal;
+
+
+/**
+ * Defines an Ical Feeds parser.
+ *
+ * @FeedsParser(
+ *   id = "feeds_ical",
+ *   title = @Translation("Ical Parser"),
+ *   description = @Translation("Parse Ical Feed.")
+ * )
+ */
+class IcalParser extends PluginBase implements ParserInterface {
+  use XmlParserTrait;
+
+  /**
+   * {@inheritdoc}
+   */
+  public function parse(FeedInterface $feed, FetcherResultInterface $fetcher_result, StateInterface $state) {
+
+    // Look at our response
+    $rawResponseString = trim($fetcher_result->getRaw());
+    if (!strlen($rawResponseString)) {
+      throw new EmptyFeedException();
+    }
+
+    // create our result object to add to
+    $result = new ParserResult();
+
+    // use our ical class to parse the feed
+    try {
+
+        // Create ical parsing object
+        $ical = new ICal('ICal.ics', array(
+            'defaultSpan'                 => 2,     // Default value
+            'defaultTimeZone'             => 'UTC',
+            'defaultWeekStart'            => 'MO',  // Default value
+            'disableCharacterReplacement' => false, // Default value
+            'skipRecurrence'              => false, // Default value
+            'useTimeZoneWithRRules'       => false, // Default value
+        ));
+         $ical->initString($rawResponseString);
+
+         // Get and loop over events
+         $events = $ical->events();
+         foreach($events as $eventIndex => $event){
+
+            // Create item to return for processing
+            $itemObject = new IcalItem();
+            // Loop over information from feed and add to item
+            foreach($event as $eventProperty => $eventPropertyValue){
+
+                switch($eventProperty){
+                    case 'dtstart':
+                        $itemObject->set($eventProperty, $event->dtstart_array[2]);
+                        break;
+                    case 'dtend':
+                        $itemObject->set($eventProperty, $event->dtend_array[2]);
+                        break;
+                    default:
+                        $itemObject->set($eventProperty, $eventPropertyValue);
+
+                }
+
+            }
+
+            // add item to results
+            $result->addItem($itemObject);
+
+         }
+
+    } catch (\Exception $e) {
+        watchdog_exeption('feeds_ical',$e);
+    }
+
+    return $result;
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function getMappingSources() {
+    return [
+      'dtstart' => [
+        'label' => $this->t('DTSTART'),
+      ],
+      'dtend' => [
+        'label' => $this->t('DTEND'),
+      ],
+      'dtstamp' => [
+        'label' => $this->t('DTSTAMP'),
+      ],
+      'uid' => [
+        'label' => $this->t('UID'),
+        'suggestions' => [
+          'targets' => ['guid'],
+        ],
+      ],
+      'created' => [
+        'label' => $this->t('CREATED'),
+      ],
+      'description' => [
+        'label' => $this->t('DESCRIPTION'),
+      ],
+      'lastmodified' => [
+        'label' => $this->t('LAST-MODIFIED'),
+      ],
+      'location' => [
+        'label' => $this->t('LOCATION'),
+      ],
+      'sequence' => [
+        'label' => $this->t('SEQUENCE'),
+      ],
+      'status' => [
+        'label' => $this->t('STATUS'),
+      ],
+      'summary' => [
+        'label' => $this->t('SUMMARY'),
+        'suggestions' => [
+          'targets' => ['title'],
+        ],
+      ],
+      'transp' => [
+        'label' => $this->t('TRANSP'),
+      ],
+    ];
+  }
+
+}
