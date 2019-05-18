@@ -1,0 +1,161 @@
+<?php
+
+/**
+ * @file
+ * The module file.
+ */
+
+use Drupal\Core\Cache\Cache;
+use Drupal\filter\FilterPluginCollection;
+
+/**
+ * Implements hook_help().
+ */
+function cookiebot_help($route_name) {
+  if ($route_name !== 'help.page.cookiebot') {
+    return '';
+  }
+
+  $text = file_get_contents(drupal_get_path('module', 'cookiebot') . '/README.md');
+
+  if (!\Drupal::moduleHandler()->moduleExists('markdown')) {
+    return [
+      '#markup' => str_replace("\n", '<br />', $text),
+      '#allowed_tags' => ['br'],
+    ];
+  }
+
+  $filters = new FilterPluginCollection(\Drupal::service('plugin.manager.filter'));
+  $filter = $filters->get('markdown');
+  $text = $filter->process($text, \Drupal::languageManager()->getCurrentLanguage()->getId());
+
+  return $text->getProcessedText();
+}
+
+/**
+ * Implements hook_theme().
+ */
+function cookiebot_theme($existing, $type, $theme, $path) {
+  return [
+    'cookiebot_declaration' => [
+      'variables' => [
+        'cookiebot_src' => NULL,
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_page_attachments_alter().
+ */
+function cookiebot_page_attachments_alter(array &$page) {
+  // Check hide if user can use site without giving Cookiebot cookie consent.
+  if (\Drupal::currentUser()->hasPermission('skip cookiebot consent')) {
+    return;
+  }
+
+  $config = \Drupal::config('cookiebot.settings');
+
+  // Check exclude paths.
+  if (!empty($config->get('exclude_paths'))) {
+    // Check both the URL path and the URL alias against the list to exclude.
+    $path = Drupal::service('path.current')->getPath();
+    $url_alias_path = \Drupal::service('path.alias_manager')->getAliasByPath($path);
+    $path_match = Drupal::service('path.matcher')->matchPath($path, $config->get('exclude_paths'));
+    $path_match_url_alias = Drupal::service('path.matcher')->matchPath($url_alias_path, $config->get('exclude_paths'));
+    $path_match = $path_match || $path_match_url_alias;
+    $exclude_paths = $config->get('exclude_paths');
+    Drupal::moduleHandler()->alter('cookiebot_path_match', $path_match, $path, $exclude_paths);
+    if ($path_match) {
+      return;
+    }
+  }
+
+  // Check hide cookie compliance on admin theme.
+  if ($config->get('exclude_admin_theme')) {
+    // Determines whether the active route is an admin one.
+    $is_route_admin = Drupal::service('router.admin_context')->isAdminRoute();
+    if ($is_route_admin) {
+      return;
+    }
+  }
+
+  // Check hide cookie for the superuser.
+  if (Drupal::currentUser()->id() == 1 && !empty($config->get('exclude_uid_1')) && $config->get('exclude_uid_1')) {
+    return;
+  }
+
+  $cbid = $config->get('cookiebot_cbid');
+
+  $page['#cache']['tags'] = Cache::mergeTags(!empty($page['#cache']['tags']) ? $page['#cache']['tags'] : [], ['cookiebot:cbid', 'cookiebot:iab_enabled']);
+
+  if (empty($cbid)) {
+    return;
+  }
+
+  $cookiebot = [
+    '#type' => 'html_tag',
+    '#tag' => 'script',
+    '#attributes' => [
+      'type' => 'text/javascript',
+      'id' => 'Cookiebot',
+      'src' => 'https://consent.cookiebot.com/uc.js',
+      'data-cbid' => $cbid,
+      'async' => 'async',
+    ],
+  ];
+
+  $iab = $config->get('cookiebot_iab_enabled');
+  if ($iab) {
+    $cookiebot['#attributes']['data-framework'] = 'IAB';
+  }
+
+  // Attach the Cookiebot library.
+  $page['#attached']['html_head'][] = [$cookiebot, 'cookiebot'];
+  $page['#attached']['library'][] = 'cookiebot/cookiebot';
+}
+
+/**
+ * Implements hook_node_view_alter().
+ */
+function cookiebot_node_view_alter(array &$build) {
+  $config = \Drupal::config('cookiebot.settings');
+  $cbid = $config->get('cookiebot_cbid');
+  $build['#cache']['tags'] = Cache::mergeTags(!empty($build['#cache']['tags']) ? $build['#cache']['tags'] : [], ['cookiebot:cbid', 'cookiebot:show_declaration']);
+
+  if ($config->get('cookiebot_show_declaration') !== 1 || empty($cbid)) {
+    return;
+  }
+
+  $declaration_node_path = $config->get('cookiebot_show_declaration_node_path');
+  $current_nid = \Drupal::routeMatch()->getRawParameter('node');
+  $current_alias = \Drupal::service('path.alias_manager')->getAliasByPath('/node/' . $current_nid);
+
+  // Print full cookies declaration from Cookiebot.
+  if ($current_alias === $declaration_node_path) {
+    $build['cookiebot'][] = [
+      '#theme' => 'cookiebot_declaration',
+      '#cookiebot_src' => 'https://consent.cookiebot.com/' . $cbid . '/cd.js',
+    ];
+  }
+}
+
+/**
+ * Implements template_preprocess_menu().
+ *
+ * Adds the 'cookiebot-renew' class to the menu link with '/cookiebot-renew' URL
+ * to re-open cookiebot popup.
+ */
+function cookiebot_preprocess_menu(&$vars) {
+  if (empty($vars['items'])) {
+    return;
+  }
+
+  foreach ($vars['items'] as &$item) {
+    if ($item['url']->toString() === '/cookiebot-renew') {
+      /** @var \Drupal\Core\Template\Attribute $attributes */
+      $attributes = $item['attributes'];
+      $attributes->addClass('cookiebot-renew');
+    }
+  }
+}
