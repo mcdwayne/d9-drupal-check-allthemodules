@@ -1,0 +1,237 @@
+<?php
+
+/**
+ * @file
+ * Contains efs.module.
+ */
+
+// @codingStandardsIgnoreStart
+/* @noinspection PhpDocSignatureInspection */
+/* @noinspection PhpUnusedParameterInspection */
+// @codingStandardsIgnoreEnd
+/* @phpcs:disable Drupal.Semantics.FunctionT.NotLiteralString */
+
+use Drupal\Component\Plugin\PluginBase;
+use Drupal\Core\Cache\CacheBackendInterface;
+use Drupal\Core\Entity\ContentEntityFormInterface;
+use Drupal\Core\Entity\Display\EntityDisplayInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\efs\Entity\ExtraField;
+use Drupal\efs\Plugin\Block\ExtraFieldBlock;
+
+/**
+ * Implements hook_help().
+ */
+function efs_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the efs module.
+    case 'help.page.efs':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Provides a plugin type for extra fields that look like real fields, but do not store data.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function efs_theme() {
+  return [
+    'efs' => [
+      'render element' => 'children',
+    ],
+  ];
+}
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function efs_entity_extra_field_info() {
+  $data = &drupal_static(__FUNCTION__, NULL);
+  if ($data !== NULL) {
+    return $data;
+  }
+  $fields = ExtraField::loadMultiple();
+  foreach ($fields as $id => $field) {
+    /** @var \Drupal\efs\Entity\ExtraField $field */
+    $entity_type = $field->getTargetEntityTypeId();
+    $bundle = $field->getBundle();
+    $context = $field->getContext();
+    $mode = $field->getMode();
+    $field_name = $field->getName();
+    $plugin = $field->getPlugin();
+    $weight = $field->get('weight') == NULL ? 0 : $field->get('weight');
+
+    $name = $field_name . '_' . $mode;
+    $data[$entity_type][$bundle][$context][$name] = [
+      'label' => t($field->label()),
+      'weight' => $weight,
+      'visible' => TRUE,
+      'mode' => $mode,
+      'field_name' => $field_name,
+      'plugin' => $plugin,
+      'id' => $id,
+    ];
+    uasort($data[$entity_type][$bundle][$context], 'efs_sort_by_weight');
+  }
+
+  return $data;
+}
+
+/**
+ * Implements hook_entity_presave().
+ */
+function efs_entity_presave(EntityInterface $entity) {
+  // Break if it's not an entity-display entity.
+  if (!($entity instanceof EntityDisplayInterface)) {
+    return;
+  }
+
+  $extra_fields = efs_entity_extra_field_info();
+  $entity_type = $entity->getTargetEntityTypeId();
+  $bundle = $entity->getTargetBundle();
+  $context = ($entity->get('displayContext') == 'view') ? 'display' : $entity->get('displayContext');
+  // Break if there are no extra fields defined by this module.
+  if (empty($extra_fields[$entity_type][$bundle][$context])) {
+    return;
+  }
+
+  // Unset extra field that don't belong to this display.
+  // @see \Drupal\Core\Entity\EntityDisplayBase::init
+  $content = $entity->get('content');
+  foreach ($extra_fields[$entity_type][$bundle][$context] as $name => $field) {
+    if ($entity->getMode() != $field['mode']) {
+      unset($content[$name]);
+    }
+  }
+
+  $entity->set('content', $content);
+}
+
+/**
+ * Function for sorting fields by weight.
+ *
+ * @param array $a
+ *   First array.
+ * @param array $b
+ *   Next array.
+ *
+ * @return bool
+ *   TRUE or FALSE.
+ */
+function efs_sort_by_weight(array $a, array $b) {
+  return $a['weight'] - $b['weight'];
+}
+
+/**
+ * Implements hook_entity_view().
+ */
+function efs_entity_view(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display, $view_mode) {
+  $extra_fields = efs_entity_extra_field_info();
+  $entity_type = $entity->getEntityTypeId();
+  $bundle = $entity->bundle();
+  $context = 'display';
+  if (!empty($extra_fields[$entity_type][$bundle][$context])) {
+    foreach ($extra_fields[$entity_type][$bundle][$context] as $name => $field) {
+      if ($display->getComponent($name) && ($field['mode'] == $view_mode || ($field['mode'] == 'default' && $view_mode == 'full'))) {
+        $extra_field = ExtraField::load($field['id']);
+        $manager = \Drupal::service('plugin.manager.efs.formatters');
+        $plugin_id = $extra_field->getPlugin();
+        /** @var \Drupal\efs\ExtraFieldFormatterPluginBase $plugin */
+        $plugin = $manager->createInstance($plugin_id);
+        $settings = $extra_field->getSettings();
+        if (empty($settings)) {
+          $settings = $plugin->defaultContextSettings($extra_field->getContext());
+        }
+        $plugin->setSettings($settings);
+        $result = $plugin->view($build, $entity, $display, $view_mode, $extra_field);
+        if (!empty($result)) {
+          $result = $result + ['#cache' => ['max-age' => CacheBackendInterface::CACHE_PERMANENT]];
+        }
+        $build[$name] = $result;
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function efs_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+  $build_info = $form_state->getBuildInfo();
+  if (!empty($build_info['callback_object']) && $build_info['callback_object'] instanceof ContentEntityFormInterface) {
+    /** @var \Drupal\Core\Entity\ContentEntityFormInterface $form_object */
+    $form_object = $build_info['callback_object'];
+    $display = $form_object->getFormDisplay($form_state);
+    $entity = $form_object->getEntity();
+    $extra_fields = efs_entity_extra_field_info();
+    $entity_type = $entity->getEntityTypeId();
+    $bundle = $entity->bundle();
+    $context = 'form';
+    $view_mode = $form_object->getOperation();
+    $build = [
+      'form' => &$form,
+      'form_state' => $form_state,
+      'form_object' => $form_object,
+    ];
+    if (!empty($extra_fields[$entity_type][$bundle][$context])) {
+      foreach ($extra_fields[$entity_type][$bundle][$context] as $name => $field) {
+        if ($display->getComponent($name) && ($field['mode'] == $view_mode || ($field['mode'] == 'default' && $view_mode == 'full'))) {
+          $extra_field = ExtraField::load($field['id']);
+          $manager = \Drupal::service('plugin.manager.efs.formatters');
+          $plugin_id = $extra_field->getPlugin();
+          /** @var \Drupal\efs\ExtraFieldFormatterPluginBase $plugin */
+          $plugin = $manager->createInstance($plugin_id);
+          $settings = $extra_field->getSettings();
+          if (empty($settings)) {
+            $settings = $plugin->defaultContextSettings($extra_field->getContext());
+          }
+          $plugin->setSettings($settings);
+          $result = $plugin->view($build, $entity, $display, $view_mode, $extra_field);
+          $form[$name] = $result;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function efs_form_entity_form_display_edit_form_alter(array &$form, FormStateInterface $form_state) {
+  $form_state->loadInclude('efs', 'inc', 'includes/field_ui');
+  efs_field_ui_display_form_alter($form, $form_state);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function efs_form_entity_view_display_edit_form_alter(array &$form, FormStateInterface $form_state) {
+  $form_state->loadInclude('efs', 'inc', 'includes/field_ui');
+  efs_field_ui_display_form_alter($form, $form_state);
+}
+
+/**
+ * Implements hook_block_alter().
+ *
+ * This hook implementation is responsible for replacing the plugin
+ * implementation class for the 'extra_field_block' plugin implemented
+ * by the layout_builder module.
+ */
+function efs_block_alter(array &$definitions) {
+  foreach ($definitions as $id => &$definition) {
+    [$plugin_id] = explode(PluginBase::DERIVATIVE_SEPARATOR, $id, 2);
+
+    if ($plugin_id !== 'extra_field_block') {
+      continue;
+    }
+
+    $definition['class'] = ExtraFieldBlock::class;
+  }
+}
