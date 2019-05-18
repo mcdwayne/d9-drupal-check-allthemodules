@@ -1,0 +1,9 @@
+# Document Indexing
+
+Once the server is configured, the FEM's are created, the Indices derived and the mappings pushed to Elastic your Drupal installation will be ready to index content. If you have existing content you should use one of the options on the [Index page](./indices.md) to push them, otherwise you can let the elastic_search module deal with content as it is created/updated/deleted.
+Exactly how content is indexed depends on the [Server Settings](./server.md) but the indexing itself is handled automatically for any entity action from this point as the elastic_search module adds some CRUD hooks which manage the lifecycle of your elastic documents for you.
+
+Due to the architecture of the plugin, and the ability to squash documents together updating or deleting a drupal entity can trigger a significant number of updates for elastic as all documents that reference it must also be updated. To put this in perspective imagine changing an Article type taxonomy term name. Every single article on the site which uses this taxonomy term now needs to be updated!
+This of course can also produce a cascade of updates as all documents that reference the updated documents will also need to be updated (depending on recursion depth). This is simply too much to do in a single insert without expecting a php timeout, and running a batch process directly on any node save is not a pleasant experience for site admins.
+Because of this by default the elastic_search plugin will queue updates and deletions to make this more manageable, this queueing process uses CRON to run through a series of actions to update referenced documents, which means that CRON must be running for it to function properly.
+The downside of this is that you will have stale data in the index until the cron task is triggered, but running these queues on a regular (10m) interval is generally acceptable.
