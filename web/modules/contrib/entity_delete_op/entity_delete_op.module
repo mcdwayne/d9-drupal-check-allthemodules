@@ -1,0 +1,237 @@
+<?php
+
+/**
+ * @file
+ * Provides generic soft delete capabilities for entities.
+ */
+
+use Drupal\entity_delete_op\EntityDeletableInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_entity_type_alter().
+ */
+function entity_delete_op_entity_type_alter(array &$entity_types) {
+  /** @var \Drupal\Core\Entity\EntityTypeInterface $entity_type  */
+  foreach ($entity_types as $entity_type_id => $entity_type) {
+    if ($entity_type->get('entity_delete_op')) {
+      if (!$entity_type->entityClassImplements(EntityDeletableInterface::class)) {
+        throw new \InvalidArgumentException(sprintf('Entity "%s" has property "entity_delete_op" but does not implement interface "%s".', $entity_type_id, EntityDeletableInterface::class));
+      }
+    }
+    elseif ($entity_type->entityClassImplements(EntityDeletableInterface::class)) {
+      $entity_type->set('entity_delete_op', TRUE);
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_base_field_info().
+ */
+function entity_delete_op_entity_base_field_info(\Drupal\Core\Entity\EntityTypeInterface $entity_type) {
+  $fields = [];
+  if ($entity_type->get('entity_delete_op')) {
+    if (isset($fields['deleted'])) {
+      throw new \InvalidArgumentException(sprintf('Entity type "%s" implements base field named "%s" which is a reserved field name for entity delete.', $entity_type->id(), 'deleted'));
+    }
+
+    $label = \Drupal::config('entity_delete_op.settings')
+      ->get('label_base_field');
+    $label = !empty($label) ? $label : t('Deleted');
+
+    $fields['deleted'] = BaseFieldDefinition::create('boolean')
+      ->setLabel($label)
+      ->setRequired(TRUE)
+      ->setRevisionable(TRUE)
+      ->setDefaultValue(0)
+      ->setSettings([])
+      ->setDisplayOptions('view', [])
+      ->setDisplayOptions('form', [])
+      ->setDisplayConfigurable('view', TRUE)
+      ->setDisplayConfigurable('form', FALSE);
+  }
+  return $fields;
+}
+
+/**
+ * Implements hook_entity_operation().
+ */
+function entity_delete_op_entity_operation(EntityInterface $entity) {
+  $operations = [];
+  /** @var EntityTypeInterface $entity_type */
+  $entity_type = $entity->getEntityType();
+  if (!$entity_type->get('entity_delete_op')) {
+    return $operations;
+  }
+
+  $account = \Drupal::currentUser();
+  $entity_type_id = $entity->getEntityType()->id();
+
+  $destination = ['query' => \Drupal::destination()->getAsArray()];
+
+  /** @var \Drupal\entity_delete_op\Access\AccessCheckBase $access_checker */
+  $access_checker = \Drupal::service('entity_delete_op.access_checker.checker');
+
+  if (!$entity->isDeleted() && $access_checker->checkAccess('delete', $entity_type_id, $entity->id(), $account)->isAllowed()) {
+    // For entities that do not have a delete link template, we will provide
+    // a entity operation here. In all other cases, the route subscriber will
+    // actually perform a route alteration to point the route to this one.
+    if (!$entity_type->hasLinkTemplate('delete_form')) {
+      $delete_label = \Drupal::config('entity_delete_op.settings')
+        ->get('label_delete_operation');
+      $delete_label = !empty($delete_label) ? $delete_label : t('Delete');
+
+      $operations['entity_delete_op_delete'] = [
+        'title' => $delete_label,
+        'url' => Url::fromRoute('entity_delete_op.delete_form', [
+          'entity_type_id' => $entity_type->id(),
+          'entity_id' => $entity->id(),
+        ], $destination),
+        'weight' => 105,
+      ];
+    }
+  }
+
+  if ($entity->isDeleted() && $access_checker->checkAccess('restore', $entity_type_id, $entity->id(), $account)->isAllowed()) {
+    $restore_label = \Drupal::config('entity_delete_op.settings')
+      ->get('label_restore_operation');
+    $restore_label = !empty($restore_label) ? $restore_label : t('Restore');
+
+    $operations['entity_delete_op_restore'] = [
+      'title' => $restore_label,
+      'url' => Url::fromRoute('entity_delete_op.restore_form', [
+        'entity_type_id' => $entity_type->id(),
+        'entity_id' => $entity->id(),
+      ], $destination),
+      'weight' => 110,
+    ];
+  }
+
+  if ($access_checker->checkAccess('purge', $entity_type_id, $entity->id(), $account)->isAllowed()) {
+    $purge_label = \Drupal::config('entity_delete_op.settings')
+      ->get('label_purge_operation');
+    $purge_label = !empty($purge_label) ? $purge_label : t('Purge');
+
+    $operations['entity_delete_op_purge'] = [
+      'title' => $purge_label,
+      'url' => Url::fromRoute('entity_delete_op.purge_form', [
+        'entity_type_id' => $entity_type->id(),
+        'entity_id' => $entity->id(),
+      ], $destination),
+      'weight' => 120,
+    ];
+  }
+
+  return $operations;
+}
+
+/**
+ * Implements hook_entity_operation_alter().
+ */
+function entity_delete_op_entity_operation_alter(array &$operations, \Drupal\Core\Entity\EntityInterface $entity) {
+  /** @var \Drupal\Core\Entity\EntityTypeInterface $entity_type */
+  $entity_type = $entity->getEntityType();
+  if (!$entity_type->get('entity_delete_op') || !($entity instanceof EntityDeletableInterface)) {
+    return;
+  }
+
+  if (isset($operations['delete'])) {
+    $delete_label = \Drupal::config('entity_delete_op.settings')
+      ->get('label_delete_operation');
+    $delete_label = !empty($delete_label) ? $delete_label : t('Delete');
+    $operations['delete']['title'] = $delete_label;
+  }
+
+  if ($entity->isDeleted()) {
+    unset($operations['delete']);
+    unset($operations['entity_delete_op_delete']);
+  }
+  elseif (isset($operations['delete']) && isset($operations['entity_delete_op_delete'])) {
+    unset($operations['entity_delete_op_delete']);
+    $operations['delete']['weight'] = 100;
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function entity_delete_op_form_alter(array &$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  $form_object = $form_state->getFormObject();
+  if (!($form_object instanceof \Drupal\Core\Entity\ContentEntityForm)) {
+    return;
+  }
+
+  $entity = $form_object->getEntity();
+  if (!($entity instanceof EntityDeletableInterface)) {
+    return;
+  }
+
+  if ($entity->isNew()) {
+    return;
+  }
+
+  if (isset($form['actions']['delete'])) {
+    unset($form['actions']['delete']);
+  }
+
+  $account = \Drupal::currentUser();
+
+  $entity_type_id = $entity->getEntityType()->id();
+  /** @var \Drupal\entity_delete_op\Access\AccessCheckBase $access_checker */
+  $access_checker = \Drupal::service('entity_delete_op.access_checker.checker');
+
+  if (!$entity->isDeleted() && $access_checker->checkAccess('delete', $entity_type_id, $entity->id(), $account)->isAllowed()) {
+    $delete_label = \Drupal::config('entity_delete_op.settings')
+      ->get('label_delete_operation');
+    $delete_label = !empty($delete_label) ? $delete_label : t('Delete');
+
+    $form['actions']['delete'] = [
+      '#type' => 'link',
+      '#title' => $delete_label,
+      '#url' => Url::fromRoute('entity_delete_op.delete_form', [
+        'entity_type_id' => $entity_type_id,
+        'entity_id' => $entity->id(),
+      ]),
+      '#button_type' => 'danger',
+      '#weight' => 100,
+    ];
+  }
+
+  if ($entity->isDeleted() && $access_checker->checkAccess('restore', $entity_type_id, $entity->id(), $account)->isAllowed()) {
+    $restore_label = \Drupal::config('entity_delete_op.settings')
+      ->get('label_restore_operation');
+    $restore_label = !empty($restore_label) ? $restore_label : t('Restore');
+
+    $form['actions']['restore'] = [
+      '#type' => 'link',
+      '#title' => $restore_label,
+      '#url' => Url::fromRoute('entity_delete_op.restore_form', [
+        'entity_type_id' => $entity_type_id,
+        'entity_id' => $entity->id(),
+      ]),
+      '#button_type' => 'danger',
+      '#weight' => 110,
+    ];
+  }
+
+  if ($access_checker->checkAccess('purge', $entity_type_id, $entity->id(), $account)->isAllowed()) {
+    $purge_label = \Drupal::config('entity_delete_op.settings')
+      ->get('label_purge_operation');
+    $purge_label = !empty($purge_label) ? $purge_label : t('Purge');
+
+    $form['actions']['purge'] = [
+      '#type' => 'link',
+      '#title' => $purge_label,
+      '#url' => Url::fromRoute('entity_delete_op.purge_form', [
+        'entity_type_id' => $entity_type_id,
+        'entity_id' => $entity->id(),
+      ]),
+      '#button_type' => 'danger',
+      '#weight' => 120,
+    ];
+  }
+
+}
