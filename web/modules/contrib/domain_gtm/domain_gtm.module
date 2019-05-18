@@ -1,0 +1,253 @@
+<?php
+
+/**
+ * @file
+ * Provides GTM Config for domains.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+
+/**
+ * Implements hook_form_alter().
+ */
+function domain_gtm_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // Change form id here.
+  if ($form_id == 'google_tag_settings') {
+    $form['advanced']['include_file']['#access'] = FALSE;
+    $form['advanced']['rebuild_snippets']['#access'] = FALSE;
+    $form['advanced']['debug_output']['#access'] = FALSE;
+
+    $configFactory = \Drupal::config('google_tag.settings');
+    $loader = \Drupal::service('domain.loader');
+    $alldomains = $loader->loadMultiple();
+
+    // To create fields if domain is not default.
+    foreach ($alldomains as $domain) {
+      if (!$domain->isDefault()) {
+        $form['general'][$domain->id()] = [
+          '#type' => 'textfield',
+          '#title' => t('Container ID for Domain : <b>@domainname</b>', ['@domainname' => $domain->getHostname()]),
+          '#maxlength' => 64,
+          '#size' => 50,
+          '#default_value' => $configFactory->get($domain->id()),
+          '#weight' => '0',
+        ];
+      }
+      else {
+        $form['general']['container_id']['#title'] = t('Container ID for Domain : <b>@domainname</b>', ['@domainname' => $domain->getHostname()]);
+        $form['general']['container_id']['#size'] = 50;
+      }
+    }
+
+    $form['#submit'][] = 'google_tag_settings_form_alter_save';
+  }
+}
+
+/**
+ * Function to save the configuration for mutidomain google tag code.
+ */
+function google_tag_settings_form_alter_save(&$form, &$form_state) {
+  $configFactory = \Drupal::configFactory()->getEditable('google_tag.settings');
+  $allDomain = \Drupal::service('domain.loader')->loadOptionsList();
+
+  foreach ($allDomain as $key => $value) {
+    $configFactory->set($key, $form_state->getValue($key))->save();
+  }
+}
+
+/**
+ * Function to attach Script Tag.
+ */
+function domain_gtm_page_attachments(&$attachments) {
+  $config = \Drupal::config('google_tag.settings');
+  $include_classes = $config->get('include_classes');
+  $types = $include_classes ? ['data_layer', 'script'] : ['script'];
+  $weight = 9;
+  $config_key = _domain_gtm_get_config_key();
+  foreach ($types as $type) {
+    $gtm_script = _domain_gtm_inline_tag($type, $config_key, $weight++);
+    if (!empty($gtm_script)) {
+      $attachments['#attached']['html_head'][] = $gtm_script;
+    }
+  }
+}
+
+/**
+ * Helper function to return key for 'google_tag.settings' config.
+ */
+function _domain_gtm_get_config_key() {
+  $default_domain = \Drupal::service('domain.loader')->loadDefaultId();
+  $config_key = \Drupal::service('domain.negotiator')->getActiveId();
+  if ($default_domain == $config_key) {
+    $config_key = 'container_id';
+  }
+  return $config_key;
+}
+
+/**
+ * Function to Return Inline Tag Attachments.
+ */
+function _domain_gtm_inline_tag($type, $config_key, $weight) {
+  $func_name = '_domain_gtm_' . $type . '_snippet';
+  $contents = $func_name($config_key);
+  $attachment = $contents ? [
+  [
+    '#type' => 'html_tag',
+    '#tag' => 'script',
+    '#value' => $contents,
+    '#weight' => $weight,
+  ],
+    "google_tag_{$type}_tag",
+  ] : [];
+  return $attachment;
+}
+
+/**
+ * Function to get Script Snippet.
+ */
+function _domain_gtm_script_snippet($config_key) {
+  // Gather data.
+  $config = \Drupal::config('google_tag.settings');
+  $container_id = _domain_gtm_variable_clean('container_id');
+  $data_layer = _domain_gtm_variable_clean('data_layer');
+  $query = _domain_gtm_environment_query();
+  $compact = $config->get('compact_snippet');
+
+  $domain_gtm = _domain_gtm_variable_clean($config_key);
+  if (!empty($domain_gtm)) {
+    $container_id = $domain_gtm;
+  }
+
+  // Build script snippet.
+  $script = <<<EOS
+(function(w,d,s,l,i){
+
+  w[l]=w[l]||[];
+  w[l].push({'gtm.start':new Date().getTime(),event:'gtm.js'});
+  var f=d.getElementsByTagName(s)[0];
+  var j=d.createElement(s);
+  var dl=l!='dataLayer'?'&l='+l:'';
+  j.src='https://www.googletagmanager.com/gtm.js?id='+i+dl+'$query';
+  j.async=true;
+  f.parentNode.insertBefore(j,f);
+
+})(window,document,'script','$data_layer','$container_id');
+EOS;
+  if ($compact) {
+    $script = str_replace(["\n", '  '], '', $script);
+  }
+  /*
+  $script = <<<EOS
+  <!-- Google Tag Manager -->
+  $script
+  <!-- End Google Tag Manager -->
+  EOS;
+   */
+  return $script;
+}
+
+/**
+ * Function To Get NoScript Tag.
+ */
+function domain_gtm_page_top(&$page) {
+  $config_key = _domain_gtm_get_config_key();
+  // Add noscript snippet to page_top region.
+  $contents = _domain_gtm_noscript_snippet($config_key);
+  if ($contents) {
+    $page['google_tag_noscript_tag'] = [
+      '#markup' => $contents,
+      '#allowed_tags' => ['noscript', 'iframe'],
+      '#weight' => -10,
+    ];
+  }
+}
+
+/**
+ * Function To Get No Script Snippet.
+ */
+function _domain_gtm_noscript_snippet($config_key) {
+  // Gather data.
+  $config = \Drupal::config('google_tag.settings');
+  $container_id = _domain_gtm_variable_clean('container_id');
+  $query = _domain_gtm_environment_query();
+  $compact = $config->get('compact_snippet');
+
+  $domain_noscript_gtm = _domain_gtm_variable_clean($config_key);
+  if (!empty($domain_noscript_gtm)) {
+    $container_id = $domain_noscript_gtm;
+  }
+  // Build noscript snippet.
+  // @todo Core removes the 'style' attribute from the snippet; so omit it.
+  // style="display:none;visibility:hidden".
+  $noscript = <<<EOS
+<noscript aria-hidden="true"><iframe src="https://www.googletagmanager.com/ns.html?id=$container_id$query"
+ height="0" width="0" title="Google Tag Manager">Google Tag Manager</iframe></noscript>
+EOS;
+  if ($compact) {
+    $noscript = str_replace("\n", '', $noscript);
+  }
+  /*
+  $noscript = <<<EOS
+  <!-- Google Tag Manager -->
+  $noscript
+  <!-- End Google Tag Manager -->
+  EOS;
+   */
+  return $noscript;
+}
+
+/**
+ * Function To Get Data Layer Snippet.
+ */
+function _domain_gtm_data_layer_snippet($config_key) {
+  $data_layer = _domain_gtm_variable_clean('data_layer');
+
+  $classes = [];
+  $names = ['whitelist', 'blacklist'];
+  foreach ($names as $name) {
+    $$name = explode("\n", $$name);
+    if (empty($$name)) {
+      continue;
+    }
+    $classes["gtm.$name"] = $$name;
+  }
+
+  if ($classes) {
+    // Build data layer snippet.
+    $script = "var $data_layer = [" . json_encode($classes) . '];';
+    return $script;
+  }
+}
+
+/**
+ * Function To Get GTM Enviroment Query.
+ */
+function _domain_gtm_environment_query() {
+  $config = \Drupal::config('google_tag.settings');
+  if (!$config->get('include_environment')) {
+    return '';
+  }
+
+  // Gather data.
+  $environment_id = _domain_gtm_variable_clean('environment_id');
+  $environment_token = _domain_gtm_variable_clean('environment_token');
+
+  // Build query string.
+  return "&gtm_auth=$environment_token&gtm_preview=$environment_id&gtm_cookies_win=x";
+}
+
+/**
+ * Function To Trim White Spaces.
+ */
+function _domain_gtm_variable_clean($variable) {
+  $config = \Drupal::config('google_tag.settings');
+  return trim(json_encode($config->get($variable)), '"');
+}
+
+/**
+ * Function To Make Default Domain GTM False for Other Countries.
+ */
+function domain_gtm_google_tag_insert_alter(&$satisfied) {
+  // Do something to the state.
+  $satisfied = FALSE;
+}
