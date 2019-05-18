@@ -1,0 +1,97 @@
+<?php
+
+/**
+ * @file
+ * Contains search_api_reference.module.
+ */
+
+use Drupal\search_api\Query\QueryInterface;
+use Solarium\QueryType\Select\Query\Query;
+
+/**
+ * Implements hook_search_api_solr_query_alter().
+ *
+ * Converts the query into a graph query, applying edismax to the data set, if
+ * its enabled for the query.
+ */
+function search_api_reference_search_api_solr_query_alter(Query $solarium_query, QueryInterface $query) {
+  // If the reference processor is enabled on the index, alter the solr query.
+  $index = $query->getIndex();
+  if ($index->isValidProcessor("reference")) {
+    $reference = $index->getProcessor("reference");
+
+    $search_string = $solarium_query->getQuery();
+    $components = $solarium_query->getComponents();
+
+    // If edismax is enabled build the query, otherwise use original string.
+    $graph_input = $search_string;
+    if (isset($components[Query::COMPONENT_EDISMAX])) {
+      $graph_input = '';
+
+      // Build the filter string for the edismax results.
+      $fqs = $solarium_query->getFilterQueries();
+      if (!empty($fqs)) {
+        // Foreach filter, copy them to a reusable param, and add the condition.
+        foreach ($fqs as $filter_id => $fq) {
+          if (!empty($graph_input)) {
+            $graph_input .= ' AND ';
+          }
+          // Prefix the filter_id to avoid collisions.
+          $filter_id = "ff_" . $filter_id;
+          $filter_string = '{!v=$' . $filter_id . '}';
+          $solarium_query->addParam($filter_id, $fq->getQuery());
+          $fq->setQuery($filter_string);
+
+          $graph_input .= $filter_string;
+        }
+        $graph_input = '(' . $graph_input . ') AND ';
+      }
+
+      // Get the dismax compointent, and build the edismax query.
+      $edismax = $components[Query::COMPONENT_EDISMAX];
+      // Remove the dismax query from the search.
+      $solarium_query->removeComponent(Query::COMPONENT_EDISMAX);
+      $edismax_string = '{!edismax';
+
+      // Qf may not always exist. If it does, copy it to a param, and add it to
+      // the edismax string.
+      $qf = $edismax->getQueryFields();
+      if (!empty($qf)) {
+        $solarium_query->addParam("fields", $qf);
+        $edismax_string .= ' qf=$fields';
+      }
+
+      // Use a query param for the search string as well, for consistency.
+      $solarium_query->addParam("qq", $search_string);
+      $edismax_string .= ' v=$qq}';
+
+      // Append this to the input query of the graph.
+      $graph_input .= $edismax_string;
+    }
+
+    // Contruct the graph query.
+    $new_query = '{!graph from=sm_reference to=ss_search_api_id}(' . $graph_input . ')';
+
+    // Build datasource filter.
+    $datasource_filter = "";
+    // Each datasource will be prefixed if mode is 'all but'.
+    $prefix = ($reference->getConfiguration()['default']) ? "-" : "";
+
+    // Build a condition for all selected datasources, Prefixing them per above.
+    foreach ($reference->getConfiguration()['sources'] as $source_id) {
+      if (!empty($datasource_filter)) {
+        $datasource_filter .= " ";
+      }
+      $datasource_filter .= $prefix . 'ss_search_api_datasource:"' . $source_id . '"';
+    }
+
+    if (!empty($datasource_filter)) {
+      // Apply filter.
+      $solarium_query->createFilterQuery("result_type")->setQuery($datasource_filter);
+    }
+
+    // Update the query with th new string.
+    $solarium_query->setQuery($new_query);
+  }
+
+}
