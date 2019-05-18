@@ -1,0 +1,779 @@
+<?php
+
+use Drupal\Core\Render;
+use Drupal\Core\Url;
+use Drupal\data_import\Controller\DataImportBatchController;
+
+// Data Import Status
+define('DATA_IMPORT_NOTICE', 0);
+define('DATA_IMPORT_INFO', 1);
+define('DATA_IMPORT_ERROR', 2);
+
+/**
+ * Implements hook_libraries_info().
+ */
+ function data_import_libraries_info() {
+  return array(
+    'sftp' => array(
+      'name' => 'sftp',
+      'path' => 'vendor',
+      'files' => array(
+        'php' => array(
+          'autoload.php',
+        ),
+      ),
+    ),
+    'cron-expression' => array(
+      'name' => 'cron-expression',
+      'path' => 'vendor',
+      'files' => array(
+        'php' => array(
+          'autoload.php',
+        ),
+      ),
+    ),
+  );
+}
+
+/**
+ * Implement hook_theme
+ */
+ function data_import_theme($existing, $type, $theme, $path) {
+  return array(
+    'data_import_table_form' => array(
+      'render element' => 'form',
+      'function' => 'theme_data_import_table_form'
+    ),
+  );
+}
+
+/**
+ * Data import Tanle Theme.
+ */
+ function theme_data_import_table_form($element) {
+  $form = $element['form'];
+
+  $header = array(
+    array('data' => 'Active', 'align' => 'center'),
+    'Importer',
+    'Actions',
+    'Logs');
+  $rows = array();
+
+  foreach (\Drupal\Core\Render\Element::children($form) as $importer) {
+    $linkEdit = \Drupal::l(t('Edit'), \Drupal\Core\Url::fromRoute('data_import.edit_importer', ['importer_id' => $importer]));
+    $linkDelete = \Drupal::l(t('Delete'), \Drupal\Core\Url::fromRoute('data_import.delete_importer', ['importer_id' => $importer]));
+    $linkRun = \Drupal::l(t('Run'), \Drupal\Core\Url::fromRoute('data_import.run_importer', ['importer_id' => $importer]));
+    $linkLog = \Drupal::l(t('Log'), \Drupal\Core\Url::fromRoute('data_import.log'));
+
+    // info importer
+    $el = array('#markup' => $form[$importer]['#importer_name'] .' <b><em>(' . $importer . ')</em></b>');
+    $cell_element = \Drupal::service('renderer')->render($el);
+
+    // actions
+    $links = array('#markup' => $linkRun . ' / ' . $linkEdit . ' / ' . $linkDelete);
+    $links_element = \Drupal::service('renderer')->render($links);
+
+    $rows[] = array(
+      array('data' => drupal_render($form[$importer]), 'align' => 'center'),
+      $cell_element,
+      array('data' =>  $links_element, 'align' => 'center'),
+      array('data' => $linkLog, 'align' => 'center')
+    );
+  }
+  $data_theme = array(
+    '#theme' => 'table',
+    '#header' => $header,
+    '#rows' => $rows,
+   );
+  
+   return \Drupal::service('renderer')->render($data_theme);
+  // return theme('table', array('header' => $header, 'rows' => $rows));
+}
+
+/**
+ * Function that loads an importer
+ *
+ * @param $importer_id
+ *   The importer ID it needs to load.
+ *
+ * @return $importer
+ *   The importer that was requested or FALSE if non-existent
+ */
+ function data_importer_load($importer_id) {
+  $importers = data_import_load_all_importers();
+  return isset($importers[$importer_id]) ? $importers[$importer_id] : FALSE;
+}
+
+/**
+ * Function that loads existing importers
+ *
+ *
+ * @return $importers
+ *   The importers that was requested
+ */
+function data_import_load_all_importers() {
+  return db_query('SELECT * FROM {data_import_importer_item}')->fetchAllAssoc('importer_id', PDO::FETCH_ASSOC);
+}
+
+/**
+ * Function to save importer in database
+ *
+ * @param $data
+ *   Configuration data to save
+ */
+function data_importer_save($data) {
+  $default = array('importer_id' => '', 'name' => '', 'importer_type' => '', 'ftp_type' => '', 'host' => '', 'port' => '', 'username' => '', 'password' => '',
+  'remote_directory' => '', 'local_directory' => '', 'file_name' => '', 'upload_file' => '', 'file_type' => '', 'delimiter' => '', 'skip_line' => '', 'active' => '', 'entity' => '',
+  'bundle_name' => '', 'schedule_rule' => '', 'optimizer' => '');
+
+    // Remove any unexpected fields.
+    if(!empty($data['upload_file']) && is_array($data['upload_file'])){
+        $data['upload_file'] = $data['upload_file'][0];
+    }
+    $data = array_intersect_key($data, $default);
+
+  db_merge('data_import_importer_item')
+      ->key(array('importer_id' => $data['importer_id']))
+      ->fields($data)
+      ->execute();
+}
+
+/**
+ * Function to delete importer
+ *
+ * @param $importer_id
+ *   id of the importer to delete
+ */
+function data_importer_delete($importer_id) {
+  db_delete('data_import_importer_item')
+      ->condition('importer_id', $importer_id)
+      ->execute();
+  db_delete('data_import_mapping_item')
+      ->condition('importer_id', $importer_id)
+      ->execute();
+}
+
+/**
+ * Function that loads all mappins for importer
+ *
+ * @param $importer_id
+ *   The importer ID it needs to load.
+ *
+ * @param $field
+ *   Optional argument to get mappings info of specific field.
+ *
+ * @return $mappings
+ *   All mappings of the importer
+ */
+function load_data_importer_mappings($importer_id, $field = null) {
+  $map = db_select('data_import_mapping_item', 'm')
+      ->fields('m')
+      ->where('importer_id = :importer_id', array(':importer_id' => $importer_id));
+
+  if (!is_null($field)) {
+    $map->condition('m.field_name', $field, '=');
+  }
+
+  return $map->execute()->fetchAllAssoc('id', PDO::FETCH_ASSOC);
+}
+
+/**
+ * Function that update, insert & delete mapping in databse
+ *
+ * @param $mapping
+ *   mapping to save or update
+ *
+ * @param $action
+ *   db action
+ */
+function save_data_import_mappings($mapping, $action) {
+
+  $default = array('id' => '', 'importer_id' => '', 'source' => '', 'field_name' => '', 'override' => '', 'primary_key' => '');
+
+  // Remove any unexpected fields.
+  $mapping = array_intersect_key($mapping, $default);
+
+  switch ($action) {
+    case 'insert':
+      db_insert('data_import_mapping_item')
+          ->fields($mapping)
+          ->execute();
+      break;
+
+    case 'update':
+      db_update('data_import_mapping_item')
+          ->fields($mapping)
+          ->condition('id', $mapping['id'], '=')
+          ->execute();
+      break;
+
+    case 'delete':
+      db_delete('data_import_mapping_item')
+          ->condition('id', $mapping['id'], '=')
+          ->execute();
+      break;
+
+    default:
+      break;
+  }
+}
+
+/**
+ * Function to get the primary key field of the importer
+ *
+ * @param $importer_id
+ *   The importer ID it needs to load.
+ *
+ * @return 
+ *   The primary key (field name) of the importer
+ */
+function get_data_importer_primary_key($importer_id) {
+  return db_select('data_import_mapping_item', 'm')
+          ->fields('m', array('field_name'))
+          ->where('importer_id = :importer_id', array(':importer_id' => $importer_id))
+          ->execute()
+          ->fetchField();
+}
+
+
+/**
+ * Callback function of hook_cronapi
+ *
+ * @param type $importer_id
+ */
+function data_import_cron_job_callback($importer_id) { 
+  DataImportBatchController::content($importer_id, FALSE);
+}
+
+/**
+ * Function to get cron schedule rule
+ *
+ * @param type $importer_id
+ * @return type
+ */
+ function data_importer_get_schedule_rule($importer_id) {
+  return db_select('data_import_importer_item', 'di')->fields('di', array('schedule_rule'))->condition('importer_id', $importer_id, '=')->execute()->fetchField();
+}
+
+/**
+ * Function to insert data in data_import_log table
+ *
+ * @param $status
+ *  Log status ( NOTICE : 0 / INFO : 1 / ERROR : 2 )
+ *
+ * @param $message
+ *  log message
+ *
+ */
+ function data_import_log($status, $message) {
+  $import_process = &drupal_static('data_import_process');
+  $field_data = array(
+    'process_id' => $import_process['process_id'],
+    'importer_id' => $import_process['importer_id']?$import_process['importer_id']:'preprocess',
+    'status' => $status,
+    'message' => base64_encode(utf8_encode($message)),
+    'timestamp' => time()
+  );
+
+  db_insert('data_import_log')
+      ->fields($field_data)
+      ->execute();
+}
+
+/**
+ * Function to get file on remote server
+ *
+ * @param $importer_config
+ *  all importer configuration
+ *
+ * @param $secure_protocol
+ *  Server protocol type (SFTP / FTP)
+ *
+ * @return file location
+ */
+ function data_import_get_file($importer_config, $secure_protocol = 0) {
+  require_once dirname(__FILE__) . '/inc/data_import.getFile.inc';
+
+  if ($secure_protocol == 1) {
+    return data_import_get_file_sftp($importer_config);
+  } else {
+    return data_import_get_file_ftp($importer_config);
+  }
+}
+
+
+/**
+ * Function to parse data
+ *
+ * @param $file
+ *  file location
+ *
+ * @param $data_importer
+ *  All config of the impoerter
+ *
+ * @return data parsed
+ */
+ function data_import_parse_file($file, $data_importer) {
+  switch ($data_importer['file_type']) {
+    case 'txt':
+      require_once dirname(__FILE__) . '/inc/parser/data_import.parserTXT.inc';
+      return data_import_parse_txt_file($file, $data_importer['delimiter']);
+      break;
+    case 'csv':
+      require_once dirname(__FILE__) . '/inc/parser/data_import.parserCSV.inc';
+      return data_import_parse_csv_file($file, $data_importer['delimiter']);
+      break;
+    case 'xls':
+      require_once dirname(__FILE__) . '/inc/parser/data_import.parserXLS.inc';
+      return data_import_parse_xls_file($file, $data_importer['delimiter']);
+      break;
+    default:
+      data_import_log(DATA_IMPORT_ERROR, t('Undefined parse for this file type @file', array('@file' => $file)));
+      return;
+      break;
+  }
+}
+
+/**
+ * Function to get data by importer_id
+ *
+ * @param $importer_id
+ *  Importer ID
+ *
+ * @return data
+ */
+ function data_import_get_data($importer_id) {
+  $prepared_data = array();
+  if (!empty($importer_id)) {
+    $datas = db_select('data_import_data', 'd')->fields('d', array('id', 'data'))->condition(db_or()->condition('soft_delete', NULL, 'IS')->condition('soft_delete', 0))->condition('importer_id', $importer_id, '=')->execute()->fetchAllKeyed(0, 1);
+    if (!empty($datas)) {
+      foreach ($datas as $i => $data) {
+        $prepared_data[] = mb_unserialize(utf8_decode(base64_decode($data)));
+      }
+    }
+  }
+  return $prepared_data;
+}
+
+/**
+ *  Unserialize data
+ */
+function mb_unserialize($string) {
+  $string2 = preg_replace_callback(
+    '!s:(\d+):"(.*?)";!s',
+    function($m){
+      $len = strlen($m[2]);
+      $result = "s:$len:\"{$m[2]}\";";
+      return $result;
+    },
+    $string);
+  return unserialize($string2);
+}
+
+/**
+ * Function to insert data in table
+ *
+ * @param $data
+ *  Data to insert
+ *
+ * @param $importer_id
+ *  importer ID
+ *
+ * @return type
+ */
+ function data_import_insert_data($data, $importer_id) {
+  if (empty($data)) {
+      data_import_log(DATA_IMPORT_ERROR, t('Import data is empty', array()));
+      return;
+  }
+
+  // Clean old values before insert new
+  db_update('data_import_data')->fields(array('soft_delete' => 1))->condition('importer_id', $importer_id, '=')->execute();
+
+  $fields = array(
+    'importer_id', 'data', 'process_id', 'status', 'timestamp'
+  );
+  $import_process = &drupal_static('data_import_process');
+
+  // Insert data
+  try {
+    foreach ($data as $key => $row) {
+      $query = db_insert('data_import_data')->fields($fields);
+      $values = array(
+        'importer_id' => $importer_id,
+        'data' => base64_encode(utf8_encode(serialize($row))),
+        'process_id' => $import_process['process_id'],
+        'status' => DATA_IMPORT_INFO,
+        'timestamp' => time(),
+        'soft_delete' => 0
+      );
+      data_import_log(DATA_IMPORT_INFO, t('Insert data row @key', array('@key' => $key)));
+      $query->values($values);
+      $query->execute();
+    }
+  } catch (Exception $e) {
+    data_import_log(DATA_IMPORT_ERROR, $e->getMessage());
+  }
+}
+
+/**
+ * Function to process importer
+ *
+ * @param $importer_id
+ *  Importer ID
+ *
+ * @param $progressive
+ *  boolean if create a prodressive batch or not
+ *
+ */
+ function data_import_process_import($datas, $progressive) {
+  $datas['current_data'] = data_import_get_data($datas['importer_id']);
+  if (!empty($datas)) {
+    // require_once dirname(__FILE__) . '/inc/data_import.batch.inc';
+    // data_import_batch_process($datas, $datas['importer_id'], $progressive);
+    return ['datas'=>$datas,'importer_id'=>$datas['importer_id'], 'progressive'=>$progressive];
+  }
+}
+
+/**
+ * Function to save item
+ *
+ * @param $item
+ *  item data
+ *
+ * @param $importer_id
+ *  Importer ID
+ *
+ * @param $row
+ *  item row number
+ */
+ function data_import_save_item($item, $previous_data, $importer_id, $row) {
+  $importer = data_importer_load($importer_id);
+  $entity_type = $importer['entity'];
+  $bundle_name = $importer['bundle_name'];
+  $primary_key = get_data_importer_primary_key($importer_id);
+
+  $skip = 0;
+
+  // Skip rows whose data is same as previous batch run
+  if($importer['optimizer'] && $previous_data && in_array($item,$previous_data)){
+    $skip = 1;
+  }
+
+  $line = $item;
+  
+  // Apply mapping sourceCol and fieldName
+  $mapping = load_data_importer_mappings($importer_id);
+  foreach ($mapping as $j => $map) {
+    $item_mapped[$map['field_name']] = $item[$map['source']];
+  }
+  $item = $item_mapped;
+
+  // Calling all modules implementing hook_data_import_alter(&$item, $importer_id, $line) :
+  \Drupal::moduleHandler()->alter('data_import', $item, $importer_id, $line);
+
+  if(empty(trim($item[$primary_key]))){
+    $skip = 1;
+  }
+  
+  $entity_status = NULL;
+  $save_func = 'data_import_save_' . $entity_type;
+  if (is_callable($save_func) && !$skip) {  
+    $element = $save_func($item, $importer);
+    $entity = $element['entity'];
+    // set fields value
+    foreach ($item as $field_name => $field_value) {
+      $field_settings = get_field_data_value_type($entity_type, $field_name, $bundle_name);
+      $field_type = $field_settings['type'];
+      if ((empty($entity->{$field_name})) || (!empty($entity->{$field_name}) && is_allowed_to_override($importer_id, $field_name)) && !is_null($field_value) ){ 
+        if($element['type'] == 'create'){
+          if (in_array($field_name, $element['base_field'])){
+            $entity[$field_name] = $field_value;
+          }else{ 
+            $entity[$field_name][$field_type] = $field_value;
+          }
+        }else{
+          if($field_settings['multiple_value']){
+            if(!empty($entity->get($field_name)->getValue())){
+              $value_check = [];
+              foreach ($entity->get($field_name)->getValue() as $key => $value) {
+                $value_check[] = $value[$field_type];
+              }
+              if(!in_array($field_value, $value_check)){
+                $field_values = $entity->get($field_name)->getValue();
+                $field_values[] = [$field_type => $field_value];
+                $entity->set($field_name, $field_values);
+              }
+            }else{
+              $entity->set($field_name, $field_value);
+            }
+          }else{
+            $entity->set($field_name, $field_value);
+          }
+        }
+      }
+    }    
+    // If entity new
+    if($element['type'] == 'create') {
+      switch($entity_type){
+        case 'node':
+          $entity = \Drupal\node\Entity\Node::create($entity);
+          break;
+        case 'taxonomy_term':
+          $entity = \Drupal\taxonomy\Entity\Term::create($entity);
+          break;
+        case 'user':
+          $entity =  \Drupal\user\Entity\User::create($entity);
+          break;
+        default:
+          break;
+      }
+    }
+  }
+
+  // Validate node
+  $status = 0;
+  $message = '';
+
+  // set message if row is to be skipped
+  if($skip) {
+    $status = DATA_IMPORT_INFO;
+    $message = 'row : '.$row.' - Entity: ' . $entity_type .' ' . $bundle_name . ' skipped since no changes';
+  } else {
+    try {
+      $status = DATA_IMPORT_INFO;
+      $message = 'row : '.$row.' - Entity: ' . $entity_type .' ' . $bundle_name . ' successfully imported';
+      $entity->save();
+    } catch(Exception $e) {
+      $status = DATA_IMPORT_ERROR;
+      $message = $e->getMessage();
+    }
+  }
+  // log
+  data_import_log($status, $message);
+}
+
+/**
+ * This function load user if it's already exist by the primary key field
+ *  if not the user will be created
+ *
+ * @param $item
+ *  item data
+ *
+ * @param $importer
+ *  importer config
+ *
+ * @return array
+ *  return the user entity (credted / loaded) & all user base field
+ */
+ function data_import_save_user($item, $importer) {
+  
+     $primary_key = get_data_importer_primary_key($importer['importer_id']);
+  
+     if ($uid = get_entity_by_field('user', FALSE, $primary_key, $item[$primary_key], array('name', 'mail', 'password'))) { 
+       $user =  \Drupal\user\Entity\User::load($uid);
+       $type = 'update';
+     } else {
+       $user = array();
+       $type = 'create';
+     }
+  
+     return array(
+       'entity' => $user,
+       'base_field' => array('name', 'mail', 'password','status','roles'),
+       'type' => $type
+     );
+   }
+  
+  /**
+  * This function load node if it's already exist by the primary key field
+  *  if not the node will be created
+  *
+  * @param $item
+  *  item data
+  *
+  * @param $importer
+  *  importer config
+  *
+  * @return array
+  *  return the node entity (credted / loaded) & all user base field
+  */
+  function data_import_save_node($item, $importer) {
+  
+    $bundle_name = $importer['bundle_name'];
+    $primary_key = get_data_importer_primary_key($importer['importer_id']);
+  
+    // prepare entity object : create/update
+    if ($nid = get_entity_by_field('node', $bundle_name, $primary_key, $item[$primary_key], array('title'))) {
+      $node = \Drupal\node\Entity\Node::load($nid);
+      $type = 'update';
+    } else {
+      $node = array(
+        'type' => $bundle_name,
+        'langcode' => \Drupal::languageManager()->getCurrentLanguage()->getId()
+      );
+      $type = 'create';
+    }
+  
+    return array(
+      'entity' => $node,
+      'base_field' => array('title','status'),
+      'type' => $type
+    );
+  }
+  
+  /**
+  * This function load taxonomy term if it's already exist by the primary key field
+  *  if not the taxonomy term will be created
+  *
+  * @param $item
+  *  item data
+  *
+  * @param $importer
+  *  importer config
+  *
+  * @return array
+  *  return the taxonomy term (created / loaded) & all user base field
+  */
+  function data_import_save_taxonomy_term($item, $importer) {
+  
+    $bundle_name = $importer['bundle_name'];
+    $primary_key = get_data_importer_primary_key($importer['importer_id']);
+    $vocabulary = taxonomy_vocabulary_machine_name_load($bundle_name);
+  
+    if ($tid = get_entity_by_field('taxonomy_term', $bundle_name, $primary_key, $item[$primary_key], array('name'))) {
+      $term = \Drupal\taxonomy\Entity\Term::load($tid);
+      $type = 'update';
+    } else {
+      $term = array(
+        'type' => $bundle_name,
+        'vid' => $vocabulary->vid,
+        'vocabulary_machine_name' => $vocabulary->machine_name
+      );
+      $type = 'create';
+    }
+  
+    return array(
+      'entity' => $term,
+      'base_field' => array('name'),
+      'type' => $type
+    );
+  }
+
+
+  /**
+ * Function to get existing entity from specific field
+ *
+ * @param $entity_type
+ *  type of the entity
+ *
+ * @param $bundle
+ *  entity bundle name
+ *
+ * @param $field_name
+ *  search field name
+ *
+ * @param $value
+ *  value to be searched in the field
+ *
+ * @param $base_field
+ *  array containing the base field of the entity
+ *
+ * @return entity id
+ */
+function get_entity_by_field($entity_type, $bundle = FALSE, $field_name, $value, $base_field) {
+
+    $query = \Drupal::entityQuery($entity_type);
+    // $query->condition('entity_type', $entity_type);
+  
+    // If Entity have a bundle
+    if($bundle) {
+      switch($entity_type){
+        case 'taxonomy_term' :
+          $query->condition('vid', $bundle);
+        break;
+        default:
+          $query->condition('type', $bundle);
+        break;
+      }
+    }
+    
+    if (in_array($field_name, $base_field)) {
+      $query->condition($field_name, $value);
+    } else {
+      $field_settings = get_field_data_value_type($entity_type, $field_name, $bundle);
+      $field_type = $field_settings['type'];
+      $query->condition($field_name, $value);
+    }
+
+    $result = $query->execute();
+
+    return !empty($result)? array_shift($result):FALSE;
+    // return isset($result[$entity_type]) ? array_shift(array_keys($result[$entity_type])) : FALSE;
+  }
+
+/**
+ * Function to get the data_type value of the field
+ *
+ * @param $entity_type
+ *  type of the entity
+ *
+ * @param $bundle_name
+ *  entity bundle name
+ *
+ * @param $field_name
+ *  name of the field to get the data types
+ *
+ * @return $field_type
+ */
+ function get_field_data_value_type($entity_type, $field_name, $bundle_name) {
+  $field_type = "value";
+  $field_isMultiple = FALSE;
+  if(!empty(\Drupal\field\Entity\FieldStorageConfig::loadByName($entity_type, $field_name))) { 
+    $settings = \Drupal\field\Entity\FieldStorageConfig::loadByName($entity_type, $field_name)->getSettings();
+    $field_isMultiple = \Drupal\field\Entity\FieldStorageConfig::loadByName($entity_type, $field_name)->isMultiple();
+    if(isset($settings['target_type'])){
+      switch ($settings['target_type']) {
+        case 'node':
+          $field_type = "target_id";
+          break;
+        case 'user':
+          $field_type = "target_id";
+          break;
+        case 'taxonomy_term':
+          $field_type = "target_id";
+          break;
+        default:
+          $field_type = "value";
+          break;
+      }
+    }
+  } 
+  return [
+    'type' => $field_type,
+    'multiple_value' => $field_isMultiple
+  ];
+}
+
+/**
+ * Function to check if the field in the specific importer can be overridden
+ *
+ * @param $importer_id
+ *  Importer ID
+ *
+ * @param $field_name
+ *
+ * @return boolean
+ */
+ function is_allowed_to_override($importer_id, $field_name) {
+  $result = db_query("SELECT m.override FROM {data_import_mapping_item} m WHERE importer_id=:importer_id AND field_name=:field_name",array(':importer_id'=>$importer_id,':field_name'=>$field_name))->fetchCol();
+  return !empty($result)?$result[0]:FALSE;
+}
+
+/**
+* Array importer Map
+*/
+function importers_map($importer) {
+  return $importer['name'];
+}
