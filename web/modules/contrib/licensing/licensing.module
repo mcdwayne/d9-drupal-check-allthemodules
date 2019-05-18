@@ -1,0 +1,235 @@
+<?php
+
+/**
+ * @file
+ * Contains license.module..
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Access\AccessResult;
+
+// License statuses.
+define('LICENSE_CREATED', 0);
+define('LICENSE_PENDING', 1);
+define('LICENSE_ACTIVE', 2);
+define('LICENSE_EXPIRED', 3);
+define('LICENSE_SUSPENDED', 5);
+define('LICENSE_REVOKED', 4);
+
+/**
+ * Implements hook_help().
+ */
+function licensing_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the license module.
+    case 'help.page.licensing':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Provides license type, which may be used to control user access to other entities.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function licensing_theme() {
+  $theme = [];
+  $theme['license'] = array(
+    'render element' => 'elements',
+    'file' => 'licensing.page.inc',
+    'template' => 'license',
+  );
+  $theme['license_content_add_list'] = [
+    'render element' => 'content',
+    'variables' => ['content' => NULL],
+    'file' => 'licensing.page.inc',
+  ];
+  return $theme;
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK().
+ */
+function licensing_theme_suggestions_license(array $variables) {
+  $suggestions = array();
+  $entity = $variables['elements']['#license'];
+  $sanitized_view_mode = strtr($variables['elements']['#view_mode'], '.', '_');
+
+  $suggestions[] = 'license__' . $sanitized_view_mode;
+  $suggestions[] = 'license__' . $entity->bundle();
+  $suggestions[] = 'license__' . $entity->bundle() . '__' . $sanitized_view_mode;
+  $suggestions[] = 'license__' . $entity->id();
+  $suggestions[] = 'license__' . $entity->id() . '__' . $sanitized_view_mode;
+  return $suggestions;
+}
+
+/**
+ * Implements hook_entity_access().
+ */
+function licensing_entity_access(\Drupal\Core\Entity\EntityInterface $entity, $operation, \Drupal\Core\Session\AccountInterface $account) {
+    $access = AccessResult::neutral();
+
+    if ($account->hasPermission('administer license entities')) {
+        return $access;
+    }
+
+    $licensed_entity_types = licensing_get_licensed_entity_types();
+    if (in_array($entity->getEntityTypeId(), $licensed_entity_types)) {
+        switch ($operation) {
+            case 'view':
+                if ($licenses = licensing_load_user_licenses_for_entity($account, $entity)) {
+                    foreach ($licenses as $license) {
+                        // If at least one license is active, allow.
+                        if ($license->isActive()) {
+                            $access = AccessResult::allowed();
+                            $access->addCacheTags($license->getCacheTags());
+                            break;
+                        }
+                    }
+
+                    // If none of the licenses were active, forbid.
+                    $access = AccessResult::forbidden();
+                    foreach ($licenses as $license) {
+                        $access->addCacheTags($license->getCacheTags());
+                    }
+
+                    // If this is a licensed entity for the current user, invoke hook_licensing_entity_access_alter().
+                    // This is hook used to allow another module to reverse a "forbidden" response, which cannot be
+                    // achieved with hook_entity_access() alone.
+                    \Drupal::moduleHandler()->alter('licensing_entity_view_access', $access, $entity, $account);
+                }
+        }
+    }
+
+  return $access;
+}
+
+/**
+ * Loads an active license for a given entity belonging to a given user.
+ *
+ * @param $account \Drupal\Core\Session\AccountInterface
+ * @param $entity \Drupal\Core\Entity\EntityInterface
+ *
+ * @return bool|\Drupal\licensing\Entity\License
+ */
+function licensing_load_active_user_license_for_entity(\Drupal\Core\Session\AccountInterface $account, \Drupal\Core\Entity\EntityInterface $entity, $properties = []) {
+    $default_properties['status'] = LICENSE_ACTIVE;
+    $properties = array_merge($default_properties, $properties);
+    $licenses = licensing_load_user_licenses_for_entity($account, $entity, $properties);
+    if ($licenses) {
+        $first_license = reset($licenses);
+        return $first_license;
+    }
+
+    return FALSE;
+}
+
+/**
+ * @param $account
+ * @param $entity
+ * @param array $properties
+ *
+ * @return \Drupal\licensing\Entity\License[]
+ */
+function licensing_load_user_licenses_for_entity(\Drupal\Core\Session\AccountInterface $account, \Drupal\Core\Entity\EntityInterface $entity, $properties = []) {
+    $default_properties = [
+      'user_id' => $account->id(),
+      'licensed_entity' => $entity->id(),
+    ];
+    $properties = array_merge($default_properties, $properties);
+    $licenses = \Drupal::entityTypeManager()
+      ->getStorage('license')
+      ->loadByProperties($properties);
+
+    $valid_licenses = [];
+    /** @var \Drupal\licensing\Entity\LicenseInterface $license */
+    foreach ($licenses as $license) {
+        if (licensing_license_applies_to_user($license, $account)) {
+            $valid_licenses[$license->id()] = $license;
+        }
+    }
+
+    return $valid_licenses;
+}
+
+/**
+ * @param \Drupal\licensing\Entity\LicenseInterface $license
+ * @param \Drupal\Core\Session\AccountInterface $account
+ *
+ * @return bool
+ */
+function licensing_license_applies_to_user(\Drupal\licensing\Entity\LicenseInterface $license, \Drupal\Core\Session\AccountInterface $account) {
+    $bundle = $license->bundle();
+    $license_type = \Drupal::entityTypeManager()->getStorage('license_type')->load($bundle);
+
+    return licensing_license_type_applies_to_user($license_type, $account);
+}
+
+/**
+ * @param \Drupal\Core\Entity\ContentEntityType $license_type
+ * @param \Drupal\Core\Session\AccountInterface $account
+ *
+ * @return bool
+ */
+function licensing_license_type_applies_to_user(\Drupal\licensing\Entity\LicenseType $license_type, \Drupal\Core\Session\AccountInterface $account) {
+  // Licensing does no apply to administrators.
+  if ($account->hasPermission('administer license entities')) {
+    return FALSE;
+  }
+
+  // If this user has an exempt role, licensing does not aply.
+  if (array_intersect((array) $license_type->get('exempt_roles'), $account->getRoles())) {
+    return FALSE;
+  }
+
+  // Verify that the user has a role whose access should be restricted by this license type.
+  if (empty($license_type->get('roles')) || array_intersect($account->getRoles(), $license_type->get('roles'))) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Returns a flat list of entity types for which access is restricted by at
+ * least one license type.
+ *
+ * @return array|mixed
+ */
+function licensing_get_licensed_entity_types() {
+    $licensed_entity_types = &drupal_static(__FUNCTION__);
+    if (!isset($licensed_entity_types)) {
+        $licensed_entity_types = [];
+        $license_types = \Drupal::entityTypeManager()->getStorage('license_type')->loadMultiple();
+        foreach ($license_types as $license_type) {
+            if ($target_entity_type = $license_type->get('target_entity_type')) {
+                $licensed_entity_types[] = $target_entity_type;
+            }
+        }
+    }
+
+    return $licensed_entity_types;
+}
+
+/**
+ * Implements hook_cron().
+ */
+function licensing_cron() {
+  $query = \Drupal::entityQuery('license');
+  $query->condition('status', LICENSE_EXPIRED, '!=')
+    ->condition('expires_automatically', '1')
+    ->condition('expiry', REQUEST_TIME, '<=');
+  if ($ids = $query->execute()) {
+    $licenses = \Drupal\licensing\Entity\License::loadMultiple($ids);
+
+    // @todo Queue this!
+    /** @var \Drupal\Core\Entity\EntityInterface $license */
+    foreach ($licenses as $license) {
+      $license->set('status', LICENSE_EXPIRED);
+      $license->save();
+    }
+  };
+}
