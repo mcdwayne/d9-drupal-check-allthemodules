@@ -1,0 +1,307 @@
+<?php
+
+/**
+ * @file
+ * A tremendously simple access control module -- it allows users to mark
+ * individual nodes as private; users with 'access private content' perms can
+ * read these nodes, while others cannot.
+ */
+
+/**
+ * @todo Views not working properly.  Should display private_content_get_value,
+ * which may differ from the actual stored value.
+ *
+ * @todo Create a better formatter.
+ */
+
+/**
+ * STRATEGY
+ * 1) Node grants are not helpful for this module because they give extra access, whereas we need to remove it.
+ * 2) Hence use hook_node_access as far as possible.  In this hook it's easy to selectively remove access with NODE_ACCESS_DENY.
+ * 3) However hook_node_access is not called for "node listings" - bulk read requests such as views.
+ *    These must be handled via node grants.
+ */
+
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Core\Field\FieldDefinitionInterface;
+use Drupal\Core\Field\FieldItemList;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\node\NodeInterface;
+use Drupal\node\NodeTypeInterface;
+
+define('PRIVATE_DISABLED', 0);
+define('PRIVATE_ALLOWED', 1);
+define('PRIVATE_AUTOMATIC', 2);
+define('PRIVATE_ALWAYS', 3);
+
+define('PRIVATE_GRANT_ALL', 1);
+
+/**
+ * @todo Warning, currently cannot uninstall this module due to https://www.drupal.org/node/2282119
+ * Workaround: drush eval "private_content_force_uninstall();"
+ */
+function private_content_force_uninstall() {
+  $base_table = \Drupal::entityTypeManager()->getDefinition('node')->getDataTable();
+  \Drupal::database()->update($base_table)->fields(['private' => NULL])->execute();
+  \Drupal::service('module_installer')->uninstall(['private_content']);
+}
+
+/**
+ * Simple function to make sure we don't respond with grants when disabling
+ * ourselves.
+ */
+function private_content_disabling($set = NULL) {
+  static $disabling = FALSE;
+  if ($set !== NULL) {
+    $disabling = $set;
+  }
+
+  return $disabling;
+}
+
+/**
+ * Implements hook_entity_base_field_info().
+ */
+function private_content_entity_base_field_info(EntityTypeInterface $entity_type) {
+  $fields = array();
+
+  if ($entity_type->id() === 'node') {
+    $fields['private'] = BaseFieldDefinition::create('boolean')
+      ->setLabel(t('Private'))
+      ->setName('private')
+      ->setRevisionable(TRUE)
+      ->setDescription(t('When checked, only users with proper access permissions will be able to see this post.'))
+      ->setDefaultValueCallback('private_content_get_default')
+      ->setDisplayOptions('view', ['weight' => 1])  // @todo proper defaults here and next line
+      ->setDisplayOptions('form', ['weight' => 1])
+      ->setDisplayConfigurable('form', TRUE)
+      ->setDisplayConfigurable('view', TRUE);
+  }
+
+  return $fields;
+}
+
+/**
+ * Implements hook_node_grants().
+ *
+ * Tell the node access system what GIDs the user belongs to for each realm.
+ */
+function private_content_node_grants(AccountInterface $account, $op) {
+  $grants = array();
+
+  if ($op == 'view') {
+    if (!$account->isAnonymous()) {
+      // Grant to the author for own content.
+      $grants['private_author'] = array($account->id());
+    }
+
+    // Grant for private content.
+    if ($account->hasPermission('access private content')) {
+      $grants['private_view'] = array(PRIVATE_GRANT_ALL);
+    }
+  }
+
+  return $grants;
+}
+
+/**
+ * Implements hook_node_access_records().
+ *
+ * All node access modules must implement this hook. If the module is
+ * interested in the privacy of the node passed in, return a list
+ * of node access values for each grant ID we offer.
+ */
+function private_content_node_access_records(NodeInterface $node) {
+  if (private_content_disabling()) {
+    return;
+  }
+
+  // See the README.txt file and the comment "STRATEGY" at the top of this file for background explanation.
+  // 1) Ignore update permissions here as they are handled in hook_access.
+  //    It's not safe to grant update access here to a private node because we cannot be sure the user is entitled.
+  // 2) Ignore any nodes where we don't wish to alter the default access; other modules may grants access,
+  //    or else core provides the correct default access.
+  $grants = array();
+
+  if ($node->status && private_content_get_value($node)) {
+    // Grant read access to users with 'access private content'.
+    $grants[] = array(
+      'realm' => 'private_view',
+      'gid' => PRIVATE_GRANT_ALL,
+      'grant_view' => 1,
+      'grant_update' => 0,
+      'grant_delete' => 0,
+      'priority' => 0,
+    );
+
+    // Grant read access to the owner, but not ANONYMOUS user.
+    if (!$node->getOwner()->isAnonymous()) {
+      $grants[] = array(
+        'realm' => 'private_author',
+        'gid' => $node->getOwnerId(),
+        'grant_view' => 1,
+        'grant_update' => 0,
+        'grant_delete' => 0,
+        'priority' => 0,
+      );
+    }
+
+    // Otherwise, deny read access for private nodes.
+  }
+
+  return $grants;
+}
+
+/**
+ * Implements hook_node_access().
+ */
+function private_content_node_access(NodeInterface $node, $op, AccountInterface $account) {
+  // Apply restrictions on private nodes, except for the owner.
+  $owner = (!$account->isAnonymous()) && ($node->getOwnerId() == $account->id());
+  if (!$owner && private_content_get_value($node)) {
+    if (($op == 'update') || ($op == 'delete')) {
+      if (!$account->hasPermission('edit private content')) {
+        // Missing access for write.
+        return AccessResult::forbidden()->cachePerPermissions()->cachePerUser()->addCacheableDependency($node);
+      }
+    }
+    elseif ($op == 'view') {
+      if (!$account->hasPermission('access private content')) {
+        // Missing access for view.
+        return AccessResult::forbidden()->cachePerPermissions()->cachePerUser()->addCacheableDependency($node);
+      }
+    }
+  }
+
+  // Otherwise, fall back to the pre-existing access rules in core/modules.
+  // Note that this module never grants extra access, it only removes it.
+  return AccessResult::neutral();
+}
+
+/**
+ * Implements hook_entity_field_access().
+ */
+function private_content_entity_field_access($operation, FieldDefinitionInterface $field_definition, AccountInterface $account, FieldItemList $items = NULL) {
+  if (($field_definition->getName() != 'private') || ($operation != 'edit')) {
+    return AccessResult::neutral();
+  }
+
+  if (private_content_is_locked($items->getEntity())) {
+    return AccessResult::forbidden();
+  }
+
+  if (!$account->hasPermission('mark content as private')) {
+    return AccessResult::forbidden()->cachePerPermissions();
+  }
+  return AccessResult::neutral();
+
+  // @todo Better code would be to use FieldItemList::defaultAccess
+  // Need @FieldType with list_class = 'xxx'
+  // That allows other code to grant permissions to selectively mark content as private.
+  // return AccessResult::allowedIfHasPermission($account, 'mark content as private');
+}
+
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter() for \Drupal\node\NodeForm.
+ */
+function private_content_form_node_form_alter(&$form, FormStateInterface &$form_state) {
+  if (isset($form['private'])) {
+    $form['private']['#group'] = 'options';
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function private_content_form_node_type_form_alter(&$form, FormStateInterface $form_state) {
+  /** @var \Drupal\node\NodeTypeInterface $type */
+  $type = $form_state->getFormObject()->getEntity();
+
+  $form['workflow']['private'] = array(
+    '#type' => 'radios',
+    '#title' => t('Privacy'),
+    '#description' => t('Privacy settings for nodes of this content type.  Changing this value will update all existing nodes and rebuild access permissions.'),
+    '#options' => array(
+      PRIVATE_DISABLED => t('Disabled (always public)'),
+      PRIVATE_ALLOWED => t('Enabled (public by default)'),
+      PRIVATE_AUTOMATIC => t('Enabled (private by default)'),
+      PRIVATE_ALWAYS => t('Hidden (always private)'),
+    ),
+    '#default_value' => $type->getThirdPartySetting('private_content', 'private', PRIVATE_ALLOWED),
+  );
+
+  $form['#entity_builders'][] = 'private_content_form_node_type_form_builder';
+}
+
+/**
+ * Entity builder for the node type form with private option.
+ *
+ * @see private_content_form_node_type_form_alter()
+ */
+function private_content_form_node_type_form_builder($entity_type, NodeTypeInterface $type, &$form, FormStateInterface $form_state) {
+  $existing = $type->getThirdPartySetting('private_content', 'private');
+  $new = $form_state->getValue('private');
+  $type->setThirdPartySetting('private_content', 'private', $new);
+  if ($new != $existing) {
+    // @todo Skip this for new content type.
+    node_access_needs_rebuild(TRUE);
+  }
+}
+
+// @todo Create a FieldItem and the 3 items below here should become calculated properties
+
+/**
+ * Return value for private field, sanitised based on the node's content type.
+ *
+ * @param \Drupal\node\NodeInterface $node
+ *   Node to check
+ *
+ * @return boolean Value
+ */
+function private_content_get_value(NodeInterface $node) {
+  $value = $node->private->value;
+  if (($value == NULL) || private_content_is_locked($node)) {
+    return private_content_get_default($node);
+  }
+  return $value;
+}
+
+/**
+ * Return default value for private field, based on the node's content type.
+ *
+ * @param \Drupal\node\NodeInterface $node
+ *   Node to check
+ *
+ * @return boolean Default value
+ */
+function private_content_get_default(NodeInterface $node) {
+  /** @var \Drupal\node\NodeTypeInterface $type */
+  $type = $node->type->entity;
+  if (is_null($type)) {
+    // Occurs during Content type creation.
+    return FALSE;
+  }
+
+  $type_setting = $type->getThirdPartySetting('private_content', 'private', PRIVATE_ALLOWED);
+  return ($type_setting == PRIVATE_ALWAYS) || ($type_setting == PRIVATE_AUTOMATIC);
+}
+
+/**
+ * Return whether private field is locked (not-writeable), based on the node's
+ * content type.
+ *
+ * @param \Drupal\node\NodeInterface $node
+ *   Node to check
+ *
+ * @return boolean True if locked.
+ */
+function private_content_is_locked(NodeInterface $node) {
+  /** @var \Drupal\node\NodeTypeInterface $type */
+  $type = $node->type->entity;
+  $type_setting = $type->getThirdPartySetting('private_content', 'private', PRIVATE_ALLOWED);
+  return ($type_setting == PRIVATE_ALWAYS) || ($type_setting == PRIVATE_DISABLED);
+}
