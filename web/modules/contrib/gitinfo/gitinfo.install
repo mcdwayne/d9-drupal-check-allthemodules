@@ -1,0 +1,211 @@
+<?php
+
+/**
+ * @file
+ * Status report info for the Git Info Report module.
+ */
+
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_requirements().
+ */
+function gitinfo_requirements($phase) {
+  if ($phase == 'runtime') {
+    // Initialize some variables.
+    $requirements = [];
+    $lastcommit = NULL;
+    $gitinfo_module = \Drupal::l(t('GIT Info Report'), Url::fromRoute('system.modules_list'));
+    // Track if an error message already kicked in to avoid being overwritten.
+    $error = FALSE;
+    // Generate a status report error message if shell_exec is not available.
+    if (!gitinfo_function_enabled('shell_exec')) {
+      $shell_exec = \Drupal::l(t('shell_exec'), Url::fromUri('http://php.net/manual/en/function.shell-exec.php'));
+      $disable_functions = \Drupal::l(t('disable_functions'), Url::fromUri('http://php.net/manual/en/ini.core.php#ini.disable-functions'));
+      $value = t("Remove the PHP function @shell_exec from the @disable_functions directive in the PHP.INI settings or disable the @gitinfo module.", [
+        '@shell_exec' => $shell_exec,
+        '@disable_functions' => $disable_functions,
+        '@gitinfo' => $gitinfo_module,
+      ]);
+      $severity = REQUIREMENT_ERROR;
+      $error = TRUE;
+    }
+    elseif (!$error && !`which locate`) {
+      $value = t("The terminal command 'locate' is not available. The server's OS is probably non-Unix. Disable the @gitinfo module.", ['@gitinfo' => $gitinfo_module]);
+      $severity = REQUIREMENT_ERROR;
+      $error = TRUE;
+    }
+    else {
+      // Git version info.
+      $version = shell_exec('git --version');
+    }
+    // Generate a status report error message if GIT is not installed ..
+    if (!$error && strpos($version, 'not found') !== FALSE) {
+      $value = t("GIT not installed. Install GIT or disable the @gitinfo module.", ['@gitinfo' => $gitinfo_module]);
+      $severity = REQUIREMENT_ERROR;
+      $error = TRUE;
+    }
+    // .. or add the GIT version info to the output for later use.
+    elseif (!$error) {
+      $gitversion = [
+        '#theme' => 'item_list',
+        '#list_type' => 'ul',
+        '#items' => [],
+        '#empty' => ucfirst($version),
+      ];
+    }
+    if (!$error) {
+      // Detect the Drupal directory and extra defined folders defined in the
+      // settings.php or a custom module (see README.txt).
+      global $_gitinfo_extra_folders_;
+      $extra_folders = NULL;
+      $extra_folders_array = array_filter(explode(',', $_gitinfo_extra_folders_));
+      // If no global variable is defined check for a Drupal variable.
+      if (!isset($_gitinfo_extra_folders_)) {
+        $extra_folders_array = array_filter(explode(',', \Drupal::config('gitinfo.settings')->get('gitinfo_extra_folders')));
+      }
+      sort($extra_folders_array);
+      // Put the monitored folders in an unordered list.
+      $items[] = \Drupal::root() . ' ' . t('(Drupal root)');
+      foreach ($extra_folders_array as $folder) {
+        if (!empty($folder)) {
+          $extra_folders .= '/' . trim($folder, '/ ') . '*/.git ';
+          $items[] = '/' . trim($folder, '/ ');
+        }
+      }
+      $dirsinfo = '';
+      if (!empty($items)) {
+        $dirsinfo = [
+          '#title' => t('Monitored main directories for GIT folders (roots)'),
+          '#theme' => 'item_list',
+          '#list_type' => 'ul',
+          '#items' => $items,
+        ];
+      }
+      // Get available git folders. Use 'sudo updatedb' first if recently added.
+      $gitdirs = shell_exec('cd ' . \Drupal::root() . '; locate "$PWD*/.git" ' . escapeshellcmd($extra_folders) . '| grep -e ".git$" | sort');
+      // Remove '/.git' to have the clean repo folder path.
+      $gitdirs = str_replace('/.git', '', $gitdirs);
+      // Store all available git folders into an array.
+      $gitdirs = array_filter(explode(PHP_EOL, $gitdirs));
+      // Generate a status report error message if no GIT folders were found.
+      if (empty($gitdirs)) {
+        $value = $gitversion . t("No git folders can be detected. Check the folder permissions or run %command first to update the Linux 'locate' cache. On OSX this is %command_osx.", ['%command' => "'sudo updatedb'", '%command_osx' => "'sudo /usr/libexec/locate.updatedb'"]) . '<br />' . $dirsinfo;
+        $severity = REQUIREMENT_WARNING;
+      }
+      else {
+        // Loop through all git directories to output the info per folder.
+        foreach ($gitdirs as $key => $value) {
+          $dir = $value == \Drupal::root() || in_array($value, $extra_folders_array) ? t('@value (root)', ['@value' => $value]) : $value;
+          // Make shell command safe.
+          // See https://stackoverflow.com/a/22739494/523688.
+          $remotecmd = trim(shell_exec('cd ' . escapeshellarg($value) . '; git config --get remote.origin.url'));
+          $remote = !empty($remotecmd) ? t('Remote URL: @remote', ['@remote' => $remotecmd]) : NULL;
+          $statuscmd = trim(shell_exec('cd ' . escapeshellarg($value) . '; git status'));
+          // Limit if too long.
+          $statuscmd = !empty($statuscmd) && strlen($statuscmd) > 600 ? substr($statuscmd, 0, 600) . ' ..' : $statuscmd;
+          // Add a closing period if not empty.
+          $status = !empty($statuscmd) ? $statuscmd . '.' : NULL;
+          // Strings to highlight in the git status output.
+          $tagcmd = shell_exec('cd ' . escapeshellarg($value) . '; git tag --points-at HEAD');
+          // Add a label if not empty.
+          $tag = !empty($tagcmd) ? t('Tag: @tag', ['@tag' => $tagcmd]) : NULL;
+          $lastpull = (int) shell_exec('cd ' . escapeshellarg($value) . '; stat -c %Y .git/FETCH_HEAD');
+          // We can not use the l() function below as it would add 'href'.
+          $lastpullhover = date('Y-m-d H:i:s O', $lastpull);
+          $lastpullfuzzy = \Drupal::service("date.formatter")->formatInterval((time() - $lastpull), 1);
+          $lastpull = !empty($lastpull) ? t('Last pull <a title="@lastpullhover">@lastpullfuzzy</a> ago.', ['@lastpullhover' => $lastpullhover, '@lastpullfuzzy' => $lastpullfuzzy]) : NULL;
+          // Use one git command to get multiple commit data by exploding.
+          // The separator is a rarely used character '⁏' (reversed semicolon).
+          $commit = explode('⁏', shell_exec('cd ' . escapeshellarg($value) . '; git log -1 --format="%at⁏%an⁏%ae⁏%cn⁏%ce⁏%h⁏%s"'));
+          if ($commit[0]) {
+            $lastcommit_datehover = date('Y-m-d H:i:s O', $commit[0]);
+            $lastcommit_datefuzzy = \Drupal::service("date.formatter")->formatInterval((time() - $commit[0]), 1);
+            // See if the author and the committer are the same.
+            $people = $commit[1] == $commit[3] ? t('by @committerauthor (@committerauthormail)', [
+              '@committerauthor' => $commit[1],
+              '@committerauthormail' => $commit[2],
+            ]) : t('authored by @author (@authormail) and committed by @committer (@committermail)', [
+              '@author' => $commit[1],
+              '@authormail' => $commit[2],
+              '@committer' => $commit[3],
+              '@committermail' => $commit[4],
+            ]);
+            // Add period at end of string if there is not one there already.
+            $message = !is_null($commit[6]) && substr(trim($commit[6]), -1) != '.' ? trim($commit[6]) . '.' : trim($commit[6]);
+            // Only include the last commit if it exists.
+            $lastcommit = t('Last commit <a title="@lastcommit_datehover">@lastcommit_datefuzzy</a> ago @people with hash @hash:<br />@message', [
+              '@lastcommit_datehover' => $lastcommit_datehover,
+              '@lastcommit_datefuzzy' => $lastcommit_datefuzzy,
+              '@people' => $people,
+              '@hash' => $commit[5],
+              '@message' => $message,
+            ]);
+          }
+          $ignoredcmd = shell_exec('cd ' . escapeshellarg($value) . '; git clean -ndX');
+          // Turn the string into an array based on linebreaks removing empties.
+          $ignoredcmd = array_filter(explode(PHP_EOL, str_replace(['Would remove ', 'Would skip repository '], [t('Ignoring') . ' ', t('Skipping repository') . ' '], $ignoredcmd)));
+          $ignored = empty($ignoredcmd) ? NULL : [
+            '#markup' => t('Ignored or skipped existing folders or files:'),
+            'children' => $ignoredcmd,
+          ];
+          $submodulescmd = shell_exec('cd ' . escapeshellarg($value) . '; git submodule status | cut -d\' \' -f3-4');
+          // Turn the string into an array based on linebreaks removing empties.
+          $submodulescmd = array_filter(explode(PHP_EOL, $submodulescmd));
+          $submodules = empty($submodulescmd) ? NULL : [
+            '#markup' => t('Submodules:'),
+            'children' => $submodulescmd,
+          ];
+          $output['items'][] = [
+            '#markup' => t('GIT directory: @dir', ['@dir' => $dir]),
+            'children' => array_filter([
+              $remote,
+              $status,
+              $tag,
+              $lastpull,
+              $lastcommit,
+              $ignored,
+              $submodules,
+            ]),
+          ];
+        }
+        $gitinfo = '';
+        // Generate an unordered list.
+        if (!empty($output)) {
+          $gitinfo = [
+            '#title' => t('Detected GIT folders (recursive from the root down)'),
+            '#theme' => 'item_list',
+            '#list_type' => 'ul',
+            '#items' => $output['items'],
+          ];
+          // Highlight any changes to bring it to attention.
+          $highlight = [
+            'Changed but not updated',
+            'Changes not staged for commit',
+            'Changes to be committed',
+            'Your branch is ahead',
+            'Your branch is behind',
+          ];
+          foreach ($gitinfo['#items'] as $key => $item) {
+            $gitinfo['#items'][$key]['children'][0] = t(preg_replace("/\w*?(?:" . implode('|', $highlight) . ")\w*/i", "<span class='gitinfo-highlight'>$0</span>", $gitinfo['#items'][$key]['children'][0], -1, $count));
+          }
+        }
+        $value = [$gitversion, $dirsinfo, $gitinfo];
+        $severity = REQUIREMENT_OK;
+        // Make it a warning and highlight relevant text if we have any changes.
+        if (!is_null($count)) {
+          $severity = REQUIREMENT_WARNING;
+          // Add CSS.
+          $value['#attached']['library'][] = 'gitinfo/gitinfo';
+        }
+      }
+    }
+    // Generate the status report info message showing the GIT info per folder.
+    $requirements['gitinfo_requirements'] = [
+      'title' => t('GIT info'),
+      'value' => $value,
+      'severity' => $severity,
+    ];
+    return $requirements;
+  }
+}
