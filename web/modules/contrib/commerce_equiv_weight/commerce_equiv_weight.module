@@ -1,0 +1,284 @@
+<?php
+
+/**
+ * @file
+ * Defines functionality for Commerce equivalency weight.
+ */
+
+use Drupal\commerce_order\Entity\OrderInterface;
+use Drupal\Core\Messenger\MessengerInterface;
+use Drupal\physical\Calculator;
+use Drupal\physical\Weight;
+use Drupal\views\Form\ViewsForm;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Link;
+
+/**
+ * Constants.
+ */
+
+/**
+ * The name of the custom weight field.
+ */
+const COMMERCE_EQUIV_WEIGHT_FIELD_EQUIVALENCY_WEIGHT = 'commerce_equiv_weight';
+
+/**
+ * Hooks.
+ */
+
+/**
+ * Implements hook_form_alter().
+ */
+function commerce_equiv_weight_form_alter(
+  &$form,
+  FormStateInterface $form_state,
+  $form_id
+) {
+  if (!($form_state->getFormObject() instanceof ViewsForm)) {
+    return;
+  }
+
+  /** @var \Drupal\views\ViewExecutable $view */
+  $view = reset($form_state->getBuildInfo()['args']);
+  if (empty($view->result)) {
+    return;
+  }
+  $tags = explode(',', $view->storage->get('tag'));
+  // `explode()` will return FALSE if there is no tag.
+  if ($tags === FALSE) {
+    return;
+  }
+  $tags = array_map('trim', $tags);
+  if (!in_array('commerce_cart_form', $tags)) {
+    return;
+  }
+
+  // We know that view forms are built on the base ID plus arguments.
+  $form_id_prefix = 'views_form_' . $view->id() . '_' . $view->current_display . '_';
+  $order_id = substr($form_id, strlen($form_id_prefix));
+  /** @var \Drupal\commerce_order\Entity\OrderInterface $cart */
+  $cart = \Drupal::entityTypeManager()
+    ->getStorage('commerce_order')
+    ->load($order_id);
+
+  if (!$cart) {
+    return;
+  }
+
+  // Set all the errors if the equivalency weight is too big.
+  if (commerce_equiv_weight_get_weight($cart)['over_limit']) {
+    commerce_equiv_weight_set_errors($form, 'checkout');
+    return;
+  }
+
+  // Clears the warning in the set errors function above. For some reason it
+  // seems to carry over when updating the order items.
+  \Drupal::messenger()->deleteByType(MessengerInterface::TYPE_WARNING);
+
+}
+
+/**
+ * Implements hook_preprocess_HOOK() for commerce-order-total-summary template.
+ */
+function commerce_equiv_weight_preprocess_commerce_order_total_summary(&$variables, $hook) {
+  $order = $variables['order'];
+  if (!$order) {
+    $variables['equiv_weight'] = 0;
+    return;
+  }
+
+  $config = \Drupal::configFactory()->get('commerce_equiv_weight.order_settings');
+  $max_equiv_weight = $config->get('equiv_weight');
+
+  $equiv_weight = commerce_equiv_weight_get_weight($order);
+  $variables['equiv_weight'] = $equiv_weight;
+  $variables['max_equiv_weight'] = $max_equiv_weight;
+}
+
+/**
+ * Implements hook_preprocess_HOOK() for commerce-cart-block template.
+ */
+function commerce_equiv_weight_preprocess_commerce_cart_block(&$variables, $hook) {
+  $carts = \Drupal::service('commerce_cart.cart_provider')->getCarts($variables['user']);
+  if (empty($carts)) {
+    $variables['equiv_weight'] = 0;
+    return;
+  }
+
+  $cart = reset($carts);
+  /** @var \Drupal\Core\Field\FieldItemList $weight_field */
+  $weight_field = NULL;
+  if ($cart->hasField(COMMERCE_EQUIV_WEIGHT_FIELD_EQUIVALENCY_WEIGHT)) {
+    $weight_field = $cart->get(COMMERCE_EQUIV_WEIGHT_FIELD_EQUIVALENCY_WEIGHT);
+  }
+  if (!$weight_field || $weight_field->isEmpty()) {
+    return;
+  }
+
+  $order_total_weight = $weight_field->first()->view('commerce_equiv_weight');
+
+  $variables['equiv_weight'] = $order_total_weight;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function commerce_equiv_weight_theme($existing, $type, $theme, $path) {
+  return [
+    'commerce_equiv_weight_field' => [
+      'variables' => [
+        'rounded_weight' => NULL,
+        'weight' => NULL,
+        'unit' => NULL,
+        'over_limit' => FALSE,
+      ],
+    ],
+    'commerce_equiv_weight_block' => [
+      'variables' => [
+        'weight' => NULL,
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function commerce_equiv_weight_form_commerce_checkout_flow_alter(
+  &$form,
+  FormStateInterface $form_state,
+  $form_id
+) {
+  /** @var \Drupal\commerce_order\Entity\OrderInterface $order */
+  $order = $form_state->getFormObject()->getOrder();
+
+  // Set all the errors if the equivalency weight is too big.
+  if (commerce_equiv_weight_get_weight($order)['over_limit']) {
+    commerce_equiv_weight_set_errors($form, 'next');
+  }
+
+}
+
+/**
+ * Custom validation callback.
+ *
+ * Will always set form error.
+ */
+function commerce_equiv_weight_checkout_validate(
+  &$form,
+  FormStateInterface &$form_state
+) {
+  // Need to check the button, otherwise the "Update Cart" submit will be
+  // blocked too, and then they will never be able to update their cart.
+  $blocked_buttons = ['edit-checkout', 'edit-actions-next'];
+  if (!in_array($form_state->getTriggeringElement()['#id'], $blocked_buttons)) {
+    return;
+  }
+
+  $form_state->setErrorByName('equivalency weight', commerce_equiv_weight_get_message());
+}
+
+/**
+ * Helper function to get equivalency weight for order.
+ *
+ * @param \Drupal\commerce_order\Entity\OrderInterface $order
+ *   The commerce order.
+ *
+ * @return array
+ *   The equivalency weight information for the order.
+ */
+function commerce_equiv_weight_get_weight(OrderInterface $order) {
+  // Set default equivalency weight.
+  $config = \Drupal::configFactory()->get('commerce_equiv_weight.order_settings');
+  $max_equiv_weight = $config->get('equiv_weight');
+
+  if (!$order->hasField(COMMERCE_EQUIV_WEIGHT_FIELD_EQUIVALENCY_WEIGHT)) {
+    return [
+      'weight' => new Weight('0', $max_equiv_weight['unit']),
+      'over_limit' => FALSE,
+    ];
+  }
+
+  /** @var \Drupal\Core\Field\FieldItemList $weight_field */
+  $weight_field = NULL;
+  if ($order->hasField(COMMERCE_EQUIV_WEIGHT_FIELD_EQUIVALENCY_WEIGHT)) {
+    $weight_field = $order->get(COMMERCE_EQUIV_WEIGHT_FIELD_EQUIVALENCY_WEIGHT);
+  }
+  if (!$weight_field || $weight_field->isEmpty()) {
+    return [
+      'weight' => new Weight('0', $max_equiv_weight['unit']),
+      'over_limit' => FALSE,
+    ];
+  }
+
+  // Convert to the unit selected in the global settings.
+  $equiv_weight['weight'] = $weight_field->first()
+    ->toMeasurement()
+    ->convert($max_equiv_weight['unit']);
+  $equiv_weight['over_limit'] = $equiv_weight['weight']
+    ->greaterThan(new Weight(
+      $max_equiv_weight['number'],
+      $max_equiv_weight['unit']
+    ));
+
+  return $equiv_weight;
+}
+
+/**
+ * Helper function to set up all equivalency errors.
+ *
+ * @param array &$form
+ *   The form array.
+ * @param string $button
+ *   Then button on the form to disable.
+ */
+function commerce_equiv_weight_set_errors(array &$form, $button) {
+  // Disable continue to review.
+  $form['actions'][$button]['#attributes']['disabled'] = 'disabled';
+  \Drupal::messenger()->addWarning(commerce_equiv_weight_get_message());
+
+  // Add custom validation that will always fail since we know the equivalency
+  // is too high. This is needed in case someone removes the disabled property
+  // added above.
+  array_unshift($form['#validate'], 'commerce_equiv_weight_checkout_validate');
+
+}
+
+/**
+ * Helper function to build equivalency message.
+ *
+ * @return \Drupal\Core\StringTranslation\TranslatableMarkup
+ *   The translated message.
+ */
+function commerce_equiv_weight_get_message() {
+  $t = \Drupal::translation();
+
+  return $t->translate(
+    'Your cart has exceeded the allowable equivalency weight. Please remove some items from @cart-link. You will not be able to proceed until you resolve this issue.',
+    [
+      '@cart-link' => Link::createFromRoute($t->translate('your cart', [], ['context' => 'cart link']), 'commerce_cart.page')
+        ->toString(),
+    ]
+  );
+}
+
+/**
+ * Helper function to ALWAYS round up to the nearest tenth.
+ *
+ * Examples:
+ *   - 14.03 => 14.1
+ *   - 7 => 7.0
+ *   - 30.0089 => 30.1
+ *   - 15.36 => 15.4
+ *   - 15.31 => 15.4
+ *
+ * @param string $number
+ *   The number to round.
+ *
+ * @return float
+ *   The rounded number.
+ */
+function commerce_equiv_weight_round($number) {
+  $number *= 10;
+  return Calculator::round((string) (ceil($number) / 10), 1);
+}
