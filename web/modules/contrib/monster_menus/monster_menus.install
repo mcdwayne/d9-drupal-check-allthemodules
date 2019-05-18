@@ -1,0 +1,1097 @@
+<?php
+
+/**
+ * @file
+ * Installation routines for Monster Menus
+ */
+
+use Drupal\Component\Uuid\Php;
+use Drupal\Core\Database\Database;
+use Drupal\Core\Url;
+use Drupal\monster_menus\Constants;
+use Drupal\node\Entity\Node;
+use Drupal\block\Entity\Block;
+use Drupal\node\Entity\NodeType;
+
+/**
+ * Implements hook_install()
+ */
+function monster_menus_install() {
+  // Load various dependencies needed for the mm_content functions.
+//  module_load_include('module', 'monster_menus', 'monster_menus');
+
+  $top       = 1;
+  $groups    = 2;
+  $vgroup    = 3;
+  $users     = 4;
+  $default   = 5;
+  $home      = 7;
+  $disabled  = 8;
+  $system    = 9;
+  $not_found = 10;
+  $denied    = 11;
+  $pic       = 12;
+
+  \Drupal::service('config.factory')->getEditable('system.site')
+    ->set('page.403', "/mm/$denied")
+    ->set('page.404', "/mm/$not_found")
+    ->save();
+
+  $list = [
+    ['mmtid', 'name', 'alias', 'parent', 'uid', 'default_mode', 'theme', 'hidden', 'vid'],
+    [$top, '[top]', '', 0, 1, Constants::MM_PERMS_READ, '', 0],
+    [$groups, Constants::MM_ENTRY_NAME_GROUPS, 'groups', $top, 1, Constants::MM_PERMS_READ, '', 0],
+    [$vgroup, Constants::MM_ENTRY_NAME_VIRTUAL_GROUP, '', $groups, 1, Constants::MM_PERMS_READ, '', 0],
+    [$users, Constants::MM_ENTRY_NAME_USERS, 'users', $top, 1, Constants::MM_PERMS_READ, '', 0],
+    [$default, Constants::MM_ENTRY_NAME_DEFAULT_USER, '', $users, 1, Constants::MM_PERMS_READ, '', 0],
+    [$home, 'Home', '', $top, 1, Constants::MM_PERMS_READ, '', 0],
+    [$disabled, Constants::MM_ENTRY_NAME_DISABLED_USER, '', $users, 1, '', '', 0],
+    [$system, Constants::MM_ENTRY_NAME_SYSTEM, Constants::MM_ENTRY_ALIAS_SYSTEM, $home, 1, Constants::MM_PERMS_READ, '', 1],
+    [$not_found, 'Not Found', 'not-found', $system, 1, Constants::MM_PERMS_READ, '', 1],
+    [$denied, 'Authorization Required', 'denied', $system, 1, Constants::MM_PERMS_READ, '', 1],
+    [$pic, 'Picture block', 'default-image', $home, 1, Constants::MM_PERMS_READ, '', 0],
+  ];
+
+  $vid = 1;
+  $php = new Php();
+  $cols = array_shift($list);
+  $db = Database::getConnection();
+  $mm_tree_revision = $db->insert('mm_tree_revision')->fields($cols);
+  $cols[] = 'uuid';
+  $mm_tree = $db->insert('mm_tree')->fields($cols);
+  foreach ($list as $entry) {
+    $entry[] = $vid++;
+    $entry[] = $php->generate();
+    $entry = array_combine($cols, $entry);
+    $mm_tree->values($entry);
+    unset($entry['uuid']);
+    $mm_tree_revision->values($entry);
+  }
+  $mm_tree->execute();
+  $mm_tree_revision->execute();
+
+  mm_content_update_parents(NULL, NULL, FALSE, TRUE);
+  // Update the mm_tree column containing the sort index.
+  mm_content_update_sort();
+  mm_content_groups_mmtid();
+  mm_content_users_mmtid();
+
+  $db->insert('mm_tree_flags')
+    ->fields(array('mmtid',  'flag',           'data'))
+    ->values(array($default, 'limit_alias',    ''))
+    ->values(array($default, 'limit_delete',   ''))
+    ->values(array($default, 'limit_hidden',   ''))
+    ->values(array($default, 'limit_location', ''))
+    ->values(array($default, 'limit_move',     ''))
+    ->values(array($default, 'limit_name',     ''))
+    ->values(array($default, 'limit_write',    ''))
+    ->values(array($system,  'limit_alias',    ''))
+    ->values(array($system,  'limit_delete',   ''))
+    ->values(array($system,  'limit_hidden',   ''))
+    ->values(array($system,  'limit_location', ''))
+    ->values(array($system,  'limit_move',     ''))
+    ->values(array($system,  'limit_name',     ''))
+    ->values(array($system,  'limit_write',    ''))
+    ->values(array($system,  'no_breadcrumb',  ''))
+    ->execute();
+
+  // MM blocks
+  $default_theme = \Drupal::service('config.factory')->get('system.theme')->get('default');
+
+  $create_block = function($id, $settings) use ($default_theme) {
+    $settings += array(
+      'delta' => $id,
+      'id' => "mmtreeblock_$id",
+      'plugin' => 'mm_tree_block',
+      'region' => 'sidebar_first',
+      'theme' => $default_theme,
+      'title' => '',
+      'visibility' => array(),
+      'label_display' => FALSE,
+      'weight' => 0,
+    );
+    $values = [];
+    foreach (array('region', 'id', 'theme', 'plugin', 'weight', 'visibility') as $key) {
+      $values[$key] = $settings[$key];
+      unset($settings[$key]);
+    }
+    $values['settings'] = $settings;
+    Block::create($values)->save();
+  };
+
+  $pic_block = Constants::MM_MENU_BID . '_2';
+  $sidebar   = Constants::MM_MENU_BID . '_3';
+  $create_block(Constants::MM_MENU_BID, [
+    'label' => 'New sub-section',
+    'title_is_cat' => 0,
+    'show_node_contents' => 0,
+    'help' => t('Creates a new left navigation menu section and makes this page the top page of the section.'),
+  ]);
+  $create_block($pic_block, [
+    'label' => 'Picture block',
+    'title_is_cat' => 0,
+    'show_node_contents' => 1,
+    'help' => t('Lets you upload an image to appear on the parent page and all sub-pages.'),
+  ]);
+  $create_block($sidebar, [
+    'label' => 'Sidebar block',
+    'title_is_cat' => 0,
+    'show_node_contents' => 1,
+    'help' => t('The contents of the current page will appear in the sidebar block of the parent page and all sub-pages.'),
+  ]);
+
+  // Assign MM blocks to default nodes
+  $db->insert('mm_tree_block')
+    ->fields(array('mmtid',  'bid',      'max_depth', 'max_parents'))
+    ->values(array($groups,  Constants::MM_MENU_BID,   -1,          5))
+    ->values(array($users,   Constants::MM_MENU_BID,   -1,          -1))
+    ->values(array($default, Constants::MM_MENU_BID,   -1,          -1))
+    ->values(array($home,    Constants::MM_MENU_BID,   -1,          -1))
+    ->values(array($pic,     $pic_block,               -1,          -1))
+    ->execute();
+
+  // Enable some default content types
+  $allowed = array_intersect(array('story', 'page'), array_keys(NodeType::loadMultiple()));
+  if ($allowed) {
+    $settings = array('allowed_node_types' => $allowed);
+    mm_content_set_cascaded_settings($users, $settings, FALSE);
+    mm_content_set_cascaded_settings($home, $settings, FALSE);
+  }
+
+  // Default virtual groups
+  foreach (array(
+      'All logged-in users' => array('uid', 'FROM {users} WHERE uid > 0'),
+      ) as $name => $list) {
+    mm_content_insert_or_update(TRUE, $vgroup, array(
+        'name' => $name,
+        'default_mode' => Constants::MM_PERMS_APPLY . ',' . Constants::MM_PERMS_READ,
+        'qfield' => $list[0],
+        'qfrom' => $list[1],
+      )
+    );
+  }
+
+  // After creating virtual groups, update the mm_virtual_group results table.
+  mm_regenerate_vgroup();
+
+  // Look for the first node type with a body field.
+  $type = '';
+  $storage = \Drupal::service('entity_field.manager')->getActiveFieldStorageDefinitions('node');
+  if (isset($storage['body']) && ($bundles = $storage['body']->getBundles())) {
+    $type = reset($bundles);
+  }
+
+  if (empty($type)) {
+    \Drupal::messenger()->addStatus(t('<p>There is no content type containing a body field. Default contents could not be created.</p>'));
+  }
+  else {
+    _mm_install_node_add($type, array(
+      'title' => 'Not Found', 'body' => '<p>The page you tried to access was not found.</p>',
+      'mm_catlist' => array($not_found => 'Not Found')));
+    _mm_install_node_add($type, array(
+      'title' => 'Authorization Required', 'body' => 'You do not have permission to read the contents of this page. <p>If you are not already logged into the system, you may be able to access the page once you do so.</p>',
+      'mm_catlist' => array($denied => 'Authorization Required')));
+  }
+
+  \Drupal::messenger()->addStatus(t('<p>Monster Menus has been enabled.</p> <p>To see the menu tree within your pages, go to <a href=":url">:url</a> and add the block "New sub-section" to a region in each of your themes.</p>', array(':url' => Url::fromRoute('block.admin_display')->toString())));
+}
+
+/**
+ * Implements hook_uninstall().
+ */
+function monster_menus_uninstall() {
+  $unset = array(
+    'monster_menus.cron_run_count',
+    'monster_menus.cron_run_last',
+    'monster_menus.cron_run_since',
+    'monster_menus.finegrain_comment_readability_ever_set',
+    'monster_menus.fix_node_urls_chunksize',
+    'monster_menus.fix_node_urls_hostname_regex',
+    'monster_menus.groups_mmtid',
+    'monster_menus.hidden_user_names',
+    'monster_menus.mysql_max_joins',
+    'monster_menus.mysql_max_joins',
+    'monster_menus.reserved_alias',
+    'monster_menus.users_alias',
+    'monster_menus.users_mmtid',
+    'monster_menus.vgroup_regen_semaphore',
+  );
+  \Drupal::state()->deleteMultiple($unset);
+
+  $site = \Drupal::service('config.factory')->getEditable('system.site');
+  if (substr($site->get('page.403'), 0, 3) == 'mm/') {
+    $site->clear('page.403');
+  }
+  if (substr($site->get('page.404'), 0, 3) == 'mm/') {
+    $site->clear('page.404');
+  }
+  $site->save();
+
+  \Drupal::messenger()->addStatus(t('You may need to correct the values for "Default 403 (access denied)" and "Default 404 (not found) page" on <a href=":link">@path</a>.', array('@path' => 'admin/config/system/site-information', ':link' => Url::fromRoute('system.site_information_settings')->toString())));
+}
+
+/**
+ * Implements hook_schema().
+ */
+function monster_menus_schema() {
+  $schema = array();
+  $schema['mm_access_cache'] = array(
+    'fields' => array(
+      'cid' => array(
+        'type' => 'varchar',
+        'length' => 32,
+        'not null' => TRUE,
+        'default' => ''),
+      'data' => array(
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => TRUE,
+        'default' => ''),
+      'expire' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0),
+      'created' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0),
+      'uid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0),
+      'nid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0),
+      'mmtid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0),
+      'serialized' => array(
+        'type' => 'int',
+        'size' => 'small',
+        'not null' => TRUE,
+        'default' => 0)
+      ),
+    'primary key' => array('cid'),
+    'indexes' => array(
+      'expire' => array('expire'),
+      'uid' => array('uid'),
+      'nid' => array('nid'),
+      'mmtid' => array('mmtid'),
+    ),
+  );
+  $schema['mm_archive'] = array(
+    'fields' => array(
+      'main_mmtid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'archive_mmtid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'frequency' => array(
+        'type' => 'varchar',
+        'length' => '5',
+        'not null' => TRUE,
+      ),
+      'main_nodes' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+    ),
+    'primary key' => array('main_mmtid'),
+    'foreign keys' => array(
+      'mm_tree' => array(
+        'table' => 'mm_tree',
+        'columns' => array(
+          'main_mmtid' => 'mmtid',
+          'archive_mmtid' => 'mmtid',
+        ),
+      ),
+    ),
+    'indexes' => array(
+      'archive_mmtid' => array('archive_mmtid'),
+    ),
+  );
+  $schema['mm_cascaded_settings'] = array(
+    'fields' => array(
+      'id' => array(
+        'type' => 'serial',
+        'size' => 'big',
+        'not null' => TRUE,
+      ),
+      'mmtid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'name' => array(
+        'type' => 'varchar',
+        'length' => '32',
+        'not null' => TRUE,
+      ),
+      'data_type' => array(
+        'type' => 'varchar',
+        'length' => '10',
+        'not null' => TRUE,
+      ),
+      'multiple' => array(
+        'type' => 'int',
+        'size' => 'tiny',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'array_key' => array(
+        'type' => 'varchar',
+        'length' => '32',
+        'not null' => TRUE,
+      ),
+      'data' => array(
+        'type' => 'varchar',
+        'length' => '512',
+        'not null' => FALSE,
+      ),
+    ),
+    'primary key' => array('id'),
+    'foreign keys' => array(
+      'mm_tree' => array(
+        'table' => 'mm_tree',
+        'columns' => array(
+          'mmtid' => 'mmtid',
+        ),
+      ),
+    ),
+    'indexes' => array(
+      'mmtid' => array('mmtid'),
+      'name' => array('name'),
+      'data' => array(array('data', 255)),
+      'array_key' => array('array_key'),
+    ),
+  );
+  $schema['mm_group'] = array(
+    'fields' => array(
+      'gid' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+      ),
+      'uid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'vgid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+    ),
+    'primary key' => array('gid', 'uid'),
+    'foreign keys' => array(
+      'mm_tree' => array(
+        'table' => 'mm_tree',
+        'columns' => array(
+          'gid' => 'mmtid',
+        ),
+      ),
+      'users' => array(
+        'table' => 'users',
+        'columns' => array(
+          'uid' => 'uid',
+        ),
+      ),
+      'mm_vgroup_query' => array(
+        'table' => 'mm_vgroup_query',
+        'columns' => array(
+          'vgid' => 'vgid',
+        ),
+      ),
+    ),
+    'indexes' => array(
+      'vgid' => array('vgid'),
+      'gid' => array('gid'),
+      'uid' => array('uid'),
+    ),
+  );
+  $schema['mm_group_temp'] = array(
+    'fields' => array(
+      'gid' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+      ),
+      'uid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'sessionid' => array(
+        'type' => 'varchar',
+        'not null' => TRUE,
+        'length' => '64',
+        'default' => ''
+      ),
+      'token' => array(
+        'type' => 'varchar',
+        'length' => '128',
+        'not null' => TRUE,
+        'default' => ''
+      ),
+      'expire' => array(
+        'type' => 'int',
+        'default' => 0,
+        'not null' => TRUE,
+      )
+    ),
+    'primary key' => array('gid', 'uid', 'sessionid', 'token'),
+    'foreign keys' => array(
+      'mm_tree' => array(
+        'table' => 'mm_tree',
+        'columns' => array(
+          'gid' => 'mmtid',
+        ),
+      ),
+      'users' => array(
+        'table' => 'users',
+        'columns' => array(
+          'uid' => 'uid',
+        ),
+      ),
+    ),
+    'indexes' => array(
+      'sessionid' => array('sessionid'),
+      'gid' => array('gid'),
+      'uid' => array('uid'),
+      'token' => array('token'),
+    ),
+  );
+  $schema['mm_node2tree'] = array(
+    'fields' => array(
+      'nid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'mmtid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+    ),
+    'primary key' => array('nid', 'mmtid'),
+    'foreign keys' => array(
+      'node' => array(
+        'table' => 'node',
+        'columns' => array(
+          'nid' => 'nid',
+        ),
+      ),
+      'mm_tree' => array(
+        'table' => 'mm_tree',
+        'columns' => array(
+          'mmtid' => 'mmtid',
+        ),
+      ),
+    ),
+    'indexes' => array(
+      'nid' => array('nid'),
+      'mmtid' => array('mmtid'),
+    ),
+  );
+  $schema['mm_node_info'] = array(
+    'fields' => array(
+      'nid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'show_node_info' => array(
+        'type' => 'int',
+        'size' => 'tiny',
+        'not null' => FALSE,
+      ),
+      'comments_readable' => array(
+        'type' => 'varchar',
+        'length' => '128',
+        'default' => ''
+      ),
+    ),
+    'primary key' => array('nid'),
+    'foreign keys' => array(
+      'node' => array(
+        'table' => 'node',
+        'columns' => array(
+          'nid' => 'nid',
+        ),
+      ),
+    ),
+  );
+  $schema['mm_node_redir'] = array(
+    'fields' => array(
+      'nid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'vid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'url' => array(
+        'type' => 'blob',
+        'not null' => FALSE
+      ),
+      'mmtid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => FALSE,
+      )
+    ),
+    'primary key' => array('nid', 'vid'),
+    'foreign keys' => array(
+      'node' => array(
+        'table' => 'node',
+        'columns' => array(
+          'nid' => 'nid',
+          'vid' => 'vid',
+        ),
+      ),
+      'mm_tree' => array(
+        'table' => 'mm_tree',
+        'columns' => array(
+          'mmtid' => 'mmtid',
+        ),
+      ),
+    ),
+    'indexes' => array(
+      'mmtid' => array('mmtid')
+    ),
+  );
+  $schema['mm_node_reorder'] = array(
+    'fields' => array(
+      'mmtid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'nid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'weight' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'region' => array(
+        'type' => 'varchar',
+        'length' => '64',
+        'default' => NULL,
+        'not null' => FALSE,
+      ),
+    ),
+    'primary key' => array('mmtid', 'nid'),
+    'foreign keys' => array(
+      'node' => array(
+        'table' => 'node',
+        'columns' => array(
+          'nid' => 'nid',
+         ),
+      ),
+      'mm_tree' => array(
+        'table' => 'mm_tree',
+        'columns' => array(
+          'mmtid' => 'mmtid',
+        ),
+      ),
+    ),
+    'indexes' => array(
+      'region' => array('region')
+    ),
+  );
+  $schema['mm_node_schedule'] = array(
+    'fields' => array(
+      'nid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'publish_on' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'unpublish_on' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'set_change_date' => array(
+        'type' => 'int',
+        'size' => 'tiny',
+        'default' => 0,
+      )
+    ),
+    'primary key' => array('nid'),
+    'foreign keys' => array(
+      'node' => array(
+        'table' => 'node',
+        'columns' => array(
+          'nid' => 'nid',
+         ),
+      ),
+    ),
+  );
+  $schema['mm_node_write'] = array(
+    'fields' => array(
+      'id' => array(
+        'type' => 'serial',
+        'unsigned' => TRUE,
+        'size' => 'big',
+        'not null' => TRUE,
+      ),
+      'nid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'gid' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+      )
+    ),
+    'primary key' => array('id'),
+    'foreign keys' => array(
+      'node' => array(
+        'table' => 'node',
+        'columns' => array(
+          'nid' => 'nid',
+        ),
+      ),
+      'mm_tree' => array(
+        'table' => 'mm_tree',
+        'columns' => array(
+          'gid' => 'mmtid',
+        ),
+      ),
+    ),
+    'indexes' => array(
+      'nid' => array('nid'),
+      'gid' => array('gid'),
+      'gid_nid' => array('gid', 'nid'),
+    ),
+  );
+  $schema['mm_recycle'] = array(
+    'fields' => array(
+      'type' => array(
+        'type' => 'varchar',
+        'length' => 4,
+        'not null' => TRUE
+      ),
+      'id' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'from_mmtid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'bin_mmtid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'recycle_date' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      )
+    ),
+    'primary key' => array('type', 'id', 'from_mmtid'),
+    'foreign keys' => array(
+      'mm_tree' => array(
+        'table' => 'mm_tree',
+        'columns' => array(
+          'from_mmtid' => 'mmtid',
+          'bin_mmtid' => 'mmtid',
+        ),
+      ),
+    ),
+    'indexes' => array(
+      'id' => array('id'),
+      'type' => array('type'),
+      'bin_mmtid' => array('bin_mmtid'),
+    ),
+  );
+  $schema['mm_tree_access'] = array(
+    'fields' => array(
+      'mmtid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'gid' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+      ),
+      'mode' => array(
+        'type' => 'varchar',
+        'length' => 1,
+        'not null' => TRUE
+      ),
+    ),
+    'primary key' => array('mmtid', 'gid', 'mode'),
+    'foreign keys' => array(
+      'mm_tree' => array(
+        'table' => 'mm_tree',
+        'columns' => array(
+          'mmtid' => 'mmtid',
+          'gid' => 'mmtid',
+        ),
+      ),
+    ),
+    'indexes' => array(
+      'mmtid' => array('mmtid'),
+      'gid' => array('gid'),
+      'mode' => array('mode'),
+    ),
+  );
+  $schema['mm_tree_block'] = array(
+    'fields' => array(
+      'mmtid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'bid' => array(
+        'type' => 'varchar',
+        'length' => 63,
+        'not null' => TRUE,
+        'default' => '-1',
+      ),
+      'max_depth' => array(
+        'type' => 'int',
+        'size' => 'tiny',
+        'not null' => TRUE,
+        'default' => -1,
+      ),
+      'max_parents' => array(
+        'type' => 'int',
+        'size' => 'tiny',
+        'not null' => TRUE,
+        'default' => -1,
+      ),
+    ),
+    'primary key' => array('mmtid', 'bid'),
+    'foreign keys' => array(
+      'mm_tree' => array(
+        'table' => 'mm_tree',
+        'columns' => array(
+          'mmtid' => 'mmtid',
+        ),
+      ),
+    ),
+    'indexes' => array(
+      'mmtid' => array('mmtid'),
+      'bid' => array('bid'),
+    ),
+  );
+  $schema['mm_tree_bookmarks'] = array(
+    'fields' => array(
+      'uid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'type' => array(
+        'type' => 'varchar',
+        'length' => '20',
+        'not null' => TRUE,
+      ),
+      'weight' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'data' => array(
+        'type' => 'text',
+        'size' => 'big',
+        'not null' => TRUE,
+      ),
+    ),
+    'primary key' => array('uid', 'type', 'weight'),
+    'foreign keys' => array(
+      'users' => array(
+        'table' => 'users',
+        'columns' => array(
+          'uid' => 'uid',
+        ),
+      ),
+    ),
+  );
+  $schema['mm_tree_flags'] = array(
+    'fields' => array(
+      'mmtid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'flag' => array(
+        'type' => 'varchar',
+        'length' => '64',
+        'not null' => TRUE,
+      ),
+      'data' => array(
+        'type' => 'varchar',
+        'length' => '255',
+        'not null' => FALSE,
+      ),
+    ),
+    'primary key' => array('mmtid', 'flag'),
+    'foreign keys' => array(
+      'mm_tree' => array(
+        'table' => 'mm_tree',
+        'columns' => array(
+          'mmtid' => 'mmtid',
+        ),
+      ),
+    ),
+    'indexes' => array(
+      'data' => array('data'),
+      'flag' => array('flag'),
+    ),
+  );
+  $schema['mm_tree_parents'] = array(
+    'fields' => array(
+      'mmtid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'parent' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'depth' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'size' => 'small',
+        'not null' => TRUE,
+      ),
+    ),
+    'primary key' => array('mmtid', 'parent'),
+    'foreign keys' => array(
+      'mm_tree' => array(
+        'table' => 'mm_tree',
+        'columns' => array(
+          'mmtid' => 'mmtid',
+          'parent' => 'mmtid',
+        ),
+      ),
+    ),
+    'indexes' => array(
+      'depth' => array('depth'),
+      'mmtid' => array('mmtid'),
+      'parent' => array('parent'),
+    ),
+  );
+  $schema['mm_vgroup_query'] = array(
+    'fields' => array(
+      'vgid' => array(
+        'type' => 'serial',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'field' => array(
+        'type' => 'varchar',
+        'length' => '40',
+        'not null' => TRUE
+      ),
+      'qfrom' => array(
+        'type' => 'text',
+        'not null' => FALSE
+      ),
+      'dirty' => array(
+        'type' => 'int',
+        'size' => 'tiny',
+        'not null' => TRUE,
+        'default' => 0,
+      )
+    ),
+    'primary key' => array('vgid'),
+    'indexes' => array(
+      'dirty' => array('dirty')
+    ),
+  );
+  $schema['mm_virtual_group'] = array(
+    'fields' => array(
+      'vgid' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'uid' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'preview' => array(
+        'type' => 'int',
+        'size' => 'small',
+        'not null' => FALSE,
+      )
+    ),
+    'primary key' => array('vgid', 'uid'),
+    'foreign keys' => array(
+      'mm_vgroup_query' => array(
+        'table' => 'mm_vgroup_query',
+        'columns' => array(
+          'vgid' => 'vgid',
+        ),
+      ),
+      'users' => array(
+        'table' => 'users',
+        'columns' => array(
+          'uid' => 'uid',
+        ),
+      ),
+    ),
+    'indexes' => array(
+      'preview' => array('preview'),
+      'vgid' => array('vgid'),
+      'uid' => array('uid'),
+    ),
+  );
+  return $schema;
+}
+
+function _mm_install_node_add($type, $arr, $format = 'full_html') {
+  if (isset($arr['body'])) {
+    $arr['body'] = array(array('value' => $arr['body'], 'format' => $format));
+  }
+  $arr = array_merge($arr, array(
+    'type' => $type,
+    'nid' => '',
+    'vid' => '',
+    'groups_w' => array(),
+    'users_w' => array(),
+    'others_w' => 0,
+    'comment' => 0,
+    'teaser' => '',
+    'status' => 1,
+    'moderate' => '',
+    'promote' => '',
+    'sticky' => '',
+    'revision' => 1,
+  ));
+  $node = Node::create($arr);
+  $node->setOwnerId(1);
+  $node->save();
+}
+
+/**
+ * Implements hook_mm_verify_integrity()
+ */
+function monster_menus_mm_verify_integrity() {
+  return array('Monster Menus' => array(
+    (string) t('mm_archive.main_mmtid refers to missing mm_tree.mmtid') =>
+      "{mm_archive} x LEFT JOIN {mm_tree} t ON t.mmtid=x.main_mmtid WHERE t.mmtid IS NULL",
+
+    (string) t('mm_archive.archive_mmtid refers to missing mm_tree.mmtid') =>
+      "{mm_archive} x LEFT JOIN {mm_tree} t ON t.mmtid=x.archive_mmtid WHERE t.mmtid IS NULL",
+
+    (string) t('mm_cascaded_settings.mmtid refers to missing mm_tree.mmtid') =>
+      "{mm_cascaded_settings} x LEFT JOIN {mm_tree} t ON t.mmtid=x.mmtid WHERE t.mmtid IS NULL",
+
+    (string) t('mm_group.gid refers to missing mm_tree.mmtid') =>
+      "{mm_group} x LEFT JOIN {mm_tree} t ON t.mmtid=x.gid WHERE t.mmtid IS NULL AND x.gid>0 AND x.vgid=0",
+    (string) t('mm_group.uid refers to missing users.uid') =>
+      "{mm_group} x LEFT JOIN {users} u ON u.uid=x.uid WHERE u.uid IS NULL AND x.uid>0",
+    (string) t('mm_group.vgid refers to missing mm_vgroup_query.vgid') =>
+      "{mm_group} x LEFT JOIN {mm_vgroup_query} v ON v.vgid=x.vgid WHERE v.vgid IS NULL AND x.vgid>0",
+
+    (string) t('mm_node2tree.mmtid refers to missing mm_tree.mmtid') =>
+      "{mm_node2tree} x LEFT JOIN {mm_tree} t ON t.mmtid=x.mmtid WHERE t.mmtid IS NULL",
+    (string) t('mm_node2tree.nid refers to missing node.nid') =>
+      "{mm_node2tree} x LEFT JOIN {node} n ON n.nid=x.nid WHERE n.nid IS NULL",
+
+    (string) t('mm_node_info.nid refers to missing node.nid') =>
+      "{mm_node_info} x LEFT JOIN {node} n ON n.nid=x.nid WHERE n.nid IS NULL",
+
+    (string) t('mm_node_redir.nid refers to missing node.nid') =>
+      "{mm_node_redir} x LEFT JOIN {node} n ON n.nid=x.nid WHERE n.nid IS NULL",
+    (string) t('mm_node_redir.mmtid refers to missing mm_tree.mmtid') =>
+      "{mm_node_redir} x LEFT JOIN {mm_tree} t ON t.mmtid=x.mmtid WHERE x.mmtid>0 AND t.mmtid IS NULL",
+
+    (string) t('mm_node_reorder.mmtid refers to missing mm_tree.mmtid') =>
+      "{mm_node_reorder} x LEFT JOIN {mm_tree} t ON t.mmtid=x.mmtid WHERE t.mmtid IS NULL",
+    (string) t('mm_node_reorder.nid refers to missing node.nid') =>
+      "{mm_node_reorder} x LEFT JOIN {node} n ON n.nid=x.nid WHERE n.nid IS NULL",
+
+    (string) t('mm_node_schedule.nid refers to missing node.nid') =>
+      "{mm_node_schedule} x LEFT JOIN {node} n ON n.nid=x.nid WHERE n.nid IS NULL",
+
+    (string) t('mm_node_write.nid refers to missing node.nid') =>
+      "{mm_node_write} x LEFT JOIN {node} n ON n.nid=x.nid WHERE n.nid IS NULL",
+    (string) t('mm_node_write.gid refers to missing mm_tree.mmtid') =>
+      "{mm_node_write} x LEFT JOIN {mm_tree} t ON t.mmtid=x.gid WHERE x.gid>0 AND t.mmtid IS NULL",
+    (string) t('mm_node_write.gid refers to missing mm_group.gid') =>
+      "{mm_node_write} x LEFT JOIN {mm_group} g ON g.gid=x.gid WHERE x.gid<0 AND g.gid IS NULL",
+
+    (string) t('mm_recycle.id refers to missing mm_tree.mmtid (when type=cat)') =>
+      "{mm_recycle} x LEFT JOIN {mm_tree} t ON t.mmtid=x.id WHERE x.type='cat' AND t.mmtid IS NULL",
+    (string) t('mm_recycle.id refers to missing node.nid (when type=node)') =>
+      "{mm_recycle} x LEFT JOIN {node} n ON n.nid=x.id WHERE x.type='node' AND n.nid IS NULL",
+    (string) t('mm_recycle.from_mmtid refers to missing mm_tree.mmtid') =>
+      "{mm_recycle} x LEFT JOIN {mm_tree} t ON t.mmtid=x.from_mmtid WHERE x.from_mmtid>0 AND t.mmtid IS NULL",
+    (string) t('mm_recycle.bin_mmtid refers to missing mm_tree.mmtid') =>
+      "{mm_recycle} x LEFT JOIN {mm_tree} t ON t.mmtid=x.bin_mmtid WHERE t.mmtid IS NULL",
+
+    (string) t('mm_tree.parent refers to missing mm_tree.mmtid') =>
+      "{mm_tree} x LEFT JOIN {mm_tree} t ON t.mmtid=x.parent WHERE x.parent>0 AND t.mmtid IS NULL",
+    (string) t('mm_tree.uid refers to missing users.uid') =>
+      "{mm_tree} x LEFT JOIN {users} u ON u.uid=x.uid WHERE u.uid IS NULL AND x.uid>0",
+    (string) t('mm_tree.vid refers to missing mm_tree_revision.vid') =>
+      "{mm_tree} x LEFT JOIN {mm_tree_revision} t ON t.vid=x.vid WHERE t.vid IS NULL",
+
+    (string) t('mm_tree_access.mmtid refers to missing mm_tree.mmtid') =>
+      "{mm_tree_access} x LEFT JOIN {mm_tree} t ON t.mmtid=x.mmtid WHERE t.mmtid IS NULL",
+    (string) t('mm_tree_access.gid refers to missing mm_tree.mmtid') =>
+      "{mm_tree_access} x LEFT JOIN {mm_tree} t ON t.mmtid=x.gid WHERE x.gid>0 AND t.mmtid IS NULL",
+
+    (string) t('mm_tree_block.mmtid refers to missing mm_tree.mmtid') =>
+      "{mm_tree_block} x LEFT JOIN {mm_tree} t ON t.mmtid=x.mmtid WHERE t.mmtid IS NULL",
+
+    (string) t('mm_tree_bookmarks.uid refers to missing users.uid') =>
+      "{mm_tree_bookmarks} x LEFT JOIN {users} u ON u.uid=x.uid WHERE u.uid IS NULL",
+
+    (string) t('mm_tree_flags.mmtid refers to missing mm_tree.mmtid') =>
+      "{mm_tree_flags} x LEFT JOIN {mm_tree} t ON t.mmtid=x.mmtid WHERE t.mmtid IS NULL",
+
+    (string) t('mm_tree_parents.mmtid refers to missing mm_tree.mmtid') =>
+      "{mm_tree_parents} x LEFT JOIN {mm_tree} t ON t.mmtid=x.mmtid WHERE t.mmtid IS NULL",
+    (string) t('mm_tree_parents.parent refers to missing mm_tree.mmtid') =>
+      "{mm_tree_parents} x LEFT JOIN {mm_tree} t ON t.mmtid=x.parent WHERE x.parent>0 AND t.mmtid IS NULL",
+
+    (string) t('mm_virtual_group.vgid refers to missing mm_vgroup_query.vgid') =>
+      "{mm_virtual_group} x LEFT JOIN {mm_vgroup_query} v ON v.vgid=x.vgid WHERE v.vgid IS NULL",
+    (string) t('mm_virtual_group.uid refers to missing users.uid') =>
+      "{mm_virtual_group} x LEFT JOIN {users} u ON u.uid=x.uid WHERE u.uid IS NULL",
+  ));
+}

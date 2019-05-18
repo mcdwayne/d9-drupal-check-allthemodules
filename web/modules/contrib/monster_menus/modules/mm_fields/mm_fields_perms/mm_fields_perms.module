@@ -1,0 +1,292 @@
+<?php
+
+/**
+ * @file
+ * Apply Monster Menus permissions to entity fields.
+ */
+
+use Drupal\Component\Plugin\Exception\PluginNotFoundException;
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Config\Entity\ConfigEntityBundleBase;
+use Drupal\Core\Config\Entity\ConfigEntityInterface;
+use Drupal\Core\Entity\EntityFormInterface;
+use Drupal\Core\Field\FieldDefinitionInterface;
+use Drupal\Core\Field\FieldItemListInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\field\Entity\FieldConfig;
+use Drupal\field\FieldConfigInterface;
+use Drupal\monster_menus\Constants;
+use Drupal\monster_menus\Form\EditContentForm;
+
+/**
+ * Implements hook_entity_type_alter().
+ * @inheritdoc
+ */
+function mm_fields_perms_entity_type_alter(array &$entity_types) {
+  $entity_types['field_config']->setListBuilderClass('Drupal\mm_fields_perms\FieldConfigListBuilder');
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function mm_fields_perms_form_alter(array &$form, FormStateInterface $form_state) {
+  $form_object = $form_state->getFormObject();
+  if (!($form_object instanceof EntityFormInterface)) {
+    return;
+  }
+  $op = $form_object->getOperation();
+  if ($op != 'edit' && $op != 'default') {
+    return;
+  }
+  $entity = $form_object->getEntity();
+  if ($entity instanceof FieldConfigInterface) {
+    _mm_fields_perms_alter_field_config_form($form, $form_state, $entity);
+  }
+  else if ($entity instanceof ConfigEntityBundleBase) {
+    _mm_fields_perms_alter_entity_config_form($form, $form_state, $entity);
+  }
+}
+
+/**
+ * Alter the form for administrator settings per entity type, to include the
+ * default permissions for all fields. (admin/structure/types/manage/X et al)
+ *
+ * @param array $form
+ *   The form array
+ * @param FormStateInterface $form_state
+ *   The form state
+ * @param ConfigEntityInterface $entity
+ *   The entity being edited
+ */
+function _mm_fields_perms_alter_entity_config_form(&$form, $form_state, ConfigEntityInterface $entity) {
+  $form['mm_fields_perms_default'] = array(
+    '#type' => 'details',
+    '#title' => t('Default field permissions'),
+    '#open' => FALSE,
+    '#description' => t('These defaults are used for any field in this entity/content type that does not have individual permissions.'),
+  );
+
+  _mm_fields_perms_defaults($entity, $default_modes, $users, $groups);
+  _mm_fields_perms_permissions_form($form['mm_fields_perms_default'], $default_modes, $users, $groups, 'node-type-form');
+  $form['mm_fields_perms_default']['#group'] = 'additional_settings';
+
+  // Note: Do not inline these functions, as serialization will fail during AJAX
+  // operations within the form.
+  $form['#validate'][] = '_mm_fields_perms_alter_entity_config_form_validate';
+  $form['#entity_builders'][] = '_mm_fields_perms_alter_entity_config_form_entity_builder';
+}
+
+function _mm_fields_perms_alter_entity_config_form_validate($form, FormStateInterface $form_state) {
+  $vals =& $form_state->getValues();
+  list($vals['mm_fields_perms_groups'], $vals['mm_fields_perms_users'], $vals['mm_fields_perms_default_modes']) =
+    _mm_ui_form_parse_perms($form_state, NULL, TRUE);
+}
+
+function _mm_fields_perms_alter_entity_config_form_entity_builder($entity_type, ConfigEntityInterface $entity, &$form, FormStateInterface $form_state) {
+  $entity->setThirdPartySetting('mm_fields_perms', 'default_modes', $form_state->getValue('mm_fields_perms_default_modes'));
+  $entity->setThirdPartySetting('mm_fields_perms', 'users',         $form_state->getValue('mm_fields_perms_users'));
+  $entity->setThirdPartySetting('mm_fields_perms', 'groups',        $form_state->getValue('mm_fields_perms_groups'));
+}
+
+/**
+ * Alter the form for administrator settings per field, to include the
+ * permissions. (admin/structure/X/manage/Y/fields/Z)
+ *
+ * @param array $form
+ *   The form array
+ * @param FormStateInterface $form_state
+ *   The form state
+ * @param FieldConfig $field
+ *   The field being edited
+ */
+function _mm_fields_perms_alter_field_config_form(&$form, FormStateInterface $form_state, FieldConfig $field) {
+  $in = $field->getThirdPartySettings('mm_fields_perms');
+  $use_defaults = !isset($in['use_defaults']) || $in['use_defaults'];
+  if ($use_defaults) {
+    // Take the defaults from the entity, in case the user enables per-field
+    // settings.
+    _mm_fields_perms_defaults(_mm_fields_perms_get_entity_type_config($field), $default_modes, $users, $groups);
+  }
+  else {
+    $default_modes = $in['default_modes'];
+    $users = $in['users'];
+    $groups = $in['groups'];
+  }
+
+  $form['third_party_settings']['mm_fields_perms'] = array(
+    '#type' => 'details',
+    '#title' => t('Permissions'),
+    '#open' => FALSE,
+    '#description' => t('These permissions apply to this instance of this field.'),
+    '#weight' => 99,
+    '#tree' => FALSE,
+  );
+  $form['third_party_settings']['mm_fields_perms']['mm_fields_perms_use_defaults'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Use default permissions'),
+    '#default_value' => $use_defaults,
+    '#description' => t('If checked, the permissions found on this entity\'s configuration page will be used.'),
+  );
+  $form['third_party_settings']['mm_fields_perms']['inner'] = array(
+    '#prefix' => '<div class="mm-fields-perms hidden">',
+    '#suffix' => '</div>',
+  );
+  $form['third_party_settings']['mm_fields_perms']['inner']['no_save'] = array(
+    '#type' => 'hidden',
+    '#value' => $use_defaults,
+  );
+  _mm_fields_perms_permissions_form($form['third_party_settings']['mm_fields_perms']['inner'], $default_modes, $users, $groups, 'content-field-edit-form');
+  // Note: Do not inline these functions, as serialization will fail during AJAX
+  // operations within the form.
+  $form['#validate'][] = '_mm_fields_perms_field_config_form_validate';
+  $form['#entity_builders'][] = '_mm_fields_perms_field_config_form_entity_builder';
+  $form['#attached']['library'][] = 'mm_fields_perms/field_config_edit_form';
+}
+
+function _mm_fields_perms_field_config_form_validate($form, FormStateInterface $form_state) {
+  $vals =& $form_state->getValues();
+  if (!$vals['mm_fields_perms_use_defaults']) {
+    list($vals['mm_fields_perms_groups'], $vals['mm_fields_perms_users'], $vals['mm_fields_perms_default_modes']) =
+        _mm_ui_form_parse_perms($form_state, NULL, TRUE);
+  }
+}
+
+function _mm_fields_perms_field_config_form_entity_builder($entity_type_id, FieldConfig $field, array $form, FormStateInterface $form_state) {
+  $vals =& $form_state->getValues();
+  $field->setThirdPartySetting('mm_fields_perms', 'use_defaults', $vals['mm_fields_perms_use_defaults']);
+  // For some reason this function is called first before #validate, then again
+  // after.
+  if (!$vals['mm_fields_perms_use_defaults'] && isset($vals['mm_fields_perms_default_modes'])) {
+    $field->setThirdPartySetting('mm_fields_perms', 'default_modes', $vals['mm_fields_perms_default_modes']);
+    $field->setThirdPartySetting('mm_fields_perms', 'users',         $vals['mm_fields_perms_users']);
+    $field->setThirdPartySetting('mm_fields_perms', 'groups',        $vals['mm_fields_perms_groups']);
+  }
+}
+
+/**
+ * Implements hook_entity_field_access(). Prevent users from accessing fields,
+ * based on the chosen permissions.
+ */
+function mm_fields_perms_entity_field_access($operation, FieldDefinitionInterface $field_definition, AccountInterface $account, FieldItemListInterface $items = NULL) {
+  static $groups_by_uid;
+
+  if (($operation == 'view' || $operation == 'edit') && $items && method_exists($field_definition, 'getThirdPartySettings')) {
+    $settings = $field_definition->getThirdPartySettings('mm_fields_perms');
+    if (!isset($settings['use_defaults']) || $settings['use_defaults']) {
+      _mm_fields_perms_defaults(_mm_fields_perms_get_entity_type_config($field_definition), $default_modes, $users, $groups);
+    }
+    else {
+      $default_modes = $settings['default_modes'];
+      $users = $settings['users'];
+      $groups = $settings['groups'];
+    }
+
+    $uid = $account->id();
+    if ($uid == 1 || in_array(Constants::MM_PERMS_WRITE, $default_modes) || $operation == 'view' && in_array(Constants::MM_PERMS_READ, $default_modes)) {
+      return AccessResult::allowed();
+    }
+
+    if ($account->isAnonymous()) {
+      return AccessResult::forbidden();
+    }
+
+    $test = $operation == 'view' ? array(Constants::MM_PERMS_WRITE, Constants::MM_PERMS_READ) : array(Constants::MM_PERMS_WRITE);
+
+    // Test users first, since that's faster.
+    foreach ($test as $mode) {
+      if (isset($users[$mode]) && in_array($uid, $users[$mode])) {
+        return AccessResult::allowed();
+      }
+    }
+
+    foreach ($test as $mode) {
+      if (isset($groups[$mode])) {
+        if (!isset($groups_by_uid[$uid])) {
+          $groups_by_uid[$uid] = mm_content_get_uids_in_group(NULL, $uid, TRUE, TRUE, FALSE);
+        }
+        if (array_intersect($groups[$mode], $groups_by_uid[$uid])) {
+          return AccessResult::allowed();
+        }
+      }
+    }
+
+    return AccessResult::forbidden();
+  }
+  return AccessResult::neutral();
+}
+
+/**
+ * Generate a form allowing the admin to set permissions on a field.
+ */
+function _mm_fields_perms_permissions_form(&$form, $default_modes, $users_in, $groups_in, $form_id) {
+  $users = $groups = array();
+
+  foreach ($users_in as $mode => $data) {
+    foreach ($data as $uid) {
+      $users[$uid]['name'] = mm_content_uid2name($uid);
+      $users[$uid]['modes'][] = $mode;
+    }
+  }
+
+  foreach ($groups_in as $mode => $data) {
+    foreach ($data as $gid) {
+      $members = mm_content_get_users_in_group($gid, '<br />', FALSE, 20, TRUE);
+      if ($members == '') $members = t('(none)');
+      $groups[$gid]['name'] = mm_content_get_name($gid);
+      $groups[$gid]['members'] = $members;
+      $groups[$gid]['modes'][] = $mode;
+    }
+  }
+
+  $types = array(
+    Constants::MM_PERMS_WRITE => array(
+      t('Edit Field'),
+      'If checked, @class can edit the field.',
+    ),
+    Constants::MM_PERMS_READ => array(
+      t('View Field'),
+      "If checked, @class can view the field's contents.",
+    ),
+  );
+
+  EditContentForm::permissionsForm($form, $types, $default_modes, $groups, $users);
+  mm_static($form, 'settings_perms', $form_id);
+}
+
+/**
+ * Get the configuration of a given field's entity.
+ *
+ * @param FieldDefinitionInterface $field
+ *   The field's definition
+ * @return ConfigEntityInterface
+ */
+function _mm_fields_perms_get_entity_type_config(FieldDefinitionInterface $field) {
+  try {
+    return \Drupal::service('entity.repository')
+      ->loadEntityByConfigTarget($field->getTargetEntityTypeId() . '_type', $field->getTargetBundle());
+  }
+  catch (PluginNotFoundException $e) {
+    return NULL;
+  }
+}
+
+/**
+ * Retrieve the permissions for a field, taking default values into account.
+ *
+ * @param ConfigEntityInterface|null $source
+ *   The config entity being queried.
+ * @param $default_modes
+ *   On return, an array of modes for the anonymous user ("Everyone").
+ * @param $users
+ *   On return, a nested array where the first index is the mode, and the
+ *   inner array contains a list of user IDs.
+ * @param $groups
+ *   On return, a nested array where the first index is the mode, and the
+ *   inner array contains a list of group IDs.
+ */
+function _mm_fields_perms_defaults($source, &$default_modes, &$users, &$groups) {
+  $default_modes = $source ? $source->getThirdPartySetting('mm_fields_perms', 'default_modes', [Constants::MM_PERMS_WRITE, Constants::MM_PERMS_READ]) : [Constants::MM_PERMS_WRITE, Constants::MM_PERMS_READ];
+  $users = $source ? $source->getThirdPartySetting('mm_fields_perms', 'users', []) : [];
+  $groups = $source ? $source->getThirdPartySetting('mm_fields_perms', 'groups', []) : [];
+}

@@ -1,0 +1,1997 @@
+<?php
+
+/**
+ * @file
+ * Allow the user to create a single page that aggregates multiple RSS feeds.
+ */
+
+/**
+Installation instructions:
+
+  cd /var/www
+  mkdir drupal-rss-cache
+  chmod 700 drupal-rss-cache
+  chown apache drupal-rss-cache
+ */
+
+define('RSS_PAGE_CACHE_PATH_DEFAULT', '/var/www/drupal-rss-cache');
+define('RSS_PAGE_CACHE_DURATION_DEFAULT', 3600);
+
+use Drupal\Core\Link;
+use Drupal\Core\Url;
+use Drupal\monster_menus\Constants;
+use \Drupal\user\Entity\User;
+use \Drupal\node\Entity\Node;
+
+/**
+ * Implements hook_help().
+ */
+function rss_page_help($path, $args = NULL) {
+  switch ($path) {
+    case 'admin/modules#description':
+      return t('Aggregates the contents of multiple RSS feeds in one location.');
+
+    case 'admin/help#rss_page':
+      return t('<p>This is the help text.</p>');
+
+    case 'node/add#rss_page':
+      // This description shows up when users click "create content."
+      return t('Displays the content of an RSS feed, CMS page, or CMS tag');
+
+    case 'node/add#portal_page':
+      return t('Create a single page which shows the contents of multiple articles based on certain rules.');
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function rss_page_theme() {
+  $themes = array(
+    'rss_feed_list' => array(
+      'render element' => 'elt',
+    ),
+  );
+  return $themes;
+}
+
+/**
+ * Implements hook_node_info().
+ */
+function rss_page_node_info() {
+  return array(
+    'rss_page' => array('name' => t('RSS feed'), 'base' => 'rss_page',
+      'description' => rss_page_help('node/add#rss_page')),
+    'portal_page' => array('name' => t('portal page'), 'base' => 'rss_page',
+      'description' => rss_page_help('node/add#portal_page')));
+}
+
+/**
+ * Implements hook_menu().
+ */
+function rss_page_menu() {
+  $items = array();
+
+  $items['admin/config/rss_page'] = array(
+    'title' => 'RSS page',
+    'description' => 'Manage RSS Page settings',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('rss_page_configure'),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM);
+  $items['rss-page-taxonomy-auto'] = array(
+    'title' => 'Autocomplete taxonomy',
+    'page callback' => 'rss_page_taxonomy_autocomplete',
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK);
+
+  return $items;
+}
+
+/**
+ * Implements hook_block_info().
+ */
+function rss_page_block_info() {
+  $out = array(
+    'nav' => array(
+      'info' => t('RSS page navigation'),
+      'cache' => DRUPAL_CACHE_PER_PAGE|DRUPAL_CACHE_PER_USER),
+    'content' => array(
+      'info' => t('RSS feeds'),
+      'cache' => DRUPAL_CACHE_PER_PAGE|DRUPAL_CACHE_PER_USER),
+    'untitled' => array(
+      'info' => t('Portal Page: @title', array('@title' => variable_get('rss_page_untitled_feeds_title', t('Amherst College Feeds')))),
+      'cache' => DRUPAL_CACHE_PER_USER),
+  );
+
+  $result = db_query("SELECT nid FROM {node} WHERE type = 'portal_page' AND status = 1 AND title <> ''");
+  foreach ($result as $n) {
+    $node = Node::load($n->nid);
+    if ($node && $node->id() && mm_content_user_can_node($node, Constants::MM_PERMS_READ)) {
+      $out[$node->id()] = array(
+        'info' => t('Portal Page: @name (node/@nid)', array('@name' => trim($node->label()), '@nid' => $node->id())),
+        'cache' => DRUPAL_CACHE_PER_USER
+      );
+    }
+  }
+
+  return $out;
+}
+
+/**
+ * Implements hook_block_view().
+ */
+function rss_page_block_view($delta = 'nav', $edit = NULL) {
+  if ($delta == 'untitled') {
+    $content = array();
+    $result = db_query("SELECT nid FROM {node} WHERE type = 'portal_page' AND status = 1 AND title = '' ORDER BY sticky DESC, changed DESC");
+    foreach ($result as $n) {
+      $node = Node::load($n->nid);
+      if (!empty($node) && $node->id() && mm_content_user_can_node($node, Constants::MM_PERMS_READ) && _rss_page_conditional($node)) {
+        $block = _rss_page_block('content', $node, $rss_link);
+        $content[] = $block['content'];
+      }
+    }
+    if ($content) {
+      return array(
+        'content' => $content,
+        'subject' => variable_get('rss_page_untitled_feeds_title', t('Amherst College Feeds')),
+      );
+    }
+  }
+  else {
+    $node = NULL;
+    if (is_numeric($delta)) {
+      $node = Node::load($delta);
+      if (empty($node) || !$node->id() || !mm_content_user_can_node($node, Constants::MM_PERMS_READ) || $node->getType() == 'portal_page' && !_rss_page_conditional($node)) return array('content' => '', 'subject' => '');
+      $delta = 'content';
+    }
+    $block = _rss_page_block($delta, $node, $rss_link, FALSE, $edit);
+    if ($node && !empty($node->label())) {
+      $block['subject'] = check_plain(_rss_page_add_vars($node->label(), $node));
+    }
+    if (!empty($node->id()) && mm_content_user_can_node($node, Constants::MM_PERMS_WRITE)) {
+      $block['content'][] = array('#weight' => -1, '#markup' => '<div class="portal-page-setup">' . Link::fromTextAndUrl(t('setup'), Url::fromRoute('entity.node.canonical', ['node' => $node->id()]))->toString() . '</div>');
+    }
+    $weight = 0;
+    foreach ($block['content'] as $index => $content) {
+      if (!isset($content['#weight'])) {
+        $block['content'][$index]['#weight'] = $weight++;
+      }
+    }
+    // Allow this block to be hidden in homebox_amherst.
+    if (!$block['count'] && isset($edit['homebox']) && empty($edit['homebox']->closable)) {
+      $block['content'] = array();
+    }
+    return $block;
+  }
+}
+
+/**
+ * Implements hook_access().
+ */
+function rss_page_access($op, Node $node, User $account) {
+  if ($node == 'portal_page') {
+    return $account->access('create portal pages');
+  }
+  elseif ($op == 'create') {
+    // Only users with permission to do so may create this node type.
+    return $account->access('create rss pages');
+  }
+
+  // Users who create a node may edit or delete it later, assuming they have the
+  // necessary permissions.
+  if ($op == 'update' || $op == 'delete') {
+    if ($account->access('edit own rss pages') && ($account->id() == $node->getOwnerId())) {
+      return TRUE;
+    }
+  }
+}
+
+/**
+ * Implements hook_exit().
+ *
+ * FIXME: convert to event subscriber
+ */
+function rss_page_exit() {
+  $_rss_page_future_goto = &drupal_static('_rss_page_future_goto');
+
+  if (!empty($_rss_page_future_goto)) {
+    header('Location: ' . $_rss_page_future_goto);
+    exit();
+  }
+}
+
+/**
+ * Implements hook_node_view().
+ */
+function rss_page_node_view(Node $node, $view_mode) {
+  $_mm_mmtid_of_node = &drupal_static('_mm_mmtid_of_node');
+
+  $node_types = array_keys(node_type_get_names());
+  mm_active_menu_item();
+  if (isset($node) && isset($_mm_mmtid_of_node[$node->id()]) && in_array($node->getType(), $node_types)) {
+    // FIXME: https://www.drupal.org/node/2294629  Field widgets generate lighter default $form[$field_name] structures
+    if (variable_get('rss_page_show_node_permalink', FALSE) && isset($node->content['#entity_type'])) {
+      // Show the permalink for everything but the 403 & 404 pages
+      $external = mm_get_current_path();
+      _rss_page_rewrite_outbound($external);
+      // FIXME: use securesite settings, like mm_access_denied().
+      if ($external != \Drupal::config('system.site')->get('page.404') && $external != \Drupal::config('system.site')->get('page.403') && $external != variable_get('httpauth_site_403', '')) {
+        $defaults = array();
+        if (!empty($dest = \Drupal::request()->query->get('destination', ''))) {
+          $defaults = array('query' => array('destination' => $dest));
+        }
+        $link = $defaults + array('title' => t('Permalink'), 'href' => 'node/' . $node->id(), 'attributes' => array('rel' => 'permalink', 'title' => 'The permanent location of this content'));
+
+        // FIXME: https://www.drupal.org/node/2294629  Field widgets generate lighter default $form[$field_name] structures
+        $node->content['links'][$node->content['#entity_type']]['#links']['rss_page_permalink'] = $link;
+      }
+    }
+  }
+}
+
+function _rss_page_rewrite_outbound(&$path) {
+  $original_path = $path;
+  $options = array();
+  \Drupal::moduleHandler()->alter('url_outbound', $path, $options, $original_path);
+}
+
+/**
+ * Menu callback; presents general node configuration options.
+ * FIXME: convert to ConfigFormBase
+ */
+function rss_page_configure($form, &$form_state) {
+  $form = rss_page_form_options($form, t('Default options'));
+  $form['mm_enable_rss'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable the "Add this page to My Portal" button'),
+    '#default_value' => mm_get_setting('pages.enable_rss'),
+    '#weight' => 1,
+  );
+  $form['rss_page_untitled_feeds_title'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Default portal page widget title'),
+    '#description' => t('Untitled portal page feeds are grouped together into a single widget. This is that widget\'s title.'),
+    '#default_value' => variable_get('rss_page_untitled_feeds_title', t('Feeds')),
+    '#weight' => 2,
+  );
+  $form['rss_page_cache_path'] = array(
+    '#type' => 'textfield',
+    '#title' => t('RSS cache path'),
+    '#description' => t('The location of the cache used to keep from fetching the same remote RSS data repeatedly.'),
+    '#default_value' => variable_get('rss_page_cache_path', RSS_PAGE_CACHE_PATH_DEFAULT),
+    '#weight' => 3,
+  );
+  $form['rss_page_cache_duration'] = array(
+    '#type' => 'select',
+    '#title' => t('RSS cache duration'),
+    '#description' => t('After this length of time, cached remote RSS data will be discarded.'),
+    '#default_value' => variable_get('rss_page_cache_duration', RSS_PAGE_CACHE_DURATION_DEFAULT),
+    '#options' => array(
+      30   => t('30 seconds'),
+      60   => t('1 minute'),
+      300  => t('5 minutes'),
+      600  => t('10 minutes'),
+      1800 => t('30 minutes'),
+      3600 => t('1 hour'),
+      7200 => t('2 hours'),
+    ),
+    '#weight' => 4,
+  );
+  $form['#submit'][] = function($form, &$form_state) {
+    $values = $form_state['values'];
+    if ($values['submit'] == $values['op']) {
+      variable_set('node_settings_rss_page', array(
+        'show_descr' => $values['rss_checks']['show_descr'],
+        'show_image' => $values['rss_checks']['show_image'],
+        'show_feed_img' => $values['rss_checks']['show_feed_img'],
+        'group_by_key' => 0,
+        'sort' => $values['rss_sort'],
+        'items' => $values['rss_items'],
+        'display' => $values['rss_display'],
+      ));
+    }
+  };
+  return system_settings_form($form);
+}
+
+function rss_page_mm_config_alter(&$form) {
+  if (isset($form['mm_page']['mm_enable_rss'])) {
+    $form['mm_page']['mm_enable_rss']['#title'] = t('Allow content creators to control the %add button and the availability of RSS feeds on a per-page basis', array('%add' => t('Add this page to my portal')));
+  }
+
+  if (isset($form['mm_node'])) {
+    $form['mm_node']['rss_page_show_add_tag_to_portal'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Enable the %add button after each tag', array('%add' => t('Add this tag to my portal'))),
+      '#default_value' => variable_get('rss_page_show_add_tag_to_portal', FALSE),
+    );
+    $form['mm_node']['rss_page_show_node_permalink'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Show a permalink icon with every node'),
+      '#default_value' => variable_get('rss_page_show_node_permalink', FALSE),
+    );
+  }
+
+  if (isset($form['mm_page'])) {
+    $form['mm_page']['rss_page_show_page_permalink'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Show a permalink icon on every page'),
+      '#default_value' => variable_get('rss_page_show_page_permalink', FALSE),
+    );
+
+    $form['mm_page']['menu'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('RSS/Permalink Menu'),
+      '#description' => t('These values can contain HTML.'),
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE
+    );
+    $form['mm_page']['menu']['rss_page_subscribe_menu_portal'] = array(
+      '#type' => 'textfield',
+      '#maxlength' => 1024,
+      '#title' => t('Text of the %add link', array('%add' => t('Add to my portal'))),
+      '#default_value' => variable_get('rss_page_subscribe_menu_portal', t('Add to my portal')),
+    );
+    $form['mm_page']['menu']['rss_page_subscribe_menu_rss'] = array(
+      '#type' => 'textfield',
+      '#maxlength' => 1024,
+      '#title' => t('Text appearing above the RSS link'),
+      '#default_value' => variable_get('rss_page_subscribe_menu_rss', t('Copy this URL to add this page to an external news reader:')),
+    );
+    $form['mm_page']['menu']['rss_page_subscribe_menu_rss_warn'] = array(
+      '#type' => 'textfield',
+      '#maxlength' => 1024,
+      '#title' => t('Warning that appears if the RSS link requires authentication'),
+      '#default_value' => variable_get('rss_page_subscribe_menu_rss_warn', t("This URL may not work with all readers; some readers can't subscribe to password-protected pages.")),
+    );
+    $form['mm_page']['menu']['rss_page_subscribe_menu_permalink'] = array(
+      '#type' => 'textfield',
+      '#maxlength' => 1024,
+      '#title' => t('Text appearing above the permalink'),
+      '#default_value' => variable_get('rss_page_subscribe_menu_permalink', t('Copy this URL to bookmark this page or send the link to someone:')),
+    );
+    $form['mm_page']['access_denied']['#weight'] = 100;
+  }
+}
+
+function rss_page_form_mm_ui_content_edit_alter(&$form, $form_state) {
+  if (isset($form['settings_appearance']['rss'])) {
+    $form['settings_appearance']['rss']['#title'] = t('Show the %add button and enable the RSS feed', array('%add' => t('Add this page to my portal')));
+  }
+}
+
+function rss_page_get_options() {
+  return variable_get('node_settings_rss_page', array(
+    'show_descr' => TRUE,
+    'show_image' => TRUE,
+    'show_feed_img' => TRUE,
+    'group_by_key' => 0,
+    'sort' => 'feed-weight',
+    'items' => 10,
+    'display' => '1-col',
+    'view_condition' => '',
+  ));
+}
+
+function rss_page_form_options($form, $title, Node $node = NULL) {
+  if (isset($node) && !empty($node->rss_page) && !empty($node->id())) {
+    $opts = (array)$node->rss_page;
+    foreach (array('show_descr', 'show_image', 'show_feed_img', 'group_by_key') as $opt) {
+      if ($opts[$opt]) {
+        $opts[$opt] = $opt;
+      }
+    }
+  }
+  else {
+    $opts = rss_page_get_options();
+  }
+
+  $form['opts'] = array(
+    '#type' => 'fieldset',
+    '#title' => $title,
+    '#collapsible' => FALSE,
+  );
+
+  $temp = array(0, 1, 2, 3, 4, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50);
+  $ilist = array_combine($temp, $temp);
+  $ilist[0] = t('(none)');
+  $ilist[-1] = t('(all)');
+
+  $form['opts']['rss_items'] = array(
+    '#type' => 'select',
+    '#title' => t('News items per feed'),
+    '#default_value' => $opts['items'],
+    '#options' => $ilist
+  );
+  $form['opts']['rss_checks'] = array(
+    '#type' => 'checkboxes',
+    '#default_value' => $opts,
+    '#options' => array(
+      'show_feed_img' => t('Show the feed logo, if it exists'),
+      'show_descr' => t('Show full item text; otherwise just show link to item'),
+      'show_image' => t('Show images in items')
+    )
+  );
+  if ($node->getType() && $node->getType() != 'rss_page') {
+    $form['opts']['rss_checks']['#options']['group_by_key'] = t('Group query results by nid or mmtid. Requires name column to be returned.');
+  }
+  $form['opts']['rss_sort'] = array(
+    '#type' => 'radios',
+    '#default_value' => $opts['sort'],
+    '#title' => t('News item sort order'),
+    '#options' => array(
+      'date' => t('by date, newest first'),
+      'date-reverse' => t('by date, oldest first'),
+      'feed-alpha' => t('grouped by feed, alphabetically'),
+      'feed-weight' => t('grouped by feed, in the order they appear above'),
+    )
+  );
+//   $form['opts']['rss_display'] = array(
+//     '#type' => 'radios',
+//     '#default_value' => $opts['display'],
+//     '#title' => t('Navigation'),
+//     '#options' => array(
+//         '1-col' => t('Show above feed content'),
+//         'block' => t('Show navigation and content in separate areas of the page'),
+//   ));
+  $form['opts']['rss_display'] = array(
+    '#type' => 'value',
+    '#value' => '1-col',
+  );
+  return $form;
+}
+
+/**
+ * Implements hook_form().
+ */
+function rss_page_form(Node $node, &$form_state) {
+  $xvars = rss_page_get_xvars();
+  $form = array();
+
+  if ($node->getType() != 'rss_page') {
+    // Once this has been moved to a route handler, set the title using
+    // _title_callback in the .yml file
+    // @see https://www.drupal.org/node/2067859
+    //drupal_set_title(!empty($node->id()) ? t('Edit a portal page') : t('Create a portal page'));
+
+    $form['vars-help'] = mm_ui_vars_help(-10, array(t('Condition'), t('Title'), t('Feed name'), t('SQL query')), array_keys($xvars));
+    $form['view_condition'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Condition'),
+      '#size' => 50, '#maxlength' => 255,
+      '#default_value' => isset($node->rss_page['view_condition']) ? $node->rss_page['view_condition'] : '',
+      '#weight' => -7,
+      '#description' => t('This page will only be displayed if the above criterion is met. Use a piece of executable PHP code that evaluates to a boolean result. Leave blank to always show this page. Do not include the keyword "if". Example: <code>"${class_year}" != ""</code>'),
+    );
+  }
+  else {
+    // Once this has been moved to a route handler, set the title using
+    // _title_callback in the .yml file
+    // @see https://www.drupal.org/node/2067859
+    // drupal_set_title(!empty($node->id()) ? t('Edit an RSS feed') : t('Create an RSS feed'));
+  }
+
+  return _rss_page_main_form($form, $node);
+}
+
+/**
+ * Implements hook_mm_fix_node_urls_info().
+ */
+function rss_page_mm_fix_node_urls_info() {
+  return array(
+    'rss_feed_data' => array(
+      'table' => 'rss_page_feed',
+      'join on' => "%alias.vid = node.vid AND %alias.`type` = 'url'",
+      'table field' => 'data',
+      'get' => '_rss_page_mm_fix_node_urls_get',
+      'set' => '_rss_page_mm_fix_node_urls_set',
+    ),
+  );
+}
+
+function _rss_page_mm_fix_node_urls_get($node) {
+  if (isset($node->rss_feeds)) {
+    // There's no provision to modify data in a one-to-many relationship as an
+    // array, so concatenate it all into a string instead.
+    $out = array();
+    foreach ($node->rss_feeds as $n => $rss) {
+      if ($rss->type == 'url') {
+        $out[] = "$n::" . $rss->data;
+      }
+    }
+    return implode('||', $out);
+  }
+  return NULL;
+}
+
+function _rss_page_mm_fix_node_urls_set($value, $node) {
+  if (isset($node->rss_feeds)) {
+    // Split the string back out into multiple rows.
+    foreach (explode('||', $value) as $row) {
+      list($n, $data) = explode('::', $row);
+      if (isset($node->rss_feeds[$n]) && $node->rss_feeds[$n]->type == 'url') {
+        $node->rss_feeds[$n]->data = $data;
+      }
+    }
+  }
+}
+
+function rss_page_taxonomy_autocomplete($string = '') {
+  // FIXME
+  $string = trim($string);
+  $matches = array();
+  if ($string != '') {
+    $result = db_query_range("SELECT t.tid, t.name FROM {taxonomy_term_data} t WHERE t.name LIKE :string", 0, 10, array(':string' => "%$string%"));
+
+    foreach ($result as $tag) {
+      $matches[$tag->tid] = check_plain($tag->name);
+    }
+  }
+
+  mm_json_response($matches);
+}
+
+function _rss_page_main_form($form, $node, $required = TRUE) {
+  $form['title'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Title'),
+    '#required' => $node->type == 'rss_page' && $required,
+    '#size' => 50,
+    '#default_value' => $node->label(),
+    '#weight' => -5
+  );
+
+  $form['feeds-url'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Enter a URL'),
+    '#attributes' => array('style' => 'display: none', 'id' => 'edit-feeds-url')
+  );
+  $form['feeds-url']['feed-url'] = array(
+    '#type' => 'textfield',
+    '#title' => t('URL of RSS feed'),
+    '#description' => t('Enter the full URL, starting with <code>http://</code>, <code>feed://</code>, etc. The feed\'s title will be set automatically the first time you view the resulting page. Click on either button below to return to the main list.'),
+    '#size' => 50, '#maxlength' => 255,
+  );
+  $form['feeds-url']['clear'] = array(
+    '#prefix' => '<div class="tax-clear">',
+    '#suffix' => '</div>',
+  );
+  $form['feeds-url']['clear']['feed-ok'] = array(
+    '#type' => 'submit',
+    '#value' => t('Done'),
+    '#button_type' => 'primary',
+  );
+  $form['feeds-url']['clear']['feed-cancel'] = array(
+    '#type' => 'submit',
+    '#value' => t('Cancel'),
+  );
+
+  if ($node->type != 'rss_page') {
+    $form['feeds-query'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Enter a query'),
+      '#attributes' => array('style' => 'display: none', 'id' => 'edit-feeds-query')
+    );
+    $form['feeds-query']['feed-name'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Feed name'),
+      '#size' => 50, '#maxlength' => 255
+    );
+    $form['feeds-query']['feed-url'] = array(
+      '#type' => 'textarea',
+      '#title' => t('SQL query'),
+      '#description' => t('Must return an "mmtid" or "nid" column; if both, "nid" takes precedence.'),
+      '#attributes' => array('spellcheck' => 'false'),
+      '#wysiwyg' => FALSE,
+      '#cols' => 50, '#maxlength' => 512,
+    );
+    $form['feeds-query']['clear'] = array(
+      '#prefix' => '<div class="tax-clear">',
+      '#suffix' => '</div>',
+    );
+    $form['feeds-query']['clear']['feed-ok'] = array(
+      '#type' => 'submit',
+      '#value' => t('Done'),
+      '#button_type' => 'primary',
+    );
+    $form['feeds-query']['clear']['feed-cancel'] = array(
+      '#type' => 'submit',
+      '#value' => t('Cancel'),
+    );
+  }
+
+  $have_tax = mm_module_exists('taxonomy');
+  if ($have_tax) {
+    $form['feeds-tax'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Choose a term or free tag'),
+      '#attributes' => array('style' => 'display: none', 'id' => 'edit-feeds-tax')
+    );
+    $form['feeds-tax']['tax-id'] = array(
+      '#type' => 'hidden',
+    );
+    $form['feeds-tax']['tax-sample'] = array(
+      '#markup' => '<div id="tax-sample-wrapper"><label for="edit-tax-text">' . t('Term/tag:') . '</label><div id="tax-sample"></div></div>',
+    );
+    $form['feeds-tax']['tax-text'] = array(
+      '#type' => 'textfield',
+      '#autocomplete_route_name' => 'rss-page-taxonomy-auto', // FIXME once the route is known
+      '#size' => 35,
+      '#maxlength' => 100,
+      '#description' => t('Type part of the tag, then choose a tag from the list of matches.'),
+    );
+    $form['feeds-tax']['clear'] = array(
+      '#prefix' => '<div class="tax-clear">',
+      '#suffix' => '</div>',
+    );
+    $form['feeds-tax']['clear']['tax-ok'] = array(
+      '#type' => 'submit',
+      '#value' => t('Done'),
+      '#button_type' => 'primary',
+    );
+    $form['feeds-tax']['clear']['tax-cancel'] = array(
+      '#type' => 'submit',
+      '#value' => t('Cancel'),
+    );
+  }
+
+  $desc = '';
+  if ($node->type == 'rss_page') {
+    $desc = t('%url displays the content of a standard URL-based feed. %page displays the content of a CMS page. %tag displays any CMS content labeled with the indicated tag. After entering a URL or selecting a page or tag, click Done.', array(
+      '%url' => t('RSS feed'),
+      '%page' => t('Page feed'),
+      '%tag' => t('Tag feed'),
+    ));
+  }
+  $form['rss_feeds'] = array(
+    '#type' => 'rss_feed_list',
+    '#required' => $required,
+    '#rss_list_url_form_ID' => 'edit-feeds-url',
+    '#rss_list_tax_form_ID' => $have_tax ? 'edit-feeds-tax' : '',
+    '#rss_list_query_form_ID' => $node->type != 'rss_page' ? 'edit-feeds-query' : '',
+    '#rss_list_subtype' => $node->type,
+    '#description' => $desc,
+    '#default_value' => serialize(isset($node->rss_feeds) ? $node->rss_feeds : array()),
+  );
+
+  return rss_page_form_options($form, t('Feed display options'), $node);
+}
+
+/**
+ * Implements hook_validate().
+ */
+function rss_page_validate(&$node) {
+  $feeds = _rss_page_split_feed_list($node->rss_feeds);
+  if (!count($feeds)) {
+    $form_state->setErrorByName('rss_feeds', t('You must add at least one feed.'));
+  }
+  else {
+    foreach ($feeds as $m) {
+      if ($m->type == 'cat') {
+        if (!mm_content_user_can($m->data, Constants::MM_PERMS_READ)) {
+          $form_state->setErrorByName('rss_feeds', t('You are not allowed to read the page %cat.',
+              array('%cat' => $m->name)));
+        }
+      }
+      elseif ($node->type == 'rss_page' && $m->type == 'url' && !valid_url($m->data, TRUE)) {
+        $form_state->setErrorByName('rss_feeds', t('%url does not seem to be a valid URL.', array('%url' => $m->data)));
+      }
+    }
+  }
+
+  if ($node->type != 'rss_page') {
+    foreach ($feeds as $m) {
+      if ($m->type == 'query' && $m->data != '') {
+        $q = _rss_page_add_vars($m->data, $node);
+        unset($row);
+        try {
+          $row = db_query($q)->fetchObject();
+        }
+        catch (\Exception $e) {
+          $form_state->setErrorByName('members', t('There was an error testing the query.<br /><strong>Query:</strong> @query<br /><strong>Error:</strong> @error', array('@query' => $q, '@error' => $e->getMessage())));
+        }
+
+        if (isset($row) && !isset($row->mmtid) && !isset($row->nid)) {
+          $form_state->setErrorByName('members', t('The query:<br />@query<br />did not return an mmtid or nid column', array('@query' => $q)));
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_insert().
+ */
+function rss_page_insert(Node $node) {
+  if (isset($node->rss_checks) && is_array($node->rss_checks)) {
+    $record = array(
+      'nid' => $node->id(),
+      'items' => $node->rss_items,
+      'sort' => $node->rss_sort,
+      'show_descr' => !empty($node->rss_checks['show_descr']),
+      'show_image' => !empty($node->rss_checks['show_image']),
+      'show_feed_img' => !empty($node->rss_checks['show_feed_img']),
+      'group_by_key' => !empty($node->rss_checks['group_by_key']),
+      'display' => $node->rss_display,
+      'view_condition' => !empty($node->view_condition) ? $node->view_condition : '',
+    );
+    if (empty($node->original)) {
+      \Drupal::database()->insert('rss_page')
+        ->fields($record)
+        ->execute();
+    }
+    else {
+      \Drupal::database()->update('rss_page')
+        ->condition('nid', $node->id())
+        ->fields($record)
+        ->execute();
+    }
+  }
+
+  if (!is_array($node->rss_feeds)) {
+    $feeds = $node->rss_feeds;
+    $node->rss_feeds = array();
+    $weight = 0;
+
+    foreach (_rss_page_split_feed_list($feeds) as $m) {
+      $node->rss_feeds[] = (object)array('type' => $m->type, 'name' => $m->name, 'data' => $m->data, 'weight' => $weight++);
+    }
+  }
+
+  foreach ($node->rss_feeds as $feed) {
+    \Drupal::database()->insert('rss_page_feed')
+      ->fields(array(
+        'nid' => $node->id(),
+        'vid' => $node->getRevisionId(),
+        'type' => $feed->type,
+        'data' => $feed->data,
+        'name_isset' => 0,
+        'name' => $feed->name,
+        'weight' => $feed->weight,
+      ))
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_update().
+ */
+function rss_page_update(Node $node) {
+  db_query('DELETE {rss_page_feed}, {rss_page_last_read} FROM {rss_page_feed} ' .
+    'LEFT JOIN {rss_page_last_read} ON {rss_page_feed}.fid={rss_page_last_read}.fid ' .
+    'WHERE vid=:vid', array(':vid' => $node->getRevisionId()));
+
+  rss_page_insert($node);
+}
+
+/**
+ * Implements hook_node_revision_delete().
+ *
+ * When a node revision is deleted, we need to remove the corresponding record
+ * from our table.
+ */
+function rss_page_node_revision_delete(Node $node) {
+  // Notice that we're matching a single revision based on the node's vid.
+  db_delete('rss_page_feed')
+    ->condition('vid', $node->getRevisionId())
+    ->execute();
+}
+
+/**
+ * Implements hook_mm_delete() from mm_content.inc.
+ */
+function rss_page_mm_delete($mmtids, $nids) {
+  if (count($nids)) {
+    db_query("DELETE f, r FROM {rss_page_feed} f LEFT JOIN {rss_page_last_read} r ON f.fid = r.fid WHERE f.nid IN(:nids[])", array(':nids[]' => (array) $nids));
+  }
+
+  if (count($mmtids)) {
+    db_query("DELETE f, r FROM {rss_page_feed} f LEFT JOIN {rss_page_last_read} r ON r.fid = f.fid WHERE f.type = 'cat' AND f.data IN(:mmtids[])", array(':mmtids[]' => (array) $mmtids));
+  }
+}
+
+/**
+ * Implements hook_delete().
+ */
+function rss_page_delete(Node $node) {
+  // Notice that we're matching all revision, by using the node's nid.
+  db_delete('rss_page')
+    ->condition('nid', $node->id())
+    ->execute();
+  db_query('DELETE f, r FROM {rss_page_feed} f LEFT JOIN {rss_page_last_read} r ON r.fid = f.fid WHERE nid = :nid', array(':nid' => $node->id()));
+}
+
+/**
+ * Implements hook_load().
+ */
+function rss_page_load($nodes) {
+  $result = db_query('SELECT nid, items, sort, show_descr, show_image, show_feed_img, group_by_key, display, view_condition FROM {rss_page} WHERE nid IN (:nids[])', array(':nids[]' => array_keys($nodes)));
+  foreach ($result as $rss_page) {
+    $feeds = array();
+    $select = db_select('rss_page_feed', 'f');
+    $select->fields('f', array('fid', 'type', 'data', 'name', 'name_isset', 'weight'));
+    $select->condition('f.vid', $nodes[$rss_page->nid]->getRevisionId());
+    $select->orderBy('f.weight');
+    $feed_result = $select->execute();
+    foreach ($feed_result as $feed) {
+      $feeds[] = $feed;
+    }
+
+    $nodes[$rss_page->nid]->rss_page = (array)$rss_page;
+    $nodes[$rss_page->nid]->rss_items = $rss_page->items;
+    $nodes[$rss_page->nid]->rss_sort = $rss_page->sort;
+    $nodes[$rss_page->nid]->rss_display = $rss_page->display;
+    $nodes[$rss_page->nid]->view_condition = $rss_page->view_condition;
+    $nodes[$rss_page->nid]->rss_feeds = $feeds;
+  }
+}
+
+function rss_page_as_user_submit($form, &$form_state) {
+  $uid = mm_ui_mmlist_key0($form_state['values']['user']);
+  if (isset($uid) && mm_content_uid2name($uid) !== FALSE && \Drupal::currentUser()->hasPermission('create portal pages')) {
+    $_SESSION['vars_uid'] = $uid;
+  }
+}
+
+function rss_page_as_user($form, &$form_state) {
+  $user_uid = \Drupal::currentUser()->id();
+
+  if (!isset($_SESSION['vars_uid'])) {
+    $_SESSION['vars_uid'] = $user_uid;
+  }
+
+  $form['as-user'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('View portal pages as a different user'),
+    '#collapsible' => TRUE,
+    '#collapsed' => $_SESSION['vars_uid'] == $user_uid,
+  );
+  $form['as-user']['user-choose'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Choose the user'),
+    '#autocomplete_route_name' => 'monster_menus.autocomplete',
+    '#description' => mm_autocomplete_desc(),
+    '#size' => 30, '#maxlength' => 40,
+  );
+  $form['as-user']['user'] = array(
+    '#type' => 'mm_userlist',
+    '#description' => t('Because you are an administrator, you can see the portal page contents as another user would. You will still not be able to see data you would not otherwise have access to, however. Any added feeds (non-portal pages) are your own.'),
+    '#title' => ' ',
+    '#default_value' => array($_SESSION['vars_uid'] => mm_content_uid2name($_SESSION['vars_uid'])),
+    '#mm_list_autocomplete_ID' => 'edit-user-choose', // this can eventually be removed
+    '#mm_list_autocomplete_name' => 'user-choose',
+    '#mm_list_min' => 1,
+    '#mm_list_max' => 1,
+  );
+  $form['as-user']['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('View'),
+    '#button_type' => 'primary',
+  );
+
+  return $form;
+}
+
+/**
+ * Implements hook_view().
+ */
+function rss_page_view(Node $node, EntityViewDisplayInterface $display, $view_mode, $langcode) {
+  static $have_user_form; // just in case this function is called more than once per page
+
+  $user_form = '';
+  if ($node->type != 'rss_page' && \Drupal::currentUser()->hasPermission('create portal pages') && !$have_user_form++) {
+    $user_form = drupal_get_form('rss_page_as_user');
+  }
+
+  $skip_display = FALSE;
+  if (isset($node->rss_page) && ($cond = trim($node->rss_page['view_condition'])) != '') {
+    $cond = _rss_page_add_vars($cond, $node);
+    if (empty($cond) || eval("return ($cond);") == FALSE) {
+      if (\Drupal::currentUser()->hasPermission('create portal pages')) {
+        if (isset($user_form)) {
+          $node->content['body'] = $user_form;
+        }
+        $skip_display = TRUE;
+      }
+      elseif (isset($user_form)) {
+        $node->content['body'] = $user_form;
+        return;
+      }
+      else {
+        $node->content = array();
+        $node->no_display = TRUE;
+        return;
+      }
+    }
+  }
+
+  $node->setTitle(_rss_page_add_vars($node->label(), $node));
+  if (!$skip_display) {
+    $nav = _rss_page_block('nav', $node, $rss_link);
+    $body = _rss_page_block('content', $node, $rss_link, TRUE);
+    $node->content['body'] = array(
+      'user_form' => $user_form,
+      'nav' => $nav['content'],
+      'body' => $body['content'],
+    );
+    $node->rss_link = $rss_link;
+  }
+
+  return $node;
+}
+
+/**
+ * Implements hook_user_delete().
+ */
+function rss_page_user_delete(User $account) {
+  if ($account->isAuthenticated()) {
+    db_delete('rss_page_last_read')
+      ->condition('uid', $account->id())
+      ->execute();
+    db_delete('rss_page_settings')
+      ->condition('uid', $account->id())
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function rss_page_form_alter(&$form, &$form_state, $form_id) {
+  if (isset($form['type']) && isset($form['type']['#value']) &&
+      ($form['type']['#value'] == 'rss_page' || $form['type']['#value'] == 'portal_page')) {
+    unset($form['preview']);
+  }
+}
+
+/**
+ * Implements hook_element_info().
+ *
+ * This hook declares to Drupal what form elements are provided by the module.
+ *
+ * FIXME: according to https://www.drupal.org/node/2320115
+ */
+function rss_page_element_info() {
+  $type['rss_feed_list'] = array(
+    '#theme' => 'rss_feed_list',
+    '#input' => TRUE,
+  );
+  return $type;
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Periodically remove old RSS cache files
+ */
+function rss_page_cron() {
+  $rss_cache = variable_get('rss_page_cache_path', RSS_PAGE_CACHE_PATH_DEFAULT);
+  foreach (file_scan_directory($rss_cache, '/\.spc$/') as $file) {
+    if (is_file($file->uri) && mm_request_time() - filemtime($file->uri) > 30 * 24 * 60 * 60) {
+      file_unmanaged_delete($file->uri);
+    }
+  }
+}
+
+/**
+ * Theme a form element allowing the user to add RSS pages.
+ */
+function theme_rss_feed_list($variables) {
+  $_mmlist_instance = &drupal_static('_mmlist_instance', 0);
+  $elt = $variables['elt'];
+  module_load_include('inc', 'monster_menus', 'mm_theme');
+  $labelAddURL = t('Add RSS feed...');
+  if ($elt['#rss_list_subtype'] == 'rss_page') {
+    $is_portal = FALSE;
+    $flags = array();
+    $labelAboveInfo = t('Location:');
+    $labelAddQuery = '';
+  }
+  else {
+    $is_portal = TRUE;
+    $flags = array('is_portal' => TRUE);
+    $labelAboveInfo = '';
+    $labelAddQuery = t('Add a query...');
+  }
+  $labelAboveList = t('Feed:');
+  $labelAboveActions = t('Action:');
+  $labelAddCat = t('Add page feed...');
+  $labels = mm_ui_mmlist_labels();
+
+  $delConfirm = t("Are you sure you want to delete this feed?\\n\\n(You can skip this alert in the future by holding the Shift key while clicking the Delete icon.)");
+
+  $popup_base = Url::fromRoute('monster_menus.browser_load', [], ['query' => ['_path' => "1-rss-$_mmlist_instance-r-r/"]]);
+  $popup_URL = mm_home_mmtid();
+
+  $adds = array();
+  if (substr($elt['#value'], 0, 2) == 'a:') {
+    foreach (unserialize($elt['#value']) as $obj) {
+      $url = '';
+      _rss_page_info($obj->type, $obj->data, $obj->name, $url, $info, $popup_URL, $is_portal);
+      $adds[] = [FALSE, $obj->name, $obj->type, $url, $info];
+    }
+  }
+  else {
+    foreach (_rss_page_split_feed_list($elt['#value']) as $m) {
+      $name = $m->name;
+      $url = !$is_portal && $m->type == 'cat' ? '' : $m->data;
+      _rss_page_info($m->type, $m->data, $name, $url, $info, $popup_URL, $is_portal);
+      $adds[] = [FALSE, $name, $m->type, $url, $info];
+    }
+  }
+
+  if (!isset($popup_URL)) {
+    $popup_URL = 1;
+  }
+  $popup_label = t('Select a page');
+
+  $imgpath = base_path() . drupal_get_path('module', 'monster_menus') . '/images';
+
+  $url_form = $elt['#rss_list_url_form_ID'];
+  $tax_form = $elt['#rss_list_tax_form_ID'];
+  $query_form = $elt['#rss_list_query_form_ID'];
+  $labelAddTax = t('Add tag feed...');
+
+  $name = $elt['#parents'][0];
+  if (count($elt['#parents']) > 1) {
+    $name .= '[' . join('][', array_slice($elt['#parents'], 1)) . ']';
+  }
+
+  $labelAboveList .= !empty($elt['#required']) ? ' <span class="form-required" title="' . t('This field is required.') . '">*</span>' : '';
+  $class = _mm_theme_add_class($elt);
+  $desc = $elt['#description'] ? "\n" . '<div class="description">' . $elt['#description'] . '</div>' : '';
+
+  $settings = [
+    'where'              => NULL,
+    'isSearch'           => mm_ui_is_search(),
+    'listObjDivSelector' => "div[name=rss_list_obj$_mmlist_instance]",
+    'outerDivSelector'   => "div[name=rss_list_obj$_mmlist_instance] + div[class=\"$class\"]",
+    'hiddenName'         => $name,
+    'add'                => $adds,
+    'autoName'           => NULL,
+    'parms'              => [
+      'popupBase'         => $popup_base,
+      'popupURL'          => $popup_URL,
+      'popupLabel'        => $popup_label,
+      'flags'             => $flags,
+      'addCallback'       => 'rssAddCallback',
+      'replaceCallback'   => 'rssReplCallback',
+      'selectCallback'    => 'rssSelectCallback',
+      'dataCallback'      => 'rssDataCallback',
+      'labelAboveList'    => $labelAboveList,
+      'labelAboveActions' => $labelAboveActions,
+      'labelAddCat'       => $labelAddCat,
+      'labelAddURL'       => $labelAddURL,
+      'labelAddQuery'     => $labelAddQuery,
+      'labelAddList'      => $labelAddTax,
+      'labelAboveInfo'    => $labelAboveInfo,
+      'imgPath'           => $imgpath,
+      'inputDivID'        => $url_form,
+      'inputDivID2'       => $tax_form,
+      'inputDivID3'       => $query_form,
+      'delConfirmMsg'     => $delConfirm,
+      'labelTop'          => $labels[0],
+      'labelUp'           => $labels[1],
+      'labelX'            => $labels[2],
+      'labelBott'         => $labels[3],
+      'labelDown'         => $labels[4],
+      'labelEdit'         => $labels[5],
+    ]
+  ];
+  $arr = [];
+  mm_add_library($arr, 'mm_list');
+  mm_add_js_setting($arr, "mmListInit[$_mmlist_instance]", $settings);
+  $output = <<<HTML
+<div name="rss_list_obj$_mmlist_instance" style = "display: none; height: 30px; margin: 0 5px 0 0"><a></a></div><div class="$class"></div>$desc
+HTML;
+  $_mmlist_instance++;
+
+  $arr[] = [ '#markup' => $output ];
+  return $arr;
+}
+
+function _rss_page_load_feeds(Node $node, $one_feed = '', $mark, &$rss_link, $raw = FALSE) {
+  $current_uid = \Drupal::currentUser()->id();
+  $feeds = &drupal_static(__FUNCTION__, array());
+
+  if (isset($feeds[$node->id()])) {
+    unset($rss_link);
+    return $feeds[$node->id()];
+  }
+  $feeds[$node->id()] = array();
+
+  if (!isset($node->rss_feeds) || !is_array($node->rss_feeds)) {
+    return array();
+  }
+
+  foreach ($node->rss_feeds as $f) {
+    if ($one_feed && $f->fid != $one_feed) {
+      continue;
+    }
+
+    $out = array();
+    $newest = 0;
+    $atime = NULL;
+    $new_rss_link = NULL;
+    if (!$mark && $node->getType() == 'rss_page') {
+      $atime = 0;
+      if (isset($f->fid)) {
+        $atime = db_select('rss_page_last_read', 'r')
+          ->fields('r', array('atime'))
+          ->condition('r.fid', $f->fid)
+          ->condition('r.uid', $current_uid)
+          ->execute()->fetchField();
+      }
+    }
+
+    if ($f->type == 'cat') {     // MM category
+      $link = '';
+      if (!mm_content_user_can($f->data, Constants::MM_PERMS_READ)) {
+        $out['error'] = t('You are not allowed to read the page %cat.',
+            array('%cat' => $f->name));
+      }
+      else {
+        $cat = mm_content_get($f->data);
+        if ($cat) {
+          $link = mm_content_get_mmtid_url($f->data, array('absolute' => TRUE));
+          $out = array(
+            'items' => array(),
+            'feed_title' => $cat->name,
+            'show_item_title' => !$node->rss_page['show_descr'],
+            'feed_link' => $link,
+            'fid' => isset($f->fid) ? $f->fid : 0,
+          );
+          _rss_page_feed_from_cat($f->data, NULL, $node, count($feeds[$node->id()]), $mark, $atime, $link, $raw, $newest, $out);
+        }
+      }
+      $new_rss_link = $link . '/feed';
+    }
+
+    elseif ($f->type == 'taxon') {     // free tag/term
+      $taxon_tids = array_keys(_rss_page_get_taxon($f->data));
+      module_load_include('inc', 'monster_menus', 'mm_taxonomy');
+      $nids = array();
+      foreach ($taxon_tids as $taxon_tid) {
+        $result = mm_taxonomy_select_nodes($taxon_tid, FALSE, FALSE);
+        foreach ($result as $nid) {
+          $nids[] = $nid;
+        }
+      }
+      $nids = array_unique($nids);
+
+      $link = '';
+      if (count($nids)) {
+        $link = Url::fromRoute('entity.taxonomy_term.canonical', ['taxonomy_term' => join(',', $taxon_tids)], array('absolute' => TRUE))->toString();
+        $out = array(
+          'items' => array(),
+          'feed_title' => $f->name,
+          'show_item_title' => !$node->rss_page['show_descr'],
+          'feed_link' => $link,
+          'fid' => isset($f->fid) ? $f->fid : 0,
+        );
+        _rss_page_feed_from_cat(NULL, $nids, $node, count($feeds[$node->id()]), $mark, $atime, '', $raw, $newest, $out);
+      }
+      $new_rss_link = $link . '/feed';
+    }
+
+    elseif ($f->type == 'query') {  // admin-defined query
+      if ($node->rss_page['group_by_key']) {
+        $result = db_query(_rss_page_add_vars($f->data, $node));
+        foreach ($result as $row) {
+          $out = array(
+            'items' => array(),
+            'feed_title' => $row->name,
+            'show_item_title' => !$node->rss_page['show_descr'],
+            'feed_link' => '',
+            'fid' => $f->fid,
+          );
+          _rss_page_feed_from_cat(isset($row->mmtid) ? $row->mmtid : NULL, isset($row->nid) ? $row->nid : NULL, $node, count($feeds[$node->id()]), $mark, $atime, '', $raw, $newest, $out);
+          if (count($out)) {
+            $feeds[$node->id()][] = (object) $out;
+          }
+        }
+        $out = array();
+      }
+      else {
+        $out = array(
+          'items' => array(),
+          'feed_title' => _rss_page_add_vars($f->name, $node),
+          'show_item_title' => !$node->rss_page['show_descr'],
+          'feed_link' => '',
+          'fid' => $f->fid,
+          'expanded' => TRUE,
+        );
+
+        $result = db_query(_rss_page_add_vars($f->data, $node));
+        foreach ($result as $row) {
+          _rss_page_feed_from_cat(isset($row->mmtid) ? $row->mmtid : NULL, isset($row->nid) ? $row->nid : NULL, $node, count($feeds[$node->id()]), $mark, $atime, '', $raw, $newest, $out);
+        }
+      }
+    }
+
+    elseif ($f->type == 'url') {  // external URL
+      rss_page_load_simplepie();
+      // avoid some errors in SimplePie
+      $old_reporting = error_reporting(error_reporting() & ~(E_STRICT|E_USER_NOTICE));
+      $feed = new SimplePie();
+      $feed->set_feed_url($f->data);
+//      $feed->enable_cache(FALSE);
+      $feed->set_cache_location(variable_get('rss_page_cache_path', RSS_PAGE_CACHE_PATH_DEFAULT));
+      $feed->set_cache_duration(variable_get('rss_page_cache_duration', RSS_PAGE_CACHE_DURATION_DEFAULT));
+      $feed->init();
+      if (!$feed->error) {
+        $feed->handle_content_type();
+      }
+
+      if (!$feed->error && $feed->data) {
+        $title = SimplePie_Misc::entities_decode($feed->get_title());
+        if (empty($f->name_isset) && $title) {
+          $f->name_isset = 1;
+          db_update('rss_page_feed')
+            ->fields(array('name_isset' => 1, 'name' => $title))
+            ->condition('name_isset', 1, '<>')
+            ->condition('type', 'url')
+            ->condition('data', $f->data)
+            ->execute();
+        }
+        if (!$title) {
+          $title = $f->name;
+        }
+
+        $out = array(
+          'items' => array(),
+          'feed_title' => $title,
+          'show_title' => TRUE,
+          'feed_link' => $feed->get_link(),
+          'fid' => isset($f->fid) ? $f->fid : 0,
+          'img' => $node->rss_page['show_feed_img'] ? $feed->get_image_url() : '',
+          'img_title' => $feed->get_image_title(), 'img_width' => $feed->get_image_width(),
+          'img_height' => $feed->get_image_height(),
+        );
+
+        for ($i = 0; ; $i++) {
+          if ($node->rss_page['items'] >= 0 && count($out['items']) >= $node->rss_page['items']) {
+            break;
+          }
+
+          if (($item = $feed->get_item($i)) == FALSE) {
+            break;
+          }
+
+          // Take the max of the updated and published fields
+          if ($updated = $item->get_item_tags(SIMPLEPIE_NAMESPACE_ATOM_10, 'updated')) {
+            $parser = SimplePie_Parse_Date::get();
+            $updated = $parser->parse($updated[0]['data']);
+          }
+          $date = max($item->get_date('U'), $updated);
+
+          if ($mark == 'read' && $node->getType() == 'rss_page') {
+            if ($date > $newest) {
+              $newest = $date;
+            }
+          }
+          elseif (is_null($atime) || $atime === FALSE || $date > $atime) {
+            $perma = html_entity_decode($item->get_permalink(), ENT_QUOTES);
+            $desc = $item->get_description();
+            if ($raw) {
+              $perma = array('value' => $perma, 'permalink' => 'true');
+            }
+            else {
+              $desc = _rss_page_fix_descr($desc, $node);
+              if ($node->rss_page['show_image']) {
+                $enclosures = $item->get_enclosures();
+                if (is_array($enclosures)) {
+                  $enc_html = '';
+                  foreach ($enclosures as $enclosure) {
+                    $enc_title = check_plain(SimplePie_Misc::entities_decode($item->get_title()));
+                    if (stripos($enclosure->type, "image") !== FALSE ) { //image file
+                      $enc_html .= '<img src="' . UrlHelper::stripDangerousProtocols($enclosure->link) . '" alt="' . $enc_title .
+                        '" title="' . $enc_title . '" ' . drupal_attributes(array('class' => array('image', 'icon'))) . ' />';
+                    }
+                    elseif (function_exists('_media_get_icon')) {
+                      $icon = _media_get_icon($enclosure->type);
+                      if (empty($icon)) {
+                        $icon = 'genericdoc.gif';
+                      }
+                      $url = base_path() . drupal_get_path('module', 'media') . '/icons/' . $icon;
+                      $enc_html .= '<a href="' . UrlHelper::stripDangerousProtocols($enclosure->link) . '"><img src="' . UrlHelper::stripDangerousProtocols($url) . '" alt="' . $enc_title .
+                          '" title="' . $enc_title . '" /></a>';
+                    }
+                  }
+                  if ($enc_html) {
+                    $desc = "<p>$desc</p>$enc_html";
+                  }
+                }
+              }
+              $desc = '<div class="content">' . $desc . '</div>';
+            }
+
+            $out['items'][] = (object)array(
+              'feed_index' => count($feeds[$node->id()]),
+              'description' => $desc,
+              'date' => $date,
+              'title' => SimplePie_Misc::entities_decode($item->get_title()),
+              'link' => $perma,
+              'categories' => $item->get_category(),
+            );
+          }
+        }
+        $new_rss_link = $f->data;
+      }
+      else {    // !$feed->data
+        $out = array('error' => _rss_page_rss_error($f->data, $feed), 'feed_title' => $f->name);
+      }
+      error_reporting($old_reporting);
+    }
+
+    if (empty($f->name_isset) && $f->type == 'url') {
+      $out['feed_title'] = '';
+    }
+
+    if (count($out)) {
+      if ($node->getType() == 'rss_page' && (!isset($out['error']) || !$out['error']) && $current_uid)
+        if ($mark == 'read') {
+          db_merge('rss_page_last_read')
+            ->keys(array(
+              'fid' => $out['fid'],
+              'uid' => $current_uid,
+            ))
+            ->fields(array(
+              'atime' => $newest,
+            ))
+            ->execute();
+        }
+        elseif ($mark == 'unread') {
+          db_delete('rss_page_last_read')
+            ->condition('fid', $out['fid'])
+            ->execute();
+        }
+
+      $feeds[$node->id()][] = (object)$out;
+    }
+
+    $rss_link = !is_null($new_rss_link) && is_null($rss_link) ? $new_rss_link : FALSE;
+  }
+  return $feeds[$node->id()];
+}
+
+function _rss_page_get_taxon($tid) {
+  // FIXME
+  $result = db_select('taxonomy_term_data', 't')
+    ->fields('t', array('tid', 'name'))
+    ->condition('t.tid', $tid)
+    ->execute();
+  $taxon_tids = array(); // array only contains terms the user has access to
+  foreach ($result as $term) {
+    $taxon_tids[$term->tid] = $term->name;
+  }
+  return $taxon_tids;
+}
+
+// split result generated by setHiddenElt in rss_list.js
+function _rss_page_split_feed_list($str) {
+  if (is_array($str)) return $str;   // trying to split something already in the right format (rss_page_insert)
+
+  $out = array();
+  foreach (mm_ui_parse_repeatlist($str, 3) as $m) {
+    $data = $m[2];
+    if ($m[1] == 'cat') {
+      $data = array_slice(explode('/', $data), -1);
+      $data = $data[0];
+    }
+    $out[] = (object)array('name' => $m[0], 'type' => $m[1], 'data' => $data);
+  }
+
+  return $out;
+}
+
+function _rss_page_info($type, $data, &$name, &$url, &$info, &$popup_URL, $is_portal) {
+  if ($type == 'cat') {
+    $parents = mm_content_get_parents($data);
+    array_shift($parents);  // skip root
+    $url = implode('/', $parents) . "/$data";
+    if (!isset($popup_URL)) {
+      $popup_URL = $url;
+    }
+
+    $path = array();
+    foreach ($parents as $par) {
+      if (!($tree = mm_content_get($par))) {
+        break;
+      }
+      $path[] = mm_content_get_name($tree);
+    }
+
+    $path[] = $name;
+    $info = implode('&nbsp;&raquo; ', $path);
+  }
+  elseif ($is_portal && $type == 'query') {
+    $info = $name;
+    $url = $data;
+  }
+  elseif ($type == 'taxon') {
+    $info = '';
+    $url = $data;
+  }
+  else {  // URL
+    $u = preg_replace('/\/(?!\/)/', '/&#8203;', $data);
+    $info = strpos($url, str_replace('...', '', $name)) ? $u : $name . '<br />' . $u;
+    $url = $data;
+  }
+}
+
+function _rss_page_item($item, $feed = NULL, $base_url = NULL) {
+  $source = '';
+  if ($feed && !empty($feed->feed_title) && $base_url && empty($feed->show_item_title)) {
+    $source = Link::fromTextAndUrl($feed->feed_title, Url::fromUserInput($base_url, array(
+        'attributes' => array('class' => array('feed-item-source')),
+        'query' => _rss_page_get_query_parameters(array('byfeed' => $feed->fid), 'bydate'),
+    )))->toString() . ' - ';
+  }
+
+  if (!$item->date) {
+    $source_date = '';
+  }
+  elseif (date('Ymd', $item->date) == date('Ymd')) {
+    $source_date = t('@ago ago', array('@ago' => format_interval(mm_request_time() - $item->date)));
+  }
+  else {
+    $source_date = mm_format_date($item->date);
+  }
+
+  $out = '';
+  if ($feed && (!empty($feed->show_title) || !empty($feed->show_item_title))) {
+    // l() and check_plain() affect &entities; so don't use them here
+    $t = str_replace(array('<', '>'), array('&lt;', '&gt;'), $item->title);
+    $out .= '<h3 class="feed-item-title">' . Link::fromTextAndUrl($t, Url::fromUri($item->link))->toString() .
+        "</h3>\n<div class=\"feed-item-meta\">" .
+        "$source<span class=\"feed-item-date\">$source_date</span></div>\n";
+  }
+
+  if ($item->description) {
+    $out .= '<div class="feed-item-body">' . $item->description . "</div>\n";
+  }
+
+//  if ($item->categories) {
+//    $out .= '<div class="feed-item-categories">'. t('Tags') .': '. implode(', ', $item->categories) ."</div>\n";
+//  }
+
+  if (!empty($out)) {
+    return '<div class="feed-item">' . $out . '</div>';
+  }
+
+  return '';
+}
+
+function _rss_page_alpha_sort($a, $b) {
+  $at = empty($a->feed_title) ? '' : $a->feed_title;
+  $bt = empty($b->feed_title) ? '' : $b->feed_title;
+  return strcasecmp($at, $bt);
+}
+
+function _rss_page_date_sort($a, $b) {
+  return strcasecmp($b->date, $a->date);
+}
+
+function _rss_page_conditional($node) {
+  if (($cond = trim($node->rss_page['view_condition'])) != '') {
+    $cond = _rss_page_add_vars($cond, $node);
+    if (empty($cond) || eval("return ($cond);") == FALSE) {
+      return FALSE;
+    }
+  }
+  return TRUE;
+}
+
+function rss_page_load_simplepie() {
+  static $loaded;
+  if (!empty($loaded)) {
+    return;
+  }
+  $loaded = TRUE;
+  if (mm_module_exists('feeds') && feeds_include_simplepie()) {
+    return;
+  }
+  if (mm_module_exists('libraries')) {
+    $lib_path = libraries_get_path('simplepie');
+  }
+  foreach (array('simplepie.mini.php', 'simplepie.php') as $file) {
+    if (!empty($lib_path) && file_exists("$lib_path/$file")) {
+      require "$lib_path/$file";
+      return;
+    }
+    $path = DRUPAL_ROOT . '/sites/all/libraries/' . $file;
+    if (file_exists($path)) {
+      require $path;
+      return;
+    }
+  }
+  // Last chance: autoload simplepie.inc in the same directory as this module.
+  if (!class_exists('SimplePie')) {
+    throw new Exception('Could not load simplepie.inc');
+  }
+}
+
+function rss_page_fix_portal_page_title($title) {
+  return preg_replace('{^Portal Page:\s+(.*?)(\s+\(node/\d+\))?$}', '\1', $title);
+}
+
+function rss_page_default_block_options($in = NULL) {
+  if (empty($in)) $in = (object)array();
+  $opts = rss_page_get_options();
+  if (isset($in->rss_page)) {
+    $rss_page = $in->rss_page;
+  }
+  else {
+    $rss_page = $opts;
+    foreach (array_keys($opts) as $key) {
+      $inkey = $key;
+      if (in_array($key, array('items', 'sort', 'display'))) {
+        $inkey = "rss_$key";
+      }
+
+      if (isset($in->$inkey)) {
+        $rss_page[$key] = $in->$inkey;
+      }
+    }
+  }
+
+  return (object)array(
+    'nid' => isset($in->key) ? $in->key : 'undefined',
+    'uid' => \Drupal::currentUser()->id(),
+    'type' => 'rss_page',
+    'rss_page' => $rss_page,
+    'rss_items' => isset($in->rss_items) ? $in->rss_items : $opts['items'],
+    'rss_sort' => isset($in->rss_sort) ? $in->rss_sort : $opts['sort'],
+    'rss_display' => isset($in->rss_display) ? $in->rss_display : $opts['display'],
+    'rss_feeds' => isset($in->rss_feeds) ? $in->rss_feeds : array(),
+    'title' => isset($in->title) ? $in->title : (isset($in->subject) ? $in->subject : ''),
+    'show_descr' => isset($in->show_descr) ? $in->show_descr : $opts['show_descr'],
+    'show_image' => isset($in->show_image) ? $in->show_image : $opts['show_image'],
+    'show_feed_img' => isset($in->show_feed_img) ? $in->show_feed_img : $opts['show_feed_img'],
+    'group_by_key' => isset($in->group_by_key) ? $in->group_by_key : $opts['group_by_key'],
+    'condition' => '',
+  );
+}
+
+function _rss_page_block($delta, Node $node, &$rss_link, $show_add_link = FALSE, $edit = NULL) {
+  $collapsible = TRUE;
+
+  $block = array('content' => array(), 'subject' => '', 'count' => 0);
+
+  mm_parse_args($mmtids, $oarg_list, $this_tid);
+  if ($node == NULL) {
+    if (is_array($edit) && isset($edit['homebox'])) {
+      $node = rss_page_default_block_options($edit['homebox']);
+      $node->dups_in_node = TRUE;   // only crunch duplicates within this "node"
+      if ($delta == 'content') {
+        $block['content'][] = array('#markup' => '<input type="hidden" name="rss-page-block-key" value="' . $edit['homebox']->key . '" />');
+      }
+    }
+    else if (count($oarg_list) < 2 || $oarg_list[0] != 'node' ||
+        (count($oarg_list) > 2 && $oarg_list[2] == 'contents') ||
+        !is_numeric($oarg_list[1]) || !($node = Node::load($oarg_list[1])) ||
+        !$node->id() || ($node->getType() != 'rss_page' && $node->getType() != 'portal_page')) {
+      return $block;
+    }
+  }
+
+  if ($node->getType() != 'rss_page' && $delta == 'nav') {   // no nav unless rss_page
+    return $block;
+  }
+
+  $base_url = "mm/$this_tid";
+  if (isset($oarg_list[0]) && $oarg_list[0] == 'node') {
+    $base_url .= '/node/' . $node->id();
+  }
+
+  $sort = isset($node->rss_page) && isset($node->rss_page['sort']) ? $node->rss_page['sort'] : 'date';
+  if (\Drupal::request()->query->get('bydate', FALSE) !== FALSE) {
+    $sort = 'date';
+  }
+
+  $one_feed = '';
+  if ($temp = \Drupal::request()->query->getInt('byfeed', FALSE) !== FALSE) {
+    $sort = 'feed-alpha';
+    if ($temp) {
+      $one_feed = $temp;
+    }
+  }
+
+  $mark = '';
+  if (\Drupal::request()->query->get('read', FALSE) !== FALSE) {
+    $mark = 'read';
+  }
+  elseif (\Drupal::request()->query->get('unread', FALSE) !== FALSE) {
+    $mark = 'unread';
+  }
+
+  if (isset($node->rss_feeds) && is_string($node->rss_feeds)) {
+    $node->rss_feeds = _rss_page_split_feed_list($node->rss_feeds);
+  }
+
+  if (is_array($edit) && isset($edit['homebox'])) {
+    $node->no_readmore = TRUE;
+  }
+  $feeds = _rss_page_load_feeds($node, $one_feed, $mark, $rss_link);
+
+  if ($mark) {
+    $_rss_page_future_goto = &drupal_static('_rss_page_future_goto');
+    $_rss_page_future_goto = Url::fromUri($base_url, array(
+      'absolute' => TRUE,
+      'query' => _rss_page_get_query_parameters(NULL, array('read', 'unread')))
+    )->toString();
+  }
+
+  if (count($feeds)) {
+    if ($sort == 'feed-alpha') {
+      usort($feeds, '_rss_page_alpha_sort');
+    }
+
+    if ($delta == 'nav') {
+      $menu = '';
+      if (\Drupal::currentUser()->id()) {
+        $menu .= '<li>' . Link::fromUrlAndText(t('(mark all read)'), Url::fromUri($base_url, array('query' => _rss_page_get_query_parameters('read'))))->toString() . "</li>\n";
+        $menu .= '<li>' . Link::fromUrlAndText(t('(mark all unread)'), Url::fromUri($base_url, array('query' => _rss_page_get_query_parameters('unread'))))->toString() . "</li>\n";
+      }
+
+      if ($sort == 'date' || $sort == 'date-reverse') {
+        $query = $node->rss_page['sort'] == 'feed-alpha' || $node->rss_page['sort'] == 'feed-weight' ? array() : _rss_page_get_query_parameters('byfeed', 'bydate');
+        $menu .= '<li>' . Link::fromUrlAndText(t('(sort by feed)'), Url::fromUri($base_url, array('query' => $query)))->toString() . "</li>\n";
+      }
+      else {
+        if (!$collapsible) {
+          foreach ($feeds as $f) {
+            if (!$f->error) {
+              $menu .= "<li><a href=\"#$f->fid\">" . _rss_page_feed_title($f) . "</a></li>\n";
+            }
+          }
+        }
+        $menu .= '<li>' . Link::fromUrlAndText(t('(sort by date)'), Url::fromUri($base_url, array('query' => _rss_page_get_query_parameters('bydate', 'byfeed'))))->toString() . "</li>\n";
+      }
+
+      if ($menu) {
+        $block['content'] = array('#markup' => "<div class=\"item-list\"><ul>$menu</ul></div>");
+        $block['subject'] = check_plain(_rss_page_add_vars($node->label(), $node));
+      }
+    }
+    elseif ($delta == 'content') {
+      $block['content']['#attached']['css'][] = drupal_get_path('module', 'rss_page') . '/rss_page.css';
+      $block['content'][] = array('#markup' => '<div class="rss-page">');
+
+      if ($sort == 'date' || $sort == 'date-reverse') {
+        $items = array();
+        foreach ($feeds as $f) {
+          if (!empty($f->error)) {
+            $block['content'][] = array('#markup' => '<div class="feed-source2">' . _rss_page_feed_title($f) .
+                '</div><div class="feed-item"><div class="feed-item-meta">' .
+                $f->error . '</div></div>');
+          }
+          else {
+            $items = array_merge($items, $f->items);
+          }
+        }
+
+        usort($items, '_rss_page_date_sort');
+        if ($sort == 'date-reverse') {
+          $items = array_reverse($items);
+        }
+        $found = array();
+
+        foreach ($items as $item) {
+          if ($item->link) {   // remove duplicates, favoring newer
+            if (!empty($found[$item->link])) {
+              continue;
+            }
+            $found[$item->link] = TRUE;
+          }
+
+          if ($item->title) {
+            if (!empty($found[$item->title])) {
+              continue;
+            }
+            $found[$item->title] = TRUE;
+          }
+
+          $out = _rss_page_item($item, $feeds[$item->feed_index], $base_url);
+          $non_html = trim(strip_tags($out));
+          if (!empty($non_html)) {
+            $block['content'][] = array('#markup' => $out);
+            $block['count']++;
+          }
+        }
+      }
+      else {    // $sort != 'date'
+        $index = 0;
+        foreach ($feeds as $f) {
+          if ($collapsible) {
+            if (!empty($f->error)) {
+              $block['content'][] = array('#markup' => '<fieldset class="collapsible"><legend>' . _rss_page_feed_title($f) . '</legend><div class="feed-item"><div class="feed-item-meta">' . $f->error . '</div></div></fieldset>');
+            }
+            elseif ($node->getType() == 'rss_page' || count($f->items)) {
+              $fieldset = array(
+                '#type' => 'fieldset',
+                '#title' => _rss_page_feed_title($f),
+                '#collapsible' => TRUE,
+                '#collapsed' => $node->getType() != 'rss_page' || !is_numeric($node->id()),
+                '#parents' => array(),
+              );
+              if ($show_add_link && !empty($f->fid) && function_exists('rss_page_subscribe_button')) {
+                if ($add_html = rss_page_subscribe_button($f->fid)) {
+                  $fieldset[] = array('#markup' => $add_html);
+                }
+              }
+
+              if (!empty($f->feed_link)) {
+                $fieldset[] = array('#markup' => '<div class="feed-source">' . Link::fromTextAndUrl(t('source'), Url::fromUri($f->feed_link))->toString() . '</div>');
+              }
+
+              if (!empty($f->img)) {
+                $fieldset[] = array('#markup' => "<div class=\"feed-icon\"><img src=\"$f->img\" alt=\"$f->img_title\"></div>");
+              }
+
+              foreach ($f->items as $item) {
+                $out = _rss_page_item($item, $feeds[$item->feed_index]);
+                $non_html = trim(strip_tags($out));
+                if (!empty($non_html)) {
+                  $fieldset[] = array('#markup' => $out);
+                  $block['count']++;
+                }
+              }
+
+              $state = array();
+              // FIXME: https://www.drupal.org/node/2038981  The template process layer has been removed
+              form_process_fieldset($fieldset, $state);
+              $block['content'][] = $fieldset;
+            }
+          }
+          else {    // !$collapsible
+            if ($index++ || $node->rss_page['display'] == '1-col') {
+              $block['content'][] = array('#markup' => '<hr>');
+            }
+            $block['content'][] = array('#markup' => "<a name=\"$f->fid\"></a><div class=\"feed-source2\">");
+            if ($f->img) {
+              $block['content'][] = array('#markup' => "<div class=\"feed-icon\"><img src=\"$f->img\" alt=\"$f->img_title\"></div>");
+            }
+            $block['content'][] = array('#markup' => _rss_page_feed_title($f) . '</div>');
+
+            if ($f->error) {
+              $block['content'][] = array('#markup' => '<div class="feed-item"><div class="feed-item-meta">' . $f->error . '</div></div>');
+            }
+            else {
+              foreach ($f->items as $item) {
+                $out = _rss_page_item($item, $feeds[$item->feed_index]);
+                $non_html = trim(strip_tags($out));
+                if (!empty($non_html)) {
+                  $block['content'][] = array('#markup' => $out);
+                  $block['count']++;
+                }
+                $block['count']++;
+              }
+            }
+          }
+        }
+      }
+      $block['content'][] = array('#markup' => '</div>');  // aggregator
+    }
+  }
+  else if (isset($edit['homebox'])) {
+    $block['content']['#attached']['css'][] = drupal_get_path('module', 'rss_page') . '/rss_page.css';
+    $block['subject'] = t('(untitled)');
+    // Arguments to format_plural() don't need t()
+    $block['content'][] = array('#markup' => count($node->rss_feeds) ? format_plural(count($node->rss_feeds), 'This feed is empty.', 'The feeds are empty.') : t('Click on the gear icon to add a feed'));
+    $block['count']++;
+  }
+  return $block;
+}
+
+function _rss_page_fix_descr($desc, $node) {
+  if (!$node->rss_page['show_descr']) {
+    return '';
+  }
+  // Remove IMG and TABLE tags. This has to be done here, not in SimplePie,
+  // because SP caches the change so it affects all readers of that feed.
+  if (!$node->rss_page['show_image']) {
+    $desc = preg_replace("{<(img|table|tr|td|th|tbody)((\s*((\w+:)?\w+)\s*=\s*(\"([^\"]*)\"|'([^']*)'|(.*)))*)\s*(/>|>)|</(table|tr|td|th|tbody)>}msiU", ' ', $desc);
+  }
+  return $desc;
+}
+
+function _rss_page_feed_title($feed) {
+  if (empty($feed->feed_title)) {
+    return t('Unknown feed');
+  }
+  return check_plain($feed->feed_title) . ' (' . (isset($feed->items) ? count($feed->items) : '0') . ')';
+}
+
+function rss_page_load_as_user() {
+  $loaded = &drupal_static(__FUNCTION__);
+
+  // Substitute vars based on $_SESSION['vars_uid']. The current user can't see
+  // posts he doesn't have permission to; instead, this just lets the user see
+  // how it would look.
+  if (!isset($loaded)) {
+    if (\Drupal::currentUser()->hasPermission('create portal pages') && isset($_SESSION['vars_uid'])) {
+      $loaded = User::load($_SESSION['vars_uid']);
+    }
+    else {
+      $loaded = \Drupal::currentUser();
+    }
+  }
+
+  return $loaded;
+}
+
+function _rss_page_add_vars($str, $node) {
+  $xvars = rss_page_get_xvars();
+  $loaded = rss_page_load_as_user();
+  // The /e switch is deprecated in PHP >= 5.5, but anonymous functions are
+  // only available in PHP >= 5.3.
+  if (PHP_MAJOR_VERSION == 5 && PHP_MINOR_VERSION < 3) {
+    return preg_replace('/\$\{([A-Za-z_]\w*)\}/e',
+      'isset($loaded->\1) && is_scalar($loaded->\1) ? $loaded->\1 : ' .
+      '(isset($xvars["\1"]) ? eval("return(".$xvars["\1"].");") : "")', $str);
+  }
+  return preg_replace_callback('/\$\{([A-Za-z_]\w*)\}/',
+    function ($matches) use ($xvars, $loaded, $node) {
+      return isset($loaded->{$matches[1]}) && is_scalar($loaded->{$matches[1]}) ? $loaded->{$matches[1]} : (isset($xvars[$matches[1]]) ? eval("return(" . $xvars[$matches[1]] . ");") : "");
+    }, $str);
+}
+
+function _rss_page_feed_from_cat($tid, $nid, $node, $index, $mark, $atime, $link, $raw, &$newest, &$out) {
+  $showed = &drupal_static(__FUNCTION__);
+
+  if (isset($nid)) {
+    $arr = is_array($nid) ? $nid : array($nid);
+  }
+  elseif (is_null($tid)) {
+    return;
+  }
+  else {
+    $out['feed_link'] = mm_content_get_mmtid_url($tid);
+    $arr = db_query(mm_content_get_accessible_nodes_by_mmtid_query($tid, $count_sql))->fetchCol();
+  }
+
+  foreach ($arr as $n) {
+    $showed_key = !empty($node->dups_in_node) ? $node->id() . "/$n" : $n;
+    if (!empty($showed[$showed_key]) || !mm_content_user_can_node($n, Constants::MM_PERMS_READ)) {
+      continue;
+    }
+
+    if ($node->rss_page['items'] >= 0 && count($out['items']) >= $node->rss_page['items']) {
+      return;
+    }
+
+    $kidnode = Node::load($n);
+    if ($kidnode && $kidnode->id() && $kidnode->getType() != 'rss_page' &&
+        $kidnode->getType() != 'portal_page' && $kidnode->getType() != 'redirect') {
+      if ($mark == 'read') {
+        if ($kidnode->getChangedTime() > $newest) {
+          $newest = $kidnode->getChangedTime();
+        }
+      }
+      elseif (is_null($atime) || $kidnode->getChangedTime() > $atime) {
+        $cats = array();
+        if (isset($kidnode->taxonomy)) {
+          foreach ($kidnode->taxonomy as $t) {
+            $cats[] = $t->name;
+          }
+        }
+
+        $ln = $link != '' ? "$link/node/" . $kidnode->id() : Url::fromRoute('entity.node.canonical', ["node" => $kidnode->id()], array('absolute' => TRUE))->toString();
+        if ($raw) {
+          $ln = array('value' => $ln, 'permalink' => 'true');
+        }
+
+        $extra = array();
+        $kidnode->setTitle(mm_ui_hide_node_title($kidnode->label()));
+        if ($raw) {
+          $desc = _rss_page_raw_node($kidnode, $raw, $extra);
+        }
+        else {
+          $viewed = node_view($kidnode, 'teaser');
+          if (empty($viewed['#node']->body) || !empty($node->no_readmore)) {
+            // If the body is empty or this is a homebox block, remove any Read More link.
+            unset($viewed['links']['node']['#links']['node-readmore']);
+          }
+          $desc = drupal_render($viewed);
+        }
+        $out['items'][] = (object)array(
+          'extra' => $extra,
+          'feed_index' => $index,
+          'uid' => $kidnode->show_node_info ? $kidnode->getOwnerId() : NULL,
+          'description' => $raw ? $desc : _rss_page_fix_descr($desc, $node),
+          'date' => $kidnode->getChangedTime(),
+          'title' => $kidnode->label(),
+          'link' => $ln,
+          'categories' => $cats,
+        );
+        $showed[$showed_key] = TRUE;
+      }
+    }
+    else $showed[$showed_key] = TRUE;    // slight speed-up
+  }
+}
+
+function _rss_page_raw_node(Node $item, $item_length, &$extra) {
+  $item_text = '';
+
+  if ($item_length != 'title') {
+    $teaser = $item_length == 'teaser';
+
+    // Filter and prepare node teaser
+    if (node_hook($item, 'view')) {
+      $item = node_invoke($item, 'view', $teaser, FALSE);
+    }
+
+    // Allow modules to change $node->teaser before viewing.
+    \Drupal::moduleHandler()->invokeAll('node_' . $item, ['view', $teaser, FALSE]);
+  }
+
+  // Allow modules to add additional item fields and/or modify $item
+  $extra = \Drupal::moduleHandler()->invokeAll('node_' . $item, ['rss item']);
+
+  // Prepare the item description
+  switch ($item_length) {
+    case 'fulltext':
+      $item_text = $item->body;
+      break;
+
+    case 'teaser':
+      $item_text = $item->teaser;
+      if ($item->readmore) {
+        $item_text .= '<p>' . Link::fromTextAndUrl(t('read more &raquo;'), Url::fromRoute('entity.node.canonical', ['node' => $item->id()], array('absolute' => TRUE)))->toString() . '</p>';
+      }
+      break;
+
+    case 'title':
+      break;
+  }
+
+  return $item_text;
+}
+
+function _rss_page_rss_error($url, $feed) {
+  // Truncate a needlessly confusing message.
+  $feed->error = preg_replace('{A feed with an invalid mime.*$}', '', $feed->error);
+
+  $eurl = array(':url' => $url, '@err' => $feed->error);
+  if (!strncmp($feed->error, 'A feed could not be found at ', 29) && strpos($url, \Drupal::request()->server->get('SERVER_NAME', '')) !== FALSE)
+    return $feed->error . ". \n" . t('To subscribe to a password-protected page inside this site, you should use a "Page Feed", not a URL.');
+
+  return strcmp($feed->error, 'Operation timed out') ?
+      (strpos($feed->error, $url) === FALSE ? t('Error when accessing :url:<br />@err', $eurl) : $feed->error) :
+      t('The RSS server at :url took too long to respond.', $eurl);
+}
+
+function rss_page_intval_load($val) {
+  $val = intval($val);
+  return $val ? $val : FALSE;
+}
+
+function rss_page_get_xvars() {
+  static $xvars;
+  if (empty($xvars)) {
+    $xvars = array(
+      'url' => '"' . request_path() . '"',
+      'nid' => '$node->id()',
+    );
+  }
+  return $xvars;
+}
+
+function _rss_page_get_query_parameters($add = '', $exclude = array()) {
+  $get = \Drupal::request()->query->all();
+
+  if (!is_array($exclude)) $exclude = array($exclude);
+
+  if (isset($add)) {
+    if (!is_array($add)) $add = array($add => '');
+    $get += $add;
+  }
+
+  return http_build_query(array_diff_key($get, $exclude));
+}

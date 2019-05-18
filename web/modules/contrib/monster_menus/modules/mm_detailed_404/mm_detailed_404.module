@@ -1,0 +1,411 @@
+<?php
+
+use Drupal\Core\Cache\Cache;
+use Drupal\Core\Database\Database;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Link;
+use Drupal\Core\Url;
+use Drupal\monster_menus\Constants;
+use Symfony\Component\Routing\Route;
+
+/**
+ * Provide a more detailed 404 (Not Found) error page, including suggested
+ * locations where the intended page may be found.
+ *
+ * This module's settings can be configured at
+ * admin/config/system/site-information.
+ */
+
+/**
+ * Implements hook_mm_showpage_routing().
+ */
+function mm_detailed_404_mm_showpage_routing() {
+  $items = [];
+  // This hook will only have an effect if the 404 page is in the MM tree.
+  if ($mmtid = mm_detailed_404_get_page_404_mmtid()) {
+    $external_path = substr(mm_content_get_mmtid_url($mmtid)->toString(), 1);
+    $items[$external_path] = [
+      'page callback' => 'mm_detailed_404_showpage',
+      'page arguments' => [],
+    ];
+  }
+  return $items;
+}
+
+function mm_detailed_404_get_page_404_mmtid() {
+  $page_404 = \Drupal::service('config.factory')->getEditable('system.site')
+    ->get('page.404');
+  // This module will only have an effect if the 404 page is in the MM tree.
+  if (preg_match('{^/mm/(\d+)(?:/|$)}', $page_404, $matches)) {
+    return $matches[1];
+  }
+}
+
+function mm_detailed_404_showpage() {
+  $bad_path = mm_get_current_path();
+  if ($page_404_mmtid = mm_detailed_404_get_page_404_mmtid()) {
+    if ($bad_path == "mm/$page_404_mmtid") {
+      return t('<p>The detailed list of suggestions would normally appear here.</p>');
+    }
+    else if ($detailed = mm_detailed_404_detail($bad_path)) {
+      return ['output_post' => $detailed];
+    }
+  }
+}
+
+/**
+ * When the requested URL is not found, evaluate it and try to come up with
+ * some possible guesses as to what the user mis-typed, or to where the intended page
+ * has moved.
+ *
+ * @param $path
+ *   Path to evaluate
+ * @return array|NULL
+ *   Render array containing the possible guesses. If NULL is returned, the
+ *   calling code should generate a default 'page not found' message.
+ */
+function mm_detailed_404_detail($path) {
+  $config = \Drupal::service('config.factory')->get('mm_detailed_404.settings');
+  $db = Database::getConnection();
+  $max_results = $config->get('max_results');
+  $fuzzy = $config->get('fuzzy');
+
+  $output = [
+    'preamble' => [
+      '#type' => 'processed_text',
+      '#text' => $config->get('preamble.value'),
+      '#format' => $config->get('preamble.format'),
+    ],
+    'postamble' => [
+      '#type' => 'processed_text',
+      '#text' => $config->get('postamble.value'),
+      '#format' => $config->get('postamble.format'),
+      '#weight' => 1000,
+    ],
+  ];
+  $skipped = FALSE;
+  $home_mmtid = mm_home_mmtid();
+  $path = explode('/', $path);
+
+  // Save the path to the missing page in a special query arg, which is only
+  // used internally for cache contexts.
+  $output['#cache']['contexts'] = ['url.query_args:_mm404'];
+  \Drupal::request()->query->add(['_mm404' => $path]);
+  // Tag this so that it can be invalidated when the settings change.
+  $output['#cache']['tags'] = ['mm_detailed_404'];
+
+  if ($path[0] == 'mm') {
+    $found_mmtid = $path[1];
+    $path = array_slice($path, 2);
+  }
+  else {
+    $found_mmtid = $home_mmtid;
+  }
+
+  $mtime = 0;
+  $output_list = array();
+  $prefix_single = t('<p>The page you are looking for appears to have moved to:') . ' ';
+  foreach ($path as $child) {
+    $select = $db->select('mm_tree_revision', 'r');
+    $select->leftJoin('mm_tree', 't', 't.mmtid = r.mmtid');
+    $num_revs = $select->condition('r.parent', $found_mmtid)
+      ->condition('r.alias', $child)
+      ->isNull('t.mmtid')
+      ->countQuery()->execute()->fetchField();
+
+    if ($num_revs) {
+      $prefix_single = t('<p>The page you requested has been permanently deleted.');
+      if (!$output_list && $found_mmtid != $home_mmtid) {
+        $output_list[0] = $found_mmtid;
+      }
+      if ($output_list) {
+        $prefix_single .= ' ' . t('You may be able to find what you were looking for here:') . ' ';
+      }
+      else {
+        $output['items']['#markup'] = $prefix_single;
+        return $output;
+      }
+    }
+  }
+
+  while ($child = array_shift($path)) {
+    $params = array(':parent' => $found_mmtid, ':alias' => $child);
+    $use_mtime = '';
+    if ($mtime > 0) {
+      $use_mtime = ' AND r.mtime <= :mtime';
+      $params[':mtime'] = $mtime;
+    }
+    $mtime_query = $db->query("SELECT r.mmtid, r.mtime FROM {mm_tree_revision} r LEFT JOIN {mm_tree} t ON t.mmtid = r.mmtid WHERE t.mmtid IS NOT NULL AND r.parent = :parent AND r.alias = :alias AND LEFT(r.name, 1) <> '.'$use_mtime ORDER BY r.vid DESC", $params);
+
+    if ($row = $mtime_query->fetchObject()) {
+      if (mm_content_user_can($row->mmtid, Constants::MM_PERMS_READ)) {
+        $output_list[0] = $found_mmtid = $row->mmtid;
+        $mtime = $row->mtime;
+        continue;
+      }
+      else {
+        $skipped = TRUE;
+      }
+    }
+    $output_list = $exclude = array();
+    // Use the SQL SOUNDEX() function instead of the PHP soundex() version,
+    // because they produce different values
+    $soundex = $fuzzy ? _mm_detailed_404_soundex($child) : '';
+    $soundex_short = substr($soundex, 1, 3);
+    $queries = array(
+      // Menu router paths
+      'hook' => array("SELECT * FROM {router} WHERE SUBSTR(path, 1, 13) <> '/mm/{mm_tree}' AND (SUBSTRING(SUBSTRING_INDEX(path, '/', 2), 2) = :child OR SOUNDEX(SUBSTRING(SUBSTRING_INDEX(path, '/', 2), 2)) = :soundex) ORDER BY fit DESC", array(':child' => $child, ':soundex' => $soundex)),
+      // Direct alias match at the correct level of the tree
+      'p+a+' => array('r.parent = :found_mmtid AND r.alias = :child', array(':found_mmtid' => $found_mmtid, ':child' => $child)),
+      // Alias starts with the string, at the correct level
+      'p+a*' => array('r.parent = :found_mmtid AND r.alias LIKE :child', array(':found_mmtid' => $found_mmtid, ':child' => $child . '%')),
+      // Alias sounds like the string, at the correct level
+      'p+as' => array('r.parent = :found_mmtid AND SOUNDEX(r.alias) = :soundex', array(':found_mmtid' => $found_mmtid, ':soundex' => $soundex)),
+      // Alias matches at any level
+      'p-a+' => array('r.alias = :child', array(':child' => $child)),
+      // Alias sounds like the string, at any level
+      'p-as' => array('r.parent <> :found_mmtid AND SOUNDEX(r.alias) = :soundex', array(':found_mmtid' => $found_mmtid, ':soundex' => $soundex)),
+      // Alias sounds like the string, at any level, using minimal match
+      'p<as' => array('r.parent <> :found_mmtid AND SUBSTR(SOUNDEX(r.alias), 2, 3) = :soundex_short', array(':found_mmtid' => $found_mmtid, ':soundex_short' => $soundex_short)),
+    );
+    if (!$fuzzy) {
+      $queries['hook'] = array("SELECT * FROM {router} WHERE SUBSTR(path, 1, 13) <> '/mm/{mm_tree}' AND SUBSTRING(SUBSTRING_INDEX(path, '/', 2), 2) = :child ORDER BY fit DESC", array(':child' => $child));
+      unset($queries['p+as']);
+      unset($queries['p-as']);
+      unset($queries['p<as']);
+    }
+    $soundex_bad = FALSE;
+    foreach ($queries as $index => $params) {
+      if ($index == 'p+as') {
+        // See if there is enough variance in the soundex value, by checking
+        // the number of consonants and the frequency of resulting digits.
+        $len_test = preg_replace('/[^bcdfghjklmnpqrstvwxyz]/i', '', $child);
+        if (strlen($len_test) < 3 || strlen(count_chars($soundex, 3)) / strlen($soundex) <= 2/3) {
+          $soundex_bad = TRUE;
+          continue;
+        }
+      }
+      elseif ($index == 'p-a+') {
+        if (count($output_list) == 1) {
+          $found_mmtid = $output_list[0];
+          break;
+        }
+      }
+      elseif ($index == 'p-as' || $index == 'p<as') {
+        // This is the last-ditch effort, only if everything before has
+        // failed, and the soundex value is sufficiently unique
+        if (count($output_list) || $soundex_bad) break;
+        // Reduce max. to no more than 5.
+        $max_results = min(5, $max_results);
+      }
+      elseif ($index == 'hook') {
+        // Search in the menu router list for a close match, using just the
+        // first element of the path. Only do this when MM found no match at
+        // all.
+        if ($found_mmtid != $home_mmtid) continue;
+
+        $path_validator = \Drupal::pathValidator();
+        $test_path = $path;
+        array_unshift($test_path, $child);
+        $results = $db->query($params[0], $params[1]);
+        foreach ($results as $menu) {
+          $matched = TRUE;
+          $link_params = array();
+          foreach (explode('/', ltrim($menu->pattern_outline, '/')) as $path_index => $elem) {
+            if ($path_index >= count($test_path)) {
+              $matched = FALSE;
+              break;
+            }
+
+            if ($elem == '%') {
+              /** @var Route $route */
+              $route = unserialize($menu->route);
+              $compiled = $route->compile();
+              $variables = $compiled->getVariables();
+              $link_params[$variables[count($link_params)]] = $test_path[$path_index];
+            }
+            elseif (strcasecmp($test_path[$path_index], $elem) && (!$fuzzy || _mm_detailed_404_soundex($test_path[$path_index]) != _mm_detailed_404_soundex($elem))) {
+              $matched = FALSE;
+              break;
+            }
+          }
+
+          if ($matched) {
+            $test_url = Url::fromRoute($menu->name, $link_params, ['base_url' => ''])->toString();
+            try {
+              // Only include URLs the current user has access to.
+              if ($path_validator->isValid($test_url)) {
+                $link_text = Url::fromRoute($menu->name, $link_params)->toString();
+                $output_list[] = $a = Link::createFromRoute($link_text, $menu->name, $link_params, ['attributes' => ['rel' => 'nofollow']]);
+              }
+            }
+            catch (\Exception $e) {
+              // Not a valid URL, probably due to bad parameters, so exclude it.
+            }
+          }
+        }
+
+        if (count($output_list)) {
+          // Stop looking.
+          $path = array();
+        }
+        continue;   // Go to next query.
+      }
+
+      $where = $params[0];
+      $params = $params[1];
+      // There's no need to do matches against mm_tree, since its data is
+      // duplicated in mm_tree_revision in the most recent revision.
+      // Don't match items or parents with a name starting with '.'.
+      $query = "SELECT DISTINCT r.mmtid FROM {mm_tree_revision} r LEFT JOIN {mm_tree} t ON t.mmtid = r.mmtid WHERE t.mmtid IS NOT NULL AND $where AND LEFT(r.name, 1) <> '.' AND (SELECT COUNT(*) FROM {mm_tree} t2 INNER JOIN {mm_tree_parents} p ON p.parent = t2.mmtid WHERE p.mmtid = r.mmtid AND LEFT(t2.name, 1) = '.') = 0";
+
+      // Skip mmtids already found
+      if ($exclude) {
+        $query .= ' AND r.mmtid NOT IN (:exclude[])';
+        $params[':exclude[]'] = $exclude;
+      }
+
+      $results = $db->query($query . ' ORDER BY r.vid DESC', $params);
+      while (count($output_list) < $max_results && ($item = $results->fetchObject())) {
+        if (mm_content_user_can($item->mmtid, Constants::MM_PERMS_READ)) {
+          $output_list[] = $exclude[] = $item->mmtid;
+        }
+        else {
+          $skipped = TRUE;
+        }
+      }
+
+      if (count($output_list) >= $max_results) {
+        break;
+      }
+    }
+
+    if (!$output_list) {
+      if ($found_mmtid == $home_mmtid) {
+        return NULL;
+      }
+      $output_list[0] = $found_mmtid;
+      $prefix_single = t('<p>The page you are looking for was not found, but you might be able to find it here:') . ' ';
+      break;
+    }
+
+    $prefix_single = t('<p>This page might be what you are looking for:') . ' ';
+
+    if (count($output_list) != 1) {
+      break;
+    }
+  }
+
+  if (count($output_list) == 1 && is_numeric($output_list[0]) && mm_content_is_recycled($output_list[0])) {
+    // We'll only get here if the page is readable by the user
+    $output['items']['#markup'] = t('<p>The page you requested has been marked for future deletion. Therefore, it is no longer accessible.</p>');
+    return $output;
+  }
+
+  foreach ($output_list as $index => $elem) {
+    if (!is_numeric($elem)) {
+      $output_list[$index] = $elem;
+    }
+    else {
+      try {
+        $link_text = mm_content_get_mmtid_url($elem)->toString();
+        $link_path = mm_content_get_mmtid_url($elem, ['absolute' => TRUE, 'attributes' => ['rel' => 'nofollow']]);
+        $output_list[$index] = Link::fromTextAndUrl($link_text, $link_path);
+      }
+      catch (\Exception $e) {
+        unset($output_list[$index]);
+        continue;
+      }
+    }
+  }
+
+  $post = \Drupal::currentUser()->isAnonymous() && $skipped ? t('<p>You might get more results if you log-in.</p>') : '';
+  if (count($output_list) == 1) {
+    $output['items'] = [
+      ['#markup' => $prefix_single],
+      $output_list[0]->toRenderable(),
+      ['#markup' => '</p>' . $post],
+    ];
+    return $output;
+  }
+
+  if ($output_list) {
+    $output['items'] = [
+      '#theme' => 'item_list',
+      '#title' => t('<p>One of these pages might be what you are looking for:'),
+      '#items' => $output_list,
+      '#suffix' => $post,
+    ];
+    return $output;
+  }
+
+  if (\Drupal::currentUser()->isAnonymous() && $skipped) {
+    $output['items']['#markup'] = t('This page may be able to provide you with suggestions as to where to find what you are looking for, but you need to log-in first.');
+    return $output;
+  }
+
+  return NULL;
+}
+
+function _mm_detailed_404_soundex($string) {
+  static $cache = [];
+
+  // The PHP soundex() function is incorrect, so use the SQL version, but cache
+  // the results.
+  $string = preg_replace('/[\x80-\xFF]/', '', $string);
+  if (!isset($cache[$string])) {
+    $cache[$string] = Database::getConnection()->query('SELECT SOUNDEX(:string)', array(':string' => $string))->fetchField();
+  }
+  return $cache[$string];
+}
+
+function mm_detailed_404_form_system_site_information_settings_alter(&$form) {
+  $config = \Drupal::service('config.factory')->get('mm_detailed_404.settings');
+  $form['error_page']['detailed_404'] = [
+    '#type' => 'details',
+    '#title' => t('Detailed 404 (not found) settings'),
+    '#open' => TRUE,
+    '#states' => [
+      // Only show details when there is something in the site_404 field.
+      'visible' => ['#edit-site-404' => ['filled' => TRUE]],
+    ],
+    'preamble' => [
+      '#type' => 'text_format',
+      '#title' => t('Preamble'),
+      '#default_value' => $config->get('preamble.value'),
+      '#format' => $config->get('preamble.format'),
+      '#description' => t('The preamble is displayed under any other nodes on the 404 page, followed by the suggested links.'),
+    ],
+    'max_results' => [
+      '#type' => 'number',
+      '#title' => t('Maximum number of suggested links'),
+      '#min' => 1,
+      '#default_value' => $config->get('max_results'),
+    ],
+    'fuzzy' => [
+      '#type' => 'checkbox',
+      '#title' => t('Use fuzzy matching'),
+      '#description' => t('If set, show a list of pages having aliases that are fuzzy (approximate) matches for the URL provided. This can be slow if you have lots of pages.'),
+      '#default_value' => $config->get('fuzzy'),
+    ],
+    'postamble' => [
+      '#type' => 'text_format',
+      '#title' => t('Postamble'),
+      '#default_value' => $config->get('postamble.value'),
+      '#format' => $config->get('postamble.format'),
+      '#description' => t('The postamble appears at the bottom of the 404 page.'),
+    ],
+  ];
+  $form['#submit'][] = '_mm_detailed_404_form_system_site_information_settings_submit';
+}
+
+function _mm_detailed_404_form_system_site_information_settings_submit(array &$form, FormStateInterface $form_state) {
+  \Drupal::service('config.factory')->getEditable('mm_detailed_404.settings')
+    ->set('preamble', $form_state->getValue('preamble'))
+    ->set('max_results', $form_state->getValue('max_results'))
+    ->set('fuzzy', $form_state->getValue('fuzzy'))
+    ->set('postamble', $form_state->getValue('postamble'))
+    ->save();
+  // Invalidate any cached 404 results.
+  Cache::invalidateTags(['mm_detailed_404']);
+}

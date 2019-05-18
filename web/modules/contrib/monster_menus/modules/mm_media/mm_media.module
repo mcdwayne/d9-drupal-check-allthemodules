@@ -1,0 +1,553 @@
+<?php
+
+/**
+ * @file
+ * UI for uploading media nodes
+ */
+
+use Drupal\Component\Utility\Html;
+use Drupal\Component\Utility\Unicode;
+use Drupal\Core\Database\Database;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Image\Image;
+use Drupal\Core\Link;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Template\Attribute;
+use Drupal\Core\Url;
+use Drupal\file\Entity\File;
+use Drupal\image\Entity\ImageStyle;
+use Drupal\mm_media\Plugin\MMTreeBrowserDisplay\Media;
+use Drupal\monster_menus\Constants;
+use Drupal\monster_menus\Plugin\MMTreeBrowserDisplay\Groups;
+use Drupal\monster_menus\Plugin\MMTreeBrowserDisplay\Nodes;
+use Drupal\node\Entity\Node;
+use Drupal\node\NodeInterface;
+use Drupal\user\Entity\User;
+use Symfony\Component\HttpKernel\Exception\HttpException;
+
+/**
+ * Implements hook_theme
+ */
+function mm_media_theme() {
+  $themes = [
+    'mm_media_image_style' => [
+      'variables' => [
+        'style_name' => NULL,
+        'path' => NULL,
+        'width' => NULL,
+        'height' => NULL,
+        'alt' => '',
+        'title' => NULL,
+        'attributes' => [],
+      ],
+    ],
+    'mm_browser_thumbnail' => [
+      'variables' => [
+        'file' => NULL,
+        'style_name' => '',
+        'mode' => '',
+        'mmtid' => 0,
+        'min_wh' => NULL,
+        'onclick' => '',
+        'attributes' => [],
+        'div_state' => '',
+        'short_title' => '',
+        'link' => '',
+        'thumbnail' => '',
+      ],
+    ],
+  ];
+  return $themes;
+}
+
+/**
+ * Implements hook_help
+ */
+function mm_media_help($path, $arg = NULL) {
+  switch ($path) {
+    case 'admin/help#file upload':
+      return t('This module is used to create and administer media (images, PDF files, Word documents, etc.) for your site. Each media item is stored as a post. For images, thumbnails of the original item are generated automatically.
+          There are three default sizes: thumbnail, icon and original.
+          The thumbnail size is shown as the preview for image posts and when browsing image galleries.
+          "Original" is the default size when first displaying an image.');
+
+    case 'admin/modules#description':
+      return t('Allows uploading of media and inserting media into content.');
+
+    case 'node/add#media':
+      return t('Upload images, PDFs, audio and other media files (after uploading files, you can insert them into articles).');
+  }
+}
+
+/**
+ * Implements hook_mm_browser_navigation().
+ */
+function mm_media_mm_browser_navigation($mode, $top_mmtid) {
+  if (!in_array($mode, Groups::supportedModes())) {
+    $user = \Drupal::currentUser();
+    if (isset($user->user_file_mmtid) && is_numeric($user->user_file_mmtid) && $user->user_file_mmtid > 0) {
+      return '<button onclick="Drupal.mm_browser_reload_data(\'' . mm_content_get_full_path($user->user_file_mmtid) . '\');" class="ui-button ui-widget ui-corner-all" id="my-uploaded-files-link">' . t('My uploaded files') . '</button>';
+    }
+  }
+}
+
+function mm_media_field_widget_entity_browser_entity_reference_form_alter(&$element, &$form_state, $context) {
+  foreach ($element['current']['items'] as $index => &$item) {
+    $item['edit_button']['#value'] = t('Edit Properties');
+    // Enhance the permissions on the Properties button.
+//    if ($item['edit_button']['#access']) {
+//      /** @var \Drupal\Core\Field\Plugin\Field\FieldType\EntityReferenceItem $context['items']->list[] */
+//      $mid = $context['items']->list[$index]->getValue('target_id');
+//      $item['edit_button']['#access'] = $element['#file'] ? (!empty($element['#entity']->id()) ? mm_content_user_can_node($element['#entity']->id(), Constants::MM_PERMS_WRITE) : file_entity_access('update', $element['#file'])) : FALSE;
+//    }
+  }
+}
+
+/**
+ * Implements hook_field_widget_form_alter().
+ */
+function mm_media_field_widget_form_alter(&$element, &$form_state, $context) {
+  // If we are using mm_media's tree browser, we don't want to allow the user
+  // to replace the image by uploading a new binary unless this is the only
+  // use of the item, as this would replace the image everywhere it is
+  // referenced.
+  if (isset($element['#type']) && $element['#type'] == 'managed_file' && !empty($element['#default_value']['target_id'])) {
+//    $params = media_get_browser_params();
+//    $plugins = media_get_browser_plugin_info();
+//
+//    // Allow parameters to provide a list of enabled or disabled media browser
+//    // plugins.
+//    if (!empty($params['enabledPlugins'])) {
+//      $plugins = array_intersect_key($plugins, array_fill_keys($params['enabledPlugins'], 1));
+//    }
+//    elseif (!empty($params['disabledPlugins'])) {
+//      $plugins = array_diff_key($plugins, array_fill_keys($params['disabledPlugins'], 1));
+//    }
+
+    // Is access already allowed?
+    if (!isset($element['#access']) || !empty($element['#access'])) {
+      $file = File::load($element['#default_value']['target_id']);
+      if ($file) {
+        $usage = \Drupal::service('file.usage')->listUsage($file);
+        $count = 0;
+        foreach ($usage as $modules) {
+          foreach ($modules as $types) {
+            if (($count += array_sum($types)) > 1) {
+              $element['#process'][] = '_mm_media_process_managed_file';
+              return;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+function _mm_media_process_managed_file($element) {
+  $element['remove_button']['#access'] = FALSE;
+  $element['remove_warning'] = array(
+    '#markup' => t('This upload cannot be removed because it is currently in use in more than one location.'),
+  );
+  return $element;
+}
+
+/**
+ * Implements hook_form_FORMID_alter().
+ */
+function mm_media_form_media_admin_config_browser_alter(&$form, &$form_state) {
+  if (isset($form['media__file_extensions'])) {
+    $form['media__file_extensions']['#type'] = 'textarea';
+  }
+}
+
+/**
+ * Implements hook_form_FORMID_alter().
+ */
+function mm_media_form_system_performance_settings_alter(&$form, &$form_state) {
+  $form['caching']['mm_media_cache_public_media'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Allow external caching of world-readable media files'),
+    '#default_value' => \Drupal::config('mm_media.settings')->get('cache_public_media'),
+    '#description' => t('If enabled, media files will be checked to see if they are readable by everyone, even if the current user is logged-in. This has a slight performance penalty for the first hit, but subsequent hits are faster because they are cached.'),
+    '#weight' => -0.5,
+  );
+  $form['#submit'][] = '_mm_media_form_system_performance_settings_submit';
+}
+
+function _mm_media_form_system_performance_settings_submit(&$form, FormStateInterface $form_state) {
+  \Drupal::service('config.factory')->getEditable('mm_media.settings')->set('cache_public_media', $form_state->getValue('mm_media_cache_public_media'))->save();
+}
+
+/**
+ * Implements hook_form_FORMID_alter().
+ */
+function mm_media_form_entity_browser_widgets_config_form_alter(&$form) {
+  // Make file extensions for element a textarea.
+  foreach (Element::children($form['widgets']['table']) as $child) {
+    if (isset($form['widgets']['table'][$child]['form']['extensions'])) {
+      $form['widgets']['table'][$child]['form']['extensions']['#type'] = 'textarea';
+      // In some cases the limit on the length of all extensions is set to 256.
+      unset($form['widgets']['table'][$child]['form']['extensions']['#maxlength']);
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORMID_alter().
+ */
+function mm_media_form_field_config_edit_form_alter(&$form) {
+  // Make file extensions for element a textarea.
+  if (isset($form['settings']['file_extensions'])) {
+    $form['settings']['file_extensions']['#type'] = 'textarea';
+    // In some cases the limit on the length of all extensions is set to 256.
+    unset($form['settings']['file_extensions']['#maxlength']);
+  }
+}
+
+// FIXME: https://www.drupal.org/node/2038981  The template process layer has been removed
+// https://www.drupal.org/node/2100775  New hooks for theme suggestions
+function mm_media_process_image_style(&$variables) {
+  array_unshift($variables['theme_hook_suggestions'], 'mm_media_image_style');
+}
+
+/**
+ * Returns HTML for an image using a specific image style.
+ *
+ * @param $variables
+ *   An associative array containing:
+ *   - style_name: The name of the style to be used to alter the original image.
+ *   - path: The path of the image file relative to the Drupal files directory.
+ *     This function does not work with images outside the files directory nor
+ *     with remotely hosted images.
+ *   - width: The width of the source image (if known).
+ *   - height: The height of the source image (if known).
+ *   - alt: The alternative text for text-based browsers.
+ *   - title: The title text is displayed when the image is hovered in some
+ *     popular browsers.
+ *   - attributes: Associative array of attributes to be placed in the img tag.
+ * @return string
+ *   HTML code
+ * @ingroup themeable
+ */
+function theme_mm_media_image_style($variables) {
+  // Determine the dimensions of the styled image.
+  $dimensions = array(
+    'width' => $variables['width'],
+    'height' => $variables['height'],
+  );
+
+  $style = ImageStyle::load($variables['style_name']);
+  $style->transformDimensions($dimensions, $variables['path']);
+
+  $variables['width'] = $dimensions['width'];
+  $variables['height'] = $dimensions['height'];
+
+  // Determine the url for the styled image.
+  $orig_path = $variables['path'];
+  $variables['path'] = $style->buildUrl($orig_path);
+  $orig_attributes = $variables['attributes'];
+  foreach (array('mm_media_outlined', 'mm_media_margin', 'mm_media_link') as $remove) {
+    unset($variables['attributes'][$remove]);
+  }
+  if (!isset($variables['attributes']['style'])) {
+    $variables['attributes']['style'] = array();
+  }
+  elseif (is_string($variables['attributes']['style'])) {
+    $temp = $variables['attributes']['style'];
+    $variables['attributes']['style'] = array();
+    $variables['attributes']['style'][] = $temp;
+  }
+  if (!empty($orig_attributes['mm_media_outlined'])) {
+    $variables['attributes']['style'][] = 'margin: 10px;';
+  }
+  if (!empty($orig_attributes['mm_media_margin'])) {
+    $variables['attributes']['style'][] = 'border: 1px solid #000000;';
+  }
+  // @FIXME
+// theme() has been renamed to _theme() and should NEVER be called directly.
+// Calling _theme() directly can alter the expected output and potentially
+// introduce security issues (see https://www.drupal.org/node/2195739). You
+// should use renderable arrays instead.
+//
+//
+// @see https://www.drupal.org/node/2195739
+// $output = theme('image', $variables);
+
+
+  if (!empty($orig_attributes['mm_media_link']) && $variables['style_name'] != 'large') {
+    $output = Link::fromTextAndUrl($output, Url::fromUri(ImageStyle::load('large')->buildUrl($orig_path), array('title' => t('Original size'))))->toString();
+  }
+  if ($variables['attributes']['style']) {
+    $output = '<div class="mm-mediainline">' . $output . '</div>';
+  }
+
+  return $output;
+}
+
+/**
+ * Theme a thumbnail.
+ *
+ * @param $variables
+ *   An associative array containing:
+ *   - file: A file object to display.
+ *   - mode: Media::BROWSER_MODE_MEDIA or another mode.
+ *   - mmtid: Currently unused. Holds the mmtid of the page.
+ *   - (optional) style_name: The name of the image style to use, such as
+ *     'thumbnail'.
+ *   - (optional) onclick: Javascript onclick event code for
+ *     Nodes::BROWSER_MODE_NODE.
+ * @return array|null
+ *   Render array
+ * @ingroup themeable
+ */
+function template_preprocess_mm_browser_thumbnail(&$variables) {
+  $file = $variables['file'];
+  $style_name = empty($variables['style_name']) ? 'thumbnail' : $variables['style_name'];
+  if (empty($file)) {
+    return [];
+  }
+
+  if (strstr($file->filemime, 'image')) {
+    $thumbnail = [
+      '#theme' => 'image_style',
+      '#uri' => $file->uri,
+      '#style_name' => $style_name,
+      '#alt' => t('Thumbnail for @filename.', ['@filename' => $file->filename]),
+    ];
+  }
+  // Display the file icon for other file types.
+  else {
+    $thumbnail = [
+      '#theme' => 'file_link',
+      '#file' => $file,
+    ];
+  }
+
+  switch ($variables['mode']) {
+    case Media::BROWSER_MODE_MEDIA:
+      $link = "Drupal.mm_browser_gallery_add($variables[mmtid], '" . mm_ui_js_escape($file->filename) . "', " . $file->mid . ');';
+      break;
+
+    case Nodes::BROWSER_MODE_NODE:
+      $link = $variables['onclick'];
+      break;
+
+    default:
+      $link = '#';
+      break;
+  }
+
+  $state = 'ui-state-default';
+  if (is_array($variables['min_wh']) && ($variables['min_wh'][0] || $variables['min_wh'][1])) {
+    /** @var Image $image */
+    $image = Drupal::service('image.factory')->get($file->uri);
+    if ($image && ($variables['min_wh'][0] && $image->getWidth() < $variables['min_wh'][0] || $variables['min_wh'][1] && $image->getHeight() < $variables['min_wh'][1])) {
+      $msg = t('The image must be at least @min pixels. This image is @this.', array('@min' => $variables['min_wh'][0] . ' x ' . $variables['min_wh'][1], '@this' => $image->getWidth() . ' x ' . $image->getHeight()));
+      $link = "alert('" . mm_ui_js_escape($msg) . "');";
+      $state = ' ui-state-disabled';
+    }
+  }
+  $short_title = Html::escape($file->filename);
+  $long_title = empty($file->title) ?
+    t('@name (@size)', array('@name' => $short_title, '@size' => format_size($file->filesize))) :
+    t('@name (@size) on page "@title"', array('@name' => $file->filename, '@title' => $file->title, '@size' => format_size($file->filesize)));
+  $variables['attributes'] = new Attribute([
+    'onclick' => $link,
+    'title' => Html::escape($long_title),
+  ]);
+  $variables['div_state'] = $state;
+  $variables['short_title'] = $short_title;
+  $variables['link'] = $link;
+  $variables['thumbnail'] = $thumbnail;
+}
+
+/**
+ * Implements module_implements_alter().
+ */
+function mm_media_module_implements_alter(&$impls, $hook) {
+  if ($hook == 'file_download') {
+    // Don't use file_file_download() because it prevents the correct cache-
+    // control headers from being returned in the case where the file is
+    // world-readable via MM.
+    unset($impls['file']);
+    // Don't use image_file_download() because it calls file_file_download()
+    // directly.
+    unset($impls['image']);
+  }
+}
+
+/**
+ * Implements hook_file_download().
+ */
+function mm_media_file_download($uri) {
+  // Get the file record based on the URI. If not in the database just return.
+  /** @var File $files[] */
+  $files = \Drupal::entityTypeManager()->getStorage('file')->loadByProperties(['uri' => $uri]);
+  if ($files) {
+    $current_is_anon = \Drupal::currentUser()->isAnonymous();
+    if (!$current_is_anon) {
+      $anon_user = User::getAnonymousUser();
+    }
+    $current_user_can = NULL;
+    $is_public = FALSE;
+    $cache_public_media = \Drupal::config('mm_media.settings')->get('cache_public_media');
+    foreach ($files as $file) {
+      // Since some database servers sometimes use a case-insensitive comparison
+      // by default, double check that the filename is an exact match.
+      if ($file->getFileUri() === $uri) {
+        // This section is taken directly from image_file_download(). We can't
+        // include the direct call to file_file_download(), though.
+        $path = file_uri_target($uri);
+        // Private file access for image style derivatives.
+        if (strpos($path, 'styles/') === 0) {
+          $args = explode('/', $path);
+          // Discard the first part of the path (styles), the style name, and
+          // the scheme from the path.
+          $args = array_slice($args, 3);
+
+          // Then the remaining parts are the path to the image.
+          $original_uri = \Drupal::service('file_system')->uriScheme($uri) . '://' . implode('/', $args);
+
+          // Check that the file exists and is an image.
+          if ($image = Drupal::service('image.factory')->get($uri)) {
+            // Check the permissions of the original to grant access to this image.
+            $headers = \Drupal::moduleHandler()->invokeAll('file_download', [$original_uri]);
+            // Confirm there's at least one module granting access and none denying access.
+            if (!empty($headers) && !in_array(-1, $headers)) {
+              return array(
+                // Send headers describing the image's size, and MIME-type...
+                'Content-Type' => $file->getMimeType(),
+                'Content-Length' => $file->getFileSize(),
+                // By not explicitly setting them here, this uses normal Drupal
+                // Expires, Cache-Control and ETag headers to prevent proxy or
+                // browser caching of private images.
+              );
+            }
+          }
+          return -1;
+        }
+
+        if ($file->getOwnerId() == \Drupal::currentUser()->id()) {
+          $current_user_can = TRUE;
+          if ($current_is_anon) {
+            $is_public = TRUE;
+          }
+        }
+        else if ($file->isTemporary()) {
+          // Denied.
+          return -1;
+        }
+
+        if (is_null($current_user_can) || $cache_public_media) {
+          // If the current user can read any of the nodes containing the file,
+          // let it through. Otherwise, return -1. We also calculate whether or
+          // not the anonymous user can view the file, so that the correct
+          // cache headers can be sent.
+          $usage = \Drupal::service('file.usage')->listUsage($file);
+          // Filter the usage list by module name.
+          $usage = array_intersect_key($usage, array('editor' => 1, 'file' => 1, 'image' => 1, 'media' => 1));
+          foreach ($usage as $use) {
+            if (!empty($use['node']) || !empty($use['media'])) {
+              if (!empty($use['media'])) {
+                // Find any base node(s) that refer to this media item.
+                $entity_query = \Drupal::entityQuery('node', 'OR');
+                /** @var BaseFieldDefinition $field_def */
+                foreach (\Drupal::service('entity_field.manager')->getActiveFieldStorageDefinitions('node') as $field_name => $field_def) {
+                  if ($field_def->getType() == 'entity_reference' && $field_def->getSetting('target_type') == 'media') {
+                    $entity_query->condition("$field_name.target_id", array_keys($use['media']), 'IN');
+                  }
+                }
+
+                if (empty($use['node'])) {
+                  $use['node'] = array();
+                }
+
+                foreach ($entity_query->execute() as $nid) {
+                  $use['node'][$nid] = 1;
+                }
+              }
+
+              if (is_null($current_user_can)) {
+                $current_user_can = FALSE;
+              }
+
+              foreach (array_keys($use['node']) as $nid) {
+                /** @var Node $node */
+                if ($node = Node::load($nid)) {
+                  // Check readability for the current user.
+                  if (!$current_user_can) {
+                    $perms = mm_content_user_can_node($node);
+                    // Either the node is published and the user can read it, or
+                    // the user can write to it.
+                    if ($perms[Constants::MM_PERMS_WRITE] || $node->isPublished() && $perms[Constants::MM_PERMS_READ]) {
+                      $current_user_can = TRUE;
+                      if (!$cache_public_media) {
+                        return mm_media_get_content_headers($file, FALSE);
+                      }
+                      if ($current_is_anon) {
+                        return mm_media_get_content_headers($file, TRUE);
+                      }
+                    }
+                  }
+                  // Check readability for the anonymous user.
+                  if ($cache_public_media && !$current_is_anon && mm_content_user_can_node($node, Constants::MM_PERMS_READ, $anon_user)) {
+                    return mm_media_get_content_headers($file, TRUE);
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        if ($current_user_can) {
+          return mm_media_get_content_headers($file, $is_public);
+        }
+
+        if ($current_user_can === FALSE) {
+          // Denied.
+          return -1;
+        }
+      }
+    }
+  }
+  return NULL;
+}
+
+function mm_media_get_content_headers(File $file, $is_public) {
+  $headers = array(
+    'Content-Type' => Unicode::mimeHeaderEncode($file->getMimeType()),
+    'Content-Disposition' => 'filename="' . strtr(Unicode::mimeHeaderEncode($file->getFilename()), array('"' => '\\"')) . '"',
+    'Content-Length' => $file->getSize(),
+    'Cache-Control' => 'private',
+  );
+  if ($is_public) {
+    $max_age = \Drupal::config('system.performance')->get('cache.page.max_age');
+    $expires = new DateTime();
+    if ($max_age) {
+      $headers['Cache-Control'] = 'public, max-age=' . Unicode::mimeHeaderEncode($max_age);
+      $expires->modify("+$max_age second");
+    }
+    else {
+      $headers['Cache-Control'] = 'public';
+      $expires->modify('+10 year');
+    }
+    $headers['Expires'] = $expires->format('r');
+
+    // See if the client has provided the required HTTP headers.
+    $_server = \Drupal::request()->server->all();
+    $if_modified_since = isset($_server['HTTP_IF_MODIFIED_SINCE']) ? strtotime($_server['HTTP_IF_MODIFIED_SINCE']) : FALSE;
+    $if_none_match = isset($_server['HTTP_IF_NONE_MATCH']) ? stripslashes($_server['HTTP_IF_NONE_MATCH']) : FALSE;
+    $moddate = @filemtime($file->getFileUri());
+
+    if ($if_modified_since && $if_none_match && $if_modified_since === $moddate) {
+      $headers = ['Cache-Control' => $headers['Cache-Control'], 'Expires' => $headers['Expires']];
+      throw new HttpException(304, $_server['SERVER_PROTOCOL'] . ' 304 Not Modified', NULL, $headers);
+    }
+
+    if ($moddate) {
+      $headers['Last-Modified'] = gmdate(DATE_RFC1123, $moddate);
+    }
+  }
+  return $headers;
+}

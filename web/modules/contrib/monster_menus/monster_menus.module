@@ -1,0 +1,1123 @@
+<?php
+
+/**
+ * @file
+ * Menus, menus, menus
+ */
+
+require_once 'mm_content.inc';
+require_once 'misc.inc';
+require_once 'mm_ui.inc';
+require_once 'mm_theme.inc';
+require_once 'mm_node.inc';
+require_once 'mm_static.inc';
+
+use Drupal\block\BlockRepositoryInterface;
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Config\Entity\ConfigEntityType;
+use Drupal\Core\Database\Connection;
+use Drupal\Core\Database\Database;
+use Drupal\Core\Database\Query\SelectInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Field\FieldItemList;
+use Drupal\Core\Form\FormState;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\Session\UserSession;
+use Drupal\Core\Template\Attribute;
+use Drupal\Core\Url;
+use Drupal\comment\Plugin\Field\FieldType\CommentItemInterface;
+use Drupal\migrate\MigrateExecutable;
+use Drupal\migrate\Plugin\MigrateSourceInterface;
+use Drupal\migrate\Row;
+use Drupal\monster_menus\Constants;
+use Drupal\monster_menus\Form\DeleteNodeConfirmForm;
+use Drupal\monster_menus\Form\RestoreNodeConfirmForm;
+use Drupal\monster_menus\MigrateMessage\MMMigrateMessage;
+use Drupal\monster_menus\Plugin\Menu\LocalTask\NodeDeleteLocalTask;
+use Drupal\node\Entity\Node;
+use Drupal\node\NodeInterface;
+use Drupal\user\Entity\User;
+
+/**
+ * Implements hook_help().
+ */
+function monster_menus_help($route_name) {
+  switch ($route_name) {
+    case 'help.page.monster_menus':
+      return t('Provides a menu system with granular node access.');
+
+    case 'monster_menus.mm_admin_list_sites':
+      return t('Monster Menus can manage an unlimited number of virtual sites, giving each its own menu tree. Each site can have different overall Drupal settings, but share the same content and Monster Menus permissions. To configure Drupal for multiple sites, see the comments in <code>sites/default/default.settings.php</code>. After setting up a new site, revisit this page using its URL, <strong>Add</strong> a new homepage, and select it as the homepage for the current site.');
+
+    case 'monster_menus.mm_admin_regions':
+      return t('Here, you can control which content types are allowed in each page region, and who can put them there. To change the default region for a given content type, visit <a href=":link">@path</a> and click on the <strong>Edit</strong> link for the type.', array('@path' => 'admin/structure/types', ':link' => Url::fromRoute('entity.node_type.collection')->toString()));
+
+    case 'monster_menus.mm_admin_reassign_controller':
+      return t('This feature allows you to transfer ownership of all pages and nodes from one user to another. It is most useful when a particular user has been removed or blacklisted from the system.<p><em>This process is irreversible.</em> Only use this feature if you are absolutely sure you know what you are doing.</p>');
+  }
+}
+
+/**
+ * Implements hook_mm_cascaded_settings().
+ */
+function monster_menus_mm_cascaded_settings() {
+  return array(
+    'allow_reorder' => array('data_type' => 'int', 'user_access' => 'administer all menus'),
+    'allowed_themes' => array('data_type' => 'string', 'multiple' => TRUE, 'user_access' => 'administer all menus'),
+    'allowed_node_types' => array('data_type' => 'string', 'multiple' => TRUE, 'user_access' => 'administer all menus'),
+    'comments_readable' => array('data_type' => 'string', 'not_empty' => TRUE),
+    'hide_menu_tabs' => array('data_type' => 'int', 'user_access' => 'administer all menus'),
+    'nodes_per_page' => array('data_type' => 'int', 'not_empty' => TRUE),
+  );
+}
+
+/**
+ * Implements hook_entity_prepare_view().
+ */
+function monster_menus_entity_prepare_view($entity_type, array $entities, array $displays) {
+  if ($entity_type == 'node') {
+    /** @var NodeInterface $node */
+    foreach ($entities as $node) {
+      /** @var EntityViewDisplayInterface[] $displays */
+      $components = $displays[$node->bundle()]->getComponents();
+
+      if ($node->id() && !mm_content_user_can_node($node, Constants::MM_PERMS_READ)) {
+        foreach (array_keys($components) as $name) {
+          try {
+            /** @var FieldItemList $item */
+            foreach ($node->get($name) as $item) {
+              $item->setValue(NULL);
+            }
+          }
+          catch (\Exception $e) {
+          }
+        }
+        // Mark for later addition of a message to the user
+        $node->_mm_access_denied = TRUE;
+      }
+      else {
+        // If this is a view rendering a node not on an MM page, allow the
+        // Edit/Delete/etc. links to appear.
+        if (isset($node->view) && isset($displays[$node->getType()]->getComponents()['links'])) {
+          $_mm_mmtid_of_node = &drupal_static('_mm_mmtid_of_node');
+          $_mm_mmtid_of_node[$node->id()] = TRUE;
+        }
+
+        // Restrict comment access based on MM's node- and page-level settings.
+        $hide = FALSE;
+        if (isset($node->field_comments) && $node->get('field_comments')->comment_count) {
+          if (!empty($node->in_preview) || _mm_content_comments_readable($node)) {
+            // Hide the comments if the node is on an MM page and the "show
+            // comment count" setting is set.
+            $hide = mm_get_setting('comments.show_count_instead') && !node_is_page($node);
+          }
+          else {
+            // The user cannot view comments. Prevent any from appearing.
+            $hide = TRUE;
+          }
+        }
+        if ($hide) {
+          $node->get('field_comments')->status = CommentItemInterface::HIDDEN;
+        }
+      }
+
+      // Hide the title if it is "[bracketed]"
+      $node->setTitle(mm_ui_hide_node_title($node->getTitle()));
+
+      // Set the creation time so that RSS feeds have something to work with
+      // when viewing a node in preview.
+      if (in_array('rss', array_keys($components)) && $node->in_preview) {
+        $node->setCreatedTime($node->getChangedTime());
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_local_tasks_alter().
+ */
+function monster_menus_local_tasks_alter(&$local_tasks) {
+  if (isset($local_tasks['entity.node.delete_form'])) {
+    unset($local_tasks['entity.node.delete_form']['title']);
+    $local_tasks['entity.node.delete_form']['class'] = NodeDeleteLocalTask::class;
+  }
+}
+
+/**
+ * Implements hook_node_links_alter().
+ */
+function monster_menus_node_links_alter(array &$links, NodeInterface $node, array &$context) {
+  // Don't add links to nodes if contextual links are enabled and the user has
+  // access to them.
+  if (mm_module_exists('contextual') && \Drupal::currentUser()->hasPermission('access contextual links')) {
+    return;
+  }
+
+  $_mm_mmtid_of_node = &drupal_static('_mm_mmtid_of_node');
+  mm_active_menu_item();
+  $nid = $node->id();
+  $vid = $node->getRevisionId();
+
+  // This is a node on an MM page and its type is associated with an installed
+  // module.
+  if (isset($_mm_mmtid_of_node[$nid]) && in_array($node->getType(), array_keys(node_type_get_names()))) {
+    $new_links = array();
+
+    if (!empty($dest = \Drupal::request()->query->get('destination', ''))) {
+      $defaults = array('query' => array('destination' => $dest));
+    }
+    else {
+      $defaults = is_numeric($_mm_mmtid_of_node[$nid]) ? array('query' => array('destination' => 'mm/' . $_mm_mmtid_of_node[$nid])) : array();
+    }
+
+    $url_args = ['node' => $nid];
+    if (is_numeric($_mm_mmtid_of_node[$nid])) {
+      $url_args['mm_tree'] = $_mm_mmtid_of_node[$nid];
+    }
+
+    $query = Database::getConnection()->select('node_revision', 'r');
+    $query->join('node', 'n', 'n.nid = r.nid');
+    $query->condition('r.nid', $nid, '=');
+    $query->addExpression('MAX(n.vid)', 'current_vid');
+    $query->addExpression('COUNT(*)', 'count_revisions');
+    $query->groupBy('n.nid');
+    $revisions = $query->execute()->fetchObject();
+
+    $is_latest = $revisions->current_vid == $vid;
+    if ($is_latest && $node->access('update')) {
+      $new_links[] = $defaults + array('title' => t('Edit'), 'url' => Url::fromRoute('entity.node.edit_form', $url_args));
+    }
+
+    if (RestoreNodeConfirmForm::canRestore($_mm_mmtid_of_node[$nid], $node)) {
+      $new_links[] = array('title' => t('Restore'), 'url' => Url::fromRoute('monster_menus.restore_node_confirm', $url_args));
+    }
+
+    if ($is_latest && DeleteNodeConfirmForm::canDelete($node)) {
+      $perm = mm_content_node_is_recycled($node, Constants::MM_NODE_RECYCLED_MMTID_CURR);
+      $new_links[] = ($perm ? array() : $defaults) + array(
+        'title' => $perm ? t('Delete permanently') : t('Delete'),
+        'url' => Url::fromRoute('entity.node.delete_form', $url_args),
+      );
+    }
+
+    $user = \Drupal::currentUser();
+    if ($revisions->count_revisions > 1 && $node->access('update') && $node->access('view') && ($user->hasPermission('view revisions') || ($user->hasPermission('administer nodes') && $user->hasPermission('bypass node access')))) {
+      $new_links[] = $defaults + array('title' => t('Revisions'), 'url' => Url::fromRoute('entity.node.version_history', $url_args));
+      if (!$is_latest) {
+        $url_args['node_revision'] = $vid;
+        $new_links[] = $defaults + array('title' => t('Revert to this revision'), 'url' => Url::fromRoute('node.revision_revert_confirm', $url_args));
+        $new_links[] = $defaults + array('title' => t('Delete this revision'), 'url' => Url::fromRoute('node.revision_delete_confirm', $url_args));
+      }
+    }
+
+    if ($new_links) {
+      $links['monster_menus'] = array(
+        '#theme' => 'links__node__monster_menus',
+        '#attributes' => new Attribute(array('class' => array('links', 'inline'))),
+        '#links' => $new_links,
+      );
+    }
+
+    if (isset($node->field_comments)) {
+      if (_mm_content_comments_readable($node)) {
+        // The user can read comments: add the count of comments if requested
+        // and it wouldn't otherwise appear.
+        if ($context['view_mode'] != 'teaser' && mm_get_setting('comments.show_count_instead') && !node_is_page($node) && function_exists('comment_node_links_alter')) {
+          $temp_context = $context;
+          $temp_context['view_mode'] = 'teaser';
+          unset($links['comment__field_comments']);
+          comment_node_links_alter($links, $node, $temp_context);
+        }
+      }
+      elseif ($node->get('field_comments')->status) {
+        $links['comment-forbidden'] = array(
+          'title' => \Drupal::service('comment.manager')->forbiddenMessage($node, 'field_comments'),
+        );
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_contextual_links_alter().
+ */
+function monster_menus_contextual_links_alter(array &$links, $group, array $route_parameters) {
+  if ($group == 'node' && isset($links['entity.node.delete_form']) && isset($links['entity.node.delete_form']['route_parameters']['node']) && ($node = Node::load($links['entity.node.delete_form']['route_parameters']['node'])) && mm_content_node_is_recycled($node)) {
+    // Change the title of the Delete link.
+    $links['entity.node.delete_form']['title'] = t('Delete Permanently');
+  }
+}
+
+/**
+ * Implements hook_contextual_links_view_alter().
+ */
+function monster_menus_contextual_links_view_alter(&$element) {
+  // The contextual menu code doesn't work out of the box with our links, so
+  // hack it here.
+  if (!empty($element['#contextual_links']['mm_block']['metadata']['mm_links'])) {
+    foreach ($element['#contextual_links']['mm_block']['metadata']['mm_links'] as $key => $link) {
+      // Unfortunately, we can't just use a Url object in the first place,
+      // because then serialization fails. So construct it here.
+      $element['#links'][$key] = [
+        'title' => $link['title'],
+        'url' => Url::fromRoute($link['route_name'], $link['route_parameters']),
+      ];
+    }
+  }
+}
+
+/**
+ * Implements hook_library_info_alter().
+ */
+function monster_menus_library_info_alter(&$libraries, $extension) {
+  if ($extension == 'core') {
+    // Fix some core jQuery UI library dependencies, until
+    // https://www.drupal.org/project/drupal/issues/2926155 is resolved.
+
+    // ui.labels requires ui.escape-selector, but core isn't including it.
+    $libraries['jquery.ui']['js']['assets/vendor/jquery.ui/ui/escape-selector-min.js'] = [ 'weight' => -11, 'minified' => TRUE ];
+    // ui.selectmenu requires ui.form-reset-mixin.
+    $libraries['jquery.ui.selectmenu']['js']['assets/vendor/jquery.ui/ui/form-reset-mixin-min.js'] = [ 'weight' => -11, 'minified' => TRUE ];
+  }
+}
+
+/**
+ * Modify the mm_rss_feed query, based on its tag, to set the display order.
+ *
+ * @param SelectInterface $query
+ */
+function monster_menus_query_mm_rss_feed_alter(SelectInterface $query) {
+  // Only alter the main query, not the count query.
+  $view = $query->getMetaData('view');
+  if (!$view || $query == $view->build_info['query']) {
+    // The argument passed in with the first contextual filter contains an ordered
+    // list of node IDs. We want the result to appear in this order, so extract
+    // it and use FIND_IN_SET() to set the correct order.
+    $args = $query->getArguments();
+    $args = reset($args);
+    // No sense in ordering if only one node.
+    if (is_array($args) && count($args) > 1) {
+      $args = [':nids' => implode(',', $args)];
+      $query->addExpression('FIND_IN_SET(nid, :nids)', 'nid_order', $args);
+      $query->orderBy('nid_order');
+    }
+  }
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Updates the table containing all results of virtual group queries; flushes
+ * any recycled content that has expired; updates the virtual user directory
+ * cache.
+ */
+function monster_menus_cron() {
+  // Update any parts of the tree with dirty sort indices. Wait for up to 10
+  // sec. if another process is updating.
+  mm_content_update_sort(1, FALSE, 10);
+
+  // regenerate mm_virtual_group if needed
+  mm_regenerate_vgroup();
+
+  // Remove unneeded cache entries. This doesn't need to be done in the case
+  // of memcache, since memcache does expiration automatically.
+  $db = Database::getConnection();
+  $db->delete('mm_access_cache')->condition('expire', mm_request_time(), '<')->execute();
+
+  // Keep track of the average time between cron runs, so that we can tell the
+  // user in mm_content_get_recycle_autodel_time() when recycling bins are
+  // likely to be automatically emptied.
+  //
+  // average_time_between_runs = (cron_run_last - cron_run_since) / cron_run_count
+  //      likely_next_cron_run = cron_run_last + average_time_between_runs
+  //
+  $state = \Drupal::state();
+  $state->set('monster_menus.cron_run_count', $state->get('monster_menus.cron_run_count', -1) + 1);
+  if ($state->get('monster_menus.cron_run_since', 0) == 0) {
+    $state->set('monster_menus.cron_run_since', mm_request_time());
+  }
+  $state->set('monster_menus.cron_run_last', mm_request_time());
+
+  // In case of error, don't save session as wrong user.
+  $accountSwitcher = \Drupal::service('account_switcher');
+  $accountSwitcher->switchTo(new UserSession(array('uid' => 1)));
+  mm_content_empty_all_bins(Constants::MM_CRON_EMPTY_BINS_LIMIT);
+  // Other tasks that must run as admin can be added here...
+  //
+  // Re-enable session saving.
+  $accountSwitcher->switchBack();
+
+  // Clear out the group editing temp table.
+  $db->delete('mm_group_temp')
+    ->condition('expire', mm_request_time(), '<')
+    ->execute();
+
+  // add any future tasks here, outside of admin user block
+}
+
+/**
+ * Implements hook_preprocess_HOOK() for the page template.
+ */
+function monster_menus_preprocess_page(&$variables) {
+  // Add content not in the main region.
+  mm_parse_args($mmtids, $oarg_list, $this_mmtid);
+  if (!$oarg_list && $this_mmtid > 0 && ($item = mm_content_get($this_mmtid)) && mm_content_user_can($item->mmtid, Constants::MM_PERMS_READ)) {
+    $_mm_mmtid_of_node = &drupal_static('_mm_mmtid_of_node');
+
+    $omit_nodes = '';
+    $omit_node_types = mm_get_node_info(Constants::MM_NODE_INFO_NO_RENDER, $item);
+    if ($omit_node_types) {
+      $omit_nodes = " AND n.type NOT IN('" . join("', '", $omit_node_types) . "')";
+    }
+
+    $result = mm_content_get_accessible_nodes_by_mmtid($item->mmtid, 0, NULL, ', MAX(n.region) AS region', '', $omit_nodes . ' AND r.region IS NOT NULL');
+    $nids = $scheduled = array();
+    foreach ($result as $n) {
+      $_mm_mmtid_of_node[$n->nid] = $item->mmtid;
+      $scheduled[$n->nid] = !empty($n->scheduled);
+      $nids[$n->region][] = $n->nid;
+    }
+
+    $mm_region_contents = &drupal_static('mm_region_contents', array());
+    $page = &$variables['page'];
+
+    foreach (array_keys(system_region_list(\Drupal::theme()
+      ->getActiveTheme()
+      ->getName(), BlockRepositoryInterface::REGIONS_VISIBLE)) as $region) {
+      $no_nodes = FALSE;
+      if (isset($mm_region_contents[$region])) {
+        $output = array();
+        foreach ($mm_region_contents[$region] as $showpage_output) {
+          if (is_array($showpage_output)) {
+            if (isset($showpage_output['output_pre'])) {
+              if (!isset($output['output_pre'])) {
+                $output['output_pre']['#weight'] = -1000;
+              }
+              $output['output_pre'][] = is_array($showpage_output['output_pre']) ? $showpage_output['output_pre'] : array('#type' => 'item', '#markup' => $showpage_output['output_pre']);
+            }
+
+            if (isset($showpage_output['output_post'])) {
+              if (!isset($output['output_post'])) {
+                $output['output_post']['#weight'] = 1000;
+              }
+              $output['output_post'][] = is_array($showpage_output['output_post']) ? $showpage_output['output_post'] : array('#type' => 'item', '#markup' => $showpage_output['output_post']);
+            }
+
+            if (isset($showpage_output['no_nodes'])) {
+              $no_nodes |= $showpage_output['no_nodes'];
+            }
+          }
+          elseif (!empty($showpage_output)) {
+            if (!isset($output['output_post'])) {
+              $output['output_post']['#weight'] = 1000;
+            }
+            $output['output_post'][] = array('#type' => 'item', '#markup' => $showpage_output);
+            $no_nodes = FALSE;
+          }
+        }
+
+        if ($no_nodes) {
+          unset($page[$region]['mm_nodes']);
+        }
+        $page[$region][] = $output;
+      }
+
+      if (!$no_nodes && isset($nids[$region])) {
+        $output = array();
+        _mm_render_nodes($nids[$region], $scheduled, $item->previews ? 'teaser' : 'full', FALSE, $output, $rss_link);
+        if ($output) {
+          $page[$region]['wrapper'] = array(
+            '#prefix' => '<div id="' . \Drupal\Component\Utility\Html::getId("block-monster-menus-$region") . '" class="block block-monster-menus">',
+            $output,
+            '#suffix' => '</div>',
+          );
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_HOOK() for the html template.
+ */
+function monster_menus_preprocess_html(&$variables) {
+  if ($footer = mm_add_page_footer()) {
+    $variables['page_bottom'][] = $footer;
+  }
+}
+
+/**
+ * Implements hook_user_delete().
+ */
+function monster_menus_user_delete(User $account) {
+  foreach (mm_module_implements('mm_user_delete') as $module) {
+    if (call_user_func_array($module . '_mm_user_delete', array(&$account))) {
+      return;
+    }
+  }
+
+  if ($account->user_mmtid) {
+    mm_content_move_to_disabled($account->user_mmtid);
+  }
+  $uid = $account->id();
+  $db = Database::getConnection();
+  $db->delete('mm_group')->condition('uid', $uid)->execute();
+  $db->delete('mm_virtual_group')->condition('uid', $uid)->execute();
+  $db->delete('mm_tree_bookmarks')->condition('uid', $uid)->execute();
+
+  // Remove cached access rights.
+  mm_content_clear_cache_tagged(['user' => $uid]);
+
+  // Regenerate "All logged-in users" virtual group during next cron.
+  mm_mark_all_logged_in_vgroup_dirty();
+}
+
+/**
+ * Implements hook_user_login().
+ */
+function monster_menus_user_login(User $account) {
+  foreach (mm_module_implements('mm_user_login') as $module) {
+    if (call_user_func_array($module . '_mm_user_login', array($account))) return;
+  }
+}
+
+/**
+ * Implements hook_user_insert().
+ */
+function monster_menus_user_insert(User $account) {
+  foreach (mm_module_implements('mm_user_insert') as $module) {
+    if (call_user_func_array($module . '_mm_user_insert', array($account))) return;
+  }
+
+  // Regenerate "All logged-in users" virtual group during next cron.
+  mm_mark_all_logged_in_vgroup_dirty();
+}
+
+/**
+ * Implements hook_user_update().
+ */
+function monster_menus_user_update(User $account) {
+  foreach (mm_module_implements('mm_user_update') as $module) {
+    if (call_user_func_array($module . '_mm_user_update', array($account))) return;
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_load().
+ */
+function monster_menus_user_load(array $users) {
+  // Note: $users is already a reference, so no need to use &$users above
+  foreach (mm_module_implements('mm_user_load') as $module) {
+    if (call_user_func_array($module . '_mm_user_load', array($users))) return;
+  }
+
+  $user = \Drupal::currentUser();
+  foreach ($users as $uid => $account) {
+    if ($uid > 0) {
+      $home = mm_content_get(array('flags' => array('user_home' => $uid)));
+      if (isset($home[0]) && is_object($home[0])) {
+        $users[$uid]->user_mmtid = $home[0]->mmtid;
+        if ($account->id() == $user->id()) $user->user_mmtid = $home[0]->mmtid;
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_load().
+ */
+function monster_menus_node_load(array $nodes, Connection $database = NULL) {
+  $database = $database ?: Database::getConnection();
+  $mmtids_to_load = array();
+  $nids = array_keys($nodes);
+  $mmtids_containing_node = mm_content_get_by_nid($nids, FALSE, $database);
+  foreach ($nids as $nid) {
+    $node = &$nodes[$nid];
+
+    mm_node_all_nodes_hook('load', $node, $database);
+
+    if (isset($mmtids_containing_node[$nid])) {
+      $mmtids_to_load = array_merge($mmtids_to_load, $mmtids_containing_node[$nid]);
+    }
+    $node->mm_catlist = array();
+    $node->others_w = FALSE;
+    $node->users_w = $node->groups_w = array();
+    $node->recycle_bins = $node->recycle_from_mmtids = array();
+  }
+
+  $result = $database->select('mm_node_write', 'w')
+    ->fields('w', array('gid', 'nid'))
+    ->condition('w.nid', $nids, 'IN')
+    ->execute();
+  foreach ($result as $r) {
+    if ($r->gid == 0) {
+      $nodes[$r->nid]->others_w = TRUE;
+    }
+    elseif ($r->gid < 0) {
+      $nodes[$r->nid]->users_w = array_fill_keys(mm_content_get_uids_in_group($r->gid), '');
+    }
+    else {
+      $nodes[$r->nid]->groups_w[$r->gid] = '';
+    }
+  }
+
+  $result = $database->select('mm_recycle', 'r')
+    ->fields('r')
+    ->condition('r.type', 'node')
+    ->condition('r.id', $nids, 'IN')
+    ->execute();
+  foreach ($result as $r) {
+    $node = &$nodes[$r->id];
+    // Display the oldest recycle date to the user.
+    if (!isset($node->recycle_date) || $r->recycle_date < $node->recycle_date) {
+      $node->recycle_date = $r->recycle_date;
+    }
+    $node->recycle_bins[] = $r->bin_mmtid;
+    $node->recycle_from_mmtids[] = $r->from_mmtid;
+  }
+
+  $result = $database->select('mm_node_info', 'i')
+    ->fields('i', array('show_node_info', 'comments_readable', 'nid'))
+    ->condition('i.nid', $nids, 'IN')
+    ->execute();
+  foreach ($result as $r) {
+    $node = &$nodes[$r->nid];
+
+    $node->show_node_info = $r->show_node_info;
+    $node->comments_readable = $r->comments_readable;
+  }
+
+  $result = $database->select('mm_node_schedule', 's')
+    ->fields('s', array('publish_on', 'unpublish_on', 'set_change_date', 'nid'))
+    ->condition('s.nid', $nids, 'IN')
+    ->execute();
+  foreach ($result as $r) {
+    $node = &$nodes[$r->nid];
+
+    $node->publish_on = $r->publish_on;
+    $node->unpublish_on = $r->unpublish_on;
+    $node->set_change_date = $r->set_change_date;
+  }
+
+  // Fetch the names of all needed pages at once.
+  $names = array();
+  foreach (mm_content_get(array_unique($mmtids_to_load)) as $mm_tree) {
+    $names[$mm_tree->mmtid] = mm_content_get_name($mm_tree);
+  }
+
+  // Cleanup
+  foreach ($nids as $nid) {
+    if (isset($nodes[$nid])) {
+      $node = &$nodes[$nid];
+
+      // Populate page list
+      if (isset($mmtids_containing_node[$nid])) {
+        foreach ($mmtids_containing_node[$nid] as $mmtid) {
+          $node->mm_catlist[$mmtid] = isset($names[$mmtid]) ? $names[$mmtid] : t('Unknown');
+        }
+      }
+
+      $node->recycle_bins = array_unique($node->recycle_bins);
+      $node->recycle_from_mmtids = array_unique($node->recycle_from_mmtids);
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_view().
+ */
+function monster_menus_node_view(array &$build, NodeInterface $node, EntityViewDisplayInterface $display, $view_mode) {
+  mm_node_all_nodes_hook('view', [$node, &$build, $display, $view_mode]);
+}
+
+/**
+ * Implements hook_node_presave().
+ */
+function monster_menus_node_presave(NodeInterface $node) {
+  mm_node_all_nodes_hook('presave', $node);
+
+  // Set the node's owner based on the form input.
+  if (\Drupal::currentUser()->hasPermission('administer all menus') && isset($node->owner) && ($account = User::load($node->owner))) {
+    $node->setOwner($account);
+  }
+
+  if (isset($node->all_values_group)) {
+    list($groups, $users,) = _mm_ui_form_parse_perms(new FormState(), $node, FALSE);
+    $node->groups_w = array_flip(array_keys($groups));
+    $node->users_w = array_flip(array_keys($users));
+    $node->others_w = !empty($node->{'node-everyone'});
+  }
+
+  // Revert node_save()'s behavior, so that we can use it to update a node
+  // without affecting its changed date.
+  if (!empty($node->keep_changed_date) && !empty($node->original)) {
+    $node->setChangedTime($node->original->getChangedTime());
+  }
+}
+
+/**
+ * Implements hook_node_access().
+ */
+function monster_menus_node_access(NodeInterface $node, $op, AccountInterface $account) {
+  $return = mm_node_all_nodes_hook('access', $node, $op, $account);
+  if (is_object($node) && $node->id()) {
+    $return[] = mm_content_node_access($node, $op, $account) ? Constants::MM_NODE_ACCESS_ALLOW : Constants::MM_NODE_ACCESS_DENY;
+  }
+
+  if (is_array($return)) {
+    if (in_array(Constants::MM_NODE_ACCESS_DENY, $return, TRUE)) {
+      return AccessResult::forbidden();
+    }
+    elseif (in_array(Constants::MM_NODE_ACCESS_ALLOW, $return, TRUE)) {
+      return AccessResult::allowed();
+    }
+  }
+
+  return AccessResult::neutral();
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function monster_menus_node_update(NodeInterface $node) {
+  mm_node_all_nodes_hook('update', $node);
+
+  if (!empty($node->mm_ignore_bin) || !mm_content_node_is_recycled($node)) {
+    if (!isset($node->mm_catlist_restricted)) {
+      $node->mm_catlist_restricted = array();
+    }
+
+    $list = array_merge(array_keys($node->mm_catlist), $node->mm_catlist_restricted);
+    $db = Database::getConnection();
+    if ($list) {
+      $db->delete('mm_node_reorder')
+        ->condition('nid', $node->id())
+        ->condition('mmtid', $list, 'NOT IN')
+        ->execute();
+    }
+    else {
+      $db->delete('mm_node_reorder')
+        ->condition('nid', $node->id())
+        ->execute();
+    }
+  }
+
+  _monster_menus_node_update_or_insert($node, FALSE);
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function monster_menus_node_insert(NodeInterface $node) {
+  mm_node_all_nodes_hook('insert', $node);
+  _monster_menus_node_update_or_insert($node, TRUE);
+}
+
+function _monster_menus_node_update_or_insert(NodeInterface $node, $insert) {
+  $db = Database::getConnection();
+  if (!$insert) {
+    $old_node = Node::load($node->id());
+    if ($old_node && empty($old_node->mm_catlist_restricted)) {
+      $old_node->mm_catlist_restricted = array();
+    }
+    $old_catlist = array_unique(array_merge(array_keys($old_node->mm_catlist), $old_node->mm_catlist_restricted));
+    sort($old_catlist);
+  }
+  else {
+    $old_catlist = array();
+  }
+
+  if (!empty($node->mm_ignore_bin) || !mm_content_node_is_recycled($node)) {
+    if (empty($node->mm_catlist)) {
+      $node->mm_catlist = array();
+    }
+
+    if (empty($node->mm_catlist_restricted)) {
+      $node->mm_catlist_restricted = array();
+    }
+
+    $node->mm_catlist = array_diff_key($node->mm_catlist, array_flip($node->mm_catlist_restricted));
+    $new_catlist = array_merge(array_keys($node->mm_catlist), $node->mm_catlist_restricted);
+    sort($new_catlist);
+
+    if ($insert || $new_catlist != $old_catlist) {
+      if (!$insert) {
+        $db->delete('mm_node2tree')
+          ->condition('nid', $node->id())
+          ->execute();
+        mm_content_clear_node_cache($node->id());
+      }
+
+      if ($new_catlist) {
+        $insert_query = $db->insert('mm_node2tree')
+          ->fields(array('nid', 'mmtid'));
+        foreach ($new_catlist as $mmtid) {
+          $insert_query->values(array(
+            'nid' => $node->id(),
+            'mmtid' => $mmtid,
+          ));
+        }
+        $insert_query->execute();
+      }
+
+      // Clear the cache used by mm_content_get_by_nid.
+      mm_content_get_by_nid(NULL, TRUE);
+      mm_content_clear_page_cache(array_diff($new_catlist, $old_catlist));
+    }
+
+    if ($insert && $new_catlist) {
+      $default_regions = mm_get_setting('nodes.default_region');
+      $node_type = $node->getType();
+      if (isset($default_regions[$node_type]) && $default_regions[$node_type] != Constants::MM_UI_REGION_CONTENT) {
+        $insert = $db->insert('mm_node_reorder')
+          ->fields(array('nid', 'mmtid', 'weight', 'region'));
+        foreach ($new_catlist as $mmtid) {
+          $insert->values(array(
+            'nid' => $node->id(),
+            'mmtid' => $mmtid,
+            'weight' => 0,
+            'region' => $default_regions[$node_type],
+          ));
+        }
+        $insert->execute();
+      }
+    }
+  }
+
+  mm_content_set_node_perms($node);
+
+  if (empty($node->show_node_info)) {
+    $node->show_node_info = FALSE;
+  }
+  if (!empty($node->field_comments[0]) && isset($node->field_comments[0]->getValue()['comments_readable'])) {
+    $node->comments_readable = $node->field_comments[0]->getValue()['comments_readable'];
+  }
+  elseif (empty($node->comments_readable)) {
+    $node->comments_readable = FALSE;
+  }
+
+  $db->merge('mm_node_info')
+    ->key('nid', $node->id())
+    ->fields(array(
+      'show_node_info' => intval($node->show_node_info),
+      'comments_readable' => $node->comments_readable,
+    ))
+    ->execute();
+
+  if (empty($node->publish_on) || is_array($node->publish_on)) {
+    $node->publish_on = 0;
+  }
+  else {
+    if (!is_numeric($node->publish_on)) {
+      $node->publish_on = strtotime($node->publish_on);
+    }
+    if ($node->publish_on <= 0) {
+      $node->publish_on = 0;
+    }
+  }
+
+  if (empty($node->unpublish_on) || is_array($node->unpublish_on)) {
+    $node->unpublish_on = 0;
+  }
+  else {
+    if (!is_numeric($node->unpublish_on)) {
+      $node->unpublish_on = strtotime($node->unpublish_on);
+    }
+    if ($node->unpublish_on <= 0) {
+      $node->unpublish_on = 0;
+    }
+  }
+
+  if (empty($node->set_change_date)) {
+    $node->set_change_date = 0;
+  }
+
+  if ($node->publish_on || $node->unpublish_on || $node->set_change_date) {
+    $db->merge('mm_node_schedule')
+      ->key('nid', $node->id())
+      ->fields(array(
+        'publish_on' => $node->publish_on,
+        'unpublish_on' => $node->unpublish_on,
+        'set_change_date' => $node->set_change_date,
+      ))
+      ->execute();
+  }
+  elseif (!$insert) {
+    $db->delete('mm_node_schedule')
+      ->condition('nid', $node->id())
+      ->execute();
+  }
+
+  $clone = clone $node;
+  if (!empty($old_catlist)) {
+    $clone->old_catlist = $old_catlist;
+  }
+  mm_content_notify_change($insert ? 'insert_node' : 'update_node', NULL, $clone->id(), array($clone->id() => $clone));
+}
+
+/**
+ * Implements hook_node_revision_delete().
+ */
+function monster_menus_node_revision_delete(NodeInterface $node) {
+  mm_node_all_nodes_hook('revision_delete', $node);
+
+  // Remove cached access rights.
+  mm_content_clear_node_cache($node->id());
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function monster_menus_node_delete(NodeInterface $node) {
+  mm_node_all_nodes_hook('delete', $node);
+
+  $nid = $node->id();
+  $db = Database::getConnection();
+  $db->delete('mm_node2tree')
+    ->condition('nid', $nid)
+    ->execute();
+  $db->delete('mm_node_reorder')
+    ->condition('nid', $nid)
+    ->execute();
+  $db->delete('mm_recycle')
+    ->condition('type', 'node')
+    ->condition('id', $nid)
+    ->execute();
+  $db->delete('mm_node_info')
+    ->condition('nid', $nid)
+    ->execute();
+  $db->delete('mm_node_schedule')
+    ->condition('nid', $nid)
+    ->execute();
+  _mm_ui_delete_node_groups($node, TRUE);
+  if (isset($node->recycle_bins) && is_array($node->recycle_bins)) {
+    foreach ($node->recycle_bins as $bin) {
+      mm_content_clear_caches($bin);
+      mm_content_delete_bin($bin);
+    }
+  }
+  // Clear the cache used by mm_content_get_by_nid.
+  mm_content_get_by_nid(NULL, TRUE);
+  mm_content_notify_change('delete_node', NULL, $nid, array($nid => $node));
+}
+
+/**
+ * Implements hook_node_type_insert().
+ */
+function monster_menus_node_type_insert($content_type) {
+  mm_node_all_nodes_hook('node_type_insert', $content_type);
+}
+
+/**
+ * Implements hook_migrate_prepare_row().
+ */
+function monster_menus_migrate_prepare_row(Row $row, MigrateSourceInterface $source) {
+  if ($source->getPluginId() == 'd7_node') {
+    $nid = $row->getSourceProperty('nid');
+    $nodes = [$nid => (object) $row->getSource()];
+    monster_menus_node_load($nodes, $source->getDatabase());
+    $diff = array_diff_assoc((array) $nodes[$nid], $row->getSource());
+    foreach ($diff as $key => $value) {
+      $row->setDestinationProperty($key, $value);
+    }
+    $row->setDestinationProperty('mm_others_w_force', TRUE);
+    $row->setDestinationProperty('mm_ignore_bin', TRUE);
+
+    // Create stubs for any missing MMTree entries.
+    $data = [];
+    foreach (array_keys($nodes[$nid]->mm_catlist) as $key) {
+      $data[] = ['mmtid' => $key];
+    }
+    foreach (array_keys($nodes[$nid]->groups_w) as $key) {
+      $data[] = ['mmtid' => $key];
+    }
+    if ($data) {
+      $definition = [
+        'source' => [
+          'plugin' => 'embedded_data',
+          'data_rows' => $data,
+          'ids' => ['mmtid' => ['type' => 'integer']],
+        ],
+        'process' => [
+          'mmtid' => [
+            'plugin' => 'migration',
+            // FIXME: the "upgrade_" prefix is necessary, but probably not correct to be hard-coded
+            'migration' => 'upgrade_d7_mm_tree',
+            'source' => 'mmtid',
+          ],
+        ],
+        'destination' => [
+          'plugin' => 'mm_null',
+        ],
+        'migration_dependencies' => [],
+      ];
+      $tree_migration = \Drupal::service('plugin.manager.migration')
+        ->createStubMigration($definition);
+      $messages = new MMMigrateMessage();
+      $executable = new MigrateExecutable($tree_migration, $messages);
+      $executable->import();
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_username().
+ *
+ * @param $variables
+ *   An associative array containing:
+ *   - account: The user object to format.
+ *   - name: The user's name, sanitized.
+ *   - extra: Additional text to append to the user's name, sanitized.
+ *   - link_path: The path or URL of the user's profile page, home page, or
+ *     other desired page to link to for more information about the user.
+ *   - link_options: An array of options to pass to the l() function's $options
+ *     parameter if linking the user's name to the user's page.
+ *   - attributes_array: An array of attributes to pass to the
+ *     drupal_attributes() function if not linking to the user's page.
+ */
+function monster_menus_preprocess_username(&$variables) {
+  /** @var AccountInterface $account */
+  $account = $variables['account'];
+  $uid = $account->id();
+  $name = $account->getAccountName();
+
+  if (!empty($uid) && !empty($name) && \Drupal::currentUser()->hasPermission('access user profiles')) {
+    $variables['name'] = mm_content_uid2name($uid, 'fml', NULL, $hover);
+    if (!empty($hover)) {
+      $variables['link_attributes']['title'] = $hover;
+    }
+  }
+}
+
+/**
+ * Implements hook_token_info_alter().
+ */
+function monster_menus_token_info_alter(&$data) {
+  // Add tokens for flag values, starting with those defined in
+  // hook_mm_tree_flags().
+  $predef_flags = array();
+  foreach (mm_ui_flags_info() as $module => $flags) {
+    foreach ($flags as $name => $info) {
+      $predef_flags[] = $name;
+      $data['tokens']['mm_tree']["flag:$name"] = array(
+        'name' => t('MM flag @name from module @module', array('@name' => $name, '@module' => $module)),
+        'description' => $info['#description'],
+      );
+    }
+  }
+
+  // Now add any found in the database table, not already found above.
+  $result = Database::getConnection()->query('SELECT DISTINCT flag FROM {mm_tree_flags}');
+  foreach ($result as $r) {
+    if (!in_array($r->flag, $predef_flags)) {
+      $data['tokens']['mm_tree']['flag:' . $r->flag] = array(
+        'name' => t('MM flag @name', array('@name' => $r->flag)),
+        'description' => t('Monster Menus flag'),
+      );
+    }
+  }
+
+  // These are not useful, so remove them.
+  unset($data['tokens']['mm_tree']['extendedSettings']);
+  unset($data['tokens']['mm_tree-extendedSettings']);
+}
+
+/**
+ * Implements hook_tokens().
+ */
+function monster_menus_tokens($type, $tokens, $data = NULL) {
+  $replacements = array();
+  if ($type == 'mm_tree' && isset($data['mm_tree'])) {
+    $tree = $data['mm_tree'];
+
+    foreach ($tokens as $name => $raw) {
+      if (isset($tree->$name)) {
+        $replacements[$raw] = $tree->$name;
+      }
+    }
+
+    if (is_array($tree->flags) && ($flags_tokens = \Drupal::token()->findWithPrefix($tokens, 'flag'))) {
+      foreach ($flags_tokens as $flag => $raw) {
+        if (isset($tree->flags[$flag])) {
+          // Convert empty flags to boolean TRUE
+          $replacements[$raw] = empty($tree->flags[$flag]) ? TRUE : $tree->flags[$flag];
+        }
+        else {
+          $replacements[$raw] = FALSE;
+        }
+      }
+    }
+  }
+  return $replacements;
+}
+
+/**
+ * Implements hook_mail().
+ */
+function monster_menus_mail($key, &$message, $params) {
+  $langcode = $message['langcode'];
+  switch ($key) {
+    case 'mm_regenerate_vgroup':
+      $message['subject'] = t('Error in virtual group regeneration', array(), array('langcode' => $langcode));
+      $message['body'] = $params['errors'];
+      $message['body'][] = t('To ignore the errors and regenerate the data in all of the listed virtual groups, execute this SQL code:', array(), array('langcode' => $langcode));
+      $message['body'][] = 'UPDATE mm_vgroup_query SET dirty=' . Constants::MM_VGROUP_DIRTY_REDO . ' WHERE vgid IN(' . $params['in'] . ')';
+  }
+}
+
+/**
+ * Implements hook_block_view_BASE_BLOCK_ID_alter() for 'mm_tree_block'.
+ */
+function monster_menus_block_view_mm_tree_block_alter(array &$build, \Drupal\Core\Block\BlockPluginInterface $block) {
+  $build['#pre_render'][] = function($build) use($block) {
+    // Set the user-facing label based on whatever was generated by the build()
+    // method.
+    if (isset($build['#configuration'])) {
+      $build['#configuration']['label'] = $block->label();
+    }
+    return $build;
+  };
+}
+
+/**
+ * Implements hook_config_schema_info_alter().
+ */
+function monster_menus_config_schema_info_alter(&$definitions) {
+  if (isset($definitions['user.role.*']['mapping'])) {
+    // Store MM role settings in the config entity.
+    $definitions['user.role.*']['mapping']['mm_gid'] = ['label' => 'MM Group ID', 'type' => 'integer'];
+    $definitions['user.role.*']['mapping']['mm_exclude'] = ['label' => 'TRUE if the role should be the inverse of the group', 'type' => 'boolean'];
+  }
+}
+
+/**
+ * Implements hook_entity_type_build().
+ *
+ * Add properties to the user_role entity:
+ * - mm_gid:
+ *   MM Group ID
+ * - mm_exclude:
+ *   TRUE if the role should be the inverse of the group Add a custom constraint
+ *   to the node entity.
+ */
+function monster_menus_entity_type_build(array &$entity_types) {
+  /** @var ConfigEntityType[] $entity_types */
+  if (isset($entity_types['user_role'])) {
+    $fields = $entity_types['user_role']->get('config_export');
+    $fields[] = 'mm_gid';
+    $fields[] = 'mm_exclude';
+    $entity_types['user_role']->set('config_export', $fields);
+  }
+  if (isset($entity_types['node'])) {
+    $entity_types['node']->addConstraint('MMNodeValidation', []);
+  }
+}
+
+// FIXME: outstanding issues
+// https://www.drupal.org/node/1413672  Renamed the taxonomy functions
+// https://www.drupal.org/node/1796238  Responsive table classes for modules and themes
+// https://www.drupal.org/node/1989646  modal dialogs
+// https://www.drupal.org/node/2016305  Architect CSS: Rename files to match CSS file naming convention  [contents of CSS files probably need to be split out better before renaming]
+// Consider rewriting parts of rss_page using http://framework.zend.com/manual/2.2/en/modules/zend.feed.introduction.html built into core
+// https://www.drupal.org/node/2070823  Rename Views methods to core standards
+// https://www.drupal.org/node/2085445  Generic solution available for entity editing overwrite avoidance  [talks about automatic validation of conflicting edits in entities]

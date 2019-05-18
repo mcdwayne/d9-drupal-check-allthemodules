@@ -1,0 +1,147 @@
+<?php
+
+/**
+ * @file
+ * Display system alerts.
+ */
+
+use Drupal\Core\Cache\Cache;
+use Drupal\Core\Config\Config;
+use Drupal\Core\Database\Database;
+use Drupal\Core\Database\Query\Condition;
+use Drupal\Core\Datetime\DrupalDateTime;
+use Drupal\Core\Render\Element;
+use Drupal\filter\Render\FilteredMarkup;
+use Drupal\monster_menus\Constants;
+use Drupal\node\Entity\Node;
+use Drupal\user\Entity\User;
+
+/**
+ * Implements hook_mm_config_alter().
+ */
+function mm_alert_mm_config_alter(&$form, Config $settings) {
+  $form['mm_node']['nodes-alert_frequency'] = array(
+    '#type' => 'select',
+    '#title' => t('Frequency of system alerts'),
+    '#default_value' => $settings->get('nodes.alert_frequency'),
+    '#options' => array(
+      'once' => t('Show only once'),
+      'login' => t('Show at every login'),
+      'constantly' => t('Show at every page load')
+    ),
+  );
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function mm_alert_form_node_alert_form_alter(&$form) {
+  foreach (Element::children($form) as $child) {
+    if ($form['#type'] == 'vertical_tabs') {
+      unset($form[$child]['#open']);
+    }
+  }
+  $form['publishing']['#weight'] = 19;
+  $form['publishing']['#open'] = TRUE;
+  $form['publish_on']['#required'] = TRUE;
+  $form['publish_on']['#description'] = '';
+  $form['publish_on']['#default_value'] = DrupalDateTime::createFromTimestamp(mm_request_time());
+}
+
+/**
+ * Implements hook_page_bottom().
+ */
+function mm_alert_page_bottom(array &$page_bottom) {
+  $user = \Drupal::currentUser();
+  if ($user->isAnonymous()) {
+    return;
+  }
+
+  // Checking for alerts is pretty expensive, so don't bother if the frequency
+  // is 'login' and the user has already been alerted.
+  if (empty($_SESSION['mm_node_displayed_alert']) || mm_get_setting('nodes.alert_frequency') != 'login') {
+    mm_ui_modal_dialog([], $page_bottom);
+    $page_bottom['#attached']['library'][] = 'mm_alert/mm_alert';
+    // Use a placeholder so that the content is dynamically created with every
+    // page load.
+    $page_bottom['#attached']['placeholders']['mm_alert']['#lazy_builder'] = ['mm_alert_placeholder', []];
+    $page_bottom['mm_alert'] = ['#markup' => ':mm_alert'];
+  }
+}
+
+function mm_alert_placeholder() {
+  $frequency = mm_get_setting('nodes.alert_frequency');
+
+  $last = 0;
+  if ($frequency == 'once') {
+    $last = \Drupal::currentUser()->getLastAccessedTime();
+  }
+  elseif ($frequency == 'login') {
+    if (!empty($_SESSION['mm_node_displayed_alert'])) {
+      return [];
+    }
+    $_SESSION['mm_node_displayed_alert'] = TRUE;
+  }
+
+  $output = [
+    '#cache' => ['max-age' => -1],
+  ];
+  // Note: If this method proves not to work well, go to using the history table
+  // instead. Just remember to call node_tag_new($node->id()) here and clear-out
+  // any entries when the node is edited.
+  $db = Database::getConnection();
+  $select = $db->select('node_field_data', 'n');
+  $select->join('mm_node_schedule', 's', 's.nid = n.nid');
+  $select->addField('n', 'nid');
+  $select->addExpression('IF(s.set_change_date = 1 AND s.publish_on > 0, s.publish_on, n.changed)', 'sort_column');
+  $or1 = new Condition('OR');
+  $or2 = new Condition('OR');
+  $select->condition('n.status', 1)
+    ->condition('n.type', 'alert')
+    ->condition('s.publish_on', mm_request_time(), '<=')
+    ->condition($or1
+      ->condition('s.unpublish_on', 0)
+      ->condition('s.unpublish_on', mm_request_time(), '>')
+    )
+    ->condition($or2
+      ->where(':last = 0', array(':last' => $last))
+      ->where(':last BETWEEN s.publish_on AND n.changed - 1', array(':last' => $last))
+      ->condition('s.publish_on', $last, '>')
+    );
+  $select->orderBy('n.sticky', 'DESC');
+  $select->orderBy('sort_column', 'DESC');
+  if (!empty($_SESSION['mm_node_alert_avoid_nid']))
+    $select->condition('n.nid', $_SESSION['mm_node_alert_avoid_nid'], 'NOT IN');
+
+  $nids = $select->execute()->fetchCol();
+  $output['#cache']['tags'] = Cache::buildTags('node', $nids);
+  $count_displayed = 0;
+
+  /** @var Node $node */
+  foreach (Node::loadMultiple($nids) as $nid => $node) {
+    if (mm_content_user_can_node($nid, Constants::MM_PERMS_READ) && !mm_content_node_is_recycled($node, Constants::MM_NODE_RECYCLED_MMTID_CURR)) {
+      $output[] = [
+        '#prefix' => FilteredMarkup::create('<div class="hidden mm-alert" id="mm-alert-' . $node->id() . '">'),
+        node_view($node),
+        '#suffix' => FilteredMarkup::create('<div class="mm-alert-close"><input type="button" value="' . t('Close') . '" /></div></div>'),
+      ];
+      $count_displayed++;
+    }
+  }
+  if ($count_displayed && $frequency == 'once') {
+    // Prevent this alert from showing again.
+    User::load(\Drupal::currentUser()->id())->setLastAccessTime(mm_request_time())->save();
+  }
+
+  return $output;
+}
+
+/**
+ * Implements hook_user_logout().
+ */
+function mm_alert_user_logout(User $account) {
+  // The access field is used by mm_alert_page_bottom(), but only gets updated
+  // at most every 180 seconds. Update it now, so that it's accurate when the
+  // user next logs-in.
+  $account->setLastAccessTime(mm_request_time())->save();
+}
