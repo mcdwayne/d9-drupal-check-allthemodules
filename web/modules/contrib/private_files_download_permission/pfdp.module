@@ -1,0 +1,133 @@
+<?php
+
+/**
+ * @file
+ * Implements the main module function and generic helper functions.
+ */
+
+use Drupal\Component\Utility\Unicode;
+use Drupal\pfdp\Entity\DirectoryEntity;
+
+/**
+ * Returns a properly formatted user string to be used in a log line.
+ */
+function pfdp_get_user_log_details($user) {
+  if (!$user) {
+    return NULL;
+  }
+  return $user->id() . ' (' . ($user->getAccountName() ? $user->getAccountName() : '-') . ', ' . ($user->getDisplayName() ? $user->getDisplayName() : '-') . ')';
+}
+
+/**
+ * Returns an array of users with no '0' values, as '0' means 'unchecked'.
+ */
+function pfdp_get_proper_user_array($users) {
+  while (in_array('0', $users)) {
+    $k = array_search('0', $users);
+    unset($users[$k]);
+  }
+  return $users;
+}
+
+/**
+ * Returns a proper array to be used for downloads.
+ */
+function pfdp_get_download_headers($uri) {
+  $settings = \Drupal::config('pfdp.settings');
+  //
+  if ($settings->get('attachment_mode')) {
+    return [
+      'Content-Type' => \Drupal::service('file.mime_type.guesser')->guess($uri),
+      'Content-Disposition' => 'attachment; filename=' . \Drupal::service('file_system')->basename($uri),
+    ];
+  }
+  else {
+    return [
+      'Content-Type' => \Drupal::service('file.mime_type.guesser')->guess($uri),
+      'Content-Disposition' => 'inline',
+    ];
+  }
+}
+
+/**
+ * {@inheritdoc}
+ */
+function pfdp_file_download($uri) {
+  $settings = \Drupal::config('pfdp.settings');
+  $logger = \Drupal::logger('pfdp');
+  $user = \Drupal::currentUser();
+  // Check if user may bypass permission restrictions.
+  if ($user->hasPermission('bypass pfdp')) {
+    if ($settings->get('debug_mode')) {
+      $logger->info('User %user granted permission to download uri "%uri".', ['%user' => pfdp_get_user_log_details($user), '%uri' => $uri]);
+    }
+    return pfdp_get_download_headers($uri);
+  }
+  elseif (($user->hasPermission('bypass pfdp for temporary files')) && ('temporary://' === Unicode::substr($uri, 0, 12))) {
+    if ($settings->get('debug_mode')) {
+      $logger->info('User %user granted permission to download uri "%uri".', ['%user' => pfdp_get_user_log_details($user), '%uri' => $uri]);
+    }
+    return pfdp_get_download_headers($uri);
+  }
+  // If not, do all the specific checks.
+  else {
+    // Extract the path from $uri, removing the protocol prefix and the file name.
+    $uri_path = array_slice(explode('/', $uri), 2, -1);
+    // Add a leading slash to $uri_path.
+    $uri_path = '/' . implode('/', $uri_path);
+    // Find the directory which best matches $uri_path.
+    $best_matching_length = 0;
+    $best_matching_directory = NULL;
+    foreach (DirectoryEntity::loadMultiple() as $directory) {
+      // Search for the best matching substring.
+      $directory_path = $directory->path;
+      if (0 === stripos($uri_path, $directory_path)) {
+        if ($best_matching_length < Unicode::strlen($directory_path)) {
+          $best_matching_length = Unicode::strlen($directory_path);
+          $best_matching_directory = $directory;
+        }
+      }
+    }
+    if (NULL != $best_matching_directory) {
+      // Check if this module should ignore the call.
+      if ($best_matching_directory->bypass) {
+        return NULL;
+      }
+      // Check if the file owner is allowed to access $uri.
+      if ($best_matching_directory->grant_file_owners) {
+        $files = \Drupal::entityTypeManager()
+          ->getStorage('file')
+          ->loadByProperties(['uri' => $uri]);
+        $file = array_shift($files);
+        if ($file->getOwnerId() == $user->id()) {
+          if ($settings->get('debug_mode')) {
+            $logger->info('User %user granted permission to download uri "%uri".', ['%user' => pfdp_get_user_log_details($user), '%uri' => $uri]);
+          }
+          return pfdp_get_download_headers($uri);
+        }
+      }
+      // Evaluate user and role permissions and optionally allow access to $uri.
+      if ($settings->get('by_user_checks')) {
+        if (in_array($user->id(), pfdp_get_proper_user_array($best_matching_directory->users))) {
+          if ($settings->get('debug_mode')) {
+            $logger->info('User %user granted permission to download uri "%uri".', ['%user' => pfdp_get_user_log_details($user), '%uri' => $uri]);
+          }
+          return pfdp_get_download_headers($uri);
+        }
+      }
+      foreach ($user->getRoles() as $rid) {
+        if (in_array($rid, $best_matching_directory->roles)) {
+          if ($settings->get('debug_mode')) {
+            $logger->info('User %user granted permission to download uri "%uri".', ['%user' => pfdp_get_user_log_details($user), '%uri' => $uri]);
+          }
+          return pfdp_get_download_headers($uri);
+        }
+      }
+    }
+  }
+  // By default, deny access.
+  if ($settings->get('debug_mode')) {
+    $logger->warning('User %user denied permission to download uri "%uri".', ['%user' => pfdp_get_user_log_details($user), '%uri' => $uri]);
+  }
+  return -1;
+}
