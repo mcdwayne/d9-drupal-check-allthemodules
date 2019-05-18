@@ -1,0 +1,210 @@
+<?php
+
+/**
+ * @file
+ * Contains field_gate.module.
+ */
+
+use Drupal\Core\Field\FieldConfigInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Render\Element;
+
+/**
+ * Implements hook_help().
+ */
+function field_gate_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.field_gate':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Configure a field so that it must be set to a certain value to see fields below it.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_field_widget_settings_summary_alter().
+ */
+function field_gate_field_widget_settings_summary_alter(&$summary, $context) {
+  $enabled = $context['widget']->getThirdPartySetting('field_gate', 'field_gate_enabled', FALSE);
+  if ($enabled) {
+    $summary[] = [
+      '#theme' => 'field_gate_settings_summary',
+      '#value' => $context['widget']->getThirdPartySetting('field_gate', 'field_gate_value'),
+    ];
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function field_gate_form_entity_form_display_edit_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // Check to see if a field gate is enabled to add in styling.
+  if (isset($form['fields']) && is_array($form['fields'])) {
+    foreach (Element::children($form['fields']) as $field_name) {
+      $is_gate = FALSE;
+      if (isset($form['fields'][$field_name]['settings_summary']['#context']['summary'])) {
+        foreach ($form['fields'][$field_name]['settings_summary']['#context']['summary'] as $summary_line) {
+          if (gettype($summary_line) === 'array' && isset($summary_line['#theme']) && $summary_line['#theme'] === 'field_gate_settings_summary') {
+            $is_gate = TRUE;
+            break;
+          }
+        }
+
+        if ($is_gate) {
+          $form['fields'][$field_name]['#attributes']['class'][] = 'field-gate';
+          $form['#attached']['library'][] = 'field_gate/field_gate_field_ui';
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_field_widget_third_party_settings_form().
+ */
+function field_gate_field_widget_third_party_settings_form($plugin, $field_definition, $form_mode, $form, $form_state) {
+  if ($plugin->getPluginId() === 'options_buttons') {
+    $enabled = $plugin->getThirdPartySetting('field_gate', 'field_gate_enabled', FALSE);
+    $element['field_gate_enabled'] = [
+      '#type' => 'checkbox',
+      '#title' => t('Field gate'),
+      '#description' => t('Check this to make this field act like a gate that the user will have to answer correctly to get past.'),
+      '#default_value' => $enabled,
+    ];
+    $element['field_gate_enabled']['#attributes']['class'][] = 'field_gate_enabled';
+
+    $value = $plugin->getThirdPartySetting('field_gate', 'field_gate_value', NULL);
+    $element['field_gate_value'] = [
+      '#type' => 'textfield',
+      '#title' => t('Value'),
+      '#description' => t('Value that this field has to have for the user to continue.'),
+      '#default_value' => $value,
+      '#states' => [
+        'visible' => [
+          '.field_gate_enabled' => ['checked' => TRUE],
+        ],
+      ],
+    ];
+
+    $message = $plugin->getThirdPartySetting('field_gate', 'field_gate_message', NULL);
+    $element['field_gate_message'] = [
+      '#type' => 'text_format',
+      '#title' => t('Message'),
+      '#description' => t('Message to show when an incorrect value has been entered.'),
+      '#default_value' => isset($message['value']) ? $message['value'] : '',
+      '#format' => isset($message['format']) ? $message['format'] : filter_fallback_format(),
+      '#states' => [
+        'visible' => [
+          '.field_gate_enabled' => ['checked' => TRUE],
+        ],
+      ],
+    ];
+
+    $hide_actions = $plugin->getThirdPartySetting('field_gate', 'field_gate_hide_actions', FALSE);
+    $element['field_gate_hide_actions'] = [
+      '#type' => 'checkbox',
+      '#title' => t('Hide actions'),
+      '#description' => t('Hide the form actions when the value is not matched.'),
+      '#default_value' => $hide_actions,
+      '#states' => [
+        'visible' => [
+          '.field_gate_enabled' => ['checked' => TRUE],
+        ],
+      ],
+    ];
+
+    return $element;
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function field_gate_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+  if (isset($form['#entity_builders'])) {
+    $storage = $form_state->getStorage();
+    if (!isset($storage['form_display'])) {
+      return;
+    }
+
+    $form_display = $storage['form_display'];
+    $field_definitions = field_gate_fetch_field_definitions($form_display->getTargetEntityTypeId(), $form_display->getTargetBundle());
+
+    $is_required = FALSE;
+    foreach ($field_definitions as $field_name => $field_definition) {
+      $widget = $form_display->getRenderer($field_name);
+      if ($widget === NULL) {
+        continue;
+      }
+
+      $enabled = $widget->getThirdPartySetting('field_gate', 'field_gate_enabled', FALSE);
+      if ($enabled) {
+        $value = $widget->getThirdPartySetting('field_gate', 'field_gate_value', '');
+        $uuid = \Drupal::service('uuid')->generate();
+        $classes = 'field-gate field-gate-value-' . $value . ' field-gate-message-' . $uuid;
+        if ($widget->getThirdPartySetting('field_gate', 'field_gate_hide_actions', FALSE)) {
+          $classes .= ' field-gate-hide-actions';
+        }
+        $form[$field_name]['#attributes']['class'][] = $classes;
+
+        $message = $widget->getThirdPartySetting('field_gate', 'field_gate_message');
+
+        $message_suffix = '<div class="field-gate-message" id="field-gate-message-' . $uuid . '">' . check_markup($message['value'], $message['format']) . '</div>';
+        $form[$field_name]['#suffix'] = isset($form[$field_name]['#suffix']) ? $form[$field_name]['#suffix'] . $message_suffix : $message_suffix;
+
+        $is_required = TRUE;
+      }
+      else {
+        $form[$field_name]['#attributes']['class'][] = 'n-field-gate';
+      }
+    }
+
+    if ($is_required) {
+      $form['#attached']['library'][] = 'field_gate/field_gate_form';
+      $form['#attributes']['class'][] = 'field-gate-enabled';
+    }
+  }
+}
+
+/**
+ * Fetch the field definitions.
+ */
+function field_gate_fetch_field_definitions($entity_type, $bundle, $field_definitions = NULL) {
+  if ($field_definitions === NULL) {
+    $entity_manager = \Drupal::entityManager();
+    $field_definitions = $entity_manager->getFieldDefinitions($entity_type, $bundle);
+  }
+
+  $field_definitions = array_filter($field_definitions, function ($field_definition) {
+    return $field_definition instanceof FieldConfigInterface;
+  });
+
+  uasort($field_definitions, ['\Drupal\Core\Config\Entity\ConfigEntityBase', 'sort']);
+
+  return $field_definitions;
+}
+
+/**
+ * Implements hook_field_group_pre_render_alter().
+ */
+function field_gate_field_group_pre_render_alter(&$element, &$group, &$rendering_object) {
+  // Add in a class to field groups so that we can more easily identify them.
+  $element['#attributes']['class'][] = 'field-gate-field-group';
+}
+
+/**
+ * Implements hook_theme().
+ */
+function field_gate_theme($existing, $type, $theme, $path) {
+  return [
+    'field_gate_settings_summary' => [
+      'variables' => [
+        'value' => '',
+      ],
+    ],
+  ];
+}
