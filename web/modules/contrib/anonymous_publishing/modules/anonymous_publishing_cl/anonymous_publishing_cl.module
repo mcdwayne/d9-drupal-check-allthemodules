@@ -1,0 +1,635 @@
+<?php
+
+/**
+ * @file
+ * Main hooks for anonymous publishing cl module.
+ */
+
+use Drupal\comment\CommentInterface;
+use Drupal\Component\Utility\Crypt;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Render\Element\Email;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Site\Settings;
+use Drupal\Core\Url;
+use Drupal\node\NodeInterface;
+
+/**
+ * Implements hook_help().
+ */
+function anonymous_publishing_cl_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.anonymous_publishing_cl':
+      $output = t('<p>This submodule of <strong>Anonymous publishing</strong> lets users publish content without first registering an account at the site, but in a manner that affords some protection against spam.</p><p>Just enabling the module does nothing. You also need to enable anonymous publishing for at least one node type.  If you want visitors to be able to create content without registering, you also need to grant the the anonymous user role the permission to “Create new content” for at least one node type .  To do this, go to <a title="Set permissions for anonymous." <a href="@url">Administration » People » Permissions</a> for the node module.</p>', array('@url' => Url::fromRoute('user.admin_permissions')->toString()));
+      $output .= _anonymous_publishing_ah_hint();
+      return $output;
+  }
+}
+
+
+/** --------------------------------------------------------------------------
+ * Hook definitions
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Implements hook_preprocess_node()
+ *
+ * Change author name for anonymously posted nodes to byline if existing.
+ */
+function anonymous_publishing_cl_preprocess_node(&$variables) {
+  $settings = \Drupal::config('anonymous_publishing_cl.settings');
+
+  if ($settings->get('user_alias') != 'anon') {
+
+    /** @var \Drupal\node\NodeInterface $node */
+    $node = $variables['node'];
+
+    // Only change if the node is authored by Anonymous.
+    if ($node->getOwnerId() == 0) {
+      $result = \Drupal::database()
+        ->select('anonymous_publishing')
+        ->fields('anonymous_publishing')
+        ->condition('nid', $node->id())
+        ->execute()
+        ->fetchAssoc();
+
+      if (!empty($result) && !empty($result['email'])) {
+
+        $alias = \Drupal::database()
+          ->select('anonymous_publishing_emails')
+          ->fields('anonymous_publishing_emails', array('alias'))
+          ->condition('email', $result['email'])
+          ->execute()
+          ->fetchField();
+
+        if (!empty($alias)) {
+          $variables['author_name'] = $alias;
+          $variables['author_name'] .= $result['verified'] ? '' : ' (' . t('not verified') . ')';
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_comment()
+ *
+ * Change author name for anonymously posted nodes to byline if existing.
+ */
+function anonymous_publishing_cl_preprocess_comment(&$variables) {
+  $settings = \Drupal::config('anonymous_publishing_cl.settings');
+
+  if ($settings->get('user_alias') != 'anon') {
+    /** @var \Drupal\comment\CommentInterface $comment */
+    $comment = $variables['comment'];
+
+    // Only change if the node is authored by Anonymous.
+    if ($comment->getOwnerId() == 0) {
+
+      $result = \Drupal::database()
+        ->select('anonymous_publishing')
+        ->fields('anonymous_publishing')
+        ->condition('cid', $comment->id())
+        ->execute()
+        ->fetchAssoc();
+
+      if (!empty($result) && !empty($result['email'])) {
+
+        $alias = \Drupal::database()
+          ->select('anonymous_publishing_emails')
+          ->fields('anonymous_publishing_emails', array('alias'))
+          ->condition('email', $result['email'])
+          ->execute()
+          ->fetchField();
+
+        if (!empty($alias)) {
+          $variables['author'] = $alias;
+          $variables['author'] .= $result['verified'] ? '' : ' (' . t('not verified') . ')';
+          $variables['submitted'] = t('Submitted by @username on @datetime', array(
+            '@username' => $variables['author'],
+            '@datetime' => $variables['created']
+          ));
+        }
+      }
+    }
+  }
+}
+
+
+/**
+ * Entity form builder to add the anonymous publishing informations to the entity.
+ */
+function anonymous_publishing_cl_entity_builder($entity_type, EntityInterface $entity, &$form, FormStateInterface $form_state) {
+  // Add the confirmation mail in the node.
+  $entity->anonymous_publishing_email = $form_state->getValue('anonymous_publishing_email');
+  $entity->anonymous_publishing_alias = $form_state->getValue('anonymous_publishing_alias');
+
+  // Always save a revision for non-administrators.
+  if (   $entity->getEntityTypeId() == 'node'
+        && !empty($entity->anonymous_publishing_email)
+        && !\Drupal::currentUser()->hasPermission('administer nodes')) {
+    $entity->setNewRevision();
+  }
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function anonymous_publishing_cl_form_node_form_alter(&$form, FormStateInterface $form_state) {
+  // Get node type.
+  $entity = $form_state->getFormObject()->getEntity();
+  $type = $entity->type->entity->get('type');
+  _anonymous_publishing_cl_alter_comment_or_node_form($form, $form_state, 'node', $type);
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function anonymous_publishing_cl_form_comment_form_alter(&$form, FormStateInterface $form_state) {
+  _anonymous_publishing_cl_alter_comment_or_node_form($form, $form_state, 'comment', 'comment');
+}
+
+/**
+ * Helper method: edit_validate().
+ *
+ * Check and validate a nodes against anonymous submission.
+ */
+function anonymous_publishing_cl_edit_form_validate(&$form, FormStateInterface $form_state) {
+  // Validates the entity.
+  return \Drupal::service('anonymous_publishing_cl.service')
+    ->validate($form, $form_state);
+}
+
+/**
+ * Helper function : edit_node_alter.
+ *
+ * Changes form for any content type managed by anonymous publishing
+ * to add two additional fields. The field for the verification email
+ * address, and a bogus "email_confirm_field".
+ *
+ * @param $form
+ *  The form to alter.
+ * @param $form_state
+ *  The form values.
+ * @param $entity_type
+ *  The entity type being altered.
+ * @param $type
+ *  The bundle type of this entity.
+ */
+function _anonymous_publishing_cl_alter_comment_or_node_form(&$form, FormStateInterface &$form_state, $entity_type, $type) {
+  $settings = \Drupal::config('anonymous_publishing_cl.settings');
+
+  // If the currently altered content type is authorized to be anonymously
+  // created.
+  if (\Drupal::currentUser()
+      ->isAnonymous() && \Drupal::service('anonymous_publishing_cl.service')
+      ->isContentTypeAllowed($type)
+  ) {
+
+    // Create the anonymous publishing options.
+    // Node author information for administrators.
+    $form['anonymous_publishing'] = array(
+      '#type' => 'details',
+      '#title' => t('Anonymous Publishing'),
+      '#group' => 'advanced',
+      '#open' => TRUE,
+      '#attributes' => array(
+        'class' => array('form-anonymous-publishing'),
+      ),
+      '#attached' => array(
+        'library' => array('node/drupal.node'),
+      ),
+      '#optional' => FALSE,
+    );
+
+    $options = $settings->get('general_options');
+    $aliasopt = $settings->get('user_alias');
+
+    $selfactmsg = $options['sactivate'] ? '' : ' ' . t('and the content is approved by by an administrator');
+    $verifymsg = t('Your content will not appear on this site until your e-mail is verified@selfactmsg.', array('@selfactmsg' => $selfactmsg));
+    $verifymsg .= ' <b>' . t('Your e-mail address will not be shown publicly.') . '</b>';
+
+    $form['anonymous_publishing']['email'] = array(
+      '#type' => 'email',
+      '#title' => t('Verification e-mail address:'),
+      '#description' => $verifymsg,
+      '#size' => 60,
+      '#maxlength' => Email::EMAIL_MAX_LENGTH,
+      '#required' => TRUE,
+      '#parents' => array('anonymous_publishing_email'),
+    );
+
+    // If user can choose an alias, give him UI for this config.
+    if ($aliasopt == 'byline') {
+      $bylineguide = $settings->get('byline_guidance');
+      if (!empty($bylineguide)) {
+        $bylineguide .= ' ';
+      }
+      $form['anonymous_publishing']['alias'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Byline:'),
+        '#description' => t('@bylineguide<em>All</em> posts associated with this e-mail address will carry this byline.  Leave blank if you want to keep the byline already associated with this email address.', array('@bylineguide' => $bylineguide)),
+        '#size' => 30,
+        '#maxlength' => Email::EMAIL_MAX_LENGTH,
+        '#parents' => array('anonymous_publishing_alias'),
+      );
+    }
+
+    // Set default_value non-empty to simulate 'bot.
+    // The text for the #title field is not user facing, it's bait for the 'bot.
+    // It shall never be seen by humans. 'Bots look for English words like
+    // "e-mail", so it is better to leave this untranslated to make sure the
+    // 'bot bites the bait.
+    $form['email_confirm_field'] = array(
+      '#type' => 'email',
+      '#title' => 'Enter your e-mail address (not!):',
+      '#default_value' => '',
+      '#size' => 20,
+      '#description' => t('This field should not even be visible to humans.'),
+      '#post_render' => array('_anonymous_publishing_honeyfield_cl_post_render'),
+      '#parents' => array('anonymous_publishing_email_confirm_field'),
+    );
+
+    // Add some CSS to actually hide the honeypot.
+    $form['#attached']['library'][] = 'anonymous_publishing/anonymous_publishing.library';
+
+    // Int the case of nodes, add some custom submit process.
+    if ($entity_type == 'node') {
+      $form['actions']['submit']['#submit'][] = 'anonymous_publishing_cl_node_form_submit';
+      $form['#validate'][] = 'anonymous_publishing_cl_edit_form_validate';
+    }
+
+    // In the case of comments, add some custom validate and submit process.
+    if ($entity_type == 'comment') {
+      $form['actions']['submit']['#submit'][] = 'anonymous_publishing_cl_comment_form_submit';
+      $form['#validate'][] = 'anonymous_publishing_cl_edit_form_validate';
+      // We disable the author field in the comment form.
+      $form['author']['name']['#access'] = FALSE;
+    }
+  }
+
+  // Special case of handling comments.
+  $amail = NULL;
+  if (isset($form['cid']['#value'])) {
+    $cid = $form['cid']['#value'];
+    $amail = \Drupal::database()
+      ->select('anonymous_publishing', 'a')
+      ->fields('a', array('email'))
+      ->where('cid = :cid', array(':cid' => $cid))
+      ->execute()
+      ->fetchField();
+  }
+  elseif ((isset($form['#node_edit_form'])) && (isset($form['nid']['#value']))) {
+    $nid = $form['nid']['#value'];
+    $amail = \Drupal::database()
+      ->select('anonymous_publishing', 'a')
+      ->fields('a', array('email'))
+      ->where('nid = :nid', array(':nid' => $nid))
+      ->execute()
+      ->fetchField();
+  }
+
+  // Show it if it exists and the user is allowed to see this form.
+  if (!empty($amail)) {
+    $form['email_confirm_field'] = array(
+      '#type' => 'markup',
+      '#markup' => t('<div class="anon-cl-email"><strong>Posted using the email-address</strong> “@email”.</div>', array('@email' => $amail)),
+      '#weight' => -5,
+    );
+  }
+
+  // Add our custom data in the node.
+  $form['#entity_builders'][] = 'anonymous_publishing_cl_entity_builder';
+}
+
+/**
+ * Implements a custom submit form for nodes.
+ */
+function anonymous_publishing_cl_node_form_submit($form, FormStateInterface &$form_state) {
+  $settings = \Drupal::config('anonymous_publishing_cl.settings');
+
+  // Retrieve the user entered email.
+  $activation_email = $form_state->getValue('anonymous_publishing_email');
+  $activation_alias = trim($form_state->getValue('anonymous_publishing_alias'));
+
+  // Save it in the node.
+  $node = $form_state->getFormObject()->getEntity();
+  //$node->anonymous_publishing_email = $activation_email;
+  //$node->anonymous_publishing_alias = $activation_alias;
+
+  // No need to manage insertion of this content.
+  if (\Drupal::currentUser()->isAuthenticated() || !isset($activation_email)) {
+    return;
+  }
+
+  // Get the anonymous user alias strategy.
+
+
+  // If the node is published already, then we can bypass email validation.
+  if ($node->isPublished()) {
+    \Drupal::database()->insert('anonymous_publishing')->fields(array(
+        'nid' => $node->id(),
+        'cid' => 0,
+        'akey' => NULL,
+        'verified' => 1,
+        'alias' => $activation_alias,
+        'email' => $activation_email,
+        'ip' => \Drupal::request()->getClientIp(),
+      ))->execute();
+
+    $aliasopt = $settings->get('user_alias');
+    if (!empty($activation_alias) && $aliasopt == 'byline') {
+      \Drupal::database()
+        ->update('anonymous_publishing_emails')
+        ->fields(array('alias' => $activation_alias))
+        ->condition('email', $activation_email, '=')
+        ->execute();
+    }
+    return;
+  }
+
+  /*
+   * IF here, the node is not yet submitted. We need to validate it's insertion
+   * via email.
+   */
+
+  // Get the generic settings for the module.
+  $options = $settings->get('general_options');
+
+  // Build a unique key for this insertion request.
+  $at = $options['sactivate'] ? 'A' : 'V';
+  $akey = $at . Crypt::hmacBase64(mt_rand(), Settings::getHashSalt());
+  \Drupal::database()->insert('anonymous_publishing')->fields(array(
+      'nid' => $node->id(),
+      'cid' => 0,
+      'akey' => $akey,
+      'verified' => 0,
+      'alias' => $activation_alias,
+      'email' => $activation_email,
+      'ip' => \Drupal::request()->getClientIp(),
+    ))->execute();
+
+  // Build and send the confirmation mail for this particular insertion.
+  \Drupal::service('anonymous_publishing_cl.service')
+    ->sendVerificationMail($node, $akey);
+}
+
+/**
+ * Implements hook_mail().
+ */
+function anonymous_publishing_cl_mail($key, &$message, $params) {
+  switch ($key) {
+    // Send a simple message from the contact form.
+    case 'verify':
+      $message['subject'] = $params['subject'];
+      $message['body'] = $params['body'];
+      break;
+  }
+}
+
+/**
+ * Implements a custom submit form for comments.
+ *
+ * Hacks the system messages generated when comments are posted.
+ * Needed because system messages for comments are confusing with the
+ * logic in this module. No need to hack messages for nodes.
+ */
+function anonymous_publishing_cl_comment_form_submit($form, &$form_state) {
+  $settings = \Drupal::config('anonymous_publishing_cl.settings');
+
+  // Retrieve the user entered email.
+  $activation_email = $form_state->getValue('anonymous_publishing_email');
+  $activation_alias = $form_state->getValue('anonymous_publishing_alias');
+
+  $comment = $form_state->getFormObject()->getEntity();
+  //$comment->anonymous_publishing_email = $activation_email;
+  //$comment->anonymous_publishing_alias = $activation_alias;
+
+  // No need to manage insertion of this content.
+  if (\Drupal::currentUser()->isAuthenticated() || !isset($activation_email)) {
+    return;
+  }
+
+  // Not logged in.
+  $aliasopt = $settings->get('user_alias');
+  if (!empty($activation_alias) && $aliasopt == 'byline') {
+    $comment->setAuthorName($activation_alias);
+    \Drupal::database()->update('anonymous_publishing_emails')
+      ->fields(array(
+        'alias' => $activation_alias,
+      ))
+      ->condition('email', $activation_email)
+      ->execute();
+  }
+
+  if ($comment->isPublished()) {
+
+    if (\Drupal::currentUser()->hasPermission('skip comment approval')) {
+      $comment->setPublished(TRUE);
+    }
+    else {
+      $comment->setPublished(FALSE);
+    }
+
+    \Drupal::database()->insert('anonymous_publishing')
+      ->fields('anonymous_publishing', array(
+        'nid' => $comment->getCommentedEntityId(),
+        'cid' => $comment->id(),
+        'akey' => NULL,
+        'verified' => 1,
+        'alias' => 'BOGUS COMMENT',
+        'email' => $activation_email,
+        'ip' => \Drupal::request()->getClientIp(),
+      ))
+      ->execute();
+    return;
+  }
+
+  /*
+  * IF here, the node is not yet submitted. We need to validate it's insertion
+  * via email.
+  */
+
+  // Get the generic settings for the module.
+  $options = $settings->get('general_options');
+
+  // Build a unique key for this insertion request.
+  $at = $options['sactivate'] ? 'A' : 'V';
+  $akey = $at . Crypt::hmacBase64(mt_rand(), Settings::getHashSalt());
+  \Drupal::database()->insert('anonymous_publishing')->fields(array(
+    'nid' => $comment->getCommentedEntityId(),
+    'cid' => $comment->id(),
+    'akey' => $akey,
+    'verified' => 0,
+    'alias' => $activation_alias,
+    'email' => $activation_email,
+    'ip' => \Drupal::request()->getClientIp(),
+  ))->execute();
+
+  // Build and send the confirmation mail for this particular insertion.
+  \Drupal::service('anonymous_publishing_cl.service')
+    ->sendVerificationMail($comment, $akey);
+
+  // Alter the drupal message, depending on comment status.
+  $mm = drupal_get_messages('status', TRUE);
+  $options = $settings->get('general_options');
+  if (\Drupal::currentUser()->hasPermission('skip comment approval') && $options['sactivate']) {
+    $key = array_search(t('Your comment has been queued for review by site administrators and will be published after approval.'), $mm['status']);
+    if (FALSE !== $key) {
+      $mm['status'][$key] = t('Your comment will be published when you validate your e-mail address.');
+    }
+  }
+  elseif (!\Drupal::currentUser()->hasPermission('skip comment approval')) {
+    $key = array_search(t('Your comment has been posted.'), $mm['status']);
+    if (FALSE !== $key) {
+      $mm['status'][$key] = t('Your comment will be published after it has been approved by an administrator.');
+    }
+    $key = array_search(t('Your comment has been queued for review by site administrators and will be published after approval.'), $mm['status']);
+    if (FALSE !== $key) {
+      $mm['status'][$key] = t("Your comment will be published after you've confirmed your email and the comment has been approved by an administrator.");
+    }
+  }
+  else {
+    $key = array_search(t('Your comment has been queued for review by site administrators and will be published after approval.'), $mm['status']);
+    if (FALSE !== $key) {
+      $mm['status'][$key] = t("Your comment will be published after you've confirmed your email and the comment has been approved by an administrator.");
+    }
+  }
+
+  foreach ($mm['status'] as $msg) {
+    drupal_set_message($msg, 'status');
+  }
+}
+
+/**
+ * Implements hook_comment_presave().
+ */
+function anonymous_publishing_cl_comment_presave(CommentInterface $comment) {
+  $settings = \Drupal::config('anonymous_publishing_cl.settings');
+
+  // Check if we are saving a node that needs treatment.
+  if (isset($comment->anonymous_publishing_email)) {
+
+    $needs_confirmation = TRUE;
+    $verification_persistency = $settings->get('verification_persistency');
+
+    // Change author name by byline if setted so.
+    $aliasopt = $settings->get('user_alias');
+    if ($aliasopt == 'byline' && isset($comment->anonymous_publishing_alias) && !empty(isset($comment->anonymous_publishing_alias))) {
+      $comment->setAuthorName($comment->anonymous_publishing_alias);
+    }
+
+    // If the verification can be persisted, first check if we actually already
+    // have a verification persisted for this node.
+    if ($verification_persistency != 'each_post') {
+
+      $result = \Drupal::database()
+        ->select('anonymous_publishing_emails')
+        ->fields('anonymous_publishing_emails', array(
+          'email',
+          'ipaddress',
+          'blocked'
+        ))
+        ->condition('email', $comment->anonymous_publishing_email)
+        ->execute()
+        ->fetchAssoc();
+
+      if ($result['email']) {
+        $ip = \Drupal::request()->getClientIp();
+        if ($verification_persistency == 'persist' || ($verification_persistency == 'ip_duration' && $ip == $result['ipaddress'])) {
+          // Blocked status handled by_anonymous_publishing_cl_content_validate().
+          $comment->set('status', CommentInterface::PUBLISHED);
+          drupal_set_message(t('Your email has been activated previously.'));
+          $needs_confirmation = FALSE;
+        }
+      }
+    }
+
+    if ($needs_confirmation) {
+      $comment->set('status', CommentInterface::NOT_PUBLISHED);
+      drupal_set_message(t('Thank you for posting here. You must also confirm that @email belongs to you.', array('@email' => $comment->anonymous_publishing_email)));
+    }
+  }
+}
+
+/**
+ * Implements hook_node_presave().
+ */
+function anonymous_publishing_cl_node_presave(NodeInterface $node) {
+  $settings = \Drupal::config('anonymous_publishing_cl.settings');
+
+  // Check if we are saving a node that needs treatment.
+  if (isset($node->anonymous_publishing_email)) {
+
+    $needs_confirmation = TRUE;
+    $verification_persistency = $settings->get('verification_persistency');
+
+    // If the verification can be persisted, first check if we actually already
+    // have a verification persisted for this node.
+    if ($verification_persistency != 'each_post') {
+      $result = \Drupal::database()
+        ->select('anonymous_publishing_emails')
+        ->fields('anonymous_publishing_emails', array(
+          'email',
+          'ipaddress',
+          'blocked'
+        ))
+        ->condition('email', $node->anonymous_publishing_email)
+        ->execute()
+        ->fetchAssoc();
+
+      if ($result['email']) {
+        $ip = \Drupal::request()->getClientIp();
+        if ($verification_persistency == 'persist' || ($verification_persistency == 'ip_duration' && $ip == $result['ipaddress'])) {
+          // Blocked status handled by_anonymous_publishing_cl_content_validate().
+          $node->set('status', NODE_PUBLISHED);
+          drupal_set_message(t('Your email has been activated previously.'));
+          $needs_confirmation = FALSE;
+        }
+      }
+    }
+
+    if ($needs_confirmation) {
+      $node->set('status', NODE_NOT_PUBLISHED);
+      drupal_set_message(t('Thank you for posting here. You must also confirm that @email belongs to you.', array('@email' => $node->anonymous_publishing_email)));
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function anonymous_publishing_cl_entity_delete(Drupal\Core\Entity\EntityInterface $entity) {
+  $apid = NULL;
+
+  $apid = \Drupal::database()->select('anonymous_publishing')
+    ->fields('anonymous_publishing', array('apid'))
+    ->condition('nid', $entity->id())
+    ->execute()
+    ->fetchField();
+
+  if (!empty($apid)) {
+    \Drupal::database()->delete('anonymous_publishing')
+      ->condition('apid', $apid)
+      ->execute();
+  }
+}
+
+
+/**
+ * --------------------------------
+ * HELPER METHODS/
+ */
+
+/**
+ * Class wrapper for honeyfield.
+ *
+ * This will wrap the field in a div so it can be hidden with CSS.
+ * The wrapper class name is deliberately misleading.
+ * The wrapper class need to be set to display_none in css.
+ */
+function _anonymous_publishing_honeyfield_cl_post_render($content, $element) {
+  return '<div class="edit-email-confirm-wrapper">' . $content . '</div>';
+}
