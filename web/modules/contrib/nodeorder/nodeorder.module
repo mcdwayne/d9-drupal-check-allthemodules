@@ -1,0 +1,286 @@
+<?php
+
+/**
+ * @file
+ * Nodeorder module.
+ */
+
+use Drupal\Core\Cache\Cache;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Url;
+use Drupal\node\NodeInterface;
+use Drupal\taxonomy\Entity\Vocabulary;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\taxonomy\Entity\Term;
+
+/**
+ * @defgroup nodeorder Module functions
+ * @{
+ * Additional functions and hooks for Node Order module.
+ */
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function nodeorder_module_implements_alter(&$implementations, $hook) {
+  if ($hook === 'node_update') {
+    $group = $implementations['nodeorder'];
+    unset($implementations['nodeorder']);
+    $implementations['nodeorder'] = $group;
+  }
+}
+
+/**
+ * Implements hook_entity_operation().
+ */
+function nodeorder_entity_operation(EntityInterface $entity) {
+  $operations = [];
+
+  if ($entity instanceof Term) {
+    /** @var \Drupal\nodeorder\NodeOrderManagerInterface $nodeorder_manager */
+    $nodeorder_manager = \Drupal::service('nodeorder.manager');
+    if ($nodeorder_manager->vocabularyIsOrderable($entity->getVocabularyId())) {
+      $operations['order'] = [
+        'title' => t('Order'),
+        'query' => \Drupal::destination()->getAsArray(),
+        'url' => Url::fromRoute('nodeorder.admin_order', ['taxonomy_term' => $entity->id()]),
+        'weight' => 20,
+      ];
+    }
+  }
+
+  return $operations;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for taxonomy_form_vocabulary().
+ */
+function nodeorder_form_taxonomy_vocabulary_form_alter(&$form, FormStateInterface $form_state) {
+  if ($form_state->get('confirm_delete')) {
+    return;
+  }
+
+  /** @var \Drupal\nodeorder\NodeOrderManagerInterface $nodeorder_manager */
+  $nodeorder_manager = \Drupal::service('nodeorder.manager');
+
+  $vocabulary = $form_state->getFormObject()->getEntity();
+
+  $form['nodeorder'] = [
+    '#type' => 'fieldset',
+    '#title' => t('Node Order'),
+    '#weight' => 1,
+  ];
+  $form['nodeorder']['orderable'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Orderable'),
+    '#description' => t('If enabled, nodes may be ordered within this vocabulary.'),
+    '#default_value' => $nodeorder_manager->vocabularyIsOrderable($vocabulary->id()),
+  ];
+
+  // Add a submit handler for saving the orderable settings.
+  $form['actions']['submit']['#submit'][] = 'nodeorder_taxonomy_vocabulary_form_submit';
+}
+
+/**
+ * Submit handler for nodeorder_form_taxonomy_vocabulary_form_alter().
+ */
+function nodeorder_taxonomy_vocabulary_form_submit($form, FormStateInterface $form_state) {
+  /** @var \Drupal\nodeorder\NodeOrderManagerInterface $nodeorder_manager */
+  $nodeorder_manager = \Drupal::service('nodeorder.manager');
+
+  $vocabulary = $form_state->getFormObject()->getEntity();
+  $config = \Drupal::configFactory()->getEditable('nodeorder.settings');
+  $orderable = $form_state->getValue('orderable');
+  $vocabularies = $config->get('vocabularies');
+
+  if ($orderable && empty($vocabularies[$vocabulary->id()])) {
+    // Switching from non-orderable to orderable.
+    Cache::invalidateTags(['nodeorder']);
+
+    // Set weight to nid for all rows in term_node where the tid is in this
+    // vocabulary.
+    $tree = \Drupal::entityManager()->getStorage("taxonomy_term")->loadTree($vocabulary->id());
+    $tids = [];
+    foreach ($tree as $term) {
+      $tids[] = $term->tid;
+    }
+
+    if (count($tids) > 0) {
+      $order = 'n.sticky DESC, tn0.weight';
+
+      $tid = 0;
+      $query_max = db_select('taxonomy_index', 'ti')
+        ->condition('tid', $tid);
+      $query_max->addExpression('MAX(weight)', 'mweight');
+
+      foreach ($tids as $tid) {
+        // Select *current* nodes for the current term.
+        // @todo: Replace this hacked function call.
+        $result = $nodeorder_manager->selectNodes([$tid], 'and', 0, FALSE, $order, 0);
+
+        foreach ($result as $node) {
+          $max = $query_max->execute()->fetchField();
+          $max = (int) $max + 1;
+          db_update('taxonomy_index')
+            ->condition('nid', $node->nid)
+            ->condition('tid', $tid)
+            ->fields(['weight' => $max])
+            ->execute();
+        }
+      }
+    }
+
+    drupal_set_message(t('You may now order nodes within this vocabulary.'));
+  }
+  elseif (!$orderable && !empty($vocabularies[$vocabulary->id()])) {
+    // Switching from orderable to non-orderable.
+    Cache::invalidateTags(['nodeorder']);
+
+    // Set weight to 0 for all rows in term_node where the tid is in this
+    // vocabulary.
+    $tree = \Drupal::entityManager()->getStorage("taxonomy_term")->loadTree($vocabulary->id());
+    $tids = [];
+    foreach ($tree as $term) {
+      $tids[] = $term->tid;
+    }
+
+    if (count($tids) > 0) {
+      db_update('taxonomy_index')
+        ->fields(['weight' => 0])
+        ->condition('tid', $tids, 'IN')
+        ->execute();
+    }
+
+    drupal_set_message(t('You may no longer order nodes within this vocabulary.'));
+  }
+
+  // Update config.
+  $vocabularies[$vocabulary->id()] = $orderable;
+  $config->set('vocabularies', $vocabularies);
+  $config->save();
+}
+
+/**
+ * Implements hook_node_presave().
+ */
+function nodeorder_node_presave(NodeInterface $node) {
+  /** @var \Drupal\nodeorder\NodeOrderManagerInterface $nodeorder_manager */
+  $nodeorder_manager = \Drupal::service('nodeorder.manager');
+
+  if ($nodeorder_manager->canBeOrdered($node)) {
+    // Store the old node orders for use in nodeorder_node_update().
+    $node->nodeorder = [];
+    // When a node is created, store an element called 'nodeorder' that
+    // contains an associative array of tid to weight.
+    $query = db_select('taxonomy_index', 'ti')
+      ->fields('ti', ['tid', 'weight'])
+      ->condition('nid', $node->id());
+    $result = $query->execute();
+    foreach ($result as $term_node) {
+      $node->nodeorder[$term_node->tid] = $term_node->weight;
+    }
+  }
+}
+
+/**
+ * Implements hook_node_delete().
+ *
+ * Handle lists in which the node is removed.
+ */
+function nodeorder_node_delete(NodeInterface $node) {
+  /** @var \Drupal\nodeorder\NodeOrderManagerInterface $nodeorder_manager */
+  $nodeorder_manager = \Drupal::service('nodeorder.manager');
+
+  // Get tids from node var; in the database they're already removed.
+  $tids = $nodeorder_manager->getOrderableTidsFromNode($node);
+  foreach ($tids as $tid) {
+    $nodeorder_manager->handleListsDecrease($tid);
+  }
+}
+
+/**
+ * Implements hook_node_insert().
+ *
+ * Handle the weights of the node in the taxonomy orderable lists it id added.
+ */
+function nodeorder_node_insert(NodeInterface $node) {
+  /** @var \Drupal\nodeorder\NodeOrderManagerInterface $nodeorder_manager */
+  $nodeorder_manager = \Drupal::service('nodeorder.manager');
+
+  $tids = $nodeorder_manager->getOrderableTids($node, TRUE);
+  foreach ($tids as $tid) {
+    $nodeorder_manager->addToList($node, $tid);
+  }
+}
+
+/**
+ * Implements hook_node_update().
+ *
+ * Handle the weights, which were reset on rebuild of the taxonomy.
+ */
+function nodeorder_node_update(NodeInterface $node) {
+  /** @var \Drupal\nodeorder\NodeOrderManagerInterface $nodeorder_manager */
+  $nodeorder_manager = \Drupal::service('nodeorder.manager');
+
+  if (!$nodeorder_manager->canBeOrdered($node)) {
+    return;
+  }
+  $tids = $nodeorder_manager->getOrderableTids($node, TRUE);
+  $old_tids = $node->nodeorder;
+  foreach ($tids as $tid) {
+    // Restore weight of unchanged terms, or leave as is if zero.
+    if (isset($old_tids[$tid])) {
+      $old_weight = $old_tids[$tid];
+      unset($old_tids[$tid]);
+
+      if (!$old_weight) {
+        continue;
+      }
+      db_update('taxonomy_index')
+        ->fields(['weight' => $old_weight])
+        ->condition('nid', $node->id())
+        ->condition('tid', $tid)
+        ->execute();
+    }
+    // Push new or newly orderable node to top of ordered list.
+    else {
+      $nodeorder_manager->addToList($node, $tid);
+    }
+  }
+
+  // Handle lists in which the node is removed.
+  // Note that the old tids are at this point only the ones that were not
+  // updated, the others were dropped when restoring above.
+  foreach ($old_tids as $tid => $weight) {
+    $nodeorder_manager->handleListsDecrease($tid);
+  }
+
+}
+
+/**
+ * Implements hook_help().
+ */
+function nodeorder_help($route_name, RouteMatchInterface $route_match) {
+  $output = '';
+  switch ($route_name) {
+    case 'entity.taxonomy_vocabulary.overview_form':
+      /** @var \Drupal\nodeorder\NodeOrderManagerInterface $nodeorder_manager */
+      $nodeorder_manager = \Drupal::service('nodeorder.manager');
+      $vocabulary = $route_match->getParameter('taxonomy_vocabulary');
+      if ($nodeorder_manager->vocabularyIsOrderable($vocabulary->id())) {
+        $output = '<p>' . t('%capital_name is an orderable vocabulary. You may order the nodes associated with a term within this vocabulary by clicking the down arrow in the <em class="placeholder">Edit</em> Button and selecting <em class="placeholder">Order</em>.', ['%capital_name' => ucfirst($vocabulary->label())]);
+      }
+      break;
+
+    case 'nodeorder.admin_order':
+      $output = '<p>' . t('This page provides a drag-and-drop interface for ordering nodes. To change the order of nodes, grab a drag-and-drop handle next to the <em class="placeholder">Title</em> column and drag the node to a new location in the list. Your changes will be saved only when you click the <em class="placeholder">Save</em> button at the bottom of the page.') . '</p>';
+      break;
+  }
+
+  return $output;
+}
+
+/**
+ * @} End of "defgroup nodeorder".
+ */
