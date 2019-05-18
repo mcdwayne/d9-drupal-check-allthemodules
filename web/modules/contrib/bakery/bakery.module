@@ -1,0 +1,497 @@
+<?php
+
+/**
+ * @file
+ * For implementing different hooks for bakery SSO functionlity.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\TrustedRedirectResponse;
+use Symfony\Component\HttpFoundation\RedirectResponse;
+
+/**
+ * Implements hook_user_login().
+ */
+function bakery_user_login($account) {
+  if (\Drupal::config('bakery.settings')->get('bakery_is_master') && $account->id() != 0) {
+    $init = \Drupal::service('bakery.bakery_service')->initField($account->id());
+    \Drupal::service('bakery.bakery_service')->bakeChocolatechipCookie($account->getUsername(), $account->getEmail(), $init);
+  }
+}
+
+/**
+ * Implements hook_user_logout().
+ */
+function bakery_user_logout($account) {
+  $user = \Drupal::currentUser();
+  $cookie = \Drupal::service('bakery.bakery_service')->validateCookie();
+
+  // Only delete the SSO cookie if the name is the same in case there was an
+  // existing session that's being logged out and SSO cookie is for new session.
+  if ($user->id() && $cookie && $cookie['name'] === $user->getUsername()) {
+    \Drupal::service('bakery.bakery_service')->eatCookie();
+  }
+  // Destroy session cookie.
+  \Drupal::service('bakery.bakery_service')->eatCookie(session_name());
+}
+
+/**
+ * Implements hook_user_presave().
+ */
+function bakery_user_presave(&$edit, $account, $category) {
+  if (\Drupal::config('bakery.settings')->get('bakery_is_master')) {
+    // We store email/name if they changed. We want to wait with doing
+    // anything else until the changes are saved locally.
+    foreach (\Drupal::config('bakery.settings')->get('bakery_supported_fields') as $type => $enabled) {
+      if ($enabled && isset($edit[$type]) && isset($account->$type) && $account->$type != $edit[$type]) {
+        $_SESSION['bakery'][$type] = $edit[$type];
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_user_update().
+ */
+function bakery_user_update(&$edit, $account, $category) {
+  // We need to push changes.
+  if (\Drupal::config('bakery.settings')->get('bakery_is_master') && isset($_SESSION['bakery'])) {
+    /*$type = 'stroopwafel';
+    $key = \Drupal::config('bakery.settings')->get('bakery_key');
+    $payload['data'] = serialize($_SESSION['bakery']);
+    $payload['timestamp'] = $_SERVER['REQUEST_TIME'];
+    $payload['uid'] = $account->id();
+    $payload['category'] = $category;
+    $payload['type'] = $type;
+    $data = \Drupal::service('bakery.bakery_service')->bakeData($payload);
+    // Respond with encrypted and signed account information.
+    $payload = drupal_http_build_query(array($type => $data));
+    unset($_SESSION['bakery']);
+    // Now update the slaves.
+    $slaves = \Drupal::config('bakery.settings')
+    ->get('bakery_slaves') || array();
+    foreach ($slaves as $slave) {
+    $options = array(
+    'headers' => array(
+    'Content-Type' => 'application/x-www-form-urlencoded; charset=utf-8',
+    ),
+    'method' => 'POST',
+    'data' => $payload,
+    );
+    $result = drupal_http_request($slave . 'bakery/update', $options);
+    if ($result->code != 200) {
+    drupal_set_message(t('Error %error for site at %url', array(
+    '%error' => $result->code . ' ' . $result->error,
+    '%url' => $slave,
+    )));
+    }
+    else {
+    drupal_set_message($result->data);
+    // TODO: Roll back the change.
+    }
+    }*/
+    $user = \Drupal::currentUser();
+    if ($user->id() === $account->id()) {
+      // Rebake SSO cookie so user stays authenticated.
+      $init = \Drupal::service('bakery.bakery_service')->initField($account->id());
+      \Drupal::service('bakery.bakery_service')->bakeChocolatechipCookie($account->getUsername(), $account->getEmail(), $init);
+    }
+  }
+}
+
+/**
+ * Implements hook_user_view().
+ */
+function bakery_user_view(array &$build, $account, $view_mode, $langcode) {
+  if (!\Drupal::config('bakery.settings')->get('bakery_is_master')) {
+    $master = \Drupal::config('bakery.settings')->get('bakery_master');
+    $init_url = _bakery_init_field_url($account->init);
+    if (parse_url($master, PHP_URL_HOST) == parse_url($init_url, PHP_URL_HOST)) {
+      $account->content['summary']['master_profile'] = array(
+        '#type' => 'user_profile_item',
+        '#title' => t('Primary profile'),
+      // Take everything up to '/edit'.
+        '#markup' => \Drupal::l(t('Profile on primary site'), substr($init_url, 0, strlen($init_url) - 5)),
+        '#access' => user_access('access user profiles'),
+      );
+
+    }
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function bakery_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  switch ($form_id) {
+    case 'user_profile_form':
+    case 'user_form':
+      if (!\Drupal::config('bakery.settings')->get('bakery_is_master') && !\Drupal::currentUser()->hasPermission('administer users')) {
+        $master_uri = \Drupal::config('bakery.settings')->get('bakery_master');
+        // $init_url = _bakery_init_field_url($form['#user']->init);.
+        if (isset($form['account'])) {
+          drupal_set_message(t('You can change the name, mail, and password <a href=":url">at the master site</a>.', array(':url' => $master_uri)), 'status', FALSE);
+          $form['account']['#access'] = FALSE;
+          $form['account']['name']['#access'] = FALSE;
+          $form['account']['pass']['#access'] = FALSE;
+          $form['account']['mail']['#access'] = FALSE;
+        }
+        foreach (\Drupal::config('bakery.settings')->get('bakery_supported_fields') as $type => $value) {
+          if ($value) {
+            switch ($type) {
+              case 'mail':
+              case 'name':
+                break;
+
+              case 'picture':
+                if (isset($form['picture'])) {
+                  $form['picture']['picture_delete']['#access'] = FALSE;
+                  $form['picture']['picture_upload']['#access'] = FALSE;
+                  $form['picture']['#description'] = t('You can change the image <a href=":url">at the master site</a>.', array(':url' => $master_uri));
+                }
+                break;
+
+              case 'language':
+                if (isset($form['locale'][$type])) {
+                  $form['locale'][$type]['#disabled'] = TRUE;
+                  $form['locale'][$type]['#description'] .= ' ' . t('You can change the language setting <a href=":url">at the master site</a>.', array(':url' => $master_uri));
+                }
+                break;
+
+              case 'signature':
+                if (isset($form['signature_settings'][$type])) {
+                  $form['signature_settings'][$type]['#disabled'] = TRUE;
+                  $form['signature_settings'][$type]['#description'] .= ' ' . t('You can change the signature <a href=":url">at the master site</a>.', array(':url' => $master_uri));
+                }
+                break;
+
+              default:
+                if (isset($form[$type])) {
+                  $form[$type]['#disabled'] = TRUE;
+                }
+                if (isset($form[$type][$type])) {
+                  $form[$type][$type]['#disabled'] = TRUE;
+                  $form[$type][$type]['#description'] .= ' ' . t('You can change this setting <a href=":url">at the master site</a>.', array(':url' => $master_uri));
+                }
+                break;
+            }
+          }
+        }
+      }
+      break;
+
+    case 'user_register_form':
+      // Provide register ability on the slave sites.
+      if (!\Drupal::config('bakery.settings')->get('bakery_is_master')) {
+        if (\Drupal::service('router.admin_context')->isAdminRoute(\Drupal::routeMatch()->getRouteObject())) {
+          // Admin create user form. Add a note about account synchronization.
+          $form['account']['bakery_help'] = array(
+            '#value' => t('<strong>Note:</strong> Only use this form to create accounts for users who exist on <a href="!url">@master</a> and not on this site. Be sure to use the exact same username and e-mail for the account here that they have on @master.', array('!url' => \Drupal::config('bakery.settings')->get('bakery_master'), '@master' => \Drupal::config('bakery.settings')->get('bakery_master'))),
+            '#weight' => -100,
+          );
+        }
+        else {
+          // Anonymous user registration form.
+          // Populate fields if set from previous attempt.
+          if (isset($_SESSION['bakery']['register'])) {
+            $form['account']['name']['#default_value'] = $_SESSION['bakery']['register']['name'];
+            $form['account']['mail']['#default_value'] = $_SESSION['bakery']['register']['mail'];
+            unset($_SESSION['bakery']['register']);
+          }
+          // Replace the submit handler with our own.
+          // $form['#submit'] = array('_bakery_register_submit');.
+        }
+      }
+      break;
+
+    case 'user_pass':
+      // Slave sites need to make sure the local account exists, if the master
+      // account exists.
+      if (!\Drupal::config('bakery.settings')->get('bakery_is_master')) {
+        array_unshift($form['#validate'], '_bakery_pass_validate');
+      }
+      break;
+
+    case 'user_pass_reset':
+      // As part of the slave site registration we need to handle email
+      // validation and password reset.
+      if (!\Drupal::config('bakery.settings')->get('bakery_is_master')) {
+        // Set a submit handler for the psuedo-reset form.
+        $form['#submit'] = array('_bakery_reset_submit');
+        // Unset its custom action.
+        unset($form['#action']);
+      }
+      break;
+
+    case 'user_login_block':
+    case 'user_login_form':
+      // Provide login ability on the slave sites.
+      if (!\Drupal::config('bakery.settings')->get('bakery_is_master')) {
+        // Replace two validators from user module because they log the user in
+        // and test if account exists. We want to check if the account exists on
+        // the master instead.
+        // dpm($form['#validate']);.
+        $form['#validate'] = array_diff($form['#validate'], array('::validateAuthentication', '::validateFinal'));
+        // Also replace the submit handler with our own to
+        // set a redirect cookie.
+        $form['#submit'] = array('_bakery_login_submit');
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
+/**
+ * Validate handler for the password reset login.
+ */
+function _bakery_pass_validate($form, &$form_state) {
+  // On a slave site it's possible that a user requests their password but
+  // doesn't have an account on the slave site. So, we check if that's the case
+  // and use our helpful functions to create their account on the slave site.
+  $name = trim($form_state['values']['name']);
+
+  $account = user_load_by_mail($name);
+  if (!$account) {
+    // No success, try to load by name.
+    $account = user_load_by_name($name);
+  }
+  if (!$account) {
+    // Attempt to copy account from master.
+    \Drupal::service('bakery.bakery_service')->requestAccount($name, TRUE);
+  }
+}
+
+/**
+ * Submit handler for the password reset form.
+ */
+function _bakery_reset_submit($form, &$form_state) {
+  global $base_url;
+
+  // If we're here it means the user has validated their email correctly.
+  $master = \Drupal::config('bakery.settings')->get('bakery_master');
+  //$key = \Drupal::config('bakery.settings')->get('bakery_key');
+  // It's safe to use arg(2) here to load the user and log in because the
+  // callback has validated the request and Drupal's Form API protects us
+  // against forgery.
+  $path_args = explode('/', current_path());
+  $account = \Drupal::entityManager()->getStorage('user')->load($path_args[2]);
+  // If they have not logged in before we need to update the master site.
+  if ($account->login === 0) {
+    $type = 'thinmint';
+    $payload = array();
+    $payload['name'] = $account->getUsername();
+    // Match how slaves are set on the master.
+    $payload['slave'] = rtrim($base_url, '/') . '/';
+    $payload['uid'] = $account->id();
+    $payload['timestamp'] = $_SERVER['REQUEST_TIME'];
+    $payload['type'] = $type;
+    $data = \Drupal::service('bakery.bakery_service')->bakeData($payload);
+    // $payload = UrlHelper::buildQuery(array($type => $data));
+    // Make request to master for account information.
+    $client = \Drupal::httpClient();
+    try {
+      // Push validation to master.
+      $response = $client->post($master . 'bakery/validate', ["form_params" => [$type => $data]]);
+    }
+    catch (BadResponseException $exception) {
+      $response = $exception->getResponse();
+      Drupal::logger('bakery')->error(t('Failed to fetch file due to HTTP error "%error"', array('%error' => $response->getStatusCode() . ' ' . $response->getReasonPhrase())), 'error');
+      return FALSE;
+    }
+    catch (RequestException $exception) {
+      Drupal::logger('bakery')->error(t('Failed to fetch file due to error "%error"', array('%error' => $exception->getMessage())), 'error');
+      return FALSE;
+    }
+  }
+
+  // If they have logged in before or the master updated correctly, log them in.
+  if ($account->login > 0 || $response->getStatusCode() == 200) {
+    // Log the user in.
+    $init = \Drupal::service('bakery.bakery_service')->initField($account->id());
+    \Drupal::service('bakery.bakery_service')->bakeChocolatechipCookie($account->getUsername(), $account->getEmail(), $init);
+    user_login_finalize($account);
+    // \Drupal::service('bakery.bakery_service')->authenticateFinalize($edit);
+    // Inform them that they need to reset their password.
+    drupal_set_message(t('You have just used your one-time login link. It is no longer necessary to use this link to login. Please change your password at <a href="!url">@master</a>.', array('!url' => check_url(_bakery_init_field_url($init)), '@master' => \Drupal::config('bakery.settings')->get('bakery_master'))));
+    return new RedirectResponse('user.page');
+  }
+  else {
+    return new RedirectResponse('user.login');
+  }
+}
+
+/**
+ * Handle registration by redirecting to master.
+ */
+function _bakery_register_submit($form, &$form_state) {
+  // Create an array of fields to send to the master.
+  // Save values to cookie.
+  $data = array(
+    "name" => $form_state->getValue('name'),
+    "pass" => $form_state->getValue('pass'),
+    "mail" => $form_state->getValue('mail'),
+  );
+  _bakery_save_destination_param($form, $data);
+  unset($_GET['destination']);
+
+  // Store name and email in case of error and return from master.
+  $_SESSION['bakery']['register'] = array(
+    'name' => $data['name'],
+    'mail' => $data['mail'],
+  );
+  // Create cookie and redirect to master.
+  \Drupal::service('bakery.bakery_service')->bakeOatmealCookie($form_state->getValue('name'), $data);
+  // Remove unneeded values.
+  $form_state->cleanValues();
+  $master_uri = \Drupal::config('bakery.settings')->get('bakery_master') . 'bakery';
+  $form_state->setFormState(['redirect' => new TrustedRedirectResponse($master_uri)]);
+}
+
+/**
+ * Handle login by redirecting to master.
+ */
+function _bakery_login_submit($form, &$form_state) {
+  // Get rid of all the values we don't explicitly know we want. While this may
+  // break some modules it ensures we don't send sensitive data between sites.
+  // login data to master site.
+  $data = array(
+    "name" => $form_state->getValue('name'),
+    "pass" => $form_state->getValue('pass'),
+  );
+
+  _bakery_save_destination_param($form, $data);
+  unset($_GET['destination']);
+
+  // Create cookie and redirect to master.
+  \Drupal::service('bakery.bakery_service')
+    ->bakeOatmealCookie($form_state->getValue('name'), $data);
+  // Remove unneeded values.
+  $form_state->cleanValues();
+  $master_uri = \Drupal::config('bakery.settings')->get('bakery_master') . 'bakery/login';
+  $form_state->setFormState(['redirect' => new TrustedRedirectResponse($master_uri)]);
+}
+
+/**
+ * Check if a form destination is set and save it in $data array.
+ *
+ * Used to preserve destination in Bakery redirection to master and slave
+ * during login and registration.
+ *
+ * @param array $form
+ *   Form definition to check.
+ * @param array $data
+ *   Array to store the detected destination value, if any.
+ */
+function _bakery_save_destination_param($form, &$data) {
+  // Hold on to destination if set.
+  if (strpos($form['#action'], 'destination=') !== FALSE) {
+    // If an absolute URL is in destination parse_url() will issue a warning
+    // and not populate $url_args so no further protection is needed.
+    parse_str(parse_url($form['#action'], PHP_URL_QUERY), $url_args);
+    if (!empty($url_args['destination'])) {
+      $data['destination'] = $url_args['destination'];
+    }
+  }
+}
+
+/**
+ * Access callback for path /user.
+ *
+ * Displays user profile if user is logged in, or login form for anonymous
+ * users.
+ */
+function bakery_user_page() {
+  $user = \Drupal::currentUser();
+  if ($user->id()) {
+    menu_set_active_item('user/' . $user->id());
+    return menu_execute_active_handler();
+  }
+}
+
+/**
+ * Validate the account information request.
+ */
+function bakery_taste_gingerbread_cookie() {
+  $type = 'gingerbread';
+  if (empty($_POST[$type])) {
+    return FALSE;
+  }
+  if (($cookie = \Drupal::service('bakery.bakery_service')->validateData($_POST[$type], $type)) === FALSE) {
+    return FALSE;
+  }
+  $_SESSION['bakery']['name'] = $cookie['name'];
+  $_SESSION['bakery']['or_email'] = $cookie['or_email'];
+  $_SESSION['bakery']['slave'] = $cookie['slave'];
+  $_SESSION['bakery']['uid'] = $cookie['uid'];
+  return TRUE;
+}
+
+/**
+ * Build full init url to master.
+ */
+function _bakery_init_field_url($init) {
+  $scheme = parse_url(\Drupal::config('bakery.settings')->get('bakery_master'), PHP_URL_SCHEME);
+  $url = $init->getValue();
+  if (is_array($url) && !empty($url)) {
+    return $url[0]['value'];
+  }
+  else {
+    return $scheme;
+  }
+}
+
+/**
+ * Encryption handler.
+ *
+ * @param string $text
+ *   The text to be encrypted.
+ *
+ * @return sting
+ *   Encryped text.
+ */
+function bakery_encrypt($text) {
+  $key = \Drupal::config('bakery.settings')->get('bakery_key');
+
+  $td = mcrypt_module_open('rijndael-128', '', 'ecb', '');
+  $iv = mcrypt_create_iv(mcrypt_enc_get_iv_size($td), MCRYPT_RAND);
+
+  $key = substr($key, 0, mcrypt_enc_get_key_size($td));
+
+  mcrypt_generic_init($td, $key, $iv);
+
+  $data = mcrypt_generic($td, $text);
+
+  mcrypt_generic_deinit($td);
+  mcrypt_module_close($td);
+
+  return $data;
+}
+
+/**
+ * Decryption handler.
+ *
+ * @param string $text
+ *   The data to be decrypted.
+ *
+ * @return string
+ *   Decrypted text.
+ */
+function bakery_decrypt($text) {
+  $key = \Drupal::config('bakery.settings')->get('bakery_key');
+
+  $td = mcrypt_module_open('rijndael-128', '', 'ecb', '');
+  $iv = mcrypt_create_iv(mcrypt_enc_get_iv_size($td), MCRYPT_RAND);
+
+  $key = substr($key, 0, mcrypt_enc_get_key_size($td));
+
+  mcrypt_generic_init($td, $key, $iv);
+
+  $data = mdecrypt_generic($td, $text);
+
+  mcrypt_generic_deinit($td);
+  mcrypt_module_close($td);
+
+  return $data;
+}
