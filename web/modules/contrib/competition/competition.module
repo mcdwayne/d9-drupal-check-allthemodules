@@ -1,0 +1,921 @@
+<?php
+
+/**
+ * @file
+ * Contains competition.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Link;
+use Drupal\Core\Url;
+use Drupal\Core\Database\Query\AlterableInterface;
+use Drupal\Core\Database\Query\ConditionInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Component\Utility\Html;
+use Drupal\competition\CompetitionInterface;
+use Drupal\competition\Entity\Competition;
+
+/**
+ * Implements hook_help().
+ */
+function competition_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the competition module.
+    case 'help.page.competition':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Create and manage competitions and their entries.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function competition_theme() {
+  $theme = [];
+
+  $theme['competition_list'] = [
+    'render element' => 'content',
+    'variables' => ['content' => NULL],
+  ];
+
+  $theme['competition_entry_archives_page'] = [
+    'variables' => [
+      'competition' => NULL,
+      'cycles_filter' => NULL,
+      'view_renderable' => NULL,
+    ],
+    'template'  => 'competition_entry-archives-page',
+  ];
+
+  $theme['competition_entry_form'] = [
+    'render element' => 'form',
+    'template' => 'competition_entry-form',
+  ];
+
+  $theme['competition_entry'] = [
+    'render element' => 'elements',
+    'template' => 'competition_entry',
+  ];
+
+  return $theme;
+}
+
+/**
+ * Implements hook_cron().
+ */
+function competition_cron() {
+
+  // Clean up all old exported reporting files.
+  $path = drupal_realpath('private://competition/reports/');
+  foreach (glob($path . '/*.csv') as $file) {
+    // If file is 7 days old or older then delete it.
+    if (filemtime($file) < ((time() - 86400) * 7)) {
+      unlink($file);
+    }
+  }
+
+}
+
+/**
+ * Implements hook_mail().
+ *
+ * For key 'competition_entry_submit_confirm', expected $params:
+ *   'entry_id'
+ *   'competition_title'
+ *   'body_text'
+ */
+function competition_mail($key, &$message, $params) {
+  if ($key == 'competition_entry_submit_confirm') {
+
+    $message['subject'] = t(
+        '@site_name | @competition_title - Entry Submission Confirmation', [
+          '@site_name' => \Drupal::config('system.site')->get('name'),
+          '@competition_title' => $params['competition_title'],
+        ]
+    );
+
+    // This is already set.
+    // Config > System > Basic Site Settings
+    // $message['from'] = \Drupal::config('system.site')->get('mail');.
+    // There should not be any HTML in here but take precaution.
+    $body_text = Html::escape($params['body_text']);
+
+    // $message['body'] must be an array of strings (or objects instanceof
+    // MarkupInterface). This will be joined by "\n\n". To avoid unexpected
+    // extra blank lines, pass just one string in the body array, reformatting
+    // line breaks to be just "\n".
+    // @see PhpMail::format()
+    $body_text = str_replace("\r\n", "\n", $body_text);
+    $body_text = str_replace("\r", "\n", $body_text);
+    $message['body'][] = $body_text;
+  }
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK().
+ */
+function competition_theme_suggestions_competition_entry(array $variables) {
+  $suggestions = array();
+  $entity = $variables['elements']['#competition_entry'];
+  $sanitized_view_mode = strtr($variables['elements']['#view_mode'], '.', '_');
+
+  $suggestions[] = 'competition_entry__' . $sanitized_view_mode;
+  $suggestions[] = 'competition_entry__' . $entity->bundle();
+  $suggestions[] = 'competition_entry__' . $entity->bundle() . '__' . $sanitized_view_mode;
+  $suggestions[] = 'competition_entry__' . $entity->id();
+  $suggestions[] = 'competition_entry__' . $entity->id() . '__' . $sanitized_view_mode;
+  return $suggestions;
+}
+
+/**
+ * Prepares variables for Competition entry templates.
+ *
+ * Default template: competition_entry.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - elements: An associative array containing the user information and any
+ *   - attributes: HTML attributes for the containing element.
+ */
+function template_preprocess_competition_entry(array &$variables) {
+  // Fetch CompetitionEntry Entity Object.
+  /* @var \Drupal\competition\Entity\CompetitionEntry $competition_entry */
+  $competition_entry = $variables['elements']['#competition_entry'];
+
+  // Get user entity that owns this entry.
+  /* @var \Drupal\user\UserInterface $owner */
+  $owner = $competition_entry->getOwner();
+
+  // Render the user entity (fields) using a custom view mode intended for
+  // displaying on the entry view (if enabled).
+  $variables['content_user'] = [];
+
+  /* @var \Drupal\Core\Entity\Entity\EntityViewDisplay $user_entry_display */
+  $user_entry_display = \Drupal::entityTypeManager()->getStorage('entity_view_display')->load('user.user.competition_entry');
+  if (!empty($user_entry_display) && $user_entry_display->status()) {
+
+    // This appears to fully build the render arrays for all the fields -
+    // rather than the view builder's view() method, which produces a render
+    // array for the entity with #pre_render callbacks that lazy-build the
+    // actual field render arrays.
+    $user_build = $user_entry_display->build($owner);
+
+    // Create variable for template - use children() to apply weight sort.
+    foreach (Element::children($user_build, TRUE) as $key) {
+      $variables['content_user'][$key] = $user_build[$key];
+    }
+  }
+
+  // Account name and email properties are not provided as fields in the
+  // display settings - so add them in.
+  // TODO: add these as "extra fields" so they can be configured in display
+  // settings too?
+  $properties_show = [
+    'name',
+    'mail',
+  ];
+  $user_build_properties = [];
+  foreach ($properties_show as $property_name) {
+    // view() method builds a #theme 'field' render array for the field values.
+    // @see FieldItemListInterface::view()
+    $user_build_properties[$property_name] = $owner->get($property_name)->view();
+  }
+
+  // The fields have already been sorted above. Inject these at the top for now.
+  $variables['content_user'] = array_merge($user_build_properties, $variables['content_user']);
+
+  // -----------------
+  // Retrieve field/property values off user entity, for use in template.
+  // 2016-09-08, Tory -
+  // TODO: deprecate this? would need to check/adjust site themes'
+  // competition_entry templates if so.
+  $variables['user_field_values'] = [];
+
+  $properties_show = [
+    'name',
+    'mail',
+  ];
+
+  foreach ($owner->toArray() as $property_name => $values) {
+    if (strpos($property_name, 'field_') === 0 || in_array($property_name, $properties_show)) {
+      // Stick with simple-structured fields for now.
+      if (!isset($values[0]['value'])) {
+        continue;
+      }
+
+      if (count($values) == 1) {
+        $variables['user_field_values'][$property_name] = $values[0]['value'];
+      }
+      elseif (count($values) > 1) {
+        // Just provide a flat array for now, e.g. for imploding.
+        foreach ($values as $value) {
+          $variables['user_field_values'][$property_name][] = $value['value'];
+        }
+      }
+    }
+  }
+  // -----------------.
+  // Helpful $content variable for templates.
+  foreach (Element::children($variables['elements']) as $key) {
+    $variables['content'][$key] = $variables['elements'][$key];
+  }
+
+  $variables['url'] = Url::fromRoute(
+        'entity.competition_entry.canonical', [
+          'competition_entry' => $competition_entry->id(),
+        ]
+    )->toString();
+
+}
+
+/**
+ * Prepares variables for a custom entity type creation list templates.
+ *
+ * Default template: competition-list.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - content: An array of competition_entry-types.
+ *
+ * @see block_content_add_page()
+ */
+function template_preprocess_competition_list(array &$variables) {
+  $variables['types'] = array();
+  $query = \Drupal::request()->query->all();
+  foreach ($variables['content'] as $type) {
+    $variables['types'][$type->id()] = array(
+      'link' => Link::fromTextAndUrl(
+        $type->label(), new Url(
+            'entity.competition_entry.add_form', array(
+              'competition' => $type->id(),
+            ), array('query' => $query)
+        )
+      ),
+      'description' => array(
+        '#markup' => $type->label(),
+      ),
+      'title' => $type->label(),
+      'localized_options' => array(
+        'query' => $query,
+      ),
+    );
+  }
+}
+
+/**
+ * Prepare variables for competition entry archives template.
+ *
+ * Provided variables:
+ * - competition - the \Drupal\competition\Entity\Competition entity by which
+ *   the archives view is filtered
+ * - cycles_filter - array of one or more cycle keys by which the view is
+ *   currently filtered (as extracted from URL arg)
+ * - cycles_archived - array of cycle keys => labels for all cycles that are
+ *   archived in this competition.
+ *
+ * @see CompetitionEntryController::displayArchives()
+ * @see competition_entry-archives.html.twig
+ */
+function template_preprocess_competition_entry_archives_page(array &$variables) {
+
+  /* @var \Drupal\competition\Entity\Competition $competition */
+  $competition = $variables['competition'];
+
+  // Set up for per-cycle filter links.
+  $cycles_all = \Drupal::configFactory()
+    ->get('competition.settings')
+    ->get('cycles');
+  $cycles_archived = array_intersect_key($cycles_all, $competition->getCyclesArchived());
+
+  // Assume that cycles are defined in the settings in oldest-to-newest order
+  // (as competition.settings.yml demonstrates); reverse the order here as newer
+  // cycles are more relevant.
+  $cycles_archived = array_reverse($cycles_archived, TRUE);
+
+  $variables['cycle_filter_links'] = [];
+  foreach ($cycles_archived as $cycle => $label) {
+    $variables['cycle_filter_links'][] = [
+      'cycle' => $cycle,
+      'href' => '/competition/' . $competition->id() . '/archives/' . $cycle,
+      'text' => $label,
+      'active' => (in_array($cycle, $variables['cycles_filter'])),
+    ];
+  }
+}
+
+/**
+ * Implements hook_entity_type_build().
+ */
+function competition_entity_type_build(array &$entity_types) {
+  $entity_types['competition_entry']->setListBuilderClass('Drupal\competition\CompetitionEntryListBuilder');
+}
+
+/**
+ * Get a competition module value stored via user.data service.
+ *
+ * @param int $uid
+ *   User ID.
+ * @param string $key
+ *   Key.
+ *
+ * @return mixed|null
+ *   The value stored in this named key for the given user; NULL if none found.
+ *
+ * @see \Drupal\user\UserData::get()
+ */
+function _competition_user_data_get($uid, $key) {
+  return \Drupal::service('user.data')->get('competition', $uid, $key);
+}
+
+/**
+ * Set a competition module value stored via user.data service.
+ *
+ * @param int $uid
+ *   User ID.
+ * @param string $key
+ *   Key.
+ * @param mixed $value
+ *   Value.
+ *
+ * @see \Drupal\user\UserData::set()
+ */
+function _competition_user_data_set($uid, $key, $value) {
+  \Drupal::service('user.data')->set('competition', $uid, $key, $value, TRUE);
+}
+
+/**
+ * Implements hook_entity_base_field_info_alter().
+ *
+ * This overrides core's UserName constraint which blocks the '+' character from
+ * use in usernames. A '+' is valid in an email address, and if a competition
+ * is set to use email as username, it could run into this validation error.
+ * So we replace with a copy of the constraint, altered only to allow '+'.
+ *
+ * @see User::baseFieldDefinitions
+ * @see UserNameConstraint
+ *
+ * TODO: core is already patched to allow this:
+ * https://www.drupal.org/node/2157963 but we currently don't require 8.2.x.
+ */
+function competition_entity_base_field_info_alter(&$fields, EntityTypeInterface $entity_type) {
+  if ($entity_type->id() == 'user') {
+    /* @var \Drupal\Core\Field\BaseFieldDefinition $field_definition */
+    $field_definition = $fields['name'];
+
+    // Check for desired object instance, because $fields is an array of objects
+    // supposedly instances of FieldDefinitionInterface but not necessarily
+    // BaseFieldDefinition.
+    // @see https://www.drupal.org/node/2346329
+    if ($field_definition instanceof BaseFieldDefinition) {
+      $constraints = $field_definition->getConstraints();
+
+      unset($constraints['UserName']);
+
+      $constraints['UserNamePlus'] = array();
+
+      $field_definition->setConstraints($constraints);
+    }
+  }
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ *
+ * Move our hook_form_alter() to run first so we can store competition entity
+ * into form state for user-related forms.
+ */
+function competition_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'form_alter') {
+    $module = 'competition';
+    $key = array_search($module, $implementations);
+    if ($key !== FALSE) {
+      unset($implementations[$key]);
+      array_unshift($implementations, $module);
+    }
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * - Set cache context for user register, login, password forms to use URL query
+ *   args.
+ *
+ * - Attempt to retrieve active competition and store as property 'competition'
+ *   in $form_state.
+ */
+function competition_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+
+  switch ($form_id) {
+    case 'user_register_form':
+    case 'user_login_form':
+    case 'user_pass':
+      // (User account edit form)
+    case 'user_form':
+
+      // Cache differently based on query params.
+      $form['#cache']['contexts'] = [
+        'url.query_args',
+      ];
+
+      // Try to determine the active competition, to which the user forms
+      // currently pertain.
+      /* @var \Drupal\competition\Entity\Competition $competition */
+      $competition = NULL;
+
+      /* @var \Drupal\competition\CompetitionManager $competitionMgr */
+      $competitionMgr = \Drupal::service('competition.manager');
+
+      // 1. Check if we're on '/competition/{competition}/register' or
+      // '/competition/{competition}/login' path.
+      // (If a site has multiple simultaneous open competitions, these paths
+      // should be used over core's /user/register to ensure the desired
+      // competition is used throughout form alteration.)
+      /* @var \Drupal\Core\Routing\RouteMatchInterface $route_match */
+      $route_match = \Drupal::routeMatch();
+      if (in_array($route_match->getRouteName(), ['competition.user_register', 'competition.user_login'])) {
+        $competition = $route_match->getParameter('competition');
+      }
+
+      // 2. Check destination path, e.g. 'competition/{competition}/enter'.
+      if (empty($competition)) {
+        $destination = \Drupal::request()->query->get('destination');
+        if (!empty($destination)) {
+          $competition = $competitionMgr->getCompetitionFromUrl($destination);
+        }
+      }
+
+      // 3. Fall back to the currently open competition - if there's only one.
+      if (empty($competition)) {
+        $competitions_open = $competitionMgr->getCompetitions(CompetitionInterface::STATUS_OPEN, TRUE);
+        if (count($competitions_open) == 1) {
+          $competition = reset($competitions_open);
+        }
+      }
+
+      if (!empty($competition)) {
+        $form_state->set('competition', $competition);
+      }
+
+      break;
+
+  }
+
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Note that this alter runs for:
+ * - form id 'user_form' (the user edit form)
+ * - base form id 'user_form', form id 'user_register_form'
+ *
+ * If user is registering or already registered for a competition that uses
+ * email as username, hide/disable username field as appropriate.
+ */
+function competition_form_user_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+
+  $is_register = ($form_id == 'user_register_form');
+
+  if (!empty($form['account']['name'])) {
+
+    $use_email = FALSE;
+
+    /* @var \Drupal\user\UserInterface $account */
+    $account = NULL;
+    if (!$is_register) {
+      $account = $form_state->getFormObject()->getEntity();
+    }
+
+    // Do not enforce using email for the site root account - it may be
+    // desirable to retain a custom username.
+    if (!empty($account) && $account->id() == 1) {
+      return;
+    }
+
+    /* @var \Drupal\competition\Entity\Competition $competition */
+    $competition = $form_state->has('competition') ? $form_state->get('competition') : NULL;
+
+    // If in a competition context, check competition's setting.
+    if (!empty($competition)) {
+      $limits = $competition->getEntryLimits();
+      if (isset($limits->email_as_username) && $limits->email_as_username) {
+        $use_email = TRUE;
+      }
+    }
+
+    // If editing existing user, check their registration data.
+    if (!empty($account)) {
+      $use_email = _competition_user_data_get($account->id(), 'email_as_username');
+    }
+
+    if ($use_email) {
+
+      // Change username field to a back-end-only value.
+      $form['account']['name']['#type'] = 'value';
+
+      if ($is_register) {
+
+        // Since field is required and must be unique across all accounts,
+        // fill it with a temporary value that won't generate a validation
+        // error.
+        $form['account']['name']['#value'] = uniqid('', TRUE);
+
+      }
+
+      // Add an explanation for admins.
+      if (\Drupal::currentUser()->hasPermission('administer users')) {
+
+        if (!empty($competition)) {
+          $form['account']['mail']['#description'] .= "<br/>" . t(
+          '<em>Admin note:</em> The <a href=":competition_settings_url">current competition is configured</a> to use the account email address for login and registration. The account username is automatically set to the email address value, so it is not editable here.', [
+            ':competition_settings_url' => Url::fromRoute(
+            'entity.competition.edit_form', [
+              'competition' => $competition->id(),
+            ]
+            )->toString(),
+          ]
+          );
+        }
+        else {
+          $form['account']['mail']['#description'] .= "<br/>" . t(
+          '<em>Admin note:</em> This user registered for a <a href=":competition_list_url">competition</a> that is configured to use the account email address for login and registration. The account username is automatically set to the email address value, so it is not editable here.', [
+            ':competition_list_url' => Url::fromRoute('entity.competition.collection')->toString(),
+          ]
+          );
+        }
+
+      }
+
+      // Inject this submit handler first, so it can alter form state value
+      // before user entity is saved.
+      array_unshift($form['actions']['submit']['#submit'], 'competition_user_form_submit_set_username_to_email');
+
+      // Append this submit handler, so it can save to user data after the
+      // user entity is saved (and thus has an ID).
+      if ($is_register) {
+        $form['actions']['submit']['#submit'][] = 'competition_user_form_submit_record_email_as_username';
+      }
+
+    }
+  }
+}
+
+/**
+ * Custom submit handler.
+ *
+ * Used by `user_register_form` and `user_form`
+ *
+ * Copies email address value to username value.
+ */
+function competition_user_form_submit_set_username_to_email($form, FormStateInterface $form_state) {
+  $value_mail = $form_state->getValue('mail');
+  $value_name = $form_state->getValue('name');
+  if (!empty($value_mail) && $value_name != $value_mail) {
+    $form_state->setValue('name', $value_mail);
+  }
+}
+
+/**
+ * Custom submit handler for user_register_form.
+ *
+ * Records in user data that this account uses email as username.
+ *
+ * @see competition_form_user_form_alter()
+ */
+function competition_user_form_submit_record_email_as_username($form, FormStateInterface $form_state) {
+  $account = $form_state->getFormObject()->getEntity();
+  _competition_user_data_set($account->id(), 'email_as_username', TRUE);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for 'user_login_form'.
+ *
+ * If current competition is set to use email for username, re-label username
+ * field.
+ */
+function competition_form_user_login_form_alter(&$form, FormStateInterface $form_state) {
+
+  if (!empty($form['name'])) {
+
+    // Determine whether open competition(s) on this site use username, email,
+    // or a mix.
+    $which = NULL;
+
+    if ($form_state->has('competition')) {
+      $limits = $form_state->get('competition')->getEntryLimits();
+      if (isset($limits->email_as_username) && $limits->email_as_username) {
+        $which = 'email';
+      }
+    }
+    else {
+      /* @var \Drupal\competition\CompetitionManager $competitionMgr */
+      $competitionMgr = \Drupal::service('competition.manager');
+      $competitions_open = $competitionMgr->getCompetitions(CompetitionInterface::STATUS_OPEN, TRUE);
+      if (count($competitions_open) > 1) {
+        foreach ($competitions_open as $competition) {
+          $limits = $competition->getEntryLimits();
+          $email = (isset($limits->email_as_username) && $limits->email_as_username);
+
+          if (empty($which)) {
+            $which = ($email ? 'email' : 'username');
+          }
+          else {
+            if (($which == 'email' && !$email) || ($which == 'username' && $email)) {
+              $which = 'mixed';
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    if (!empty($which)) {
+      $site_name = \Drupal::config('system.site')->get('name');
+
+      switch ($which) {
+
+        case 'email':
+          $form['name']['#title'] = t("Email address");
+
+          // Replace "username" mentions.
+          if (isset($form['name']['#description'])) {
+            $form['name']['#description'] = t(
+            "Enter your @site_name account email address.", [
+              '@site_name' => $site_name,
+            ]
+            );
+          }
+          if (!empty($form['pass']) && isset($form['pass']['#description'])) {
+            $form['pass']['#description'] = t("Enter the password for your account.");
+          }
+
+          break;
+
+        case 'mixed':
+          // If there are multiple open competitions with different user/email
+          // settings, it's clearest to use the per-competition login forms.
+          $form['name']['#title'] = t("Username or Email address");
+          $form['name']['#description'] = t(
+            "Enter your @site_name account username, or email address if you do not have a username.", [
+              '@site_name' => $site_name,
+            ]
+          );
+
+          if (!empty($form['pass']) && isset($form['pass']['#description'])) {
+            $form['pass']['#description'] = t("Enter the password for your account.");
+          }
+
+          break;
+
+        case 'username':
+        default:
+
+          break;
+
+      }
+    }
+
+  }
+
+  $form['#submit'][] = 'competition_form_user_login_form_submit';
+
+}
+
+/**
+ * Custom user user login handler.
+ */
+function competition_form_user_login_form_submit(&$form, FormStateInterface $form_state) {
+
+  // Redirect judging users to entries list page, if judging is enabled.
+  $user = \Drupal::currentUser();
+  if ($user->hasPermission('judge competition entries') || $user->hasPermission('administer competition judging')) {
+
+    $roles = $user->getRoles();
+
+    // Determine a competition to which to redirect judge.
+    $competition = NULL;
+    $assigned = [];
+
+    /* @var \Drupal\competition\CompetitionJudgingSetup $judging_setup */
+    $judging_setup = \Drupal::service('competition.judging_setup');
+
+    if ($form_state->has('competition')) {
+      // 1. Check if form has a specific competition.
+      $competition = $form_state->get('competition');
+
+      // ...but only use it if this judge is assigned.
+      if (!$judging_setup->isJudgeAssignedCompetition($competition->id(), $user->id())) {
+        $competition = NULL;
+      }
+    }
+    else {
+      // 2. Get competitions to which this judge is assigned.
+      $assigned = $judging_setup->getJudgeAssignedCompetitions($user->id());
+      if (count($assigned) == 1) {
+        $competition = reset($assigned);
+      }
+    }
+
+    // Determine a callback parameter if in a single competition context.
+    $callback = NULL;
+    if (!empty($competition)) {
+      $judging = $competition->getJudging();
+
+      // In single competition context, go directly to relevant judging
+      // Assignments or Round N page.
+      if ($judging->enabled && !empty($judging->active_round)) {
+        if ($user->hasPermission('administer competition judging')) {
+          $callback = 'round-' . $judging->active_round;
+        }
+        else {
+          $callback = 'assignments';
+        }
+      }
+    }
+
+    // If the user's role is likely primarily in judging, redirect to the
+    // judging area. The page callback handles appropriate redirections based
+    // on current judging context and user role.
+    // @see CompetitionEntryController::adminJudging()
+    if ((in_array('competition_judge', $roles) || in_array('competition_judge_leader', $roles)) && !in_array('administrator', $roles)) {
+
+      $route_params = [];
+
+      if (!empty($competition)) {
+        $route_params['competition'] = $competition->id();
+        $route_params['callback'] = $callback;
+      }
+
+      $form_state->setRedirect('entity.competition_entry.judging', $route_params);
+
+    }
+
+  }
+
+}
+
+/**
+ * Implements hook_menu_local_tasks_alter().
+ */
+function competition_menu_local_tasks_alter(&$data, $route_name) {
+
+  if (empty($data['tabs'][0])) {
+    return;
+  }
+
+  $tabs = &$data['tabs'][0];
+
+  /* @var \Drupal\competition\CompetitionManager $competitionMgr */
+  $competitionMgr = \Drupal::service('competition.manager');
+  $open = $competitionMgr->getCompetitions(Competition::STATUS_OPEN);
+
+  // If there are multiple open competitions using separate registration URLs,
+  // it becomes more complicated to have 3 simple login/register/password tabs.
+  if (count($open) > 1) {
+
+    // Multiple open competitions should use per-competition register route.
+    // On core login or reset-password tab, hide core register tab (which does
+    // not "know" which competition to use).
+    if (($route_name == 'user.login' || $route_name == 'user.pass') && !empty($tabs['user.register'])) {
+      unset($tabs['user.register']);
+    }
+
+  }
+
+}
+
+/**
+ * Implements hook_query_TAG_alter() for 'competition_entry_archives'.
+ *
+ * This tag is applied to the `competition_entry` view,
+ * `embed_archives` display. It adds condition to limit to entries in
+ * archived cycles.
+ *
+ * Note: Currently, the archives page (displayed on custom route) limits to only
+ * one cycle anyway. However, the embed view could be used other ways.
+ *
+ * Note: There are a couple of potential holes in this method:
+ * - Views' QueryBase is an abstract class, only extended by one class in core,
+ *   Sql. This attaches the ViewExecutable as metadata on the query. Any other
+ *   extending class may not do so (although they should).
+ * - The $query arg must only be AlterableInterface, which does not provide
+ *   methods for altering query conditions.
+ */
+function competition_query_competition_entry_archives_alter(AlterableInterface $query) {
+  // @see Drupal\views\Plugin\views\query\Sql::execute()
+  /* @var \Drupal\views\ViewExecutable $viewEx */
+  $view_ex = $query->getMetaData('view');
+  if (empty($view_ex)) {
+    return;
+  }
+
+  /* @var \Drupal\views\Entity\View $view_entity */
+  $view_entity = $view_ex->storage;
+
+  // This holds a display's configuration; it's not an object though.
+  /* @var array $display */
+  $display = $view_entity->getDisplay($view_ex->current_display);
+
+  // The arguments stored in $view_ex->args are not keyed by what they're
+  // actually going to filter - so, check the display config to find the
+  // arg (contextual filter) for competition_entry type, i.e. competition ID.
+  // (This should always be there, but sites/modules could alter the view...)
+  $type_arg_index = NULL;
+  if (!empty($display['display_options']['arguments'])) {
+    foreach (array_keys($display['display_options']['arguments']) as $i => $argument_name) {
+      if ($argument_name == 'type') {
+        $type_arg_index = $i;
+        break;
+      }
+    }
+  }
+
+  // Assuming we found the arg, load the competition and apply filtering to
+  // only the archived cycles.
+  if (!is_null($type_arg_index) && !empty($view_ex->args[$type_arg_index])) {
+
+    $competition = \Drupal::service('competition.manager')->getCompetition($view_ex->args[$type_arg_index]);
+    $cycles_archived = $competition->getCyclesArchived();
+    if (!empty($cycles_archived)) {
+      // $query is hopefully an instance of something with a condition method.
+      if ($query instanceof ConditionInterface) {
+        $query->condition('competition_entry.cycle', array_keys($cycles_archived), 'IN');
+      }
+    }
+
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for 'views_exposed_form'.
+ */
+function competition_form_views_exposed_form_alter(&$form, &$form_state) {
+  if ($form['#form_id'] == 'views_exposed_form') {
+    $form['#cache']['contexts'] = ['url.query_args'];
+    if (isset($form['cycle'])) {
+      $input = $form_state->getUserInput();
+
+      $cycles = \Drupal::configFactory()->get('competition.settings')->get('cycles');
+      $cycle_list = array('All' => '- All -');
+      foreach ($cycles as $key => $label) {
+        $cycle_list[$key] = $label;
+      }
+      $form['cycle'] = array(
+        '#type' => "select",
+        '#options' => $cycle_list,
+        '#value' => (isset($input['cycle']) ? $input['cycle'] : "All"),
+      );
+
+      $statuses = \Drupal::configFactory()->get('competition.settings')->get('statuses');
+      $status_list = array('All' => '- All -');
+      foreach ($statuses as $key => $label) {
+        $status_list[$key] = $label;
+      }
+      $form['status'] = array(
+        '#type' => "select",
+        '#options' => $status_list,
+        '#value' => (isset($input['status']) ? $input['status'] : "All"),
+      );
+
+      // Add "Export" button.
+      $form['actions']['export'] = array(
+        '#type' => 'submit',
+        '#value' => t('Export'),
+        '#weight' => 100,
+        '#submit' => [
+          '::submitForm',
+          'competition_form_views_exposed_form_submit',
+        ],
+      );
+    }
+  }
+}
+
+/**
+ * Custom submit handler for views_exposed_form.
+ *
+ * Redirects to generate report with the form inputs as filter values.
+ */
+function competition_form_views_exposed_form_submit($form, FormStateInterface $form_state) {
+
+  $input = $form_state->getValues();
+
+  // Unset "All" or null values that come from views_exposed_form.
+  foreach ($input as $key => $value) {
+    if (strtolower($value) == 'all' || $value == '') {
+      unset($input[$key]);
+    }
+  }
+
+  $form_state->disableRedirect(FALSE);
+  $form_state->setRedirect('entity.competition_entry.report_generate', $input);
+
+}

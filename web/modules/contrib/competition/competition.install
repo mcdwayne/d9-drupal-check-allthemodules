@@ -1,0 +1,627 @@
+<?php
+
+/**
+ * @file
+ * Contains competition.install.
+ */
+
+use Drupal\Core\Database\Database;
+use Drupal\Core\Utility\UpdateException;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Site\Settings;
+use Drupal\Core\Url;
+use Drupal\competition\CompetitionEntryInterface;
+use Drupal\competition\CompetitionReporter;
+use Drupal\competition\CompetitionJudgingSetup;
+
+/**
+ * Implements hook_uninstall().
+ *
+ * Note that module need not remove tables it defines in its hook_schema()
+ * implementation - those are handled by Drupal's uninstall process.
+ */
+function competition_uninstall() {
+  // Remove states.
+  // @see CompetitionReporter::getReportDataLastUpdated().
+  // @see CompetitionReporter::setReportDataLastUpdated().
+  \Drupal::state()->delete('competition.report_data_last_updated');
+}
+
+/**
+ * Implements hook_schema().
+ */
+function competition_schema() {
+
+  // Define fields we will use in multiple custom tables.
+  $fields = [
+    'type' => [
+      'description' => 'Competition entry type/bundle (competition entity ID)',
+      // @see EntityReferenceItem::schema()
+      'type' => 'varchar_ascii',
+      'length' => EntityTypeInterface::BUNDLE_MAX_LENGTH,
+      'not null' => TRUE,
+      // Not sure where to dredge up whatever default core uses, but what
+      // else could make sense?
+      'default' => '',
+    ],
+    'cycle' => [
+      'description' => 'Competition entry cycle value',
+      // @see ListStringItem::schema()
+      'type' => 'varchar',
+      'length' => 255,
+      'not null' => TRUE,
+      // @see CompetitionEntry::baseFieldDefinitions()
+      'default' => '2015',
+    ],
+    'ceid' => [
+      'description' => 'Competition entry entity ID',
+      'type' => 'int',
+      'unsigned' => TRUE,
+      'not null' => TRUE,
+      'default' => 0,
+    ],
+    'status' => [
+      'description' => 'Competition entry status value',
+      // @see ListStringItem::schema()
+      'type' => 'varchar',
+      'length' => 255,
+      'not null' => TRUE,
+      // @see CompetitionEntry::baseFieldDefinitions()
+      'default' => CompetitionEntryInterface::STATUS_CREATED,
+    ],
+  ];
+
+  // Define the report data table.
+  // This single table holds "flattened" competition entry and user entities -
+  // one row = one entity's field values.
+  // The only user entities in here are those without any competition entry;
+  // for these, `ceid` is 0, and `type`, `cycle`, `status` are NULL.
+  // @see CompetitionEntry::baseFieldDefinitions()
+  $schema[CompetitionReporter::REPORT_TABLE] = [
+    'description' => 'Store competition entry and user field values, one entity per row, for reports',
+    'fields' => [
+      // For 'type', 'cycle', 'status' - allow NULL, for user rows.
+      'type' => array_merge($fields['type'], [
+        'not null' => FALSE,
+        'default' => NULL,
+      ]),
+      'cycle' => array_merge($fields['cycle'], [
+        'not null' => FALSE,
+        'default' => NULL,
+      ]),
+      'ceid' => array_merge($fields['ceid'], [
+        'not null' => TRUE,
+        'default' => 0,
+      ]),
+      'uid' => [
+        'description' => 'User entity ID',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ],
+      'status' => array_merge($fields['status'], [
+        'not null' => FALSE,
+        'default' => NULL,
+      ]),
+      'exported' => [
+        'description' => 'Timestamp at which this record was exported',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ],
+      // Provide a good amount of space here.
+      'data' => [
+        'description' => 'JSON string of all other entry/user field values',
+        'type' => 'text',
+        // Should hold 16MB, according to Drupal/MySQL docs.
+        'size' => 'medium',
+        'not null' => TRUE,
+      ],
+    ],
+    'primary key' => ['uid', 'ceid'],
+  ];
+
+  // Define the judging report data table.
+  // This holds mostly "flattened" judging-related data in 3 types of rows:
+  // - score row - judge assignments, score values, score finalized
+  //   (1 per judge, per round, per entry; all entries in any judging round)
+  // - logs row - all judging log messages for an entry
+  //   (1 per entry; all entries in any judging round).
+  // - votes row - total number of votes for entry in voting round
+  //   (1 per round, per entry; all entries in any voting round).
+  $schema[CompetitionReporter::REPORT_JUDGING_TABLE] = [
+    'description' => 'Store competition entry judging data, mostly flattened, for reporting.',
+    'fields' => [
+      'type' => $fields['type'],
+      'cycle' => $fields['cycle'],
+      'ceid' => $fields['ceid'],
+      'user_name' => [
+        'description' => 'Entry owner (user) entity name property',
+        'type' => 'varchar',
+        'length' => USERNAME_MAX_LENGTH,
+        'not null' => TRUE,
+        // Not sure where to dredge up whatever default core uses, but what
+        // else could make sense?
+        'default' => '',
+      ],
+      'round_id' => [
+        'description' => 'Judging round number',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'default' => NULL,
+      ],
+      'judge_name' => [
+        'description' => 'Judge (user) entity name property',
+        'type' => 'varchar',
+        'length' => USERNAME_MAX_LENGTH,
+        'default' => NULL,
+      ],
+      'score' => [
+        'description' => 'Judge score values for this entry/round',
+        // Give this a little extra space as precaution.
+        // Drupal docs say this is stored in MySQL as: text, 16 KB.
+        'type' => 'text',
+        'size' => 'normal',
+        'default' => NULL,
+      ],
+      'score_finalized' => [
+        'description' => 'Boolean whether judge score for entry/round is complete and final',
+        'type' => 'int',
+        'size' => 'tiny',
+        'default' => NULL,
+      ],
+      'votes' => [
+        'description' => 'Total votes for this entry in this voting round',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'default' => NULL,
+      ],
+      'log' => [
+        'description' => 'Judging log messages for this entry, in all rounds',
+        // Give this a good amount of space.
+        // Drupal docs say it's stored in MySQL as: mediumtext, 16KB.
+        'type' => 'text',
+        'size' => 'medium',
+        'default' => NULL,
+      ],
+      'exported' => [
+        'description' => 'Timestamp at which this record was exported',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ],
+    ],
+
+    // Skipping primary key for this table - it's too sparse.
+  ];
+
+  $schema[CompetitionJudgingSetup::INDEX_TABLE] = [
+    'description' => 'Store competition entry average score, one entity & round per row, for judging.',
+    'fields' => [
+      'ceid' => $fields['ceid'],
+      'scores_round' => [
+        'description' => 'Judging round number',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ],
+      'scores_finalized' => [
+        'description' => 'Number of finalized scores',
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ],
+      'scores_computed' => [
+        'description' => 'Average of all finalized scores',
+        'type' => 'float',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ],
+      'votes' => [
+        'type' => 'int',
+        'description' => 'Total votes for this entry in this voting round',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'default' => NULL,
+      ],
+    ],
+    'primary key' => ['ceid', 'scores_round'],
+  ];
+
+  return $schema;
+
+}
+
+/**
+ * Implements hook_requirements().
+ */
+function competition_requirements($phase) {
+
+  // Since we don't pass a default, this returns NULL if the value isn't set in
+  // settings.php.
+  $file_private_path = Settings::get('file_private_path');
+  if (empty($file_private_path)) {
+    $requirements['competition_private_files'] = [
+      'title' => t("Competition - private file system"),
+      'severity' => REQUIREMENT_ERROR,
+      'value' => t('Private file system path not configured'),
+      'description' => t('Private file system path is required for competition entry exporting. Please configure %key in settings.php.', ['%key' => '$settings[\'file_private_path\']']),
+    ];
+  }
+  else {
+    $requirements['competition_private_files'] = [
+      'title' => t("Competition - private file system"),
+      'severity' => REQUIREMENT_OK,
+      'value' => t('<a href=":admin_file_system_url">Private file system path</a> is configured.', [
+        ':admin_file_system_url' => Url::fromRoute('system.file_system_settings')->toString(),
+      ]),
+      'description' => t('(Private file system is required for competition entry exporting.)'),
+    ];
+  }
+
+  return $requirements;
+
+}
+
+/**
+ * Adds the competition_entry.ceid_referrer column.
+ */
+function competition_update_8101() {
+  Database::getConnection()
+    ->schema()
+    ->addField('competition_entry', 'ceid_referrer', [
+      'type' => 'int',
+      'label' => 'ID referrer',
+      'description' => 'Indicates if the Competition entry is a referral triggered by another entry.',
+      'not null' => FALSE,
+      'initial' => NULL,
+    ]);
+}
+
+/**
+ * Adds the competition_entry.status column.
+ */
+function competition_update_8102() {
+  Database::getConnection()
+    ->schema()
+    ->addField('competition_entry', 'status', [
+      'type' => 'int',
+      'label' => 'Status',
+      'description' => 'The Competition entry status.',
+      'not null' => TRUE,
+      'initial' => 0,
+    ]);
+}
+
+/**
+ * Adds the competition_entry.weight column.
+ */
+function competition_update_8106() {
+  Database::getConnection()
+    ->schema()
+    ->addField('competition_entry', 'weight', [
+      'type' => 'int',
+      'label' => 'Weight',
+      'description' => 'A weight value for custom sorting, to be assigned by admins.',
+      'initial' => 0,
+    ]);
+}
+
+/**
+ * Add the `competition_entry_report_data` table.
+ */
+function competition_update_8107() {
+
+  // Per documentation, any new tables/fields should be (re)defined in the
+  // update hook, since the values returned by hook_schema() implementation
+  // must always be the latest version, while this must match the state of the
+  // module at this point.
+  $table = [
+    'description' => 'Store competition entry and user field values, one entity per row, for reports',
+    'fields' => [
+      'type' => [
+        'description' => 'Competition entry type/bundle (competition entity ID)',
+        // @see EntityReferenceItem::schema()
+        'type' => 'varchar_ascii',
+        'length' => EntityTypeInterface::BUNDLE_MAX_LENGTH,
+        'default' => NULL,
+      ],
+      'cycle' => [
+        'description' => 'Competition entry cycle value',
+        // @see ListStringItem::schema()
+        'type' => 'varchar',
+        'length' => 255,
+        'default' => NULL,
+      ],
+      'ceid' => [
+        'description' => 'Competition entry entity ID',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ],
+      'uid' => [
+        'description' => 'User entity ID',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ],
+      'status' => [
+        'description' => 'Competition entry status value',
+        // @see ListStringItem::schema()
+        'type' => 'varchar',
+        'length' => 255,
+        'default' => NULL,
+      ],
+      'exported' => [
+        'description' => 'Timestamp at which this record was exported',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ],
+      // Provide a good amount of space here.
+      'data' => [
+        'description' => 'JSON string of all other entry/user field values',
+        'type' => 'text',
+        // Should hold 16MB, according to Drupal/MySQL docs.
+        'size' => 'medium',
+        'not null' => TRUE,
+      ],
+    ],
+    'primary key' => ['uid', 'ceid'],
+  ];
+
+  $message = '';
+
+  try {
+    Database::getConnection()
+      ->schema()
+      ->createTable(CompetitionReporter::REPORT_TABLE, $table);
+
+    $message = t("Report data table %table_name added to database.", [
+      '%table_name' => CompetitionReporter::REPORT_TABLE,
+    ]);
+  }
+  catch (\Exception $e) {
+    // createTable() throws \Drupal\Core\Database\SchemaObjectExistsException
+    // if the table already exists.
+    throw new UpdateException($e->getMessage());
+  }
+
+  if (!empty($message)) {
+    return $message;
+  }
+}
+
+/**
+ * Adds the competition_entry_index table.
+ */
+function competition_update_8109() {
+
+  $connection = Database::getConnection();
+
+  if ($connection->schema()->tableExists('competition_entry_judging_assignment')) {
+    $connection->schema()->dropTable('competition_entry_judging_assignment');
+  }
+  if ($connection->schema()->tableExists('competition_entry_judging_average_scores_index')) {
+    $connection->schema()->dropTable('competition_entry_judging_average_scores_index');
+  }
+
+  try {
+    $schema = competition_schema();
+
+    $connection
+      ->schema()
+      ->createTable(CompetitionJudgingSetup::INDEX_TABLE, $schema[CompetitionJudgingSetup::INDEX_TABLE]);
+
+    $message = t("%table_name added to database.", [
+      '%table_name' => CompetitionJudgingSetup::INDEX_TABLE,
+    ]);
+  }
+  catch (\Exception $e) {
+    throw new UpdateException($e->getMessage());
+  }
+
+  if (!empty($message)) {
+    return $message;
+  }
+
+}
+
+/**
+ * Adds the competition_entry.data column if not exists.
+ */
+function competition_update_8110() {
+
+  $schema = Database::getConnection()
+    ->schema();
+
+  if (!$schema->fieldExists('competition_entry', 'data')) {
+    $schema
+      ->addField('competition_entry', 'data', [
+        'type' => 'text',
+        'size' => 'medium',
+        'label' => 'Data',
+        'description' => 'JSON string of all other entry/user field values',
+        'not null' => FALSE,
+      ]);
+  }
+
+}
+
+/**
+ * Adds the `competition_entry_index` table if not exists.
+ */
+function competition_update_8111() {
+  if (!Database::getConnection()->schema()->tableExists(CompetitionJudgingSetup::INDEX_TABLE)) {
+    competition_update_8109();
+  }
+}
+
+/**
+ * Adds the `competition_entry_report_judging_data` table.
+ */
+function competition_update_8112() {
+
+  // Per documentation, any new tables/fields should be (re)defined in the
+  // update hook, since the values returned by hook_schema() implementation
+  // must always be the latest version, while this must match the state of the
+  // module at this point.
+  $table = [
+    'description' => 'Store competition entry judging data, mostly flattened, for reporting.',
+    'fields' => [
+      'type' => [
+        'description' => 'Competition entry type/bundle (competition entity ID)',
+        // @see EntityReferenceItem::schema()
+        'type' => 'varchar_ascii',
+        'length' => EntityTypeInterface::BUNDLE_MAX_LENGTH,
+        'not null' => TRUE,
+        // Not sure where to dredge up whatever default core uses, but what
+        // else could make sense?
+        'default' => '',
+      ],
+      'cycle' => [
+        'description' => 'Competition entry cycle value',
+        // @see ListStringItem::schema()
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => TRUE,
+        // @see CompetitionEntry::baseFieldDefinitions()
+        'default' => '2015',
+      ],
+      'ceid' => [
+        'description' => 'Competition entry entity ID',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ],
+      'user_name' => [
+        'description' => 'Entry owner (user) entity name property',
+        'type' => 'varchar',
+        'length' => USERNAME_MAX_LENGTH,
+        'not null' => TRUE,
+        // Not sure where to dredge up whatever default core uses, but what
+        // else could make sense?
+        'default' => '',
+      ],
+      'round_id' => [
+        'description' => 'Judging round number',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'default' => NULL,
+      ],
+      'judge_name' => [
+        'description' => 'Judge (user) entity name property',
+        'type' => 'varchar',
+        'length' => USERNAME_MAX_LENGTH,
+        'default' => NULL,
+      ],
+      'score' => [
+        'description' => 'Judge score values for this entry/round',
+        // Give this a little extra space as precaution.
+        // Drupal docs say this is stored in MySQL as: text, 16 KB.
+        'type' => 'text',
+        'size' => 'normal',
+        'default' => NULL,
+      ],
+      'score_finalized' => [
+        'description' => 'Boolean whether judge score for entry/round is complete and final',
+        'type' => 'int',
+        'size' => 'tiny',
+        'default' => NULL,
+      ],
+      'votes' => [
+        'description' => 'Total votes for this entry in this voting round',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'default' => NULL,
+      ],
+      'log' => [
+        'description' => 'Judging log messages for this entry, in all rounds',
+        // Give this a good amount of space.
+        // Drupal docs say it's stored in MySQL as: mediumtext, 16KB.
+        'type' => 'text',
+        'size' => 'medium',
+        'default' => NULL,
+      ],
+      'exported' => [
+        'description' => 'Timestamp at which this record was exported',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ],
+    ],
+
+  ];
+
+  $message = '';
+
+  try {
+    Database::getConnection()
+      ->schema()
+      ->createTable(CompetitionReporter::REPORT_JUDGING_TABLE, $table);
+
+    $message = t("Table %table_name added to database.", [
+      '%table_name' => CompetitionReporter::REPORT_JUDGING_TABLE,
+    ]);
+  }
+  catch (\Exception $e) {
+    // createTable() throws \Drupal\Core\Database\SchemaObjectExistsException
+    // if the table already exists.
+    throw new UpdateException($e->getMessage());
+  }
+
+  if (!empty($message)) {
+    return $message;
+  }
+
+}
+
+/**
+ * Adds `batch_size` to competition.settings.
+ */
+function competition_update_8113() {
+  $config_factory = \Drupal::configFactory();
+  $config = $config_factory->getEditable('competition.settings');
+
+  $value_existing = $config->get('batch_size');
+  if ($value_existing === NULL) {
+    $config->set('batch_size', 100);
+    $config->save(TRUE);
+    return t("Added key %key with default value %value to `competition.settings` configuration.", [
+      '%key' => 'batch_size',
+      '%value' => '100',
+    ]);
+  }
+  else {
+    return t("Key %key was already present with value %value in `competition.settings` configuration. (No update was necessary.)", [
+      '%key' => 'batch_size',
+      '%value' => $value_existing,
+    ]);
+  }
+}
+
+/**
+ * Adds the `votes` column to `competition_entry_index`.
+ */
+function competition_update_8114() {
+
+  $schema = Database::getConnection()
+    ->schema();
+
+  if (!$schema->fieldExists(CompetitionJudgingSetup::INDEX_TABLE, 'votes')) {
+    $schema
+      ->addField(CompetitionJudgingSetup::INDEX_TABLE, 'votes', [
+        'type' => 'int',
+        'description' => 'Total votes for this entry in this voting round',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'default' => NULL,
+      ]);
+  }
+
+}
