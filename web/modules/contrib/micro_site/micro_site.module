@@ -1,0 +1,661 @@
+<?php
+
+/**
+ * @file
+ * Contains micro_site.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Database\Query\AlterableInterface;
+use Drupal\micro_site\SiteUsers;
+use Drupal\Core\StringTranslation\TranslatableMarkup;
+use Drupal\Component\Utility\Html;
+use Drupal\micro_site\Entity\SiteInterface;
+use Drupal\Component\Utility\UrlHelper;
+use Drupal\micro_site\AssetFileStorage;
+use Drupal\Core\Cache\RefinableCacheableDependencyInterface;
+use Drupal\Core\Render\Renderer;
+
+/**
+ * Implements hook_help().
+ */
+function micro_site_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the micro_site module.
+    case 'help.page.micro_site':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Provide the content entity type site') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_views_data_alter().
+ */
+function micro_site_views_data_alter(array &$data) {
+  $data['users_field_data']['site'] = [
+    'title' => t("Sites related to user"),
+    'help' => t("Permit to retrieve sites related to their owner"),
+    'relationship' => [
+      'group' => t('Sites'),
+      'label' => t("Sites related"),
+      'base' => 'site_field_data', // Custom entity table.
+      'base field' => 'user_id', // Custom entity field name on which do the join.
+      'field' => 'uid', // Field name on which do the join from the table users_field_data.
+      'id' => 'standard',
+    ],
+  ];
+}
+
+/**
+ * Implements hook_cache_flush().
+ *
+ * Delete all asset files.
+ */
+function micro_site_cache_flush() {
+  AssetFileStorage::deleteAllFiles();
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ */
+function micro_site_preprocess_html(&$variables) {
+  /** @var \Drupal\micro_site\SiteNegotiatorInterface $negotiator */
+  $negotiator = \Drupal::service('micro_site.negotiator');
+  /** @var \Drupal\micro_site\Entity\SiteInterface $site */
+  if ($site = $negotiator->getActiveSite()) {
+    $variables['attributes']['class'][] = 'site--entity';
+    $variables['attributes']['class'][] = 'site--type--' . Html::cleanCssIdentifier($site->bundle());
+    $variables['attributes']['class'][] = 'site--' . $site->id();
+  }
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ */
+function micro_site_preprocess_block__system_branding_block(&$variables) {
+
+  /** @var \Drupal\micro_site\SiteNegotiatorInterface $negotiator */
+  $negotiator = \Drupal::service('micro_site.negotiator');
+  if ($site = $negotiator->getActiveSite()) {
+    $site = \Drupal::service('entity.repository')->getTranslationFromContext($site);
+    // Override the site logo.
+    $variables['site_logo'] = '';
+    /** @var \Drupal\file\FileInterface $file */
+    if ($file = $site->getLogo()) {
+      /** @var \Drupal\Core\Image\Image $image */
+      $image = \Drupal::service('image.factory')->get($file->getFileUri());
+      if ($image->isValid()) {
+        $variables['site_logo'] = file_url_transform_relative(file_create_url($image->getSource()));
+      }
+    }
+    // Override the site name and slogan.
+    $variables['site_name'] = $site->getName();
+    $variables['site_slogan'] = $site->getSlogan();
+  }
+
+}
+
+/**
+ * Implements hook_query_TAG_alter().
+ */
+function micro_page_query_site_access_alter(AlterableInterface $query) {
+  // Read meta-data from query, if provided.
+  if (!($account = $query->getMetaData('account'))) {
+    $account = \Drupal::currentUser();
+  }
+  if ($account->hasPermission('administer site entities') || $account->hasPermission('link to any page')) {
+    return;
+  }
+
+  // @TODO choose which strategy apply.
+  // Limit site selectable by site owned by the user.
+//    $query->condition('user_id', $account->id());
+  // Limit site selectable by ownner or administrator.
+//  $access_alias = $query->join('site__' . SiteUsers::MICRO_SITE_ADMINISTRATOR, 'fsa', 'base_table.id = %alias.entity_id');
+//  $or = new Condition('OR');
+//  $or->condition('user_id', $account->id())
+//    ->condition($access_alias . '.' . SiteUsers::MICRO_SITE_ADMINISTRATOR .'_target_id', $account->id());
+//  $query->condition($or);
+
+
+}
+
+/**
+ * Implements hook_theme().
+ */
+function micro_site_theme() {
+  $theme = [];
+
+  $theme['site'] = [
+    'render element' => 'elements',
+    'file' => 'site.page.inc',
+    'template' => 'site',
+  ];
+
+  $theme['site_edit_form'] = [
+    'render element' => 'form',
+  ];
+
+  $theme['site_content_add_list'] = [
+    'render element' => 'content',
+    'variables' => ['content' => NULL],
+    'file' => 'site.page.inc',
+  ];
+
+  return $theme;
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update().
+ */
+function micro_site_site_update(EntityInterface $entity) {
+  _micro_site_create_host_pattern_file($entity);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update().
+ */
+function micro_site_site_insert(EntityInterface $entity) {
+  _micro_site_create_host_pattern_file($entity);
+}
+
+/**
+ * Helper function for creating the trusted host pattern file.
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ * @param bool $force
+ */
+function _micro_site_create_host_pattern_file(EntityInterface $entity, $force = FALSE) {
+  $trusted_host_patterns_directory = DRUPAL_ROOT . '/sites/default/hosts';
+  file_prepare_directory($trusted_host_patterns_directory, FILE_CREATE_DIRECTORY | FILE_MODIFY_PERMISSIONS);
+  file_save_htaccess($trusted_host_patterns_directory, TRUE);
+
+  /** @var \Drupal\micro_site\Entity\SiteInterface $entity */
+  $site_url = $entity->getSiteUrl();
+  $trusted_host_pattern = preg_quote($site_url);
+  $trusted_host_pattern_file_path = $trusted_host_patterns_directory . '/' . $site_url . '.host.php';
+
+  if (!file_exists($trusted_host_pattern_file_path) || $force) {
+    $lines = '<?php' . PHP_EOL;
+    $lines .= '$settings[\'trusted_host_patterns\'][] = \'^' . $trusted_host_pattern .'$\';' . PHP_EOL;
+    file_unmanaged_save_data($lines, $trusted_host_pattern_file_path, FILE_EXISTS_REPLACE);
+  }
+}
+
+/**
+* Implements hook_theme_suggestions_HOOK().
+*/
+function micro_site_theme_suggestions_site(array $variables) {
+  $suggestions = [];
+  /** @var \Drupal\micro_site\Entity\SiteInterface $entity */
+  $entity = $variables['elements']['#site'];
+  $sanitized_view_mode = strtr($variables['elements']['#view_mode'], '.', '_');
+
+  $suggestions[] = 'site__' . $sanitized_view_mode;
+  $suggestions[] = 'site__' . $entity->bundle();
+  $suggestions[] = 'site__' . $entity->bundle() . '__' . $sanitized_view_mode;
+  $suggestions[] = 'site__' . $entity->id();
+  $suggestions[] = 'site__' . $entity->id() . '__' . $sanitized_view_mode;
+  return $suggestions;
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK_alter().
+ */
+function micro_site_theme_suggestions_page_alter(array &$suggestions, array $variables) {
+  $negotiator = \Drupal::service('micro_site.negotiator');
+  /** @var \Drupal\micro_site\Entity\SiteInterface $site */
+  if ($site = $negotiator->getActiveSite()) {
+    $suggestions = [];
+    $suggestions[] = 'page__site';
+    $suggestions[] = 'page__site__' . $site->bundle();
+    $suggestions[] = 'page__site__' . $site->id();
+
+    $route_name = \Drupal::routeMatch()->getRouteName();
+    switch ($route_name) {
+      case 'system.401':
+        $error = '401';
+        break;
+      case 'system.403':
+        $error = '403';
+        if (!$site->isPublished()) {
+          $error = '403__unpublished';
+        }
+        break;
+      case 'system.404':
+        $error = '404';
+        break;
+    }
+    if (isset($error)) {
+      $suggestions[] = 'page__site__' . $error;
+      $suggestions[] = 'page__site__' . $site->bundle() . '__'. $error;
+    }
+  }
+
+  return $suggestions;
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK_alter().
+ */
+function micro_site_theme_suggestions_menu_local_tasks_alter(array &$suggestions, array $variables) {
+  /** @var \Drupal\micro_site\SiteNegotiatorInterface $negotiator */
+  $negotiator = \Drupal::service('micro_site.negotiator');
+  /** @var \Drupal\micro_site\Entity\SiteInterface $site */
+  if ($site = $negotiator->loadFromRequest()) {
+    if (!$site instanceof SiteInterface) {
+      return;
+    }
+    $suggestions[] = 'menu_local_tasks__site';
+    $suggestions[] = 'menu_local_tasks__site__' . $site->bundle();
+    $suggestions[] = 'menu_local_tasks__site__' . $site->id();
+    return $suggestions;
+  }
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function micro_site_page_attachments(array &$attachments) {
+  /** @var \Drupal\micro_site\SiteNegotiatorInterface $negotiator */
+  $negotiator = \Drupal::service('micro_site.negotiator');
+  /** @var \Drupal\micro_site\Entity\SiteInterface $site */
+  if ($site = $negotiator->getActiveSite()) {
+    $micro_site_css = [
+      '#tag' => 'link',
+      '#attributes' => [
+        'rel' => 'stylesheet',
+        'href' => $site->cssFilePathRelativeToDrupalRoot(),
+      ],
+    ];
+    $attachments['#attached']['html_head'][] = [$micro_site_css, 'micro_site_css'];
+  }
+
+}
+
+/**
+ * Implements hook_page_attachments_alter().
+ */
+function micro_site_page_attachments_alter(array &$attachments) {
+  /** @var \Drupal\micro_site\SiteNegotiatorInterface $negotiator */
+  $negotiator = \Drupal::service('micro_site.negotiator');
+  /** @var \Drupal\micro_site\Entity\SiteInterface $site */
+  if ($site = $negotiator->getActiveSite()) {
+    /** @var \Drupal\file\FileInterface $file */
+    if ($file = $site->getFavicon()) {
+      $favicon_changed = FALSE;
+      $type = $file->getMimeType();
+      $favicon_uri = $file->getFileUri();
+      $favicon_url = file_url_transform_relative(file_create_url($favicon_uri));
+      $html_head_link = $attachments['#attached']['html_head_link'];
+      foreach ($html_head_link as $key => $value) {
+        if (isset($value[0]['rel'])){
+          switch ($value[0]['rel']) {
+            case 'shortcut icon':
+              $attachments['#attached']['html_head_link'][$key] = [
+                [
+                  'rel' => 'shortcut icon',
+                  'href' => UrlHelper::stripDangerousProtocols($favicon_url),
+                  'type' => $type,
+                ]
+              ];
+              $favicon_changed = TRUE;
+              break;
+          }
+        }
+      }
+
+      if (!$favicon_changed) {
+        $attachments['#attached']['html_head_link'][][] = [
+          'rel' => 'shortcut icon',
+          'href' => UrlHelper::stripDangerousProtocols($favicon_url),
+          'type' => $type,
+        ];
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ *
+ * Provide site variables to override header, menu in the page template
+ * dedicated to site entities.
+ */
+function micro_site_preprocess_page(&$variables) {
+  $negotiator = \Drupal::service('micro_site.negotiator');
+  /** @var \Drupal\micro_site\Entity\SiteInterface $site */
+  if ($site = $negotiator->getActiveSite()) {
+//    // Attach micro site asset css.
+//    $variables['page']['#attached']['html_head_link'][] = [
+//      [
+//        'rel' => 'stylesheet',
+//        'href' => $site->filePathRelativeToDrupalRoot(),
+//        'media' => 'all',
+//      ],
+//    ];
+
+    // Provide the site entity.
+    $variables['site'] = $site;
+
+    if ($home_site = \Drupal::routeMatch()->getParameter('site')) {
+      $variables['is_front'] = TRUE;
+    }
+
+    // Build the site logo.
+    $variables['site_logo'] = '';
+    /** @var \Drupal\file\FileInterface $file */
+    if ($file = $site->logo->entity) {
+      /** @var \Drupal\Core\Image\Image $image */
+      $image = \Drupal::service('image.factory')->get($file->getFileUri());
+      if ($image->isValid()) {
+        $logo = [
+          '#theme' => 'image',
+          '#uri' => $image->getSource(),
+          '#width' => $image->getWidth(),
+          '#height' => $image->getHeight(),
+          '#alt' => $site->getName(),
+          '#cache' => [
+            'tags' => $file->getCacheTags(),
+          ],
+        ];
+
+        $variables['site_logo'] = $logo;
+      }
+    }
+
+    // Build the site menu if exists.
+    $variables['menu'] = '';
+    if ($site->hasMenu() && $site->getSiteMenu()) {
+      $menu_id = $site->getSiteMenu();
+
+      // @Todo build the menu.
+      $variables['menu'] = [];
+    }
+
+    $variables['site_name'] = $site->getName();
+    $variables['site_slogan'] = $site->getSlogan();
+    $variables['site_url'] = $site->getSiteUrl();
+
+  }
+
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ */
+function micro_site_preprocess_maintenance_page(&$variables) {
+  $negotiator = \Drupal::service('micro_site.negotiator');
+  /** @var \Drupal\micro_site\Entity\SiteInterface $site */
+  if ($site = $negotiator->getActiveSite()) {
+    $logo = $site->getLogo();
+    $logo_url = '';
+    if ($logo instanceof \Drupal\file\FileInterface) {
+      $logo_uri = $logo->getFileUri();
+      $logo_url = file_url_transform_relative(file_create_url($logo_uri));
+    }
+    $variables['logo'] = $logo_url;
+    $variables['site_name'] = $site->getName();
+    $variables['site_slogan'] = $site->getSlogan();
+  }
+}
+
+/**
+ * Implements hook_menu_local_tasks_alter().
+ */
+function micro_site_menu_local_tasks_alter(&$data, $route_name, RefinableCacheableDependencyInterface &$cacheability) {
+  $cacheability->addCacheContexts(['user']);
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function micro_site_form_site_form_alter(&$form, FormStateInterface $form_state) {
+  /** @var \Drupal\micro_site\Entity\SiteInterface $site */
+  $form['#theme'] = ['site_edit_form'];
+
+  // Site users fields wrapper.
+  $form['site_users'] = [
+    '#type' => 'details',
+    '#title' => t('Site users'),
+    '#group' => 'advanced',
+    '#attributes' => [
+      'class' => ['site-form-users'],
+    ],
+    '#weight' => 101,
+    '#optional' => TRUE,
+  ];
+
+  $site = $form_state->getFormObject()->getEntity();
+  /** @var \Drupal\micro_site\Entity\SiteTypeInterface $site_type */
+  $site_type = $site->type->entity;
+
+  if (isset($form[SiteUsers::MICRO_SITE_ADMINISTRATOR])) {
+    $form[SiteUsers::MICRO_SITE_ADMINISTRATOR]['#group'] = 'site_users';
+    $form[SiteUsers::MICRO_SITE_ADMINISTRATOR]['widget']['add_more']['#value'] = new TranslatableMarkup('Add new administrator');
+    $form[SiteUsers::MICRO_SITE_ADMINISTRATOR]['#access'] = $site_type->getUsersManagement();
+  }
+  if (isset($form[SiteUsers::MICRO_SITE_MANAGER])) {
+    $form[SiteUsers::MICRO_SITE_MANAGER]['#group'] = 'site_users';
+    $form[SiteUsers::MICRO_SITE_MANAGER]['widget']['add_more']['#value'] = new TranslatableMarkup('Add new manager');
+    $form[SiteUsers::MICRO_SITE_MANAGER]['#access'] = $site_type->getUsersManagement();
+  }
+  if (isset($form[SiteUsers::MICRO_SITE_CONTRIBUTOR])) {
+    $form[SiteUsers::MICRO_SITE_CONTRIBUTOR]['#group'] = 'site_users';
+    $form[SiteUsers::MICRO_SITE_CONTRIBUTOR]['widget']['add_more']['#value'] = new TranslatableMarkup('Add new contributor');
+    $form[SiteUsers::MICRO_SITE_CONTRIBUTOR]['#access'] = $site_type->getUsersManagement();
+  }
+  if (isset($form[SiteUsers::MICRO_SITE_MEMBER])) {
+    $form[SiteUsers::MICRO_SITE_MEMBER]['#group'] = 'site_users';
+    $form[SiteUsers::MICRO_SITE_MEMBER]['widget']['add_more']['#value'] = new TranslatableMarkup('Add new member');
+    $form[SiteUsers::MICRO_SITE_MEMBER]['#access'] = $site_type->getUsersManagement();
+  }
+
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ *
+ * Creates our fields when new node types are created.
+ */
+function micro_site_site_type_insert(EntityInterface $entity) {
+  /** @var \Drupal\Core\Config\Entity\ConfigEntityInterface $entity */
+  if (!$entity->isSyncing()) {
+    // Do not fire hook when config sync in progress.
+    micro_site_assign_fields('site', $entity->id());
+  }
+}
+
+/**
+ * Creates our site user fields for an entity bundle.
+ *
+ * @param string $entity_type
+ *   The entity type being created. Node and user are supported.
+ * @param string $bundle
+ *   The bundle being created.
+ *
+ * This function is here for convenience during installation. It is not really
+ * an API function. Modules wishing to add fields to non-node entities must
+ * provide their own field storage.
+ *
+ * @see micro_site_site_type_insert()
+ * @see micro_site_install()
+ */
+function micro_site_assign_fields($entity_type, $bundle) {
+
+  try {
+    $field_storage = \Drupal::entityTypeManager()->getStorage('field_config');
+    // Assign the site administrator field.
+    $id = $entity_type . '.' . $bundle . '.' . SiteUsers::MICRO_SITE_ADMINISTRATOR;
+    if (!$field = $field_storage->load($id)) {
+      $field = array(
+        'field_name' => SiteUsers::MICRO_SITE_ADMINISTRATOR,
+        'entity_type' => $entity_type,
+        'label' => 'Site administrator',
+        'bundle' => $bundle,
+        'required' => FALSE,
+        'description' => 'The site administrator can update the site properties and of course has all the rights on any content on the site.',
+        'settings' => [
+          'handler' => 'default:user',
+          'handler_settings' => [
+            'include_anonymous' => FALSE,
+            'filter' => [
+              'type' => '_none',
+            ],
+            'target_bundles' => NULL,
+            'sort' => ['field' => '_none'],
+            'auto_create' => FALSE,
+          ],
+        ],
+        'field_type' => 'entity_reference',
+      );
+      $field_config = $field_storage->create($field);
+      $field_config->save();
+    }
+
+    // Assign the site manager field.
+    $id = $entity_type . '.' . $bundle . '.' . SiteUsers::MICRO_SITE_MANAGER;
+    if (!$field = $field_storage->load($id)) {
+      $field = array(
+        'field_name' => SiteUsers::MICRO_SITE_MANAGER,
+        'entity_type' => $entity_type,
+        'label' => 'Site manager',
+        'bundle' => $bundle,
+        'required' => FALSE,
+        'description' => 'The site manager can create, update and delete any content on the site, and of course view any unpublished content',
+        'settings' => [
+          'handler' => 'default:user',
+          'handler_settings' => [
+            'include_anonymous' => FALSE,
+            'filter' => [
+              'type' => '_none',
+            ],
+            'target_bundles' => NULL,
+            'sort' => ['field' => '_none'],
+            'auto_create' => FALSE,
+          ],
+        ],
+        'field_type' => 'entity_reference',
+      );
+      $field_config = $field_storage->create($field);
+      $field_config->save();
+    }
+
+    // Assign the site contributor field.
+    $id = $entity_type . '.' . $bundle . '.' . SiteUsers::MICRO_SITE_CONTRIBUTOR;
+    if (!$field = $field_storage->load($id)) {
+      $field = array(
+      'field_name' => SiteUsers::MICRO_SITE_CONTRIBUTOR,
+        'entity_type' => $entity_type,
+        'label' => 'Site contributor',
+        'bundle' => $bundle,
+        'required' => FALSE,
+        'description' => 'The site contributor can create content and update or delete own content (and has the rights of a site member).',
+        'settings' => [
+          'handler' => 'default:user',
+          'handler_settings' => [
+            'include_anonymous' => FALSE,
+            'filter' => [
+              'type' => '_none',
+            ],
+            'target_bundles' => NULL,
+            'sort' => ['field' => '_none'],
+            'auto_create' => FALSE,
+          ],
+        ],
+        'field_type' => 'entity_reference',
+      );
+      $field_config = $field_storage->create($field);
+      $field_config->save();
+    }
+
+    // Assign the site member field.
+    $id = $entity_type . '.' . $bundle . '.' . SiteUsers::MICRO_SITE_MEMBER;
+    if (!$field = $field_storage->load($id)) {
+      $field = array(
+        'field_name' => SiteUsers::MICRO_SITE_MEMBER,
+        'entity_type' => $entity_type,
+        'label' => 'Site member',
+        'bundle' => $bundle,
+        'required' => FALSE,
+        'description' => 'The site member can view unpublished content.',
+        'settings' => [
+          'handler' => 'default:user',
+          'handler_settings' => [
+            'include_anonymous' => FALSE,
+            'filter' => [
+              'type' => '_none',
+            ],
+            'target_bundles' => NULL,
+            'sort' => ['field' => '_none'],
+            'auto_create' => FALSE,
+          ],
+        ],
+        'field_type' => 'entity_reference',
+      );
+      $field_config = $field_storage->create($field);
+      $field_config->save();
+    }
+
+    // Tell the form system how to behave. Default to auto complete.
+    /** @var \Drupal\Core\Entity\Entity\EntityFormDisplay $entity_form_display */
+    $entity_form_display = \Drupal::entityTypeManager()->getStorage('entity_form_display')->load($entity_type . '.' . $bundle . '.default');
+    if (!$entity_form_display) {
+      $values = array(
+        'targetEntityType' => $entity_type,
+        'bundle' => $bundle,
+        'mode' => 'default',
+        'status' => TRUE,
+      );
+      $entity_form_display = \Drupal::entityTypeManager()->getStorage('entity_form_display') ->create($values);
+    }
+
+    $entity_form_display
+      ->setComponent(SiteUsers::MICRO_SITE_ADMINISTRATOR, array(
+        'type' => 'entity_reference_autocomplete',
+        'weight' => 40,
+      ))
+      ->setComponent(SiteUsers::MICRO_SITE_MANAGER, array(
+        'type' => 'entity_reference_autocomplete',
+        'weight' => 41,
+      ))
+      ->setComponent(SiteUsers::MICRO_SITE_CONTRIBUTOR, array(
+        'type' => 'entity_reference_autocomplete',
+        'weight' => 42,
+      ))
+      ->setComponent(SiteUsers::MICRO_SITE_MEMBER, array(
+        'type' => 'entity_reference_autocomplete',
+        'weight' => 43,
+      ))
+      ->save();
+
+    // Tell the view system how to behave. Default to auto complete.
+    /** @var \Drupal\Core\Entity\Entity\EntityViewDisplay $entity_view_display */
+    $entity_view_display = \Drupal::entityTypeManager()->getStorage('entity_view_display')->load($entity_type . '.' . $bundle . '.default');
+    if (!$entity_view_display) {
+      $values = array(
+        'targetEntityType' => $entity_type,
+        'bundle' => $bundle,
+        'mode' => 'default',
+        'status' => TRUE,
+      );
+      $entity_view_display = \Drupal::entityTypeManager()->getStorage('entity_view_display') ->create($values);
+    }
+
+    $entity_view_display
+      ->removeComponent(SiteUsers::MICRO_SITE_ADMINISTRATOR)
+      ->removeComponent(SiteUsers::MICRO_SITE_MANAGER)
+      ->removeComponent(SiteUsers::MICRO_SITE_CONTRIBUTOR)
+      ->removeComponent(SiteUsers::MICRO_SITE_MEMBER)
+      ->save();
+  }
+  catch (Exception $e) {
+    \Drupal::logger('micro_site')->error('Site users field installation failed with message @message.', ['@message' => $e->getMessage()]);
+  }
+}
