@@ -1,0 +1,2805 @@
+<?php
+
+/**
+ * @file
+ * AWS Cloud module.
+ *
+ * This module handles UI interactions with the cloud system for Amazon related
+ * clouds. Amazon clouds are EC2 and OpenStack Nova.
+ */
+
+use Drupal\aws_cloud\Entity\Ec2\Instance;
+use Drupal\aws_cloud\Entity\Ec2\Volume;
+use Drupal\aws_cloud\Entity\Ec2\Snapshot;
+use Drupal\cloud\Entity\CloudConfig;
+use Drupal\Core\Ajax\AjaxResponse;
+use Drupal\Core\Ajax\ReplaceCommand;
+use Drupal\Core\Cache\Cache;
+use Drupal\Core\Database\Query\AlterableInterface;
+use Drupal\Core\Database\Query\Condition;
+use Drupal\Core\Datetime\DrupalDateTime;
+use Drupal\Core\Entity\ContentEntityInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Link;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\StreamWrapper\PrivateStream;
+use Drupal\Core\Url;
+use Drupal\field\Entity\FieldStorageConfig;
+use Symfony\Component\HttpFoundation\RedirectResponse;
+
+/**
+ * Implements hook_libraries_info().
+ */
+function aws_cloud_libraries_info() {
+  return [
+    'awssdk' => [
+      'title' => 'AWS SDK for PHP',
+      'vendor url' => 'http://aws.amazon.com/sdkforphp/',
+      'download url' => 'http://aws.amazon.com/sdkforphp/',
+      'version arguments' => [
+        'file' => 'sdk.class.php',
+        'pattern' => "/define\('CFRUNTIME_VERSION', '(.*)'\);/",
+        'lines' => 200,
+      ],
+      'files' => [
+        'php' => [
+          'sdk.class.php',
+        ],
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_help().
+ */
+function aws_cloud_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.aws_cloud':
+      $output = '<p>' . t('The aws_cloud module creates a user interface for managing AWS related clouds. AWS clouds are defined as EC2, OpenStack Nova and Cloudn.') . '</p>';
+
+      return $output;
+  }
+}
+
+/**
+ * Set dynamic allowed values for the alignment field.
+ *
+ * @param \Drupal\field\Entity\FieldStorageConfig $definition
+ *   The field definition.
+ * @param \Drupal\Core\Entity\ContentEntityInterface|null $entity
+ *   The entity being created if applicable.
+ * @param bool $cacheable
+ *   Boolean indicating if the results are cacheable.
+ *
+ * @return array
+ *   An array of possible key and value options.
+ *
+ * @see options_allowed_values()
+ */
+function aws_cloud_instance_type_allowed_values_function(FieldStorageConfig $definition, ContentEntityInterface $entity = NULL, $cacheable) {
+  $instance_types = [];
+  try {
+    if ($entity->bundle() == 'aws_cloud') {
+      if ($entity->isNew()) {
+        $route = \Drupal::routeMatch();
+        $cloud_context = $route->getParameter('cloud_context');
+      }
+      else {
+        $cloud_context = $entity->getCloudContext();
+      }
+      $instance_types = aws_cloud_get_instance_types($cloud_context);
+
+      $config = \Drupal::config('aws_cloud.settings');
+      if ($config->get('aws_cloud_instance_type_cost') == FALSE) {
+        $instance_types_converted = [];
+        foreach ($instance_types as $id => $value) {
+          $instance_types_converted[$id] = explode(':', $value)[0];
+        }
+        $instance_types = $instance_types_converted;
+      }
+    }
+  }
+  catch (Exception $e) {
+    \Drupal::logger('aws_cloud')->debug('No cloud context specified');
+  }
+  return $instance_types;
+}
+
+/**
+ * Set dynamic allowed values for the alignment field.
+ *
+ * @param \Drupal\field\Entity\FieldStorageConfig $definition
+ *   The field definition.
+ * @param \Drupal\Core\Entity\ContentEntityInterface|null $entity
+ *   The entity being created if applicable.
+ * @param bool $cacheable
+ *   Boolean indicating if the results are cacheable.
+ *
+ * @return array
+ *   An array of possible key and value options.
+ *
+ * @see options_allowed_values()
+ */
+function aws_cloud_availbility_zone_allowed_values_function(FieldStorageConfig $definition, ContentEntityInterface $entity = NULL, $cacheable) {
+
+  /* @var \Drupal\aws_cloud\Service\AwsEc2ServiceInterface $awsEc2Service */
+  $awsEc2Service = \Drupal::service('aws_cloud.ec2');
+  $availability_zones = [];
+
+  if ($entity->bundle() == 'aws_cloud') {
+    try {
+      if ($entity->isNew()) {
+        $route = \Drupal::routeMatch();
+        $cloud_context = $route->getParameter('cloud_context');
+      }
+      else {
+        $cloud_context = $entity->getCloudContext();
+      }
+      $awsEc2Service->setCloudContext($cloud_context);
+      $availability_zones = $awsEc2Service->getAvailabilityZones();
+    }
+    catch (Exception $e) {
+      \Drupal::logger('aws_cloud')->debug('No cloud context specified');
+    }
+  }
+
+  return $availability_zones;
+}
+
+/**
+ * Set dynamic allowed values for the vpc field.
+ *
+ * @param \Drupal\field\Entity\FieldStorageConfig $definition
+ *   The field definition.
+ * @param \Drupal\Core\Entity\ContentEntityInterface|null $entity
+ *   The entity being created if applicable.
+ * @param bool $cacheable
+ *   Boolean indicating if the results are cacheable.
+ *
+ * @return array
+ *   An array of possible key and value options.
+ *
+ * @see options_allowed_values()
+ */
+function aws_cloud_vpc_allowed_values_function(FieldStorageConfig $definition, ContentEntityInterface $entity = NULL, $cacheable) {
+  $allowed_values = [];
+
+  if ($entity->bundle() == 'aws_cloud') {
+    $aws_ec2_service = \Drupal::service('aws_cloud.ec2');
+    if ($entity->isNew()) {
+      $route = \Drupal::routeMatch();
+      $cloud_context = $route->getParameter('cloud_context');
+    }
+    else {
+      $cloud_context = $entity->getCloudContext();
+    }
+    try {
+      $aws_ec2_service->setCloudContext($cloud_context);
+
+      $response = $aws_ec2_service->describeVpcs();
+      foreach ($response['Vpcs'] as $vpc) {
+        $vpc_id = $vpc['VpcId'];
+        $name = $vpc_id;
+        if (isset($vpc['Tags'])) {
+          foreach ($vpc['Tags'] as $tag) {
+            if ($tag['Key'] == 'Name') {
+              $name = $tag['Value'];
+              break;
+            }
+          }
+        }
+
+        $allowed_values[$vpc_id] = sprintf('%s (%s)', $name, $vpc_id);
+      }
+    }
+    catch (Exception $e) {
+      \Drupal::logger('aws_cloud')->debug('No cloud context specified');
+    }
+  }
+
+  return $allowed_values;
+}
+
+/**
+ * Set dynamic allowed values for the subnet field.
+ *
+ * @param \Drupal\field\Entity\FieldStorageConfig $definition
+ *   The field definition.
+ * @param \Drupal\Core\Entity\ContentEntityInterface|null $entity
+ *   The entity being created if applicable.
+ * @param bool $cacheable
+ *   Boolean indicating if the results are cacheable.
+ *
+ * @return array
+ *   An array of possible key and value options.
+ *
+ * @see options_allowed_values()
+ */
+function aws_cloud_subnet_allowed_values_function(FieldStorageConfig $definition, ContentEntityInterface $entity = NULL, $cacheable) {
+  $allowed_values = [];
+  if ($entity->bundle() == 'aws_cloud') {
+    $allowed_values = aws_cloud_get_subnet_options_by_vpc_id(NULL, $entity);
+  }
+
+  return $allowed_values;
+}
+
+/**
+ * Set dynamic allowed values for the alignment field.
+ *
+ * @param \Drupal\field\Entity\FieldStorageConfig $definition
+ *   The field definition.
+ * @param \Drupal\Core\Entity\ContentEntityInterface|null $entity
+ *   The entity being created if applicable.
+ * @param bool $cacheable
+ *   Boolean indicating if the results are cacheable.
+ *
+ * @return array
+ *   An array of possible key and value options.
+ *
+ * @see options_allowed_values()
+ */
+function aws_cloud_schedule_allowed_values_function(FieldStorageConfig $definition, ContentEntityInterface $entity = NULL, $cacheable) {
+  return aws_cloud_get_schedule();
+}
+
+/**
+ * Set dynamic allowed values for the region field.
+ *
+ * @param \Drupal\field\Entity\FieldStorageConfig $definition
+ *   The field definition.
+ * @param \Drupal\Core\Entity\ContentEntityInterface|null $entity
+ *   The entity being created if applicable.
+ * @param bool $cacheable
+ *   Boolean indicating if the results are cacheable.
+ *
+ * @return array
+ *   An array of possible key and value options.
+ *
+ * @see options_allowed_values()
+ */
+function aws_cloud_region_allowed_values_function(FieldStorageConfig $definition, ContentEntityInterface $entity = NULL, $cacheable) {
+  $aws_ec2_service = \Drupal::service('aws_cloud.ec2');
+  return $aws_ec2_service->getRegions();
+}
+
+/**
+ * Set dynamic allowed values for the api endpoint uri field.
+ *
+ * @param \Drupal\field\Entity\FieldStorageConfig $definition
+ *   The field definition.
+ * @param \Drupal\Core\Entity\ContentEntityInterface|null $entity
+ *   The entity being created if applicable.
+ * @param bool $cacheable
+ *   Boolean indicating if the results are cacheable.
+ *
+ * @return array
+ *   An array of possible key and value options.
+ *
+ * @see options_allowed_values()
+ */
+function aws_cloud_api_endpoint_uri_allowed_values_function(FieldStorageConfig $definition, ContentEntityInterface $entity = NULL, $cacheable) {
+  $aws_ec2_service = \Drupal::service('aws_cloud.ec2');
+  $urls = array_values($aws_ec2_service->getEndpointUrls());
+  return array_combine($urls, $urls);
+}
+
+/**
+ * Set dynamic allowed values for the image upload url field.
+ *
+ * @param \Drupal\field\Entity\FieldStorageConfig $definition
+ *   The field definition.
+ * @param \Drupal\Core\Entity\ContentEntityInterface|null $entity
+ *   The entity being created if applicable.
+ * @param bool $cacheable
+ *   Boolean indicating if the results are cacheable.
+ *
+ * @return array
+ *   An array of possible key and value options.
+ *
+ * @see options_allowed_values()
+ */
+function aws_cloud_image_upload_url_allowed_values_function(FieldStorageConfig $definition, ContentEntityInterface $entity = NULL, $cacheable) {
+  return aws_cloud_api_endpoint_uri_allowed_values_function($definition, $entity, $cacheable);
+}
+
+/**
+ * Set dynamic allowed values for the IAM role field.
+ *
+ * @param \Drupal\field\Entity\FieldStorageConfig $definition
+ *   The field definition.
+ * @param \Drupal\Core\Entity\ContentEntityInterface|null $entity
+ *   The entity being created if applicable.
+ * @param bool $cacheable
+ *   Boolean indicating if the results are cacheable.
+ *
+ * @return array
+ *   An array of possible key and value options.
+ *
+ * @see options_allowed_values()
+ */
+function aws_cloud_iam_role_allowed_values_function(FieldStorageConfig $definition, ContentEntityInterface $entity = NULL, $cacheable) {
+  $allowed_values = [];
+
+  if ($entity->bundle() == 'aws_cloud') {
+    try {
+      if ($entity->isNew()) {
+        $route = \Drupal::routeMatch();
+        $cloud_context = $route->getParameter('cloud_context');
+      }
+      else {
+        $cloud_context = $entity->getCloudContext();
+      }
+      $allowed_values = aws_cloud_get_iam_roles($cloud_context);
+    }
+    catch (Exception $e) {
+      \Drupal::logger('aws_cloud')->debug('No cloud context specified');
+    }
+  }
+
+  return $allowed_values;
+}
+
+/**
+ * Function to get iam roles from aws_cloud.iam service.
+ *
+ * @param string $cloud_context
+ *   Cloud context.
+ *
+ * @return array
+ *   An array of roles.
+ */
+function aws_cloud_get_iam_roles($cloud_context) {
+  $roles = [];
+  $aws_iam_service = \Drupal::service('aws_cloud.iam');
+  $aws_iam_service->setCloudContext($cloud_context);
+  $response = $aws_iam_service->listInstanceProfiles();
+  foreach ($response['InstanceProfiles'] as $instance_profile) {
+    // Skip profiles without a role.
+    if (empty($instance_profile['Roles'])) {
+      continue;
+    }
+    $roles[$instance_profile['Arn']] = $instance_profile['InstanceProfileName'];
+  }
+
+  return $roles;
+}
+
+/**
+ * Implements hook_entity_bundle_field_info_alter().
+ */
+function aws_cloud_entity_type_alter(array &$entity_types) {
+  // Add aws constraint to cloud_server_template.
+  // This constraint will perform AWS specific validations.
+  $entity_types['cloud_server_template']->addConstraint('AWSConstraint');
+
+  // Change list builder of cloud_server_template for aws_cloud.
+  $entity_types['cloud_server_template']
+    ->setListBuilderClass('Drupal\aws_cloud\Controller\Ec2\AwsCloudServerTemplateListBuilder');
+}
+
+/**
+ * Implements hook_entity_view().
+ */
+function aws_cloud_entity_view(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display, $view_mode) {
+  if ($entity->getEntityTypeId() == 'aws_cloud_key_pair' && $view_mode == 'full') {
+    if ($entity->id() != NULL) {
+      $keypair = \Drupal::entityTypeManager()->getStorage('aws_cloud_key_pair')->load($entity->id());
+
+      // If the key is on the server, prompt user to download it.
+      if ($keypair->getKeyFileLocation() != FALSE) {
+        $url = Url::fromRoute('entity.aws_cloud_key_pair.download', ['cloud_context' => $keypair->getCloudContext(), 'aws_cloud_key_pair' => $keypair->id()])->toString();
+        $messenger = \Drupal::messenger();
+        $messenger->addWarning(t('<a href="@download_link">Download private key</a>.  Once downloaded, the key will be deleted from the server.',
+          ['@download_link' => $url]
+        ));
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function aws_cloud_cron() {
+  $entities = \Drupal::service('plugin.manager.cloud_config_plugin')->loadConfigEntities('aws_ec2');
+  foreach ($entities as $entity) {
+    aws_cloud_update_ec2_resources($entity, TRUE);
+
+    // @todo: re-enabled instance bundling
+    // Update any instance types if needed.
+    aws_cloud_update_instance_types($entity);
+  }
+
+  // Notify owners and admins if their instances have been running for to long.
+  aws_cloud_notify_instance_owners_and_admins();
+
+  // Notify admins about unused EBS volumes.
+  aws_cloud_notify_unused_volumes_owners_and_admins();
+
+  // Notify admins about unused EBS snapshot.
+  aws_cloud_notify_unused_snapshots_owners_and_admins();
+}
+
+/**
+ * Implements hook_rebuild().
+ */
+function aws_cloud_rebuild() {
+  // Rebuild the instance type cache.
+  $entities = \Drupal::service('plugin.manager.cloud_config_plugin')->loadConfigEntities('aws_ec2');
+  foreach ($entities as $entity) {
+    // Update any instance types if needed.
+    aws_cloud_update_instance_types($entity);
+  }
+}
+
+/**
+ * Implements hook_cloud_config_presave().
+ */
+function aws_cloud_cloud_config_presave(CloudConfig $cloud_config) {
+  if ($cloud_config->get('field_use_instance_credentials')->value == FALSE) {
+    if (isset($cloud_config->get('field_access_key')->value) && isset($cloud_config->get('field_secret_key')->value)) {
+      // Write the access key and secret out to an ini file.
+      $access_data = <<<EOF
+[default]
+aws_access_key_id = {$cloud_config->get('field_access_key')->value}
+aws_secret_access_key = {$cloud_config->get('field_secret_key')->value}
+EOF;
+
+      $credential_file = aws_cloud_ini_file_path($cloud_config->get('cloud_context')->value);
+      $credential_directory = aws_cloud_ini_directory();
+      if (file_prepare_directory($credential_directory, FILE_CREATE_DIRECTORY | FILE_MODIFY_PERMISSIONS)) {
+        file_unmanaged_save_data($access_data, $credential_file, FILE_EXISTS_REPLACE);
+      }
+      $cloud_config->set('field_access_key', NULL);
+      $cloud_config->set('field_secret_key', NULL);
+    }
+  }
+
+  // Update instance types.
+  aws_cloud_update_instance_types($cloud_config);
+
+  // Create or update a pricing spreadsheet.
+  aws_cloud_create_or_update_pricing_spreadsheet($cloud_config);
+}
+
+/**
+ * Create or update the pricing spreadsheet.
+ *
+ * @param \Drupal\cloud\Entity\CloudConfig $cloud_config
+ *   The cloud config entity.
+ */
+function aws_cloud_create_or_update_pricing_spreadsheet(CloudConfig $cloud_config) {
+  $config = \Drupal::config('aws_cloud.settings');
+  if ($config->get('aws_cloud_instance_type_prices_spreadsheet') == FALSE) {
+    return;
+  }
+
+  $url = $cloud_config->get('field_spreadsheet_pricing_url')->value;
+  if (empty($url)) {
+    // Find the existing spreadsheet created for other cloud config entities.
+    $cloud_configs = \Drupal::entityTypeManager()
+      ->getStorage('cloud_config')
+      ->loadByProperties(
+        ['field_account_id' => [$cloud_config->get('field_account_id')->value]]
+      );
+    if (!empty($cloud_configs)) {
+      $url = array_shift($cloud_configs)->get('field_spreadsheet_pricing_url')->value;
+    }
+  }
+
+  // If there isn't a spreadsheet, a new one will be created.
+  if (!empty($url)) {
+    // Validate if there is a valid google credential.
+    if (!aws_cloud_is_google_credential_valid()) {
+      $page_link = \Drupal::l(t('AWS Cloud Settings'), Url::fromRoute('aws_cloud.settings'));
+      \Drupal::messenger()->addMessage(
+        t(
+          'The content of google credential file is invalid. Please update google credential in @link.',
+          ['@link' => $page_link]
+        ),
+        'error'
+      );
+      return;
+    }
+  }
+
+  $spreadsheet_service = \Drupal::service('aws_cloud.google_spreadsheet');
+  $url = $spreadsheet_service->createOrUpdate(
+    $url,
+    $cloud_config->get('field_region')->value,
+    'AWS Cloud Instance Type Pricing'
+  );
+
+  $cloud_config->set('field_spreadsheet_pricing_url', $url);
+}
+
+/**
+ * Check whether the content of google credential file is valid.
+ *
+ * @return bool
+ *   Whether the content of google credential file is valid.
+ */
+function aws_cloud_is_google_credential_valid() {
+  $config = \Drupal::config('aws_cloud.settings');
+  $signature = $config->get('google_credential_signature');
+
+  $signature_of_file = '';
+  $credential_file_path = aws_cloud_google_credential_file_path();
+  if (file_exists($credential_file_path)) {
+    $signature_of_file = hash(
+      'sha256',
+      json_encode(json_decode(file_get_contents($credential_file_path)))
+    );
+  }
+  return $signature === $signature_of_file;
+}
+
+/**
+ * Implements hook_cloud_config_update().
+ */
+function aws_cloud_cloud_config_update(CloudConfig $cloud_config) {
+  if ($cloud_config->bundle() == 'aws_ec2'
+    && !aws_cloud_cloud_configs_equal(
+      $cloud_config,
+      $cloud_config->original,
+      ['changed', 'field_spreadsheet_pricing_url']
+    )
+  ) {
+    // Update resources.
+    aws_cloud_update_ec2_resources($cloud_config);
+  }
+}
+
+/**
+ * Compare two cloud configs.
+ *
+ * @param \Drupal\cloud\Entity\CloudConfig $cloud_config1
+ *   One cloud config.
+ * @param \Drupal\cloud\Entity\CloudConfig $cloud_config2
+ *   Another cloud config.
+ * @param array $excluded_field_names
+ *   The names of fields excluded.
+ *
+ * @return bool
+ *   The result of compariation.
+ */
+function aws_cloud_cloud_configs_equal(
+  CloudConfig $cloud_config1,
+  CloudConfig $cloud_config2,
+  array $excluded_field_names = []
+) {
+  $field_names = array_keys($cloud_config1->getFields());
+  $field_names = array_diff($field_names, $excluded_field_names);
+  foreach ($field_names as $field_name) {
+    if ($cloud_config1->get($field_name)->value != $cloud_config2->get($field_name)->value) {
+      return FALSE;
+    }
+  }
+  return TRUE;
+}
+
+/**
+ * Update EC2 resources.
+ *
+ * @param \Drupal\cloud\Entity\CloudConfig $cloud_config
+ *   The cloud config object.
+ * @param bool $for_cron
+ *   Update resources for cron job or not.
+ */
+function aws_cloud_update_ec2_resources(
+  CloudConfig $cloud_config,
+  $for_cron = FALSE
+) {
+  $aws_ec2_service = \Drupal::service('aws_cloud.ec2');
+  $aws_ec2_service->setCloudContext($cloud_config->getCloudContext());
+
+  if ($for_cron) {
+    // Terminate instances past the timestamp.
+    $instances = aws_cloud_get_expired_instances($cloud_config->getCloudContext());
+    if ($instances) {
+      \Drupal::logger('aws_cloud')->notice(
+        t('Terminating the following instances %instance',
+          ['%instance' => implode(', ', $instances['InstanceIds'])]
+        )
+      );
+      $aws_ec2_service->terminateInstance($instances);
+    }
+  }
+
+  $aws_ec2_service->updateInstances();
+  $aws_ec2_service->updateSecurityGroups();
+  $aws_ec2_service->updateKeyPairs();
+  $aws_ec2_service->updateElasticIp();
+  $aws_ec2_service->updateNetworkInterfaces();
+  $aws_ec2_service->updateSnapshots();
+  $aws_ec2_service->updateVolumes();
+
+  if ($for_cron) {
+    // Update any pending images in the DB. Pending images are usually
+    // created from an active instance.
+    $images = aws_cloud_get_pending_images($cloud_config->getCloudContext());
+    if (count($images)) {
+      $aws_ec2_service->updateImages([
+        'ImageIds' => $images,
+      ]);
+    }
+  }
+  else {
+    $account_id = $cloud_config->get('field_account_id')->value;
+    $aws_ec2_service->updateImages(['Owners' => [$account_id]], TRUE);
+  }
+}
+
+/**
+ * Implements hook_cloud_config_delete().
+ */
+function aws_cloud_cloud_config_delete(CloudConfig $cloud_config) {
+  /* @var \Drupal\aws_cloud\Service\AwsEc2ServiceInterface $aws_ec2_service */
+  $aws_ec2_service = \Drupal::service('aws_cloud.ec2');
+  $aws_ec2_service->setCloudContext($cloud_config->getCloudContext());
+  $aws_ec2_service->clearAllEntities();
+
+  // Clean up credential files.
+  $credential_file = aws_cloud_ini_file_path($cloud_config->get('cloud_context')->value);
+  file_unmanaged_delete($credential_file);
+
+  // Delete the pricing spreadsheet.
+  aws_cloud_delete_pricing_spreadsheet($cloud_config);
+}
+
+/**
+ * Delete the pricing spreadsheet.
+ *
+ * @param \Drupal\cloud\Entity\CloudConfig $cloud_config
+ *   The cloud config entity.
+ */
+function aws_cloud_delete_pricing_spreadsheet(CloudConfig $cloud_config) {
+  $url = $cloud_config->get('field_spreadsheet_pricing_url')->value;
+  if (empty($url)) {
+    return;
+  }
+
+  // Check whether other cloud configs are referring to the url.
+  $entity_ids = \Drupal::entityTypeManager()
+    ->getStorage('cloud_config')
+    ->getQuery()
+    ->condition('field_account_id', $cloud_config->get('field_account_id')->value)
+    ->condition('field_spreadsheet_pricing_url', NULL, 'IS NOT NULL')
+    ->execute();
+
+  // Skip deleting if there are other cloud configs referring the spreadsheet.
+  if (!empty($entity_ids)) {
+    return;
+  }
+
+  $spreadsheet_service = \Drupal::service('aws_cloud.google_spreadsheet');
+  $spreadsheet_service->delete($url);
+}
+
+/**
+ * Implements hook_entity_operation().
+ *
+ * @params \Drupal\Core\Entity\EntityInterface $entity
+ */
+function aws_cloud_entity_operation(EntityInterface $entity) {
+  $operations = [];
+  $account = \Drupal::currentUser();
+
+  if ($entity->getEntityTypeId() == 'aws_cloud_instance') {
+    if ($account->hasPermission('edit any aws cloud instance') || ($account->hasPermission('edit own aws cloud instance') && $account->id() == $entity->getOwner()->id())) {
+      if ($entity->getInstanceState() == 'running') {
+        $operations['stop'] = [
+          'title' => t('Stop'),
+          'url' => $entity->toUrl('stop-form'),
+          'weight' => 20,
+        ];
+        $operations['reboot'] = [
+          'title' => t('Reboot'),
+          'url' => $entity->toUrl('reboot-form'),
+          'weight' => 21,
+        ];
+      }
+      else {
+        if ($entity->getInstanceState() == 'stopped') {
+          $operations['start'] = [
+            'title' => t('Start'),
+            'url' => $entity->toUrl('start-form'),
+            'weight' => 20,
+          ];
+
+          // Add associate IP link.
+          if (aws_cloud_can_attach_ip($entity) == TRUE && count(aws_cloud_get_available_elastic_ips($entity->getCloudContext()))) {
+            $operations['associate_elastic_ip'] = [
+              'title' => t('Associate Elastic IP'),
+              'url' => $entity->toUrl('associate-elastic-ip-form'),
+              'weight' => 22,
+            ];
+          }
+        }
+      }
+      // Create Image.
+      $operations['create_image'] = [
+        'title' => t('Create Image'),
+        'url' => $entity->toUrl('create-image-form'),
+        'weight' => 21,
+      ];
+    }
+  }
+  elseif ($entity->getEntityTypeId() == 'aws_cloud_volume') {
+    if ($account->hasPermission('edit aws cloud volume')) {
+      if ($entity->getState() == 'available') {
+        $operations['attach'] = [
+          'title' => t('Attach'),
+          'url' => $entity->toUrl('attach-form'),
+          'weight' => 20,
+        ];
+      }
+      elseif ($entity->getState() == 'in-use') {
+        $operations['detach'] = [
+          'title' => t('Detach'),
+          'url' => $entity->toUrl('detach-form'),
+          'weight' => 20,
+        ];
+      }
+    }
+
+    if ($account->hasPermission('add aws cloud snapshot')) {
+      $operations['create_snapshot'] = [
+        'title' => t('Create Snapshot'),
+        'url' => Url::fromRoute(
+          'entity.aws_cloud_snapshot.add_form',
+          [
+            'cloud_context' => $entity->getCloudContext(),
+            'volume_id' => $entity->getVolumeId(),
+          ]
+        ),
+        'weight' => 21,
+      ];
+    }
+  }
+  elseif ($entity->getEntityTypeId() == 'aws_cloud_elastic_ip') {
+    if ($account->hasPermission('edit aws cloud elastic ip')) {
+      if ($entity->getAssociationId() == NULL) {
+        $operations['associate'] = [
+          'title' => t('Associate'),
+          'url' => $entity->toUrl('associate-form'),
+        ];
+      }
+      else {
+        $operations['disassociate'] = [
+          'title' => t('Disassociate'),
+          'url' => $entity->toUrl('disassociate-form'),
+        ];
+      }
+    }
+  }
+  elseif ($entity->getEntityTypeId() == 'aws_cloud_snapshot') {
+    if ($account->hasPermission('add aws cloud volume')) {
+      $operations['create_volume'] = [
+        'title' => t('Create Volume'),
+        'url' => Url::fromRoute(
+          'entity.aws_cloud_volume.add_form',
+          [
+            'cloud_context' => $entity->getCloudContext(),
+            'snapshot_id' => $entity->getSnapshotId(),
+          ]
+        ),
+        'weight' => 20,
+      ];
+    }
+  }
+
+  return $operations;
+}
+
+/**
+ * Implements hook_entity_operation_alter().
+ *
+ * @params arrays $operations
+ *   Operations array.
+ * @params \Drupal\Core\Entity\EntityInterface $entity
+ *   Entity interface.
+ */
+function aws_cloud_entity_operation_alter(array &$operations, EntityInterface $entity) {
+
+  if ($entity->getEntityTypeId() == 'aws_cloud_volume') {
+    if ($entity->getState() == 'in-use') {
+      unset($operations['delete']);
+    }
+  }
+
+  if ($entity->getEntityTypeId() == 'aws_cloud_image') {
+    if ($entity->getStatus() == 'pending') {
+      unset($operations['delete']);
+    }
+  }
+
+  if ($entity->getEntityTypeId() == 'aws_cloud_instance') {
+    if (isset($operations['edit'])) {
+      /* @var Drupal\Core\Url $url */
+      $url = $operations['edit']['url'];
+      $url->setOption('query', []);
+    }
+  }
+
+  if ($entity->getEntityTypeId() == 'aws_cloud_elastic_ip') {
+    $association_id = $entity->getAssociationId();
+    if (isset($association_id)) {
+      unset($operations['delete']);
+    }
+  }
+}
+
+/**
+ * Implements hook_query_TAG_Alter().
+ *
+ * Alter the query for users that can only view their regions.
+ */
+function aws_cloud_query_all_aws_cloud_instances_views_access_alter(AlterableInterface $query) {
+  if (!$account = $query->getMetaData('account')) {
+    $account = \Drupal::currentUser();
+  }
+
+  $entities = \Drupal::service('plugin.manager.cloud_config_plugin')
+    ->loadConfigEntities('aws_ec2');
+  $cloud_contexts = [];
+  foreach ($entities as $entity) {
+    if ($account->hasPermission('view ' . $entity->getCloudContext())) {
+      $cloud_contexts[] = $entity->getCloudContext();
+    }
+  }
+  if (count($cloud_contexts)) {
+    $query->condition('aws_cloud_instance.cloud_context', $cloud_contexts, 'IN');
+  }
+  else {
+    // No permissions, don't let them view any cloud context.
+    // Return an empty page.  This is just a catch all.  In
+    // normal cases, users will have access to certain cloud context.
+    $query->condition('aws_cloud_instance.cloud_context', '');
+  }
+
+}
+
+/**
+ * Implements hook_query_TAG_Alter().
+ *
+ * Alter the query for users that can only view their own instances.
+ */
+function aws_cloud_query_aws_cloud_instance_views_access_alter(AlterableInterface $query) {
+  if (!$account = $query->getMetaData('account')) {
+    $account = \Drupal::currentUser();
+  }
+  if ($account->hasPermission('view any aws cloud instance')) {
+    return;
+  }
+  else {
+    // Add a uid condition.
+    $query->condition('aws_cloud_instance.uid', $account->id());
+  }
+
+}
+
+/**
+ * Implements hook_query_TAG_Alter().
+ *
+ * Alter the query for users that can only view their own images.
+ */
+function aws_cloud_query_aws_cloud_image_views_access_alter(AlterableInterface $query) {
+  if (!$account = $query->getMetaData('account')) {
+    $account = \Drupal::currentUser();
+  }
+  if ($account->hasPermission('view any aws cloud image')) {
+    return;
+  }
+  else {
+    // Add a uid condition and let users view public images.
+    $or = new Condition('OR');
+    $or->condition('aws_cloud_image.uid', $account->id())
+      ->condition('aws_cloud_image.visibility', TRUE);
+    $query->condition($or);
+  }
+
+}
+
+/**
+ * Implements hook_query_TAG_Alter().
+ *
+ * Alter the query for users that can only view their own instances.
+ */
+function aws_cloud_query_aws_cloud_snapshot_views_access_alter(AlterableInterface $query) {
+  if (!$account = $query->getMetaData('account')) {
+    $account = \Drupal::currentUser();
+  }
+  if ($account->hasPermission('view any aws cloud snapshot')) {
+    return;
+  }
+  else {
+    // Add a uid condition.
+    $query->condition('aws_cloud_snapshot.uid', $account->id());
+  }
+
+}
+
+/**
+ * Implements hook_query_TAG_Alter().
+ *
+ * Alter the query for users that can only view their own instances.
+ */
+function aws_cloud_query_aws_cloud_volume_views_access_alter(AlterableInterface $query) {
+  if (!$account = $query->getMetaData('account')) {
+    $account = \Drupal::currentUser();
+  }
+  if ($account->hasPermission('view any aws cloud volume')) {
+    return;
+  }
+  else {
+    // Add a uid condition.
+    $query->condition('aws_cloud_volume.uid', $account->id());
+  }
+
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Add termination options to the server template launch form.
+ */
+function aws_cloud_form_cloud_server_template_aws_cloud_launch_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  /* @var \Drupal\cloud\Entity\CloudServerTemplate $cloud_server_template */
+  $cloud_server_template = \Drupal::routeMatch()->getParameter('cloud_server_template');
+
+  $config = \Drupal::config('aws_cloud.settings');
+  if ($config->get('aws_cloud_instance_type_cost_list')) {
+    $form['cost'] = [
+      '#type' => 'details',
+      '#title' => t('Cost'),
+      '#open' => TRUE,
+    ];
+
+    $cloud_context = \Drupal::routeMatch()->getParameter('cloud_context');
+    $price_table_renderer = \Drupal::service('aws_cloud.instance_type_price_table_renderer');
+    $form['cost']['price_table'] = $price_table_renderer->render(
+      $cloud_context,
+      $cloud_server_template->get('field_instance_type')->value
+    );
+  }
+
+  $form['automation'] = [
+    '#type' => 'details',
+    '#title' => t('Automation'),
+    '#open' => TRUE,
+  ];
+
+  $form['automation']['description'] = $form['description'];
+  unset($form['description']);
+
+  $form['automation']['termination_protection'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Termination Protection'),
+    '#description' => t('Indicates whether termination protection is enabled. If enabled, this instance cannot be terminated using the console, API, or CLI until termination protection is disabled.'),
+    '#default_value' => $form_state->getFormObject()->getEntity()->get('field_termination_protection')->value == '1',
+  ];
+
+  $config = \Drupal::config('aws_cloud.settings');
+  $form['automation']['terminate'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Automatically terminate instance'),
+    '#description' => t('Terminate instance automatically.  Specify termination date in the date picker below.'),
+    '#default_value' => $config->get('aws_cloud_instance_terminate'),
+  ];
+
+  // @TODO: make 30 days configurable
+  $form['automation']['termination_date'] = [
+    '#type' => 'datetime',
+    '#title' => t('Termination Date'),
+    '#description' => t('The default termination date is 30 days into the future'),
+    '#default_value' => DrupalDateTime::createFromTimestamp(time() + 2592000),
+  ];
+
+  /* @var \Drupal\cloud\Entity\CloudServerTemplate $cloud_server_template */
+  $cloud_server_template = \Drupal::routeMatch()->getParameter('cloud_server_template');
+
+  $form['automation']['schedule'] = [
+    '#title' => t('Schedule'),
+    '#type' => 'select',
+    '#default_value' => $cloud_server_template->get('field_schedule')->value,
+    '#options' => aws_cloud_get_schedule(),
+    '#description' => t('Specify a start/stop schedule. This helps reduce server hosting costs.'),
+  ];
+  if ($cloud_server_template->get('field_instance_shutdown_behavior')->value == 'terminate') {
+    // Add a warning message setting a schedule will terminate the instance,
+    // since the shutdown behavior is terminate.
+    $form['automation']['terminate_message'] = [
+      '#markup' => t('Setting a schedule will potentially terminate the instance since the <strong>%text</strong> is set to Terminate',
+        ['%text' => 'Instance Shutdown Behavior']),
+    ];
+  }
+
+  $view_builder = \Drupal::entityTypeManager()->getViewBuilder('cloud_server_template');
+  $build = $view_builder->view($cloud_server_template, 'view');
+  unset($build['#weight']);
+  $build['#pre_render'][] = 'aws_cloud_server_template_reorder';
+  $form['detail'] = $build;
+
+  $form['#validate'][] = 'aws_cloud_form_cloud_server_template_aws_cloud_launch_form_validate';
+}
+
+/**
+ * Validate function for form cloud_server_template_aws_cloud_launch_form.
+ *
+ * @param array $form
+ *   An associative array containing the structure of the form.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   The current state of the form.
+ */
+function aws_cloud_form_cloud_server_template_aws_cloud_launch_form_validate(array &$form, FormStateInterface $form_state) {
+  if ($form_state->getValue('terminate') && $form_state->getValue('termination_protection')) {
+    $form_state->setErrorByName(
+      'terminate',
+      t('"@name1" and "@name2" can\'t be selected both. Please unselect one of them.',
+        [
+          '@name1' => t('Termination Protection'),
+          '@name2' => t('Automatically terminate instance'),
+        ]
+      )
+    );
+  }
+}
+
+/**
+ * Reorder fields of aws cloud server template.
+ *
+ * @param array $build
+ *   Build array.
+ *
+ * @return array
+ *   Build array reordered.
+ */
+function aws_cloud_server_template_reorder(array $build) {
+  $build['name']['#label_display'] = 'inline';
+  $build['instance']['name'] = $build['name'];
+  unset($build['name']);
+  return $build;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Alter vpc and subnet field.
+ */
+function aws_cloud_form_cloud_server_template_aws_cloud_edit_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  aws_cloud_form_cloud_server_template_aws_cloud_form_common_alter($form, $form_state, $form_id);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Alter vpc and subnet field.
+ */
+function aws_cloud_form_cloud_server_template_aws_cloud_add_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  aws_cloud_form_cloud_server_template_aws_cloud_form_common_alter($form, $form_state, $form_id);
+}
+
+/**
+ * Implements hook_preprocess_field_multiple_value_form().
+ */
+function aws_cloud_preprocess_field_multiple_value_form(&$variables) {
+  // Disable reordering of the ip_permission field.
+  if ($variables['element']['#field_name'] == 'ip_permission' || $variables['element']['#field_name'] == 'outbound_permission') {
+    aws_cloud_remove_table_reordering($variables['table']);
+    // Switch the text of "Add another item" to "Add Rule".
+    $variables['element']['add_more']['#value'] = t('Add Rule');
+    $variables['button']['#value'] = t('Add Rule');
+  }
+}
+
+/**
+ * Common alter function for edit and add forms.
+ */
+function aws_cloud_form_cloud_server_template_aws_cloud_form_common_alter(&$form, FormStateInterface $form_state, $form_id) {
+  aws_cloud_form_reorder($form, aws_cloud_server_template_field_orders());
+
+  $form['instance']['field_iam_role']['widget']['#options']['_none'] = t('No Role');
+
+  $form['network']['field_vpc']['widget']['#ajax'] = [
+    'callback' => 'aws_cloud_ajax_callback_get_fields',
+  ];
+
+  $vpc_id = '_none';
+  if (!empty($form['network']['field_vpc']['widget']['#default_value'])) {
+    $vpc_id = $form['network']['field_vpc']['widget']['#default_value'][0];
+  }
+
+  // If validation happened, we should get vpc_id from user input.
+  $user_input = $form_state->getUserInput();
+  if (isset($user_input['field_vpc'])) {
+    $vpc_id = $user_input['field_vpc'];
+  }
+
+  $subnet_options = aws_cloud_get_subnet_options_by_vpc_id($vpc_id, $form_state->getFormObject()->getEntity());
+  $form['#attached']['library'][] = 'aws_cloud/aws_cloud_form';
+  $form['#attached']['drupalSettings']['aws_cloud']['field_subnet_default_values']
+    = array_keys($subnet_options);
+
+  $security_group_options = aws_cloud_get_security_group_options_by_vpc_id($vpc_id);
+  $security_group_default_values = [];
+  foreach ($security_group_options as $id => $security_group_option) {
+    $security_group_default_values[] = strval($id);
+  }
+
+  $form['#attached']['drupalSettings']['aws_cloud']['field_security_group_default_values']
+    = $security_group_default_values;
+
+  $config = \Drupal::config('aws_cloud.settings');
+  $form['#attached']['drupalSettings']['aws_cloud']['aws_cloud_instance_type_cost']
+    = $config->get('aws_cloud_instance_type_cost') == '1' ? TRUE : FALSE;
+
+  // Hide labels of field_tags.
+  $form['tags']['field_tags']['widget']['#title'] = NULL;
+}
+
+/**
+ * Return orders of aws cloud server template fields.
+ *
+ * @param string $include_name
+ *   Whether to include name field or not.
+ *
+ * @return array
+ *   Fieldsets array.
+ */
+function aws_cloud_server_template_field_orders($include_name = TRUE) {
+  $fieldsets_def = [
+    [
+      'name' => 'instance',
+      'title' => t('Instance'),
+      'open' => TRUE,
+      'fields' => [
+        'name',
+        'field_description',
+        'field_instance_type',
+        'field_iam_role',
+        'field_min_count',
+        'field_max_count',
+        'field_test_only',
+      ],
+    ],
+    [
+      'name' => 'ami',
+      'title' => t('AMI'),
+      'open' => TRUE,
+      'fields' => [
+        'field_image_id',
+        'field_kernel_id',
+        'field_ram',
+      ],
+    ],
+    [
+      'name' => 'network',
+      'title' => t('Network'),
+      'open' => TRUE,
+      'fields' => [
+        'field_availability_zone',
+        'field_vpc',
+        'field_subnet',
+        'field_security_group',
+        'field_ssh_key',
+        'field_network',
+      ],
+    ],
+    [
+      'name' => 'tags',
+      'title' => t('Tags'),
+      'open' => TRUE,
+      'fields' => [
+        'field_tags',
+      ],
+    ],
+    [
+      'name' => 'options',
+      'title' => t('Options'),
+      'open' => TRUE,
+      'fields' => [
+        'field_instance_shutdown_behavior',
+        'field_termination_protection',
+        'field_monitoring',
+        'field_schedule',
+        'field_user_data',
+      ],
+    ],
+    [
+      'name' => 'others',
+      'title' => t('Others'),
+      'open' => FALSE,
+      'fields' => [
+        'cloud_context',
+        'uid',
+        'revision_log_message',
+      ],
+    ],
+  ];
+
+  if (!$include_name) {
+    unset($fieldsets_def[0]['fields'][0]);
+  }
+
+  return $fieldsets_def;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Alter cloud config aws ec2 edit form.
+ */
+function aws_cloud_form_cloud_config_aws_ec2_edit_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $form['#validate'][] = 'aws_cloud_form_cloud_config_aws_ec2_credentials_validate';
+  aws_cloud_form_cloud_config_aws_ec2_form_common_alter($form, $form_state, $form_id);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Alter cloud config aws ec2 add form.
+ */
+function aws_cloud_form_cloud_config_aws_ec2_add_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // Hide fields which will be set automatically.
+  $form['cloud_context']['#access'] = FALSE;
+  $form['field_region']['#access'] = FALSE;
+  $form['field_api_endpoint_uri']['#access'] = FALSE;
+  $form['field_image_upload_url']['#access'] = FALSE;
+  $form['field_cloud_type']['widget']['#default_value'] = 'amazon_ec2';
+
+  $form['actions']['submit']['#submit'] = ['aws_cloud_form_cloud_config_aws_ec2_add_form_submit'];
+  $form['#validate'][] = 'aws_cloud_form_cloud_config_aws_ec2_add_form_validate';
+  $form['#validate'][] = 'aws_cloud_form_cloud_config_aws_ec2_credentials_validate';
+  aws_cloud_form_cloud_config_aws_ec2_form_common_alter($form, $form_state, $form_id);
+
+  // Add checkboxes to enable regions.
+  $aws_ec2_service = \Drupal::service('aws_cloud.ec2');
+  $regions = $aws_ec2_service->getRegions();
+  $form['profile']['common']['regions'] = [
+    '#title' => t('Regions'),
+    '#description' => t('Select regions for which cloud config will be created.'),
+    '#type' => 'checkboxes',
+    '#options' => $regions,
+    '#default_value' => array_keys($regions),
+    '#required' => TRUE,
+    '#weight' => $form['profile']['common']['field_account_id']['#weight'] + 1,
+  ];
+}
+
+/**
+ * Submit function for form cloud_config_aws_ec2_add_form.
+ *
+ * @param array $form
+ *   An associative array containing the structure of the form.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   The current state of the form.
+ */
+function aws_cloud_form_cloud_config_aws_ec2_add_form_submit(array $form, FormStateInterface $form_state) {
+  // Get regions.
+  $aws_ec2_service = \Drupal::service('aws_cloud.ec2');
+  $regions = $aws_ec2_service->getRegions();
+
+  $entity_object = $form_state->getFormObject()->getEntity();
+  $field_names = array_keys($entity_object->getFields());
+  $form_values = $form_state->getValues();
+  $name = $form_values['name'][0]['value'];
+
+  // Filter regions.
+  $regions_selected = array_values(array_filter($form_values['regions']));
+  $regions = array_filter($regions, function ($region_name) use ($regions_selected) {
+    return in_array($region_name, $regions_selected);
+  }, ARRAY_FILTER_USE_KEY);
+
+  // Create operation arrays for batch.
+  $count = 1;
+  $items = [];
+  foreach ($regions as $region_name => $region_display_name) {
+    $items[$region_name] = $region_display_name;
+
+    if ($count % 2 === 0 || $count === count($regions)) {
+      $operations[] = [
+        'aws_cloud_form_cloud_config_aws_ec2_add_form_submit_batch',
+        [$items, $name, $field_names, $form_values],
+      ];
+
+      $items = [];
+    }
+    ++$count;
+  }
+
+  // Create a $batch array.
+  $batch = [
+    'operations'       => $operations,
+    'finished'         => 'aws_cloud_form_cloud_config_aws_ec2_add_form_submit_finished',
+    'title'            => t('Creating Cloud config - Batch Processing'),
+    'init_message'     => t('Starting to create Cloud config...'),
+    'progress_message' => t('Completed @current step of @total.'),
+    'error_message'    => t('Creating Cloud config has encountered an error.'),
+  ];
+
+  try {
+    batch_set($batch);
+  }
+  catch (Exception $e) {
+    foreach ($e->getErrors() as $error_message) {
+      \Drupal::messenger()->addMessage($error_message, 'error');
+    }
+  }
+
+  $form_state->setRedirect('entity.cloud_config.collection', []);
+}
+
+/**
+ * Validate function for form cloud_config_aws_ec2_add_form.
+ *
+ * @param array $form
+ *   An associative array containing the structure of the form.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   The current state of the form.
+ */
+function aws_cloud_form_cloud_config_aws_ec2_add_form_validate(array &$form, FormStateInterface $form_state) {
+  // Validate Name.
+  $name = $form_state->getValue('name')[0]['value'];
+  $aws_ec2_service = \Drupal::service('aws_cloud.ec2');
+  $regions = $aws_ec2_service->getRegions();
+  $cloud_contexts = array_map(function ($region_name) use ($name) {
+    return aws_cloud_form_cloud_config_aws_ec2_add_form_create_cloud_context($name, $region_name);
+  }, array_keys($regions));
+
+  $entities = \Drupal::service('plugin.manager.cloud_config_plugin')->loadConfigEntities('aws_ec2');
+  $cloud_contexts_exist = array_map(function ($entity) {
+    return $entity->getCloudContext();
+  }, $entities);
+
+  if (!empty(array_intersect($cloud_contexts, $cloud_contexts_exist))) {
+    $form_state->setErrorByName(
+      'name',
+      t('The cloud config entities with the same cloud context have existed.')
+    );
+  }
+
+  // Validate Regions.
+  $account_id = $form_state->getValue('field_account_id')[0]['value'];
+  $regions_selected = array_values(array_filter($form_state->getValue('regions')));
+  $regions_used = array_map(function ($entity) use ($account_id) {
+    if ($entity->get('field_account_id')->value != $account_id) {
+      return NULL;
+    }
+
+    return $entity->get('field_region')->value;
+  }, $entities);
+  $regions_used = array_filter($regions_used);
+
+  if (!empty($regions_invalid = array_intersect($regions_selected, $regions_used))) {
+    $form_state->setErrorByName(
+      'regions',
+      t(
+        'The regions selected %regions_invalid have been used. Please select other regions.',
+        ['%regions_invalid' => implode(',', $regions_invalid)]
+      )
+    );
+  }
+}
+
+/**
+ * Validate access key, secret key, iam role configurations.
+ *
+ * @param array $form
+ *   An associative array containing the structure of the form.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   The current state of the form.
+ */
+function aws_cloud_form_cloud_config_aws_ec2_credentials_validate(array &$form, FormStateInterface $form_state) {
+  $use_credentials = $form_state->getValue('field_use_instance_credentials');
+  $assume_role = $form_state->getValue('field_assume_role');
+
+  if ($use_credentials['value'] == FALSE) {
+    $access_key = $form_state->getValue('field_access_key');
+    $secret_key = $form_state->getValue('field_secret_key');
+
+    if (empty($access_key[0]['value'])) {
+      $form_state->setErrorByName(
+        'field_access_key',
+        t('Access key required.')
+      );
+    }
+    if (empty($secret_key[0]['value'])) {
+      $form_state->setErrorByName(
+        'field_secret_key',
+        t('Secret key required.')
+      );
+    }
+  }
+
+  if ($assume_role['value'] == TRUE) {
+    $iam_role = $form_state->getValue('field_iam_role');
+    if (empty($iam_role[0]['value'])) {
+      $form_state->setErrorByName(
+        'field_iam_role',
+        t('IAM role name required.')
+      );
+    }
+  }
+}
+
+/**
+ * Process to create the CloudConfig.
+ *
+ * @param array $regions
+ *   The regions.
+ * @param string $name
+ *   The name of the CloudConfig entity.
+ * @param array $field_names
+ *   The names of the CloudConfig entity's fields.
+ * @param array $form_values
+ *   The values of form input elements.
+ * @param array &$context
+ *   The batch context.
+ */
+function aws_cloud_form_cloud_config_aws_ec2_add_form_submit_batch(
+  array $regions,
+  $name,
+  array $field_names,
+  array $form_values,
+  array &$context) {
+
+  foreach ($regions as $region_name => $region_display_name) {
+
+    // Create CloudConfig.
+    $entity = CloudConfig::create([
+      'type' => 'aws_ec2',
+    ]);
+
+    foreach ($form_values as $key => $value) {
+      if (in_array($key, $field_names)) {
+        $entity->set($key, $value);
+      }
+    }
+
+    // Set name.
+    $entity->setName("${name} ${region_display_name}");
+
+    // Set cloud_context.
+    $entity->set(
+      'cloud_context',
+      aws_cloud_form_cloud_config_aws_ec2_add_form_create_cloud_context($name, $region_name)
+    );
+
+    // Set field_region.
+    $entity->set('field_region', [$region_name]);
+
+    // Set field_api_endpoint_uri and field_image_upload_url.
+    $api_endpoint_uri = "https://ec2.${region_name}.amazonaws.com";
+    $entity->set('field_api_endpoint_uri', [$api_endpoint_uri]);
+    $entity->set('field_image_upload_url', [$api_endpoint_uri]);
+
+    $entity->save();
+    $context['results']['regions'][] = $entity->getCloudContext();
+  }
+
+}
+
+/**
+ * Create cloud context according to name and region name.
+ *
+ * @param string $name
+ *   The name of the CloudConfig entity.
+ * @param string $region_name
+ *   The name of the region.
+ *
+ * @return string
+ *   The cloud context
+ */
+function aws_cloud_form_cloud_config_aws_ec2_add_form_create_cloud_context($name, $region_name) {
+  // Convert " " to "_".
+  $cloud_context = str_replace(' ', '_', strtolower($name));
+
+  // Remove special characters.
+  $cloud_context = preg_replace('/[^a-z0-9_]/', '', $cloud_context);
+
+  // Concat with region.
+  $cloud_context .= '_' . str_replace('-', '_', strtolower($region_name));
+
+  return $cloud_context;
+}
+
+/**
+ * Batch finish function.
+ *
+ * @param bool $success
+ *   Indicates if the batch was successfully finished.
+ * @param array $results
+ *   The value of the results item from the context variable used in the batch
+ *   processing.
+ * @param array $operations
+ *   If the success parameter is false then this is a list of the operations
+ *   that haven't completed yet.
+ */
+function aws_cloud_form_cloud_config_aws_ec2_add_form_submit_finished(
+  $success,
+  array $results,
+  array $operations) {
+
+  if ($success) {
+    // Send to update_all url to update all the regions.
+    return new RedirectResponse('/clouds/aws_cloud/update_all?regions=' . implode(',', $results['regions']));
+  }
+  else {
+    $message = t('Creating Cloud config has NOT been finished successfully.');
+    \Drupal::messenger()->addMessage($message);
+  }
+}
+
+/**
+ * Common alter function.
+ *
+ * Common alter function for aws_cloud_form_cloud_config_aws_ec2_edit_form and
+ * aws_cloud_form_cloud_config_aws_ec2_add_form.
+ */
+function aws_cloud_form_cloud_config_aws_ec2_form_common_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $fieldset_defs = [
+    [
+      'name' => 'cloud_provider',
+      'title' => t('Cloud Provider'),
+      'open' => TRUE,
+      'fields' => [
+        'field_cloud_type',
+        'cloud_context',
+        'name',
+        'field_description',
+      ],
+    ],
+    [
+      'name' => 'profile',
+      'title' => t('Profile'),
+      'open' => TRUE,
+      'fields' => [],
+      'subfieldsets' => [
+        [
+          'name' => 'common',
+          'title' => t('Common'),
+          'open' => TRUE,
+          'fields' => [
+            'field_account_id',
+            'field_region',
+          ],
+        ],
+        [
+          'name' => 'credentials',
+          'title' => t('Credentials'),
+          'open' => TRUE,
+          'fields' => [
+            'field_use_instance_credentials',
+            'field_access_key',
+            'field_secret_key',
+          ],
+        ],
+        [
+          'name' => 'assume_role',
+          'title' => t('Assume Role'),
+          'open' => TRUE,
+          'fields' => [
+            'field_assume_role',
+            'field_iam_role',
+          ],
+        ],
+      ],
+    ],
+    [
+      'name' => 'api',
+      'title' => t('API'),
+      'open' => FALSE,
+      'fields' => [
+        'field_api_version',
+      ],
+    ],
+  ];
+
+  $others = [
+    'name' => 'others',
+    'title' => t('Others'),
+    'open' => FALSE,
+    'fields' => [
+      'uid',
+    ],
+  ];
+
+  $fieldset_defs[] = $others;
+
+  // Hide the instance credential field, if security sever url not available.
+  if (aws_cloud_ping_metadata_security_server() == FALSE) {
+    $form['field_use_instance_credentials']['#access'] = FALSE;
+  }
+
+  $form['field_api_endpoint_uri']['#access'] = FALSE;
+  $form['field_image_upload_url']['#access'] = FALSE;
+  $form['field_x_509_certificate']['#access'] = FALSE;
+  $form['new_revision']['#access'] = FALSE;
+  $form['revision_log_message']['#access'] = FALSE;
+
+  $form['#attached']['library'][] = 'aws_cloud/aws_cloud_config';
+
+  aws_cloud_form_reorder($form, $fieldset_defs);
+
+  // Disable the submit button if private directory not configured properly.
+  $credential_directory = aws_cloud_ini_directory();
+  if (!PrivateStream::basePath() ||
+    !file_prepare_directory($credential_directory, FILE_CREATE_DIRECTORY | FILE_MODIFY_PERMISSIONS)) {
+    \Drupal::messenger()->addMessage(t('Error occurred setting up private file directory. Cloud Config will not work properly. Please confirm the private directory is setup and writeable by the web server before proceeding. This must be changed in settings.php'), 'error');
+    $form['actions']['submit']['#access'] = FALSE;
+  }
+
+}
+
+/**
+ * Function to reorder form values.
+ *
+ * @param array $form
+ *   Form elements.
+ * @param array $fieldset_defs
+ *   Field set definitions.
+ */
+function aws_cloud_form_reorder(array &$form, array $fieldset_defs) {
+  $weight = 0;
+  foreach ($fieldset_defs as $fieldset_def) {
+    $fieldset_name = $fieldset_def['name'];
+    $form[$fieldset_name] = [
+      '#type' => 'details',
+      '#title' => $fieldset_def['title'],
+      '#weight' => $weight++,
+      '#open' => $fieldset_def['open'],
+    ];
+
+    foreach ($fieldset_def['fields'] as $field_name) {
+      if (!isset($form[$field_name])) {
+        continue;
+      }
+
+      $form[$fieldset_name][$field_name] = $form[$field_name];
+      $form[$fieldset_name][$field_name]['#weight'] = $weight++;
+      unset($form[$field_name]);
+    }
+
+    // Support an extra fieldset.
+    if (isset($fieldset_def['subfieldsets'])) {
+      foreach ($fieldset_def['subfieldsets'] as $subfieldset_def) {
+        $subfieldset_name = $subfieldset_def['name'];
+        $form[$fieldset_name][$subfieldset_name] = [
+          '#type' => 'details',
+          '#title' => $subfieldset_def['title'],
+          '#weight' => $weight++,
+          '#open' => $subfieldset_def['open'],
+        ];
+        foreach ($subfieldset_def['fields'] as $subfield) {
+          if (!isset($form[$subfield])) {
+            continue;
+          }
+          $form[$fieldset_name][$subfieldset_name][$subfield] = $form[$subfield];
+          $form[$fieldset_name][$subfieldset_name][$subfield]['#weight'] = $weight++;
+          unset($form[$subfield]);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Ajax callback function to get fields(subnet, security group).
+ */
+function aws_cloud_ajax_callback_get_fields(array $form, FormStateInterface $form_state) {
+  $vpc_id = $form['network']['field_vpc']['widget']['#value'];
+
+  // Field subnet.
+  $field_subnet = $form['network']['field_subnet'];
+  $field_subnet['#id'] = 'edit-field-subnet-wrapper';
+  $field_subnet['widget']['#options'] = aws_cloud_get_subnet_options_by_vpc_id(
+    $vpc_id,
+    $form_state->getFormObject()->getEntity()
+  );
+
+  $response = new AjaxResponse();
+  $response->addCommand(
+    new ReplaceCommand('#edit-field-subnet-wrapper',
+    \Drupal::service('renderer')->render($field_subnet))
+  );
+
+  // Field security group.
+  $field_security_group = $form['network']['field_security_group'];
+  $field_security_group['#id'] = 'edit-field-security-group-wrapper';
+  $field_security_group['widget']['#options'] = aws_cloud_get_security_group_options_by_vpc_id($vpc_id);
+
+  $response->addCommand(
+    new ReplaceCommand('#edit-field-security-group-wrapper',
+    \Drupal::service('renderer')->render($field_security_group))
+  );
+
+  return $response;
+}
+
+/**
+ * Get options of field subnet belongs to vpc.
+ */
+function aws_cloud_get_subnet_options_by_vpc_id($vpc_id, $entity) {
+  $options = [];
+  if ($vpc_id === '_none') {
+    return $options;
+  }
+
+  try {
+    $aws_ec2_service = \Drupal::service('aws_cloud.ec2');
+    if ($entity->isNew()) {
+      $route = \Drupal::routeMatch();
+      $cloud_context = $route->getParameter('cloud_context');
+    }
+    else {
+      $cloud_context = $entity->getCloudContext();
+    }
+    $aws_ec2_service->setCloudContext($cloud_context);
+
+    $params = [];
+    if ($vpc_id != NULL) {
+      $params['Filters'] = [
+        [
+          'Name' => 'vpc-id',
+          'Values' => [$vpc_id],
+        ],
+      ];
+    }
+    $response = $aws_ec2_service->describeSubnets($params);
+
+    foreach ($response['Subnets'] as $subnet) {
+      $subnet_id = $subnet['SubnetId'];
+      $name = $subnet_id;
+      if (isset($subnet['Tags'])) {
+        foreach ($subnet['Tags'] as $tag) {
+          if ($tag['Key'] == 'Name') {
+            $name = $tag['Value'];
+            break;
+          }
+        }
+      }
+      $options[$subnet_id] = sprintf('%s (%s)', $name, $subnet_id);
+    }
+  }
+  catch (Exception $e) {
+    \Drupal::logger('aws_cloud')->debug('No cloud context specified');
+  }
+
+  return $options;
+}
+
+/**
+ * Get options of field security group belongs to vpc.
+ */
+function aws_cloud_get_security_group_options_by_vpc_id($vpc_id) {
+  $options = [];
+
+  if ($vpc_id === '_none') {
+    return $options;
+  }
+
+  $entity_storage = \Drupal::entityTypeManager()->getStorage('aws_cloud_security_group');
+  $entity_ids = $entity_storage
+    ->getQuery()
+    ->condition('vpc_id', $vpc_id)
+    ->execute();
+  $security_groups = $entity_storage->loadMultiple($entity_ids);
+  foreach ($security_groups as $security_group) {
+    $options[$security_group->id()] = $security_group->getGroupName();
+  }
+
+  return $options;
+}
+
+/**
+ * Function will get instances that needs to be terminated.
+ *
+ * Query the aws_cloud_instance table and return instances that are past a
+ * certain timestamp.
+ *
+ * @param string $cloud_context
+ *   The cloud context used to get expired instances.
+ *
+ * @return array
+ *   An array of expired instance objects.
+ */
+function aws_cloud_get_expired_instances($cloud_context) {
+  $expired_instances = [];
+  /* @var \Drupal\Core\Entity\EntityStorageInterface $entity_storage $entity_storage */
+  $entity_storage = \Drupal::entityTypeManager()->getStorage('aws_cloud_instance');
+  $entity_ids = $entity_storage
+    ->getQuery()
+    ->condition('termination_timestamp', time(), '<')
+    ->condition('termination_timestamp', 0, '!=')
+    ->condition('termination_timestamp', NULL, 'IS NOT NULL')
+    ->condition('instance_state', ['running', 'stopped'], 'IN')
+    ->condition('cloud_context', $cloud_context, '=')
+    ->execute();
+  $entities = $entity_storage->loadMultiple($entity_ids);
+  foreach ($entities as $entity) {
+    /* @var \Drupal\aws_cloud\Entity\Ec2\Instance $entity */
+    $expired_instances['InstanceIds'][] = $entity->getInstanceId();
+  }
+  return $expired_instances;
+}
+
+/**
+ * Get pending images.
+ *
+ * @param string $cloud_context
+ *   Cloud context.
+ *
+ * @return string[]
+ *   Pending images array.
+ */
+function aws_cloud_get_pending_images($cloud_context) {
+  $images = [];
+  /* @var \Drupal\Core\Entity\EntityStorageInterface $entity_storage $entity_storage */
+  $entity_storage = \Drupal::entityTypeManager()->getStorage('aws_cloud_image');
+  $entity_ids = $entity_storage
+    ->getQuery()
+    ->condition('status', 'pending')
+    ->condition('cloud_context', $cloud_context, '=')
+    ->execute();
+  $entities = $entity_storage->loadMultiple($entity_ids);
+  foreach ($entities as $entity) {
+    /* @var \Drupal\aws_cloud\Entity\Ec2\Image $entity */
+    $images[] = $entity->getImageId();
+  }
+  return $images;
+}
+
+/**
+ * Implements hook_mail().
+ */
+function aws_cloud_mail($key, &$message, $params) {
+  switch ($key) {
+    case 'notify_aws_entity_admins_users':
+      $message['subject'] = $params['subject'];
+      $message['body'][] = $params['message'];
+      break;
+  }
+}
+
+/**
+ * Notify instance owners and admins.
+ *
+ * Notify instance owners if their instances
+ * have been running for too long.
+ */
+function aws_cloud_notify_instance_owners_and_admins() {
+  $config = \Drupal::config('aws_cloud.settings');
+  $emails = $config->get('aws_cloud_instance_notification_emails');
+  $notification_flag = $config->get('aws_cloud_notification');
+  $frequency = $config->get('aws_cloud_notification_frequency');
+
+  $last_notified = \Drupal::state()->get('aws_cloud_instance_last_notified');
+  $notification_time = new DrupalDateTime($config->get('aws_cloud_instance_notification_time'));
+
+  // Run notification if set by user.
+  if (aws_cloud_can_send_notification($notification_flag, $emails, $notification_time->getTimestamp(), $frequency, $last_notified)) {
+    $instances = aws_cloud_get_long_running_instances($config->get('aws_cloud_notification_criteria'));
+
+    // Send the notification to admins.
+    $instance_message = aws_cloud_get_entity_notification_message(
+      $instances,
+      $config->get('aws_cloud_instance_notification_instance_info'),
+      'aws_cloud_instance',
+      $config->get('aws_cloud_notification_msg'),
+      'instances'
+    );
+
+    if ($instance_message != FALSE) {
+      aws_cloud_send_notification_email(
+        $config->get('aws_cloud_notification_subject'),
+        $instance_message,
+        $emails,
+        'notify_aws_entity_admins_users',
+        'instance'
+      );
+    }
+
+    // Create an array of instances grouped by email addresses.
+    if ($config->get('aws_cloud_notify_owner')) {
+      $admin_emails = explode(',', $emails);
+      $user_instances = [];
+
+      foreach ($instances as $instance) {
+        $account = $instance->getOwner();
+        if ($account != NULL && !empty($account->getEmail())) {
+          $user_instances[$account->getEmail()][] = $instance;
+        }
+      }
+
+      foreach ($user_instances as $email => $instances) {
+        if (!in_array($email, $admin_emails)) {
+          $instance_message = aws_cloud_get_entity_notification_message(
+            $user_instances[$email],
+            $config->get('aws_cloud_instance_notification_instance_info'),
+            'aws_cloud_instance',
+            $config->get('aws_cloud_notification_msg'),
+            'instances'
+          );
+
+          if ($instance_message != FALSE) {
+            aws_cloud_send_notification_email(
+              $config->get('aws_cloud_notification_subject'),
+              $instance_message,
+              $email,
+              'notify_aws_entity_admins_users',
+              'instance'
+            );
+          }
+        }
+      }
+    }
+    \Drupal::state()->set('aws_cloud_instance_last_notified', time());
+  }
+}
+
+/**
+ * Notify a list of emails of unused EBS volumes.
+ */
+function aws_cloud_notify_unused_volumes_owners_and_admins() {
+  $config = \Drupal::config('aws_cloud.settings');
+  $emails = $config->get('aws_cloud_volume_notification_emails');
+  $notification_flag = $config->get('aws_cloud_volume_notification');
+  $frequency = $config->get('aws_cloud_volume_notification_frequency');
+
+  $last_notified = \Drupal::state()->get('aws_cloud_volume_last_notified');
+  $notification_time = new DrupalDateTime($config->get('aws_cloud_volume_notification_time'));
+
+  if (aws_cloud_can_send_notification($notification_flag, $emails, $notification_time->getTimestamp(), $frequency, $last_notified)) {
+    $volumes = aws_cloud_get_unused_volumes();
+    $volume_message = aws_cloud_get_entity_notification_message(
+      $volumes,
+      $config->get('aws_cloud_volume_notification_volume_info'),
+      'aws_cloud_volume',
+      $config->get('aws_cloud_volume_notification_msg'),
+      'volumes'
+    );
+
+    if ($volume_message != FALSE) {
+      aws_cloud_send_notification_email(
+        $config->get('aws_cloud_volume_notification_subject'),
+        $volume_message,
+        $emails,
+        'notify_aws_entity_admins_users',
+        'volume'
+      );
+    }
+
+    if ($config->get('aws_cloud_volume_notify_owner')) {
+      $admin_emails = explode(',', $emails);
+      $user_volumes = [];
+
+      foreach ($volumes as $volume) {
+        $account = $volume->getOwner();
+        if ($account != NULL && !empty($account->getEmail())) {
+          $user_volumes[$account->getEmail()][] = $volume;
+        }
+      }
+
+      foreach ($user_volumes as $email => $volumes) {
+        if (!in_array($email, $admin_emails)) {
+          $volume_message = aws_cloud_get_entity_notification_message(
+            $user_volumes[$email],
+            $config->get('aws_cloud_volume_notification_volume_info'),
+            'aws_cloud_volume',
+            $config->get('aws_cloud_volume_notification_msg'),
+            'volumes'
+          );
+          if ($volume_message) {
+            aws_cloud_send_notification_email(
+              $config->get('aws_cloud_volume_notification_subject'),
+              $volume_message,
+              $email,
+              'notify_aws_entity_admins_users',
+              'volume'
+            );
+          }
+        }
+      }
+    }
+    \Drupal::state()->set('aws_cloud_volume_last_notified', time());
+  }
+}
+
+/**
+ * Notifies a list of emails of unused EBS snapshots.
+ */
+function aws_cloud_notify_unused_snapshots_owners_and_admins() {
+  $config = \Drupal::config('aws_cloud.settings');
+  $emails = $config->get('aws_cloud_snapshot_notification_emails');
+  $notification_flag = $config->get('aws_cloud_snapshot_notification');
+  $frequency = $config->get('aws_cloud_snapshot_notification_frequency');
+
+  $last_notified = \Drupal::state()->get('aws_cloud_snapshot_last_notified');
+  $notification_time = new DrupalDateTime($config->get('aws_cloud_snapshot_notification_time'));
+
+  if (aws_cloud_can_send_notification($notification_flag, $emails, $notification_time->getTimestamp(), $frequency, $last_notified)) {
+    $snapshots = aws_cloud_get_unused_snapshots();
+    $snapshot_message = aws_cloud_get_entity_notification_message(
+      $snapshots,
+      $config->get('aws_cloud_snapshot_notification_snapshot_info'),
+      'aws_cloud_snapshot',
+      $config->get('aws_cloud_snapshot_notification_msg'),
+      'snapshots'
+    );
+    if ($snapshot_message != FALSE) {
+      aws_cloud_send_notification_email(
+        $config->get('aws_cloud_snapshot_notification_subject'),
+        $snapshot_message,
+        $emails,
+        'notify_aws_entity_admins_users',
+        'snapshot'
+      );
+    }
+    if ($config->get('aws_cloud_snapshot_notify_owner')) {
+      $admin_emails = explode(',', $emails);
+      $user_snapshots = [];
+
+      foreach ($snapshots as $snapshot) {
+        $account = $snapshot->getOwner();
+        if ($account != NULL && !empty($account->getEmail())) {
+          $user_snapshots[$account->getEmail()][] = $snapshot;
+        }
+      }
+      foreach ($user_snapshots as $email => $snapshots) {
+        if (!in_array($email, $admin_emails)) {
+          $snapshot_message = aws_cloud_get_entity_notification_message(
+            $user_snapshots[$email],
+            $config->get('aws_cloud_snapshot_notification_snapshot_info'),
+            'aws_cloud_snapshot',
+            $config->get('aws_cloud_snapshot_notification_msg'),
+            'snapshots'
+          );
+          if ($snapshot_message) {
+            aws_cloud_send_notification_email(
+              $config->get('aws_cloud_snapshot_notification_subject'),
+              $snapshot_message,
+              $email,
+              'notify_aws_entity_admins_users',
+              'snapshot'
+            );
+          }
+        }
+      }
+    }
+    \Drupal::state()->set('aws_cloud_snapshot_last_notified', time());
+  }
+}
+
+/**
+ * Send email to users. Log the email transaction in Drupal logger.
+ *
+ * @param string $subject
+ *   The message subject.
+ * @param string $message
+ *   The email message.
+ * @param string $emails
+ *   The list of emails.
+ * @param string $mail_hook
+ *   The mail hook.
+ * @param string $message_type
+ *   The message type.
+ */
+function aws_cloud_send_notification_email($subject, $message, $emails, $mail_hook, $message_type) {
+  $mailManager = \Drupal::service('plugin.manager.mail');
+  $result = $mailManager->mail(
+    'aws_cloud',
+    $mail_hook,
+    $emails,
+    \Drupal::languageManager()->getDefaultLanguage(),
+    [
+      'message' => $message,
+      'subject' => $subject,
+    ]
+  );
+  if ($result['result']) {
+    \Drupal::logger('aws_cloud')->notice(
+      t(
+        'An @type notification has been sent to @email for @types with the subject @subject.',
+        [
+          '@type' => $message_type,
+          '@email' => $emails,
+          '@subject' => $subject,
+        ]
+      )
+    );
+  }
+}
+
+/**
+ * Get long running instances.
+ *
+ * @param string $criteria
+ *   The criteria defined for long running instances.
+ *
+ * @return array
+ *   Array of fully loaded instance entities.
+ */
+function aws_cloud_get_long_running_instances($criteria) {
+  $instances = [];
+  $results = \Drupal::database()
+    ->query(
+      'select id, uid, instance_id, launch_time ' .
+      'from {aws_cloud_instance} aws_cloud_instance ' .
+      'where aws_cloud_instance.uid > 0 ' .
+      'and aws_cloud_instance.instance_state = :state and launch_time < ' .
+      'unix_timestamp(date_sub(current_date(), INTERVAL :day DAY))',
+      [
+        ':state' => 'running',
+        ':day' => $criteria,
+      ]
+    )
+    ->fetchAll();
+
+  foreach ($results as $result) {
+    $instances[] = Instance::load($result->id);
+  }
+  return $instances;
+}
+
+/**
+ * Prepare the mail message for a given entity type.
+ *
+ * @param array $entities
+ *   An array of entities.
+ * @param string $entity_message
+ *   The entity message to be transformed by tokens.
+ * @param string $entity_token_name
+ *   The entity token name used in token definition.
+ * @param string $mail_message
+ *   The email message.
+ * @param string $mail_token_name
+ *   The mail token name used in token definition.
+ *
+ * @return string|bool
+ *   A fully transformed email message or FALSE.
+ */
+function aws_cloud_get_entity_notification_message(array $entities, $entity_message, $entity_token_name, $mail_message, $mail_token_name) {
+  $message = FALSE;
+  $entity_messages = [];
+  $token_service = \Drupal::token();
+
+  foreach ($entities as $entity) {
+    $entity_messages[] = $token_service->replace(
+      $entity_message,
+      [
+        $entity_token_name => $entity,
+      ]
+    );
+  }
+  if (count($entity_messages)) {
+    $message = $token_service->replace(
+      $mail_message,
+      [
+        $mail_token_name => implode("\n\n", $entity_messages),
+      ]
+    );
+  }
+  return $message;
+}
+
+/**
+ * Get an array of unused EBS volume IDs.
+ *
+ * @return array
+ *   An array of volumes.
+ */
+function aws_cloud_get_unused_volumes() {
+  $config = \Drupal::config('aws_cloud.settings');
+  $unused_interval = time() - ($config->get('aws_cloud_unused_volume_criteria') * 86400);
+  $entity_type_manager = \Drupal::entityTypeManager();
+  $unused_volumes = [];
+  $volumes = $entity_type_manager->getStorage('aws_cloud_volume')
+    ->getQuery()
+    ->condition('state', 'available')
+    ->condition('created', $unused_interval, "<")
+    ->execute();
+  foreach ($volumes as $id) {
+    $unused_volumes[] = Volume::load($id);
+  }
+  return $unused_volumes;
+}
+
+/**
+ * Get an array of unused EBS snapshots.
+ *
+ * Unused EBS snapshots are snapshots that do not have an EBS volume.
+ *
+ * @return array
+ *   An array of snapshots.
+ */
+function aws_cloud_get_unused_snapshots() {
+  $unused_snapshots = [];
+  $volume_ids = [];
+
+  $ids = \Drupal::entityTypeManager()
+    ->getStorage('aws_cloud_volume')
+    ->getQuery()
+    ->execute();
+  $volume_entities = \Drupal::entityTypeManager()
+    ->getStorage('aws_cloud_volume')
+    ->loadMultiple($ids);
+
+  foreach ($volume_entities as $entity) {
+    $volume_ids[] = $entity->getVolumeId();
+  }
+  $snapshots = \Drupal::entityTypeManager()
+    ->getStorage('aws_cloud_snapshot')
+    ->getQuery()
+    ->condition('volume_id', $volume_ids, 'NOT IN')
+    ->execute();
+  foreach ($snapshots as $id) {
+    $unused_snapshots[] = Snapshot::load($id);
+  }
+  return $unused_snapshots;
+}
+
+/**
+ * Determine if notifications can be sent for a specific set of time intervals.
+ *
+ * @param string $notification_flag
+ *   The notification flag.
+ * @param string $emails
+ *   Email string.
+ * @param int $notification_time
+ *   Notification timestamp.
+ * @param int $frequency
+ *   Frequency timestamp.
+ * @param int $last_notified
+ *   Last time notification was sent.
+ *
+ * @return bool
+ *   TRUE if emails should be sent, FALSE if not.
+ */
+function aws_cloud_can_send_notification($notification_flag, $emails, $notification_time, $frequency, $last_notified) {
+  $can_send = FALSE;
+  if ($notification_flag && !empty($emails) && time() > $notification_time) {
+    if (time() - $last_notified > $frequency) {
+      $can_send = TRUE;
+    }
+  }
+  return $can_send;
+}
+
+/**
+ * Helper function that disables multi-value field ordering.
+ *
+ * This function also massages the table for javascript processing. Function
+ * from https://drupal.stackexchange.com/questions/62662/how-to-remove-show-row-
+ * weights-option-on-file-upload-field.
+ *
+ * @param array $table
+ *   Table array.
+ */
+function aws_cloud_remove_table_reordering(array &$table) {
+
+  unset($table['#tabledrag']);
+
+  // Remove re-order header column.
+  foreach ($table['#header'] as $header_i => $header) {
+    if (is_object($header) && (string) $header == 'Order') {
+      unset($table['#header'][$header_i]);
+    }
+    // Remove the colspan=2.
+    if (!is_object($header) && isset($table['#header'][$header_i]['colspan'])) {
+      unset($table['#header'][$header_i]['colspan']);
+    }
+  }
+  // Add an extra column.
+  $table['#header'][]['data'] = t('Operation');
+
+  // Loop table rows.
+  $row_count = 0;
+  foreach ($table['#rows'] as &$row) {
+    // Remove draggable class from tr.
+    $i = array_search('draggable', $row['class']);
+    if ($i !== FALSE) {
+      unset($row['class'][$i]);
+    }
+
+    foreach ($row['data'] as $col_i => &$col) {
+      $row['class'][] = "row-$row_count";
+
+      if (empty($col['class'])) {
+        // The table gets re-rendered when the "add rule" is clicked.
+        // Try to preserve the classes.  If from and to port are empty,
+        // but the other fields still have value hide them.
+        if (is_array($col['data'])) {
+          if (empty($col['data']['from_port']['#value']) && empty($col['data']['to_port']['#value']) && !_aws_cloud_is_row_empty($col['data'])) {
+            $row['class'][] = "hide";
+          }
+        }
+        continue;
+      }
+
+      // Remove td with drag handle.
+      $i = array_search('field-multiple-drag', $col['class']);
+      if ($i !== FALSE) {
+        unset($row['data'][$col_i]);
+      }
+
+      // Remove td with re-ordering select.
+      $i = array_search('delta-order', $col['class']);
+      if ($i !== FALSE) {
+        unset($row['data'][$col_i]);
+      }
+    }
+
+    // Make sure we grab the table_id before Ajax appends characters to the
+    // table id.  Do this so the javascript has a constant id to pull from.
+    // Otherwise the id will keep changing and the javascript in
+    // aws_cloud_security_groups. js will not work properly.
+    $table_id = explode('--', $table['#attributes']['id']);
+    if (count($table_id)) {
+      $table['#attributes']['class'][] = $table_id[0];
+    }
+
+    // Add a removal link.  Link does not do anything by itself.
+    // The link behavior is initiated by Javascript.
+    $row['data'][] = Link::fromTextAndUrl(t('Remove rule'), Url::fromUserInput('#remove-rule', [
+      'attributes' => [
+        'class' => [
+          'remove-rule',
+        ],
+        'data-row' => $row_count,
+        'data-table-id' => $table_id != FALSE ? $table_id[0] : '',
+      ],
+    ]));
+
+    $row_count++;
+  }
+}
+
+/**
+ * Helper function determines if a inbound/outbound rule form element is empty.
+ *
+ * @param array $ip_element
+ *   The ip element.
+ *
+ * @return bool
+ *   Returns true or false if the row is empty.
+ */
+function _aws_cloud_is_row_empty(array $ip_element) {
+  $is_empty = TRUE;
+  $elements = [
+    'cidr_ip',
+    'cidr_ip_v6',
+    'group_id',
+    'group_name',
+    'prefix_list_id',
+    'peering_status',
+    'uid',
+    'vpc_id',
+    'peering_connection_id',
+  ];
+
+  foreach ($elements as $element) {
+    if (!empty($ip_element[$element]['#value'])) {
+      $is_empty = FALSE;
+      break;
+    }
+  }
+
+  return $is_empty;
+}
+
+/**
+ * Return a list of schedules configured in the aws_cloud_scheduler_periods.
+ */
+function aws_cloud_get_schedule() {
+  $options = ['' => t('None')];
+
+  $config = \Drupal::config('aws_cloud.settings');
+  $schedules = $config->get('aws_cloud_scheduler_periods');
+  $schedules = trim($schedules);
+  $schedules = explode("\r\n", $schedules);
+
+  foreach ($schedules as $value) {
+    if (!empty($value)) {
+      $schedule = explode('|', $value);
+      if (count($schedule) > 1) {
+        $options[$schedule[0]] = "$schedule[0] ($schedule[1])";
+      }
+      else {
+        $options[$schedule[0]] = $schedule[0];
+      }
+    }
+  }
+
+  return $options;
+}
+
+/**
+ * Get instance types from the EC2 pricing endpoint with cloud_context.
+ *
+ * @param string $cloud_context
+ *   The cloud context used to get instance types.
+ *
+ * @return array
+ *   An array of instances.
+ */
+function aws_cloud_get_instance_types($cloud_context) {
+  $instance_types = [];
+
+  try {
+    $cloud_config_plugin = \Drupal::service('plugin.manager.cloud_config_plugin');
+    $cloud_config_plugin->setCloudContext($cloud_context);
+    $cloud_config = $cloud_config_plugin->loadConfigEntity();
+
+    if ($cloud_config != FALSE) {
+      $instance_types = aws_cloud_get_instance_types_by_region(
+        $cloud_config->get('field_region')->value
+      );
+    }
+    else {
+      // Cannot load cloud config entity. Show an error to the user.
+      \Drupal::messenger()->addError(t('Cannot load cloud config entity'));
+    }
+  }
+  catch (Exception $e) {
+    \Drupal::logger('aws_cloud')->debug('No cloud context specified');
+  }
+  return $instance_types;
+}
+
+/**
+ * Get instance types from the EC2 pricing endpoint with region.
+ *
+ * @param string $region
+ *   The region used to get instance types.
+ *
+ * @return array
+ *   An array of instances.
+ */
+function aws_cloud_get_instance_types_by_region($region) {
+  $instance_types = [];
+  $cache_key = _aws_cloud_get_instance_type_cache_key_by_region($region);
+  $cache = \Drupal::cache()->get($cache_key);
+  if ($cache) {
+    $instance_types = $cache->data;
+  }
+  else {
+    // Set a message saying instance types need to be imported.  This
+    // can occur when the cache clear all is run.
+    \Drupal::messenger()->addError(t(
+      'Instance types for @region not found.  Please wait for cron to run or re-save the cloud config entity: @cloud_context.', [
+        '@region' => $region,
+      ]
+    ));
+  }
+
+  return $instance_types;
+}
+
+/**
+ * Update instance types every 30 days.
+ *
+ * @param \Drupal\cloud\Entity\CloudConfig $cloud_config
+ *   Cloud config entity.
+ * @param bool $force
+ *   True to always refresh. False to look at next_import time or if no cache
+ *   value.
+ */
+function aws_cloud_update_instance_types(CloudConfig $cloud_config, $force = FALSE) {
+  // Get the state key.
+  $state_key = _aws_cloud_get_instance_type_state_key($cloud_config);
+  // Get the timestamp for next import.
+  $next_import = \Drupal::state()->get($state_key);
+  // Check if the array is in the cache.
+  $cache_key = _aws_cloud_get_instance_type_cache_key($cloud_config);
+  $cache = \Drupal::cache()->get($cache_key);
+
+  if ($next_import < time() || $cache == FALSE || $force == TRUE) {
+    aws_cloud_import_instance_types($cloud_config);
+    // Cache the instance types for 30 days.
+    \Drupal::state()->set($state_key, time() + aws_cloud_get_reimport_interval());
+  }
+}
+
+/**
+ * Get instance types from pricing service.
+ *
+ * @param \Drupal\cloud\Entity\CloudConfig $cloud_config
+ *   The cloud config object.
+ *
+ * @return array
+ *   An array of instance types.
+ */
+function aws_cloud_import_instance_types(CloudConfig $cloud_config) {
+  $cloud_context = $cloud_config->getCloudContext();
+  $cache_key = _aws_cloud_get_instance_type_cache_key($cloud_config);
+
+  /* @var \Drupal\aws_cloud\Service\AwsPricingServiceInterface $pricing_service */
+  $pricing_service = \Drupal::service('aws_cloud.pricing');
+  $pricing_service->setCloudContext($cloud_context);
+  $pricing_service->setCloudConfigEntity($cloud_config);
+  $instance_types = $pricing_service->getInstanceTypes();
+
+  if (count($instance_types)) {
+    // Cache as permanent.  However, a cache clear all will nuke all caches,
+    // including this one.  At that point, wait for cron to run to update the
+    // instance types.
+    \Drupal::cache()->set($cache_key, $instance_types, Cache::PERMANENT);
+  }
+
+  return $instance_types;
+}
+
+/**
+ * Helper function to generate instance type cache key with cloud_config.
+ *
+ * @param Drupal\cloud\Entity\CloudConfig $cloud_config
+ *   Cloud config object.
+ *
+ * @return string
+ *   Instance type cache key.
+ */
+function _aws_cloud_get_instance_type_cache_key(CloudConfig $cloud_config) {
+  return $cloud_config->get('field_region')->value . '-instance_types';
+}
+
+/**
+ * Helper function to generate instance type cache key with region.
+ *
+ * @param string $region
+ *   Region.
+ *
+ * @return string
+ *   Instance type cache key.
+ */
+function _aws_cloud_get_instance_type_cache_key_by_region($region) {
+  return $region . '-instance_types';
+}
+
+/**
+ * Helper function to generate instance type state key.
+ *
+ * @param \Drupal\cloud\Entity\CloudConfig $cloud_config
+ *   Cloud config object.
+ *
+ * @return string
+ *   instance type state key
+ */
+function _aws_cloud_get_instance_type_state_key(CloudConfig $cloud_config) {
+  return 'aws_cloud_next_instance_import_' . $cloud_config->get('field_region')->value;
+}
+
+/**
+ * Function to check if an instance can attach an elastic ip.
+ *
+ * @param \Drupal\aws_cloud\Entity\Ec2\Instance $instance
+ *   Instance object.
+ *
+ * @return bool
+ *   True or false depending on if the ip can be attached.
+ */
+function aws_cloud_can_attach_ip(Instance $instance) {
+  $can_attach = FALSE;
+  $entity_type_manager = \Drupal::entityTypeManager();
+  $results = $entity_type_manager->getStorage('aws_cloud_network_interface')
+    ->getQuery()
+    ->condition('instance_id', $instance->getInstanceId())
+    ->notExists('public_ips')
+    ->execute();
+  if (count($results) > 0) {
+    $can_attach = TRUE;
+  }
+  return $can_attach;
+}
+
+/**
+ * Helper function to get the available elastic ips.
+ *
+ * @param string $cloud_context
+ *   The cloud context to query from.
+ *
+ * @return array|bool|int
+ *   Returns array of elastic ip ids or false if no found.
+ */
+function aws_cloud_get_available_elastic_ips($cloud_context) {
+  $entity_type_manager = \Drupal::entityTypeManager();
+  return $entity_type_manager->getStorage('aws_cloud_elastic_ip')
+    ->getQuery()
+    ->condition('cloud_context', $cloud_context)
+    ->notExists('association_id')
+    ->execute();
+}
+
+/**
+ * Implements hook_entity_view_alter().
+ */
+function aws_cloud_entity_view_alter(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display) {
+  if ($entity->getEntityTypeId() == 'cloud_server_template'
+    && $entity->bundle() == 'aws_cloud'
+  ) {
+    aws_cloud_form_reorder($build, aws_cloud_server_template_field_orders(FALSE));
+    $build['#attached']['library'][] = 'aws_cloud/aws_cloud_view_builder';
+  }
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function aws_cloud_page_attachments(array &$attachments) {
+  $route = \Drupal::routeMatch();
+  if (in_array($route->getRouteName(), [
+    'view.aws_instances.page_1',
+    'view.aws_images.page_1',
+    'view.aws_snapshot.page_1',
+    'view.aws_volume.page_1',
+  ])) {
+    $attachments['#attached']['library'][] = 'aws_cloud/aws_cloud_auto_refresh';
+
+    $config = \Drupal::config('aws_cloud.settings');
+    $attachments['#attached']['drupalSettings']['aws_cloud_view_refresh_interval']
+      = $config->get('aws_cloud_view_refresh_interval');
+  }
+}
+
+/**
+ * Return private directory for ini storage.
+ *
+ * @return string
+ *   Private directory path.
+ */
+function aws_cloud_ini_directory() {
+  return 'private://aws_cloud/.aws';
+}
+
+/**
+ * Return private ini string.
+ *
+ * @param string $cloud_context
+ *   The cloud context.
+ *
+ * @return string
+ *   Full path of the ini file.
+ */
+function aws_cloud_ini_file_path($cloud_context) {
+  return aws_cloud_ini_directory() . "/cloud_config_{$cloud_context}.ini";
+}
+
+/**
+ * Ping the metadata server for security credentials url.
+ *
+ * @return bool
+ *   TRUE if 169.254.169.254 is accessible.
+ */
+function aws_cloud_ping_metadata_security_server() {
+  $pinged = FALSE;
+  try {
+    $metadata_url = 'http://169.254.169.254/latest/meta-data/iam/security-credentials/';
+    $client = \Drupal::httpClient();
+    $client->get($metadata_url);
+    $pinged = TRUE;
+  }
+  catch (Exception $e) {
+    \Drupal::logger('aws_cloud')->notice($e->getMessage());
+    $pinged = FALSE;
+  }
+  return $pinged;
+}
+
+/**
+ * Update the configuration of view.
+ *
+ * @param string $view_name
+ *   The name of view.
+ * @param array $options
+ *   The key and value array of view configuration.
+ */
+function aws_cloud_update_views_configuration($view_name, array $options) {
+  $config_factory = \Drupal::configFactory();
+  $view = $config_factory->getEditable($view_name);
+
+  foreach ($options as $key => $value) {
+    $view->set($key, $value);
+  }
+  $view->save(TRUE);
+}
+
+/**
+ * Return google credential file default path.
+ *
+ * @return string
+ *   Full path of the google credential file.
+ */
+function aws_cloud_google_credential_file_default_path() {
+  return 'private://aws_cloud/.gapps/client_secrets.json';
+}
+
+/**
+ * Return google credential file path.
+ *
+ * @return string
+ *   Full path of the google credential file.
+ */
+function aws_cloud_google_credential_file_path() {
+  $config = \Drupal::config('aws_cloud.settings');
+  $credential_file_path = $config->get('google_credential_file_path');
+  if (!empty($credential_file_path)) {
+    return $credential_file_path;
+  }
+  return aws_cloud_google_credential_file_default_path();
+}
+
+/**
+ * Get the reimport interval.
+ *
+ * @return int
+ *   Integer of 1 day in seconds.
+ */
+function aws_cloud_get_reimport_interval() {
+  return 86400;
+}
+
+/**
+ * Get the views items per page.
+ *
+ * @return array
+ *   Array of page items.
+ */
+function aws_cloud_get_views_items_options() {
+  return [
+    10 => '10',
+    15 => '15',
+    20 => '20',
+    25 => '25',
+    50 => '50',
+    100 => '100',
+  ];
+}
+
+/**
+ * Implements hook_views_pre_view().
+ */
+function aws_cloud_views_pre_view($view, $display_id, array &$args) {
+  if ($view->id() === 'cloud_listing') {
+    $config = \Drupal::config('aws_cloud.settings');
+    if ($config->get('aws_cloud_instance_type_prices') == FALSE) {
+      $view->removeHandler($display_id, 'field', 'pricing_internal_cloud_config');
+    }
+
+    if ($config->get('aws_cloud_instance_type_prices_spreadsheet') == FALSE) {
+      $view->removeHandler($display_id, 'field', 'pricing_external_cloud_config');
+    }
+
+    return;
+  }
+
+  if ($view->id() === 'aws_instances') {
+    $config = \Drupal::config('aws_cloud.settings');
+    if ($config->get('aws_cloud_instance_list_cost_column') == FALSE) {
+      $view->removeHandler($display_id, 'field', 'cost');
+    }
+  }
+}
+
+/**
+ * Implements hook_menu_local_tasks_alter().
+ */
+function aws_cloud_menu_local_tasks_alter(&$data, $route_name) {
+  $config = \Drupal::config('aws_cloud.settings');
+  if ($config->get('aws_cloud_instance_type_prices') == FALSE) {
+    unset($data['tabs'][0]['aws_cloud.local_tasks.instance_type_price']);
+  }
+}
+
+/**
+ * Implements hook_menu_local_actions_alter().
+ */
+function aws_cloud_menu_local_actions_alter(&$local_actions) {
+  $config = \Drupal::config('aws_cloud.settings');
+  if ($config->get('aws_cloud_instance_type_prices') == FALSE) {
+    unset($local_actions['aws_cloud.instance_type_prices']);
+  }
+}
