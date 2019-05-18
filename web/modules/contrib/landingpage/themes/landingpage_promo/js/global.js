@@ -1,0 +1,3 @@
+(function ($, Drupal) {
+
+})(jQuery, Drupal);

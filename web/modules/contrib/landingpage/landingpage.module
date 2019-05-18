@@ -1,0 +1,261 @@
+<?php
+
+/**
+ * @file
+ * Contains landingpage.module..
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Template\Attribute;
+use Symfony\Component\Yaml\Yaml;
+use Drupal\node\Entity\Node;
+use Drupal\paragraphs\Entity\Paragraph;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Config\FileStorage;
+
+/**
+ * Implements hook_help().
+ */
+function landingpage_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the landingpage module.
+    case 'help.page.landingpage':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Paragraphs driven LandingPage Kit') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_entity_view_mode_alter().
+ *
+ * Over ride the display mode if the display field is populated.
+ */
+function landingpage_entity_view_mode_alter(&$view_mode, EntityInterface $entity, $context) {
+
+  $display_fields = \Drupal::entityManager()->getFieldMapByFieldType('paragraph_display_field_type');
+
+  // If display fields are present, swap the view mode.
+  if (!empty($display_fields)) {
+    foreach ($display_fields as $field_wrapper) {
+      foreach (array_keys($field_wrapper) as $field_name) {
+        if (!empty($entity->$field_name->value)) {
+          $view_mode = $entity->$field_name->value;
+          break;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ */
+function landingpage_preprocess_paragraph(&$variables) {
+  global $base_url;
+  $variables['base_url'] = $base_url;
+  $paragraph = $variables['paragraph'];
+  $skin_fields = \Drupal::entityManager()->getFieldMapByFieldType('paragraph_skin_field_type');
+  $inline_styles = '';
+  if (!empty($skin_fields)) {
+    $variables['attributes'] = new Attribute();
+    foreach ($skin_fields as $field_wrapper) {
+      foreach (array_keys($field_wrapper) as $field_name) {
+        if ($paragraph->hasField($field_name)) {
+          $classes = $paragraph->$field_name->getValue();
+          foreach ($classes as $class) {
+            if (preg_match_all("~\[\s*(.*?)\s*\]~", $class['value'], $result)) {
+              if (!empty($result[1][0])) {
+                $variables['attributes']->addClass($result[1][0]);
+              }
+            }
+            if (strpos($class['value'], ':') !== FALSE && strpos($class['value'], ';') !== FALSE) {
+              $inline_styles .= $class['value'];
+            }
+          }
+        }
+      }
+    }
+  }
+  $variables['inline_styles'] = $inline_styles;
+}
+
+/**
+ * Attach CSS and JS we need for Landingpage Kit admin.
+ */
+function landingpage_page_attachments(array &$page) {
+  $node = \Drupal::routeMatch()->getParameter('node');
+  if (!empty($node)) {
+    if ($node->getType() === 'landingpage' && _landingpage_is_admin()) {
+      $page['#attached']['library'][] = 'landingpage/formimprove';
+    }
+  }
+}
+
+/**
+ * Service function. Check if it's admin route.
+ */
+function _landingpage_is_admin() {
+  $route = \Drupal::routeMatch()->getRouteObject();
+  $is_admin = \Drupal::service('router.admin_context')->isAdminRoute($route);
+  return $is_admin;
+}
+
+/**
+ * Service function that will be API soon :-) Create LandingPage node with YAML file
+ *
+ * @param string
+ *   name of the YAML file without '.landingpage.yml'
+ *   for example for 'test.lamdingpag.yml' you need to set 'test'
+ * @param string
+ *   module name, where locted your YAML file
+ *
+ * @return \Drupal\node\Entity\Node $node
+ *   A node object
+ *
+ */
+
+function _landingpage_import_yaml($name, $module) {
+  global $base_url;
+
+  $parser = new Yaml();
+  $yaml = $parser->parse(file_get_contents(drupal_get_path('module', $module) . '/' . $name . '.landingpage.yml'));
+  $node_array = array();
+  foreach ($yaml as $key => $field) {
+    if ($key == 'field_landingpage_paragraphs') {
+      $node_array[$key] = _landingpage_import_yaml_paragraphs($field, $module);
+    }
+    else {
+      $node_array[$key] = $field;
+    }
+  }
+  $node = Node::create($node_array);
+  $node->save();
+  return $node;
+}
+
+function _landingpage_import_yaml_paragraphs($field, $module) {
+  global $base_url;
+  $paragraphs = array();
+  foreach ($field as $paragraph) {
+    if ($paragraph['type'] == 'landingpage_grid') {
+      $grid_paragraphs = _landingpage_import_yaml_paragraphs($paragraph['field_landingpage_grid'], $module);
+      $paragraph['field_landingpage_grid'] = $grid_paragraphs;
+    }
+    if (isset($paragraph['field_landingpage_image'])) {
+        $data = file_get_contents($base_url . '/' . drupal_get_path('module', $module) . '/images/' . $paragraph['field_landingpage_image'][0]['image']);
+        $file = file_save_data($data, 'public://' . $paragraph['field_landingpage_image'][0]['image'], FILE_EXISTS_REPLACE);
+        $paragraph['field_landingpage_image'][0]['target_id'] = $file->id();
+        unset($paragraph['field_landingpage_image'][0]['image']);
+    }
+    if (isset($paragraph['field_landingpage_images'])) {
+      $images = array();
+      foreach ($paragraph['field_landingpage_images'] as $image) {
+        $data = file_get_contents($base_url . '/' . drupal_get_path('module', $module) . '/images/' . $image['image']);
+        $file = file_save_data($data, 'public://' . $image['image'], FILE_EXISTS_REPLACE);
+        $image['target_id'] = $file->id();
+        unset($image['image']);
+        $images[] = $image;
+      } 
+      $paragraph['field_landingpage_images'] = $images;
+    }        
+    $paragraph_obj = Paragraph::create($paragraph);
+    $paragraph_obj->save();
+    $paragraphs[] = array(
+      'target_id' => $paragraph_obj->id(),
+      'target_revision_id' => $paragraph_obj->getRevisionId(),
+    );
+  }
+  return $paragraphs;
+}
+
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Setup landingpage paragraph icons.
+ */
+function landingpage_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  global $base_url;
+  if (isset($form['field_landingpage_paragraphs'])) {
+    $form['#attached']['library'][] = 'landingpage/landingpage.icons';
+    $landingpage_modules = _landingpage_module_list();
+    foreach ($form['field_landingpage_paragraphs']['widget']['add_more'] as $key => $value) {
+      if (strpos($key, 'add_more_button_landingpage_') !== false) {
+        $image_name = explode("add_more_button_", $key);
+        $file = $base_url . "/" . drupal_get_path("module", "landingpage") . "/landingpage.png";
+        foreach ($landingpage_modules as $module) { // TODO: less stupid code
+          $path = "/" . drupal_get_path("module", $module) . "/" . $image_name[1] . ".png";
+          if (file_exists("." . $path)) {
+            $file = $base_url . $path;
+            break;
+          }  
+        }  
+        $form['field_landingpage_paragraphs']['widget']['add_more'][$key]['#prefix'] = '<div class="landingpage_wrapper"><img src="' . $file .'" style="vertical-align: super;"></a>';
+       $form['field_landingpage_paragraphs']['widget']['add_more'][$key]['#suffix'] = '</div>';             
+      }
+    }
+  }
+  if (isset($form['field_landingpage_grid'])) { // TODO: make to work it
+    foreach ($form['field_landingpage_grid']['widget']['add_more'] as $key => $value) {
+      if (strpos($key, 'add_more_button_landingpage_') !== false) {
+        $image_name = explode("add_more_button_", $key);
+        $file = $base_url . "/" . drupal_get_path("module", "landingpage") . "/landingpage.png";
+        foreach ($landingpage_modules as $module) { // TODO: less stupid code
+          $path = "/" . drupal_get_path("module", $module) . "/" . $image_name[1] . ".png";
+          if (file_exists("." . $path)) {
+            $file = $base_url . $path;
+            break;
+          }  
+        }  
+        $form['field_landingpage_grid']['widget']['add_more'][$key]['#prefix'] = '<div class="landingpage_wrapper"><img src="' . $file .'" style="vertical-align: super;"></a>';
+       $form['field_landingpage_grid']['widget']['add_more'][$key]['#suffix'] = '</div>';             
+      }
+    }
+  }
+}
+
+function _landingpage_module_list() {
+  $modules = \Drupal::moduleHandler()->getModuleList();
+  $module_list = array_keys($modules);
+  sort($module_list);
+  $landingpage_modules = array();
+  foreach ($module_list as $module) {
+    if (strpos($module, 'landingpage_') !== false) {
+      $landingpage_modules[] = $module;
+    }
+  }
+  return $landingpage_modules;
+}
+
+function _landingpage_update_configurations(array $configurations, $module = 'landingpage') { 
+  foreach ($configurations as $configuration) {
+  $config_path = drupal_get_path('module', $module) . '/config/install'; 
+  $source = new FileStorage($config_path);
+  $config_storage = \Drupal::service('config.storage');
+  $config_storage->write($configuration, $source->read($configuration));
+  }
+}
+
+/**
+ * Implements hook_requirements().
+ *
+ */
+function landingpage_requirements($phase) {
+  $requirements = array();
+
+  $themes = array_keys(system_list('theme'));
+
+  if (!in_array('bootstrap', $themes)) {
+    $requirements['landingpage'] = array(
+      'title' => t('LandingPage Module'),
+      'value' => t('Please add <a href="https://www.drupal.org/project/bootstrap">Bootstrap theme</a>! It\'s required for LandingPage Bootstrap Theme.'),
+      'severity' => REQUIREMENT_ERROR,
+    );
+  }
+  return $requirements;
+}
