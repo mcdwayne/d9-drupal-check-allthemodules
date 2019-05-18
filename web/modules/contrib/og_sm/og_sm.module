@@ -1,0 +1,226 @@
+<?php
+
+/**
+ * @file
+ * Base module for the Organic Groups Sites functionality.
+ */
+
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Field\FieldItemListInterface;
+use Drupal\Core\Field\FieldDefinitionInterface;
+use Drupal\node\NodeInterface;
+use Drupal\node\NodeTypeInterface;
+use Drupal\og\OgGroupAudienceHelper;
+use Drupal\og_sm\OgSm;
+use Drupal\og_sm\Event\SiteEvents;
+use Drupal\og_sm\Event\SiteTypeEvent;
+use Drupal\og_sm\Event\SiteTypeEvents;
+use Zend\Diactoros\Exception\DeprecatedMethodException;
+
+/**
+ * Implements hook_hook_info().
+ */
+function og_sm_hook_info() {
+  $group = ['group' => 'og_sm'];
+
+  $hooks = [
+    'og_sm_site_view' => $group,
+    'og_sm_site_homepage_alter' => $group,
+    'og_sm_site_menu_links_discovered_alter' => $group,
+  ];
+
+  return $hooks;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for node_type_form().
+ */
+function og_sm_form_node_type_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+  $form_state->loadInclude('og_sm', 'inc', 'og_sm.admin');
+  _og_sm_form_node_type_form_alter($form, $form_state);
+}
+
+/**
+ * Set the breadcrumb for the given Site.
+ *
+ * @param \Drupal\node\NodeInterface $site
+ *   The site object to setthe breadcrumb for.
+ * @param array $path
+ *   Array of links to append to the breadcumb.
+ *
+ * @todo: Check if this is still needed.
+ * @deprecated in Drupal 8.x and will be removed before stable release.
+ */
+function og_sm_set_breadcrumb(NodeInterface $site, array $path = []) {
+  throw new DeprecatedMethodException('og_sm_set_breadcrumb() still needs to be ported.');
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_view() for node entities.
+ */
+function og_sm_node_view(array &$build, NodeInterface $node, EntityViewDisplayInterface $display, $view_mode) {
+  // Only for Site node types.
+  if (!OgSm::isSite($node)) {
+    return;
+  }
+  Drupal::moduleHandler()->invokeAll('og_sm_site_view', [
+    $build,
+    $node,
+    $display,
+    $view_mode,
+  ]);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete() for node entities.
+ */
+function og_sm_node_delete(NodeInterface $node) {
+  OgSm::siteEventDispatch(SiteEvents::DELETE, $node);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_presave() for node entities.
+ */
+function og_sm_node_presave(NodeInterface $node) {
+  OgSm::siteEventDispatch(SiteEvents::PRESAVE, $node);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update() for node entities.
+ */
+function og_sm_node_update(NodeInterface $node) {
+  OgSm::siteEventDispatch(SiteEvents::UPDATE, $node);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert() for node entities.
+ */
+function og_sm_node_insert(NodeInterface $node) {
+  OgSm::siteEventDispatch(SiteEvents::INSERT, $node);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update() for node_type entities.
+ */
+function og_sm_node_type_update(NodeTypeInterface $node_type) {
+  _og_sm_node_type_save($node_type);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert() for node_type entities.
+ */
+function og_sm_node_type_insert(NodeTypeInterface $node_type) {
+  _og_sm_node_type_save($node_type);
+}
+
+/**
+ * Helper function called when a node type is either inserted or updated.
+ *
+ * @param \Drupal\node\NodeTypeInterface $node_type
+ *   The node type.
+ */
+function _og_sm_node_type_save(NodeTypeInterface $node_type) {
+  $is_site_type_original = FALSE;
+  if (isset($node_type->original)) {
+    $is_site_type_original = OgSm::isSiteType($node_type->original);
+  }
+
+  $is_site_type = OgSm::isSiteType($node_type);
+  if ($is_site_type_original === $is_site_type) {
+    return;
+  }
+
+  $event = new SiteTypeEvent($node_type);
+  if ($is_site_type) {
+    $event_name = SiteTypeEvents::ADD;
+  }
+  else {
+    $event_name = SiteTypeEvents::REMOVE;
+  }
+  \Drupal::service('event_dispatcher')->dispatch($event_name, $event);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete() for node_type entities.
+ */
+function og_sm_node_type_delete(NodeTypeInterface $node_type) {
+  if (OgSm::isSiteType($node_type)) {
+    $event = new SiteTypeEvent($node_type);
+    \Drupal::service('event_dispatcher')->dispatch(SiteTypeEvents::REMOVE, $event);
+  }
+}
+
+/**
+ * Implements hook_field_widget_form_alter().
+ */
+function og_sm_field_widget_form_alter(&$element, FormStateInterface $form_state, $context) {
+  // Leave the field as is if it is already filled is.
+  /* @var \Drupal\Core\Field\FieldItemListInterface $items */
+  $items = $context['items'];
+  if (!$items->isEmpty()) {
+    return;
+  }
+
+  // Only intervene with audience fields.
+  if (!OgGroupAudienceHelper::isGroupAudienceField($items->getFieldDefinition())) {
+    return;
+  }
+
+  $site = OgSm::siteManager()->currentSite();
+  if ($site) {
+    // Prepopulate the audience field with the current site content.
+    $element['target_id'] = [
+      '#type' => 'hidden',
+      '#value' => $site->id(),
+    ];
+  }
+}
+
+/**
+ * Implements hook_entity_field_access().
+ */
+function og_sm_entity_field_access($operation, FieldDefinitionInterface $field_definition, AccountInterface $account, FieldItemListInterface $items = NULL) {
+  // Only intervene with audience fields.
+  if (!OgGroupAudienceHelper::isGroupAudienceField($field_definition)) {
+    return AccessResult::neutral();
+  }
+
+  $site = OgSm::siteManager()->currentSite();
+  // Don't intervene when we are not within site context.
+  if (!$site) {
+    return AccessResult::neutral();
+  }
+
+  // Hide the audience field when we have site context since it will be
+  // prefilled in og_sm_field_widget_form_alter() anyway.
+  return AccessResult::forbidden();
+}
+
+/**
+ * Helper function that checks whether an account has a certain site permission.
+ *
+ * @param string $operation
+ *   The entity operation being checked for.
+ * @param \Drupal\Core\Session\AccountInterface $account
+ *   (optional) The user to check. Defaults to the current user.
+ *
+ * @return bool
+ *   TRUE if the user has the site permission.
+ */
+function og_sm_site_user_access($operation, AccountInterface $account = NULL) {
+  if (!isset($account)) {
+    $account = \Drupal::currentUser()->getAccount();
+  }
+
+  $site = OgSm::siteManager()->currentSite();
+  if (!$site) {
+    return FALSE;
+  }
+
+  /* @var \Drupal\og\OgAccess $og_access */
+  $og_access = \Drupal::service('og.access');
+  return $og_access->userAccess($site, $operation, $account)->isAllowed();
+}

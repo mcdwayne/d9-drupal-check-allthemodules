@@ -1,0 +1,136 @@
+<?php
+
+/**
+ * @file
+ * Site taxonomy support.
+ */
+
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Database\Query\AlterableInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\og_sm\OgSm;
+use Drupal\og_sm_taxonomy\Form\TermDeleteForm;
+use Drupal\og_sm_taxonomy\Form\VocabularyResetForm;
+use Drupal\og_sm_taxonomy\FormAlter\TermOverviewFormAlter;
+
+/**
+ * Implements hook_entity_type_alter().
+ */
+function og_sm_taxonomy_entity_type_alter(array &$entity_types) {
+  /** @var $entity_types \Drupal\Core\Entity\EntityTypeInterface[] */
+  $entity_types['taxonomy_vocabulary']->setFormClass('reset', VocabularyResetForm::class);
+  $entity_types['taxonomy_term']->setFormClass('delete', TermDeleteForm::class);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_access() for taxonomy_vocabulary entities.
+ */
+function og_sm_taxonomy_taxonomy_vocabulary_access(EntityInterface $entity, $operation, AccountInterface $account) {
+  if ($operation !== 'access taxonomy overview') {
+    return AccessResult::neutral();
+  }
+
+  $site_manager = OgSm::siteManager();
+  $site = $site_manager->currentSite();
+  if (!$site) {
+    return AccessResult::neutral();
+  }
+
+  /* @var \Drupal\og\OgAccessInterface $og_access */
+  $og_access = \Drupal::service('og.access');
+
+  $term_permissions = [
+    "create {$entity->id()} taxonomy_term",
+    "update any {$entity->id()} taxonomy_term",
+    "update own {$entity->id()} taxonomy_term",
+    "delete any {$entity->id()} taxonomy_term",
+    "delete own {$entity->id()} taxonomy_term",
+  ];
+  foreach ($term_permissions as $term_permission) {
+    if ($og_access->userAccess($site, $term_permission, $account)->isAllowed()) {
+      return AccessResult::allowed();
+    }
+  }
+
+  return AccessResult::neutral();
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_create_access() for 'taxonomy_term'.
+ */
+function og_sm_taxonomy_taxonomy_term_create_access(AccountInterface $account, $context, $entity_bundle) {
+  $site_manager = OgSm::siteManager();
+  $site = $site_manager->currentSite();
+  if (!$site) {
+    return AccessResult::neutral();
+  }
+
+  /* @var \Drupal\og\OgAccessInterface $og_access */
+  $og_access = \Drupal::service('og.access');
+  if ($og_access->userAccess($site, "create $entity_bundle taxonomy_term", $account)->isAllowed()) {
+    return AccessResult::allowed();
+  }
+
+  return AccessResult::neutral();
+}
+
+/**
+ * Implements hook_query_TAG_alter().
+ *
+ * Filters the term query by the current Site (if any).
+ */
+function og_sm_taxonomy_query_term_access_alter(AlterableInterface $query) {
+  // Only alter when in a Site context.
+  $site = OgSm::siteManager()->currentSite();
+  if (!$site) {
+    return;
+  }
+
+  // Get the taxonomy_term_data and taxonomy_vocabulary alias.
+  $table_aliases = [];
+  $tables = $query->getTables();
+  $original_tables = ['taxonomy_term_data', 'taxonomy_term_field_data'];
+  foreach ($tables as $info) {
+    if (isset($table_aliases[$info['table']]) || !in_array($info['table'], $original_tables)) {
+      continue;
+    }
+    $table_aliases[$info['table']] = $info['alias'];
+  }
+
+  // Make sure the taxonomy_term_data table is in the query.
+  if (empty($table_aliases)) {
+    return;
+  }
+  $table_alias = reset($table_aliases);
+
+  /* @var \Drupal\og_sm_taxonomy\SiteTaxonomyManagerInterface $site_taxonomy_manager */
+  $site_taxonomy_manager = \Drupal::service('og_sm_taxonomy.site_manager');
+
+  // Get the vocabularies from the query conditions.
+  $vocabularies = $site_taxonomy_manager->getSiteVocabulariesFromConditions($table_aliases, $query->conditions());
+  foreach ($vocabularies as $vocabulary) {
+    // Only when the vocabulary is a Site vocabulary.
+    if (!$site_taxonomy_manager->isSiteVocabulary($vocabulary->id())) {
+      continue;
+    }
+
+    $query->join('taxonomy_term__og_audience', 'og_audience', 'og_audience.entity_id = ' . $table_alias . '.tid');
+    $query->condition('og_audience.og_audience_target_id', $site->id());
+    return;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Alters the vocabulary terms overview page.
+ *
+ * @see taxonomy_overview_terms()
+ */
+function og_sm_taxonomy_form_taxonomy_overview_terms_alter(&$form, FormStateInterface $form_state) {
+  \Drupal::classResolver()
+    ->getInstanceFromDefinition(TermOverviewFormAlter::class)
+    ->formAlter($form, $form_state);
+}

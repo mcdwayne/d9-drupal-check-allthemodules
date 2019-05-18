@@ -1,0 +1,266 @@
+<?php
+/**
+ * @file
+ * Calculate and validate node_access based on the Site node status.
+ */
+
+// Node access realm.
+define('OG_SM_ACCESS_REALM_SITE', 'og_sm_access:site');
+define('OG_SM_ACCESS_REALM_CONTENT', 'og_sm_access:node');
+define('OG_SM_ACCESS_GRANT_ALL', 0);
+define('OG_SM_ACCESS_PERMISSION_SITE', 'view unpublished site and its content');
+define('OG_SM_ACCESS_PERMISSION_CONTENT', 'manage all content within site');
+
+/**
+ * Implements hook_views_api().
+ */
+function og_sm_access_views_api($module = NULL, $api = NULL) {
+  return array("api" => "3.0");
+}
+
+/**
+ * Implements hook_og_permission().
+ */
+function og_sm_access_og_permission() {
+  return array(
+    OG_SM_ACCESS_PERMISSION_SITE => array(
+      'title' => t('View an unpublished Site and its content'),
+      'description' => t('View all content within a Site that is not published.'),
+      'roles' => array(OG_AUTHENTICATED_ROLE),
+      'default role' => array(OG_ADMINISTRATOR_ROLE),
+    ),
+    OG_SM_ACCESS_PERMISSION_CONTENT => array(
+      'title' => t('Manage all content within a Site'),
+      'description' => t('View and manage all content in the Site. <em>Warning: Give to trusted roles only; this permission has security implications in the Site context.</em>'),
+      'roles' => array(OG_AUTHENTICATED_ROLE),
+      'default role' => array(OG_ADMINISTRATOR_ROLE),
+    ),
+  );
+}
+
+/**
+ * Page Access callback to validate access of the user to the active Site.
+ *
+ * Use this only as "access callback" within menu items.
+ *
+ * WARNING: This will return FALSE if no Site is currently active.
+ *
+ * @param object $account
+ *   Optional, a user object representing the user for whom the operation is to
+ *   be performed. Determines access for a user other than the current user.
+ *
+ * @return bool
+ *   Access TRUE/FALSE
+ */
+function og_sm_access_callback($account = NULL) {
+  $site = og_sm_current_site();
+  if (!$site) {
+    return FALSE;
+  }
+
+  return node_access('view', $site, $account);
+}
+
+/**
+ * Page Access callback to validate access of the user by the given Site nid.
+ *
+ * @param int $site_nid
+ *   The Site Node Id.
+ * @param object $account
+ *   The optional account to check for.
+ *
+ * @return bool
+ *   Access TRUE/FALSE
+ */
+function og_sm_access_site_nid_callback($site_nid, $account = NULL) {
+  $site = og_sm_site_load($site_nid);
+  if (!$site) {
+    return FALSE;
+  }
+
+  return node_access('view', $site, $account);
+}
+
+/**
+ * Implements hook_node_access_records().
+ */
+function og_sm_access_node_access_records($node) {
+  if (og_sm_is_site($node)) {
+    return og_sm_access_node_access_records_site($node);
+  }
+
+  if (og_sm_content_is_site_content($node)) {
+    return og_sm_access_node_access_records_site_content($node);
+  }
+}
+
+/**
+ * Calculate the node grants for a Site node.
+ *
+ * @param object $site
+ *   The site to calculate the node record for.
+ *
+ * @return array
+ *   Array of grants.
+ */
+function og_sm_access_node_access_records_site($site) {
+  $grants = array();
+
+  $gid = (empty($site->status))
+    ? (int) $site->nid
+    : OG_SM_ACCESS_GRANT_ALL;
+
+  $grants[] = array(
+    'realm' => OG_SM_ACCESS_REALM_SITE,
+    'gid' => $gid,
+    'grant_view' => 1,
+    'grant_update' => 0,
+    'grant_delete' => 0,
+    'priority' => 0,
+  );
+
+  return $grants;
+}
+
+/**
+ * Calculate the node grants for Site content node.
+ *
+ * @param object $node
+ *   The Site content node to calculate the grants for.
+ *
+ * @return array
+ *   Array of grants.
+ */
+function og_sm_access_node_access_records_site_content($node) {
+  // Only if the node belongs to sites.
+  $sites = og_sm_content_get_sites($node);
+  if (empty($sites)) {
+    return array();
+  }
+
+  $grants = array();
+  foreach ($sites as $site) {
+    // If the Site is not published only users with proper permissions can view
+    // the Site content node.
+    // Else everybody has access based on the content node status.
+    $gid = (empty($site->status))
+      ? (int) $site->nid
+      : OG_SM_ACCESS_GRANT_ALL;
+
+    $grants[] = array(
+      'realm' => OG_SM_ACCESS_REALM_SITE,
+      'gid' => $gid,
+      'grant_view' => (int) $node->status,
+      'grant_update' => 0,
+      'grant_delete' => 0,
+      'priority' => 0,
+    );
+
+    // Site content administration.
+    $grants[] = array(
+      'realm' => OG_SM_ACCESS_REALM_CONTENT,
+      'gid' => $site->nid,
+      'grant_view' => 1,
+      'grant_update' => 1,
+      'grant_delete' => 1,
+      'priority' => 0,
+    );
+  }
+
+  return $grants;
+}
+
+/**
+ * Implements hook_node_grants().
+ */
+function og_sm_access_node_grants($account, $op) {
+  $grants = array();
+
+  // Defaults for users without Site membership.
+  $grants[OG_SM_ACCESS_REALM_SITE] = array(OG_SM_ACCESS_GRANT_ALL);
+
+  // Specific for Sites the user is member of.
+  $sites = og_sm_user_get_sites($account);
+  foreach ($sites as $site) {
+    // View sites and their content when the Site is not published.
+    if ($site->status < 1 && og_sm_site_permission_access($site, OG_SM_ACCESS_PERMISSION_SITE, $account)) {
+      $grants[OG_SM_ACCESS_REALM_SITE][] = (int) $site->nid;
+    }
+
+    // Manage all content within a Site.
+    if (og_sm_site_permission_access($site, OG_SM_ACCESS_PERMISSION_CONTENT, $account)) {
+      $grants[OG_SM_ACCESS_REALM_CONTENT][] = (int) $site->nid;
+    }
+  }
+
+  return $grants;
+}
+
+/**
+ * Implements hook_og_sm_site_update().
+ */
+function og_sm_access_og_sm_site_update($site) {
+  if ((int) $site->status !== (int) $site->original->status) {
+    module_load_include('inc', 'og_sm_access', 'og_sm_access.batch');
+    og_sm_access_node_access_rebuild($site);
+  }
+}
+
+/**
+ * Implements hook_query_TAG_alter().
+ *
+ * By default Drupal core hides menu items that are not published.
+ * If a user has access to an unpublished group, he does not see the full menu.
+ * This alter will check the context and add the items back to the menu.
+ *
+ * Contains the query being altered here. This is most likely the only query
+ * with tag node_access where the first condition is for the node.status column.
+ *
+ * Based on code found in http://dgo.to/menu_view_unpublished.
+ *
+ * @see menu_tree_check_access()
+ */
+function og_sm_access_query_node_access_alter(QueryAlterableInterface $query) {
+  // Only when in a Site context.
+  $site = og_sm_current_site();
+  if (!$site) {
+    return;
+  }
+
+  // Only if the user has view access to the Site.
+  if (!node_access('view', $site)) {
+    return;
+  }
+
+  // Only if the node_access tag has been set.
+  if (!$query->hasTag('node_access')) {
+    return;
+  }
+
+  // Remove the status condition if we suspect this query originates from
+  // menu_tree_check_access().
+  $conditions = &$query->conditions();
+
+  // First condition should be about the status.
+  if (!is_string($conditions[0]['field']) || $conditions[0]['field'] !== 'n.status' || $conditions[0]['value'] !== 1) {
+    return;
+  }
+
+  // Second condition should be about the nid.
+  if (!is_string($conditions[1]['field']) || $conditions[1]['field'] !== 'n.nid' || $conditions[1]['operator'] !== 'IN') {
+    return;
+  }
+
+  // There is an optional 3rd option.
+  if (!empty($conditions[2]) && !($conditions[2]['value'] instanceof SelectQuery)) {
+    return;
+  }
+
+  // There should be 3 or 4 items in the conditions array.
+  $count = count($conditions);
+  if ($count !== 3 && $count !== 4) {
+    return;
+  }
+
+  unset($conditions[0]);
+}

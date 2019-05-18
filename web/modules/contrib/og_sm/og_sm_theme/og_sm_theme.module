@@ -1,0 +1,346 @@
+<?php
+/**
+ * @file
+ * Configurable theme per Site.
+ */
+
+// Permission access the site theme settings.
+define('OG_SM_THEME_OG_PERM_ADMINISTER_THEME', 'administer theme');
+
+/**
+ * Implements hook_hook_info().
+ */
+function og_sm_theme_hook_info() {
+  $group = array('group' => 'og_sm');
+  $hooks = array(
+    'og_sm_theme_themes_site_alter' => $group,
+    'og_sm_theme_themes_page_alter' => $group,
+  );
+
+  return $hooks;
+}
+
+/**
+ * Implements hook_og_permission().
+ */
+function og_sm_theme_og_permission() {
+  return array(
+    OG_SM_THEME_OG_PERM_ADMINISTER_THEME => array(
+      'title' => t('Administer theme'),
+      'description' => t('Allows the user to administer the Site theme.'),
+      'roles' => array(OG_AUTHENTICATED_ROLE),
+      'default role' => array(OG_ADMINISTRATOR_ROLE),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function og_sm_theme_menu() {
+  $items = array();
+  $items['group/%/%og_sm_site/admin/theme'] = array(
+    'title' => 'Theme settings',
+    'description' => 'Configure the theme for a Site.',
+    'page callback' => 'og_sm_theme_themes_page',
+    'page arguments' => array(2),
+    'access callback' => 'og_sm_site_permission_access',
+    'access arguments' => array(2, OG_SM_THEME_OG_PERM_ADMINISTER_THEME),
+    'file' => 'og_sm_theme.admin.inc',
+  );
+
+  $items['group/%/%og_sm_site/admin/theme/default'] = array(
+    'title' => 'Set default theme',
+    'page callback' => 'og_sm_theme_set_default',
+    'page arguments' => array(2),
+    'access callback' => 'og_sm_site_permission_access',
+    'access arguments' => array(2, OG_SM_PERMISSION_SITE_ADMIN),
+    'type' => MENU_CALLBACK,
+    'file' => 'og_sm_theme.admin.inc',
+  );
+
+  $items['group/%/%og_sm_site/admin/theme/settings/%'] = array(
+    'title' => 'General settings',
+    'description' => 'Configure default and theme specific settings within a Site.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('og_sm_theme_site_settings_form', 2, 6),
+    'access callback' => 'og_sm_site_permission_access',
+    'access arguments' => array(2, OG_SM_PERMISSION_SITE_ADMIN),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'og_sm_theme.admin.inc',
+  );
+
+  $items['group/%/%og_sm_site/admin/theme/settings/%/configure'] = array(
+    'title' => 'General settings',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => -1,
+  );
+
+  $items['admin/config/group/theme']  = array(
+    'title' => 'OG Theme settings',
+    'description' => 'Configure the global Site theme settings.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('og_sm_theme_global_settings_form'),
+    'access arguments' => array('administer group'),
+    'file' => 'og_sm_theme.admin.inc',
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_themes_disabled().
+ */
+function og_sm_theme_themes_disabled($theme_list) {
+  $all_themes = list_themes();
+
+  // If the Default site theme got disabled, set it to the default theme.
+  $default_site_theme = variable_get('og_sm_theme_default_theme');
+  if (in_array($default_site_theme, $theme_list)) {
+    $default_theme = variable_get('theme_default', 'bartik');
+    variable_set('og_sm_theme_default_theme', $default_theme);
+    drupal_set_message(t('A theme was disabled when it was set as the Site default theme. The default Site theme has been reset to the default theme (@default). To change this, go to <a href="@url">OG Theme settings</a>.', array(
+      '@url' => url('admin/config/group/theme'),
+      '@default' => $all_themes[$default_theme]->info['name'],
+    )));
+    $default_site_theme = $default_theme;
+  }
+
+  // If one of the themes is in the allowed themes list, remove it.
+  $allowed_site_themes = variable_get('og_sm_theme_site_themes', array());
+  $intersection = array_intersect(array_filter($allowed_site_themes), $theme_list);
+  if ($intersection) {
+    $new_allowed_site_themes = array_filter($allowed_site_themes, function ($theme) use ($intersection) {
+      return !in_array($theme, $intersection);
+    });
+    variable_set('og_sm_theme_site_themes', $new_allowed_site_themes);
+    drupal_set_message(t('A theme was disabled when it was set as an allowed Site theme. It has been removed from the allowed Site themes.'));
+  }
+
+  // See if a Site uses one of the disabled themes.
+  $sites_disabled = _og_sm_theme_verify_disabled_site_themes($theme_list);
+  if ($sites_disabled) {
+    drupal_set_message(t('A theme was disabled. The Site theme of @sites has been reset to the default Site theme (@default).', array(
+      '@sites' => implode(', ', $sites_disabled),
+      '@default' => $all_themes[$default_site_theme]->info['name'],
+    )));
+  }
+}
+
+/**
+ * Implements hook_themes_enabled().
+ */
+function og_sm_theme_themes_enabled($theme_list) {
+  drupal_set_message(t('A theme was enabled. To make it available to Sites, go to <a href="@url">OG Theme settings</a> and enable it.', array(
+    '@url' => url('admin/config/group/theme'),
+  )));
+}
+
+/**
+ * Verify that disabled themes are not in use anymore.
+ *
+ * If a theme is disabled globally or in the allowed site themes, we have to
+ * make sure existing Site variables get updated as well.
+ */
+function _og_sm_theme_verify_disabled_site_themes($disabled_themes) {
+  // Determine the fallback theme in case the disabled theme is in use.
+  $default_theme = variable_get('theme_default', 'bartik');
+  $default_site_theme = variable_get('og_sm_theme_default_theme');
+  if (!$default_site_theme) {
+    $default_site_theme = $default_theme;
+  }
+
+  // Verify that the disabled theme is not in use anymore.
+  $sites_disabled = array();
+  foreach (_og_sm_variable_load_all_sites('theme') as $nid => $theme) {
+    if (in_array($theme, $disabled_themes)) {
+      // The theme isn't allowed anymore, revert to the global default.
+      og_sm_variable_set($nid, 'theme', $default_site_theme);
+      $site = og_sm_site_load($nid);
+      $sites_disabled[$nid] = $site->title;
+    }
+  }
+  return $sites_disabled;
+}
+
+/**
+ * Get the available themes for a Site to choose from.
+ *
+ * @param object $site
+ *   The Site.
+ *
+ * @return array $themes
+ *   The list of themes.
+ */
+function og_sm_theme_site_themes($site) {
+  // Get all active themes.
+  $all_themes = array_filter(list_themes(), function ($theme) {
+    return !empty($theme->status);
+  });
+
+  // Allowed site themes by global configuration.
+  $site_themes = variable_get('og_sm_theme_site_themes', array());
+  $themes = array_map(function ($theme_name) use ($all_themes) {
+    return isset($all_themes[$theme_name]) ? $all_themes[$theme_name] : 0;
+  }, $site_themes);
+  $themes = array_filter($themes);
+
+  // Allow other modules to change the list within a site context.
+  $context = array(
+    'site' => clone $site,
+  );
+  drupal_alter('og_sm_theme_site_themes', $themes, $context);
+
+  return $themes;
+}
+
+/**
+ * Implements hook_custom_theme().
+ */
+function og_sm_theme_custom_theme() {
+
+  // Skip admin paths.
+  $current_path = current_path();
+  if (user_access('view the administration theme') && path_is_admin($current_path)) {
+    // Even though we are on an admin path, we allow node forms to be themed
+    // in a custom theme, when we use the og_sm_content links.
+    $paths = "group/node/*content/add/*\rgroup/node/*content/edit/*";
+    if (!drupal_match_path($current_path, $paths)) {
+      return;
+    };
+  }
+
+  $default_site_theme = variable_get('og_sm_theme_default_theme');
+
+  // IMPORTANT: We can NOT use og_context() here. It calls menu_get_item,
+  // potentially before a theme is initialized. This will cause the menu to
+  // rebuild if we don't have a cached menu router. The result is we initialized
+  // the theme before we arrive here and the value we return is ignored. This
+  // will happen typically directly after the menu cache is cleared.
+  // We use the context determination function directly using a fake path.
+  // This skips the menu_get_item() call.
+  // See https://www.drupal.org/node/943616, https://www.drupal.org/node/2086335
+  if ($gid = og_context_determine_context('node', array('path' => 'foo/bar'))) {
+    return og_sm_variable_get($gid, 'theme', $default_site_theme);
+  }
+
+  // Fallback to the default Site theme.
+  return $default_site_theme;
+}
+
+/**
+ * Get the theme settings for a specific theme in a Site.
+ *
+ * @param object $site
+ *   The Site object.
+ * @param string $theme_key
+ *   The theme key.
+ *
+ * @return array
+ *   The settings array.
+ *
+ * @see theme_get_setting()
+ *   The idea is the same as core's, but we store the settings for a theme
+ *   in a Site context.
+ */
+function og_sm_theme_get_theme_settings($site = NULL, $theme_key = NULL) {
+  if (!$site) {
+    $site = og_sm_current_site();
+  }
+  if (!$theme_key) {
+    $theme_key = $GLOBALS['theme_key'];
+  }
+
+  $data = &drupal_static(__FUNCTION__);
+  if (!$data || !isset($data[$site->nid])) {
+    $data[$site->nid] = array();
+  }
+  if (!isset($data[$site->nid][$theme_key])) {
+    $variable_name = 'theme_' . $theme_key . '_settings';
+    $defaults = array(
+      // The defaults for toggleable components.
+      'toggle_logo_link' => 0,
+      'logo_link_url' => NULL,
+      'logo_link_target' => '_self',
+    );
+    $data[$site->nid][$theme_key] = array_merge(
+      $defaults,
+      og_sm_variable_get($site->nid, $variable_name, array())
+    );
+  }
+
+  return $data[$site->nid][$theme_key];
+}
+
+/**
+ * Set the theme settings for a specific theme in a Site.
+ *
+ * @param array $settings
+ *   The settings to set.
+ * @param object $site
+ *   The Site object.
+ * @param string $theme_key
+ *   The theme key.
+ */
+function og_sm_theme_set_theme_settings($settings, $site = NULL, $theme_key = NULL) {
+  if (!$site) {
+    $site = og_sm_current_site();
+  }
+  if (!$theme_key) {
+    $theme_key = $GLOBALS['theme_key'];
+  }
+
+  $variable_name = 'theme_' . $theme_key . '_settings';
+  og_sm_variable_set($site->nid, $variable_name, $settings);
+
+  drupal_static_reset('og_sm_theme_get_theme_settings');
+}
+
+/**
+ * Implements hook_preprocess_page().
+ *
+ * Adds the custom logo link settings to the page template variables.
+ */
+function og_sm_theme_preprocess_page(&$variables) {
+  // Default logo settings when not in Site context.
+  $variables['logo_link_url'] = $variables['front_page'];
+  $variables['logo_link_target'] = '_self';
+
+  // Only override when Site context is available.
+  $site = og_sm_current_site();
+  if (!$site) {
+    return;
+  }
+
+  // Default link to the Site homepage.
+  $variables['logo_link_url'] = url(og_sm_site_homepage());
+
+  // Set the overridden link (if any).
+  $settings = og_sm_theme_get_theme_settings($site);
+  if ($settings['toggle_logo_link']) {
+    $variables['logo_link_url'] = $settings['logo_link_url'];
+    $variables['logo_link_target'] = $settings['logo_link_target'];
+  }
+}
+
+/**
+ * Get the theme for the given Site.
+ *
+ * @param object $site
+ *   The Site to get the theme name for.
+ *
+ * @return string
+ *   The theme name for the Site.
+ */
+function og_sm_theme_get_site_theme($site) {
+  $theme = og_sm_variable_get($site->nid, 'theme');
+
+  // We need to check this manually as the theme variable can contain an empty
+  // value.
+  if (empty($theme)) {
+    $theme = variable_get('theme_default', 'bartik');
+  }
+
+  return $theme;
+}

@@ -1,0 +1,247 @@
+<?php
+/**
+ * @file
+ * OG SM Breadcrumbs module.
+ */
+
+/**
+ * Feature namespace.
+ */
+define('OG_SM_BREADCRUMB_FEATURE', 'breadcrumb');
+
+/**
+ * Global permission to manage the global breadcrumb settings.
+ */
+define('OG_SM_BREADCRUMB_PERM_ADMINISTER', 'administer site breadcrumb settings');
+
+/**
+ * Implements hook_permission().
+ */
+function og_sm_breadcrumb_permission() {
+  $perm = array();
+
+  // Permission only required if og_sm_feature module is not enabled.
+  if (!module_exists('og_sm_feature')) {
+    $perm[OG_SM_BREADCRUMB_PERM_ADMINISTER] = array(
+      'title' => t('Administer Breadcrumb settings'),
+      'description' => t('Manage the global Site breadcrumb settings.'),
+    );
+  }
+
+  return $perm;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function og_sm_breadcrumb_menu() {
+  $items = array();
+
+  // Global & OG Administration forms.
+  $file_admin = 'og_sm_breadcrumb.admin.inc';
+
+  // Support global breadcrumb settings when the og_sm_feature module is not
+  // enabled.
+  if (!module_exists('og_sm_feature')) {
+    $items['admin/config/group/breadcrumb'] = array(
+      'title' => 'OG Breadcrumb',
+      'description' => 'Configuration of the OG breadcrumb.',
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('og_sm_breadcrumb_admin'),
+      'access arguments' => array(OG_SM_BREADCRUMB_PERM_ADMINISTER),
+      'file' => $file_admin,
+      'type' => MENU_NORMAL_ITEM,
+    );
+  }
+  // When og_sm_feature is enabled, we use that interface to manage breadcrumb
+  // settings.
+  else {
+    $items['admin/config/group/features/breadcrumb'] = array(
+      'title' => 'Breadcrumb',
+      'description' => 'Default Breadcrumb configuration.',
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('og_sm_breadcrumb_admin_feature'),
+      'access arguments' => array('administer site features'),
+      'file' => $file_admin,
+    );
+    $items['group/%/%og_sm_site/admin/features/breadcrumb'] = array(
+      'title' => 'Breadcrumb',
+      'description' => 'Breadcrumb configuration.',
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('og_sm_breadcrumb_og_admin_feature', 2),
+      'access callback' => 'og_sm_site_permission_access',
+      'access arguments' => array(2, 'administer features'),
+      'file' => $file_admin,
+    );
+  }
+
+  return $items;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function og_sm_breadcrumb_theme() {
+  return array(
+    'og_sm_breadcrumb_og_admin_root_parts' => array(
+      'file' => 'og_sm_breadcrumb.admin.inc',
+      'render element' => 'element',
+    ),
+  );
+}
+
+/**
+ * Implements hook_theme_registry_alter().
+ */
+function og_sm_breadcrumb_theme_registry_alter(&$theme_registry) {
+  // If only one module preprocesses breadcrumb, bail.
+  if (count($theme_registry['breadcrumb']['preprocess functions']) <= 1) {
+    return;
+  }
+
+  // Make sure our module's preprocess function for breadcrumb is always first.
+  foreach ($theme_registry['breadcrumb']['preprocess functions'] as $key => $value) {
+    if ($value !== 'og_sm_breadcrumb_preprocess_breadcrumb') {
+      continue;
+    }
+
+    $item = $theme_registry['breadcrumb']['preprocess functions'][$key];
+    unset($theme_registry['breadcrumb']['preprocess functions'][$key]);
+    array_unshift($theme_registry['breadcrumb']['preprocess functions'], $item);
+    break;
+  }
+}
+
+/**
+ * Get the breadcrumb settings from the Site feature or global settings.
+ *
+ * @param object $site
+ *   The Site object to get the settings for.
+ *
+ * @return array
+ *   The Site settings:
+ *   - hide_on_frontpage : Should the breadcrumb be hidden on Site frontpage.
+ *   - force_home : Should the "home" link be replaced by the Site homepage.
+ *   - append_title : Should the title of the current item be added to the
+ *     breadcrumb.
+ *   - override_root : Should the first item of the breadcrumb be replaced by
+ *     custom part(s).
+ *   - override_root_parts : Array of root part(s), containing title and URL, to
+ *     prepend the breadcrumb with if the override_root option is enabled.
+ */
+function og_sm_breadcrumb_settings($site) {
+  // Default to global settings.
+  $settings = array(
+    'hide_on_frontpage' => variable_get('og_sm_breadcrumb_hide_on_frontpage', 1),
+    'force_home' => variable_get('og_sm_breadcrumb_force_home', 1),
+    'append_title' => variable_get('og_sm_breadcrumb_append_title', 1),
+    'override_root' => 0,
+    'override_root_parts' => array(),
+  );
+
+  // Get from Site feature settings if feature module is enabled.
+  if (module_exists('og_sm_feature')) {
+    foreach ($settings as $key => $default) {
+      $var_key = 'og_sm_breadcrumb_' . $key;
+      $settings[$key] = og_sm_variable_get($site->nid, $var_key, $default);
+    }
+  }
+
+  return $settings;
+}
+
+/**
+ * Implements hook_preprocess_breadcrumb().
+ *
+ * Normally we'd use hook_menu_breadcrumb_alter() to alter the breadcrumb trail.
+ * If any module calls drupal_set_breadcrumb during page load, that hook is
+ * never called (f.e. og_sm_set_breadcrumb, ...). Therefore we use
+ * module_preprocess_breadcrumb() to make sure we're called before the
+ * theme_preprocess_breadcrumb() functions in our themes get called.
+ */
+function og_sm_breadcrumb_preprocess_breadcrumb(&$variables) {
+  // Only when in Site context!
+  $site = og_sm_current_site();
+  if (!$site) {
+    return;
+  }
+
+  // Check path type.
+  $path_is_admin = (user_access('view the administration theme') && path_is_admin(current_path()));
+  $site_homepage = og_sm_site_homepage($site);
+  $path_is_site_frontpage = (current_path() === $site_homepage);
+  $og_sm_feature_exists = module_exists('og_sm_feature');
+
+  // Hide breadcrumb if og_sm_feature and the global option is not enabled.
+  if (!$path_is_admin && !$og_sm_feature_exists && !variable_get('og_sm_breadcrumb_enable', 0)) {
+    $variables['breadcrumb'] = array();
+    return;
+  }
+
+  // Hide breadcrumbs if feature is not enabled (only when not on admin pages).
+  if (!$path_is_admin && $og_sm_feature_exists && !og_sm_feature_site_is_enabled($site, OG_SM_BREADCRUMB_FEATURE)) {
+    $variables['breadcrumb'] = array();
+    return;
+  }
+
+  // Get the Site breadcrumb settings.
+  $settings = og_sm_breadcrumb_settings($site);
+
+  // Hide the breadcrumb when on Site homepage.
+  if ($path_is_site_frontpage && $settings['hide_on_frontpage']) {
+    $variables['breadcrumb'] = array();
+    return;
+  }
+
+  // Get the breadcrumb.
+  $breadcrumb = drupal_get_breadcrumb();
+
+
+  // Custom breadcrumb root (only when not on admin pages).
+  if (!$path_is_admin && $settings['override_root']) {
+    // Remove the first item.
+    array_shift($breadcrumb);
+
+    // Get all parts and prepend to the existing breadcrumb.
+    foreach (array_reverse($settings['override_root_parts']) as $part) {
+      array_unshift($breadcrumb, l($part['text'], $part['path']));
+    }
+  }
+  // Force the root part to the Site frontpage, this should be ignored when the
+  // breadcrumb's root parts are overridden.
+  elseif ($settings['force_home']) {
+    // Remove the first 2 items of the breadcrumb, since they contain both the
+    // PP homepage and the site homepage.
+    $breadcrumb = array_slice($breadcrumb, 2);
+
+    // Replace by the Site home page.
+    array_unshift($breadcrumb, l(t('Home'), $site_homepage));
+  }
+
+  // Append current page title unless we are on the site's homepage, in that
+  // case the site title should be added.
+  if ($settings['append_title']) {
+    $breadcrumb[] = drupal_get_title();
+  }
+
+  // Update the variable and set the new breadcrumb to allow the rest of the
+  // preprocessing chain to call drupal_get_breadcrumb() as well.
+  $variables['breadcrumb'] = $breadcrumb;
+  drupal_set_breadcrumb($breadcrumb);
+}
+
+/**
+ * Implements hook_node_view().
+ */
+function og_sm_breadcrumb_node_view($node, $view_mode, $langcode) {
+  if ($view_mode !== 'full') {
+    return;
+  }
+  if (!module_exists('og_sm_content')) {
+    return;
+  }
+  $site = og_sm_content_get_site($node);
+  if ($site) {
+    og_sm_set_breadcrumb($site);
+  }
+}

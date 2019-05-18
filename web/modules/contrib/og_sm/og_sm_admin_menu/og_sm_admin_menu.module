@@ -1,0 +1,193 @@
+<?php
+
+/**
+ * @file
+ * Site Manager Administration module.
+ */
+
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\Template\Attribute;
+use Drupal\og_sm\OgSm;
+use Drupal\Core\Menu\MenuTreeParameters;
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_local_tasks_alter().
+ */
+function og_sm_admin_menu_local_tasks_alter(&$local_tasks) {
+  // We are taking over the admin route and don't want it to be a local task for
+  // site nodes.
+  unset($local_tasks['og.og_admin_routes:node.og_admin_routes']);
+}
+
+/**
+ * Implements hook_toolbar().
+ */
+function og_sm_admin_menu_toolbar() {
+  $site_manager = OgSm::siteManager();
+  $links = [];
+
+  $main_tab = NULL;
+  $platform_url = Url::fromRoute('<front>');
+  $platform_access = FALSE;
+  // Check if we are allowed to the platform, if so set the platform URL as our
+  // main tab.
+  if (\Drupal::pathValidator()->isValid($platform_url->getInternalPath())) {
+    $platform_access = TRUE;
+    $main_tab = [
+      'title' => t('Platform'),
+      'url' => $platform_url,
+    ];
+  }
+
+  $current_site = $site_manager->currentSite();
+  $tab_cache_tags = [];
+  // If we are currently within site context, the main tab should be the site,
+  // if the main tab was previously set it should be added to the links array.
+  if ($current_site) {
+    if ($main_tab) {
+      $links['platform'] = $main_tab;
+    }
+
+    $main_tab = [
+      'title' => $current_site->label(),
+      'url' => $site_manager->getSiteHomePage($current_site),
+    ];
+    $tab_cache_tags[] = 'node:' . $current_site->id();
+  }
+
+  // If we don't have access to the platform, and we are outside of site context
+  // don't show the site switcher.
+  if (!$main_tab) {
+    return [];
+  }
+
+  $switch_sites = $site_manager->getUserManageableSites();
+  if (!$platform_access && count($switch_sites) < 2) {
+    return [];
+  }
+
+  $cache_tags = [];
+  foreach ($switch_sites as $site) {
+    if ($current_site && $current_site->id() === $site->id()) {
+      continue;
+    }
+
+    $links['site-' . $site->id()] = [
+      'title' => $site->label(),
+      'url' => $site_manager->getSiteHomePage($site),
+    ];
+    $cache_tags[] = 'node:' . $site->id();
+  }
+
+  $items['site_switcher'] = [
+    '#type' => 'toolbar_item',
+    'tab' => [
+      '#type' => 'link',
+      '#title' => $main_tab['title'],
+      '#url' => $main_tab['url'],
+      '#attributes' => [
+        'title' => t('Return to site content'),
+        'class' => ['toolbar-site-switcher'],
+      ],
+      '#cache' => [
+        'contexts' => [
+          'og_group_context',
+          'user',
+        ],
+        'tags' => $tab_cache_tags,
+      ],
+    ],
+    'tray' => [
+      '#heading' => t('Site switcher'),
+      'site_switcher' => [
+        '#theme' => 'links__toolbar',
+        '#links' => $links,
+        '#attributes' => [
+          'class' => ['toolbar-menu'],
+        ],
+        '#cache' => [
+          'tags' => $cache_tags,
+        ],
+      ],
+    ],
+    '#attached' => [
+      'library' => [
+        'og_sm_admin_menu/og_sm.site_switcher',
+      ],
+    ],
+    '#weight' => 200,
+  ];
+
+  return $items;
+}
+
+/**
+ * Implements hook_toolbar_alter().
+ */
+function og_sm_admin_menu_toolbar_alter(&$items) {
+  $items['administration']['tray']['toolbar_administration']['#pre_render'] = ['og_sm_admin_menu_prerender_toolbar_administration_tray'];
+  $items['administration']['#cache']['contexts'][] = 'og_group_context';
+}
+
+/**
+ * Renders the toolbar's site administration tray.
+ *
+ * @param array $element
+ *   A renderable array.
+ *
+ * @return array
+ *   The updated renderable array.
+ */
+function og_sm_admin_menu_prerender_toolbar_administration_tray(array $element) {
+  $site_manager = OgSm::siteManager();
+
+  $admin_toolbar_exists = \Drupal::moduleHandler()->moduleExists('admin_toolbar');
+
+  if (!$site_manager->currentSite()) {
+    // If there's no site context, render the toolbar as usual.
+    return $admin_toolbar_exists ? admin_toolbar_prerender_toolbar_administration_tray($element) : toolbar_prerender_toolbar_administration_tray($element);
+  }
+
+  // @todo: This can be simplified once https://www.drupal.org/node/1869638 has
+  // been implemented in core and the "admin_toolbar" module.
+  /* @var \Drupal\Core\Menu\MenuLinkTreeInterface $menu_tree */
+  $menu_tree = \Drupal::service('toolbar.menu_tree');
+  $parameters = new MenuTreeParameters();
+  // Depending on whether the 'admin_toolbar' module exists we should change the
+  // menu depth shown in the toolbar.
+  $max_depth = $admin_toolbar_exists ? 4 : 2;
+  $parameters->setMinDepth(2)->setMaxDepth($max_depth)->onlyEnabledLinks();
+  $tree = $menu_tree->load('og_sm_admin_menu', $parameters);
+  $manipulators = [
+    ['callable' => 'menu.default_tree_manipulators:checkAccess'],
+    ['callable' => 'menu.default_tree_manipulators:generateIndexAndSort'],
+    ['callable' => $admin_toolbar_exists ? 'toolbar_tools_menu_navigation_links' : 'toolbar_menu_navigation_links'],
+  ];
+  $tree = $menu_tree->transform($tree, $manipulators);
+  $element['administration_menu'] = $menu_tree->build($tree);
+
+  return $element;
+}
+
+/**
+ * Implements hook_preprocess_HOOK() for HTML document templates.
+ */
+function og_sm_admin_menu_preprocess_html(&$variables) {
+  // Make sure the root path is set to "admin" for group admin pages. This adds
+  // a "page-admin" class to the body tags which caused the "Back to home"
+  // to appear on admin pages.
+  if ($variables['root_path'] === 'group' && \Drupal::routeMatch()->getRouteObject()->getOption('_admin_route')) {
+    $variables['root_path'] = 'admin';
+  }
+
+  // Alter the toolbar's #access key to also include the og permission when in
+  // site context.
+  $toolbar_access = og_sm_site_user_access('access toolbar');
+  if ($toolbar_access) {
+    $variables['page_top']['toolbar']['#access'] = $toolbar_access;
+    $variables['page_top']['toolbar']['#cache']['contexts'][] = 'og_group_context';
+    $variables['attributes'] = new Attribute($variables['attributes']);
+    $variables['attributes']->addClass(['toolbar-tray-open', 'toolbar-horizontal', 'toolbar-fixed', 'toolbar-loading']);
+  }
+}
