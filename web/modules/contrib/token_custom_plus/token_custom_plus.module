@@ -1,0 +1,183 @@
+<?php
+
+/**
+ * @file
+ * Hooks for Custom Tokens Plus module.
+ */
+
+use Drupal\Core\Render\BubbleableMetadata;
+use Drupal\Core\TypedData\TranslatableInterface;
+use Drupal\Core\Language\Language;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\token_custom\Entity\TokenCustom;
+
+/**
+ * Retrieves the value of a configuration setting for this module.
+ *
+ * @param string $setting_name
+ *   Name of the setting in config/install/token_custom_plus.settings.yml.
+ *
+ * @return mixed|array|null
+ *   The value of the config setting
+ */
+function token_custom_plus_get_setting($setting_name) {
+  return \Drupal::config('token_custom_plus.settings')->get($setting_name);
+}
+
+/**
+ * Implements hook_tokens().
+ *
+ * Based on token_custom_tokens() this skips all the tokens already dealt with
+ * by that function, processing only custom tokens with arguments.
+ */
+function token_custom_plus_tokens($type, $tokens, array $data, array $options, BubbleableMetadata $bubbleable_metadata) {
+  $replacements = [];
+
+  foreach ($tokens as $token_name => $full_token_name) {
+
+    $actual_args = token_custom_plus_explode_args($token_name);
+    $actual_name = array_shift($actual_args);
+
+    // Tokens without args have already been processed by token_custom.module.
+    // However, if the replacement text contains missing args, (%1,2...), then
+    // we want to set these to the empty string. So we push on, even when
+    // $actual_args is empty, partly re-doing what token_custom_tokens has done
+    // already, when it turns out that the replacement text does not feature
+    // any args.
+    // Find the base token as entered and stored via token_custom module.
+    $token_custom_array = TokenCustom::loadMultiple([$actual_name]);
+    if ($token_custom_array && ($token_custom = reset($token_custom_array))) {
+
+      // Translate if necessary -- taken from token_custom_tokens().
+      if ($token_custom instanceof TranslatableInterface) {
+        $langcode = isset($options['langcode']) ? $options['langcode'] : Language::LANGCODE_DEFAULT;
+        $token_custom = \Drupal::service('entity.repository')->getTranslationFromContext($token_custom, $langcode);
+      }
+
+      // Replace token args. args can be like %1 or %arg1 (case-insensitive).
+      $replacement = preg_replace_callback(
+        '/%(arg)?\d+/i',
+        function ($matches) use ($actual_args) {
+          if (preg_match('/\d+/', reset($matches), $digits)) {
+            // $actual_args starts at 0, but replacement content uses %1, %2, ..
+            $i = reset($digits) - 1;
+            return isset($actual_args[$i]) ? $actual_args[$i] : '';
+          }
+        },
+        $token_custom->getRawContent()
+      );
+      $replacements[$full_token_name] = check_markup($replacement, $token_custom->getFormat());
+
+      $bubbleable_metadata->addCacheableDependency($token_custom);
+    }
+  }
+  return $replacements;
+}
+
+/**
+ * Example: 'thumbnail{50px,file.jpg}' returns ['thumbnail','50px','file.jpg'].
+ *
+ * @param string $string
+ *   The token nome and any arguments.
+ *
+ * @return array[]
+ *   Array starting with token base name, followed by arguments, if any.
+ */
+function token_custom_plus_explode_args($string) {
+  if ($arg_pos = strrpos($string, '{}')) {
+    // Empty argument list. Return as empty string.
+    return [substr($string, 0, $arg_pos), ''];
+  }
+  $string = str_replace(['{', '}'], ',', $string);
+  return array_filter(explode(',', $string));
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function token_custom_plus_form_token_custom_form_alter(&$form, FormStateInterface &$form_state) {
+  // NOTE: $form['#form_id] =
+  // 'token_custom_custom_form (Add Token) or
+  // 'token_custom_TOKEN_edit_form' (Edit)
+  //
+  $form['name']['widget'][0]['value']['#title'] = t('Administrative name');
+  $form['name']['widget'][0]['value']['#description'] = t('Administrative name as used in this UI.');
+
+  $is_relaxed_machine_names = token_custom_plus_get_setting('relaxed_machine_names');
+
+  // To support uppercase and special characters (if desired), we change the
+  // machine_name field to a normal textfield, as the validation that comes
+  // with a machine name only allows lowercase, digits and underscore.
+  // If we choose to do this, we must also relax the permissable character
+  // range for token edit and delete URLs, @see src/Routing/RoutSubscriber.php.
+  if ($is_relaxed_machine_names) {
+    $form['machine_name']['widget'][0]['value']['#type'] = 'textfield';
+    unset($form['machine_name']['widget'][0]['value']['#machine_name']);
+  }
+  $form['machine_name']['widget'][0]['value']['#title'] = $is_relaxed_machine_names
+    ? t('Name or Name{arg1,arg2} (optional)')
+    : t('Machine name');
+
+  $form['machine_name']['widget'][0]['value']['#description'] =
+    t('The token name to be used when embedding it in a formatted field.') . '<br/>' .
+    t('Depending on what you enter in the <strong>Content</strong> area below, a token may be used with arguments, placed between <em>{ }</em>.') . '<br/>' .
+    t('<strong>Example:</strong> the name <em>thumbnail</em>, may be used as a token like so: <em>[custom:thumbnail{80px,image.jpg}]</em>');
+
+  $form['description']['widget'][0]['value']['#description'] = t('Description as used in this UI.');
+
+  // Changing $form['content']['widget'][0]['value']['#description'] here does
+  // not work for some reason, so ....
+  $form['#after_build'][] = 'token_custom_plus_form_after_build';
+}
+
+/**
+ * After-build form alteration.
+ *
+ * @param array $form
+ *   The form.
+ * @param Drupal\Core\Form\FormStateInterface $form_state
+ *   The form state.
+ *
+ * @return array
+ *   The altered form.
+ */
+function token_custom_plus_form_after_build(array &$form, FormStateInterface &$form_state) {
+  $form['content']['widget'][0]['#description'] =
+    t('The text that will replace this token.') . '<br/>' .
+    t('If token arguments are used, as in <em>[custom:thumbnail{80px,image.jpg}]</em>, then refer to them here as %ARG1, %ARG2... or %1, %2...') . '<br/>' .
+    t('<strong>Example:</strong> &lt;img style="height:%1; border:1px solid red" src="/sites/default/%2"/>');
+
+  // Patch because token_custom_plus_entity_prepare_form() doesn't work on Type.
+  $pars = \Drupal::request()->query->all();
+  if (!empty($pars['token_custom_type'])) {
+    $form['type']['#value'] = $pars['token_custom_type'];
+  }
+  return $form;
+}
+
+/**
+ * Implements hook_entity_type_alter().
+ */
+function token_custom_plus_entity_type_alter(array &$entity_types) {
+  // Replace TokenCustomListBuilder by our own version, so we can alter the
+  // sorting and paging.
+  $entity_types['token_custom']->setListBuilderClass('Drupal\token_custom_plus\TokenCustomPlusListBuilder');
+}
+
+/**
+ * Implements hook_entity_prepare_form().
+ */
+function token_custom_plus_entity_prepare_form($entity, $operation, $form_state) {
+  if (!in_array($entity->getEntityTypeId(), ['token_custom', 'token_custom_type'])) {
+    return;
+  }
+  // Ensure entity supports necessary functionality.
+  if (method_exists($entity, 'hasField')) {
+    $pars = \Drupal::request()->query->all();
+    foreach ($pars as $name => $value) {
+      if ($entity->hasField($name)) {
+        $entity->set($name, $value);
+      }
+    }
+  }
+}
