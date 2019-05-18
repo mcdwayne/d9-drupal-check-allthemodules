@@ -1,0 +1,1 @@
+Set access permissions on individual image styles (to limit content editors to certain image styles when embedding in wysiwygs).
