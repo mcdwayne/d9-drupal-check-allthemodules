@@ -1,0 +1,339 @@
+<?php
+
+/**
+ * @file
+ * Contains hook implementations for Parade.
+ *
+ * @todo Make the whole thing dynamic, do not rely on Parade content type.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\file\Entity\File;
+use Drupal\Component\Utility\Html;
+
+/**
+ * Implements hook_preprocess_paragraph().
+ */
+function parade_preprocess_paragraph(&$variables) {
+  /** @var Drupal\paragraphs\Entity\Paragraph $paragraph */
+  $paragraph = &$variables['paragraph'];
+
+  if (!method_exists($paragraph, 'getType')) {
+    return;
+  }
+
+  // Attach libraries for each paragraph type.
+  $variables['#attached']['library'][] = 'parade/paragraphs.' . $paragraph->getType();
+
+  if (!method_exists($paragraph, 'hasField')) {
+    return;
+  }
+
+  // Some templates maybe needs to determinate it was called from an edit page
+  // or not.
+  $route_name = Drupal::request()->attributes->get('_route');
+  $variables['isEditPage'] = FALSE;
+  if ('entity.node.edit_form' === $route_name) {
+    $variables['isEditPage'] = TRUE;
+  }
+
+  // Pass the Anchor field value for the template.
+  if ($paragraph->hasField('parade_anchor') && $anchor = $paragraph->get('parade_anchor')->value) {
+    $variables['attributes']['id'] = Html::getId($anchor);
+  }
+
+  // Parallax and background stuff for Header and Parallax types.
+  if (
+    $paragraph->hasField('parade_background') &&
+    in_array($paragraph->getType(), ['header', 'parallax'], FALSE)
+  ) {
+    $target_id = $paragraph->get('parade_background')->target_id;
+    if (!$target_id) {
+      return;
+    }
+
+    // Get background file info.
+    $file = File::load($target_id);
+    if (is_object($file)) {
+      $file_uri = $file->getFileUri();
+      $file_mime = $file->getMimeType();
+      $file_path = parse_url(file_create_url($file_uri))['path'];
+
+      // Attach parallax library if the user enabled the effect.
+      $enable_parallax = 0;
+      if ($paragraph->hasField('parade_enable_parallax')) {
+        // Check parade_enable_parallax field.
+        $enable_parallax = (int) $paragraph->get('parade_enable_parallax')->value;
+        if (1 === $enable_parallax) {
+          $variables['#attached']['library'][] = 'parade/parallax';
+        }
+      }
+
+      // @todo Maybe use this...?
+      //
+      // @code
+      // if (isset($vars['elements']['field_video'])) {
+      //   $video_path = $vars['elements']['field_video'][0]['#markup'];
+      //   $vars['video'] = array(
+      //   'path' => file_create_url($video_path),
+      //   'mime' => Drupal::service('file.mime_type.guesser')
+      //                ->guess($video_path)
+      //   );
+      // }
+      // @endcode
+      // Image is the default.
+      $type = 'image';
+
+      if (in_array($file_mime, [
+        'video/mp4',
+        'application/mp4',
+        'video/webm',
+      ], FALSE)) {
+        $type = 'video';
+        // Attach video related libraries.
+        $variables['#attached']['library'][] = 'parade/inline-video';
+      }
+
+      // Add variables to theme.
+      _parade_add_template_variable($variables, [
+        'background' => [
+          'type' => $type,
+          'url' => $file_path,
+          'mime' => $file_mime,
+        ],
+
+        'enable_parallax' => $enable_parallax,
+      ]);
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_paragraph__text_box().
+ */
+function parade_preprocess_paragraph__text_box(&$variables) {
+  /** @var Drupal\paragraphs\Entity\Paragraph $paragraph */
+  $paragraph = &$variables['paragraph'];
+  /** @var Drupal\paragraphs\Entity\Paragraph $parent */
+  $parent = $paragraph->getParentEntity();
+
+  // Pass the number of Columns field value.
+  if (method_exists($parent, 'hasField') && $parent->hasField('parade_boxes_per_row') && ($columns = $parent->get('parade_boxes_per_row')->value)) {
+    _parade_add_template_variable($variables, [
+      'columns' => $columns,
+    ]);
+  }
+}
+
+/**
+ * Implements hook_preprocess_paragraph__text_boxes().
+ */
+function parade_preprocess_paragraph__text_boxes(&$variables) {
+  /** @var Drupal\paragraphs\Entity\Paragraph $paragraph */
+  $paragraph = &$variables['paragraph'];
+
+  // Pass the number of Columns field value.
+  if ($columns = $paragraph->get('parade_boxes_per_row')->value) {
+    _parade_add_template_variable($variables, [
+      'columns' => $columns,
+    ]);
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function parade_theme($existing, $type, $theme, $path) {
+  return [
+    'paragraph__parade' => [
+      'base hook' => 'paragraph',
+    ],
+    'paragraph__header' => [
+      'base hook' => 'paragraph',
+    ],
+    'paragraph__parallax' => [
+      'base hook' => 'paragraph',
+    ],
+    'paragraph__text_box' => [
+      'base hook' => 'paragraph',
+    ],
+    'paragraph__text_boxes' => [
+      'base hook' => 'paragraph',
+    ],
+    'parade_preview' => [
+      'variables' => ['paragraph' => NULL],
+    ],
+    'parade__paragraphs_dropbutton_wrapper' => [
+      'variables' => [
+        'label' => NULL,
+        'children' => NULL,
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK_alter().
+ */
+function parade_theme_suggestions_page_alter(&$suggestions, $variables) {
+  // Add content type suggestions based on machine_name field and content type.
+  // e.g. page--node--parade.html.twig
+  // page--node--parade--my-awesome-page.html.twig.
+  // @todo Check for any nodes which has Parade field (entity_revisions_paragraphs_preview).
+  $attributes = Drupal::request()->attributes;
+  if (!$attributes->has('_entity_form') && $attributes->get('_entity_form') !== "node.edit" && $node = $attributes->get('node')) {
+    $type = (is_object($node) && method_exists($node, 'getType')) ? $node->getType() : 'parade';
+    array_unshift($suggestions, 'page__node__' . $type);
+    if (method_exists($node, 'hasField') && $node->hasField('parade_machine_name')) {
+      if ($machine_name = $node->get('parade_machine_name')->value) {
+        $suggestions[] = 'page__node__' . $type . '__' . $machine_name;
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK_alter().
+ */
+function parade_theme_suggestions_paragraph_alter(array &$suggestions, array $variables) {
+  // Add custom suggestions for paragraph types with parade_layout.
+  $paragraph = $variables['elements']['#paragraph'];
+  if ($paragraph->hasField('parade_layout')) {
+    if ($layout = $paragraph->get('parade_layout')->target_id) {
+      $sanitized_view_mode = strtr($variables['elements']['#view_mode'], '.', '_');
+      $suggestions[] = 'paragraph__' . $paragraph->bundle() . '__' . $sanitized_view_mode . '__' . $layout;
+    }
+  }
+  // Add custom suggestions for Paragraph types with machine name.
+  // @todo Check for any nodes which has Parade field (entity_revisions_paragraphs_preview).
+  $attributes = Drupal::request()->attributes;
+  $node = $attributes->get('node');
+  if (
+    !$attributes->has('_entity_form') &&
+    $attributes->get('_entity_form') !== "node.edit" &&
+    $attributes->has('node') &&
+    method_exists($node, 'hasField') &&
+    $node->hasField('parade_onepage_id')
+  ) {
+    if (is_object($node)) {
+      $parade_suggestions = [];
+      if ($machine_name = $node->get('parade_onepage_id')->value) {
+        /** @var string[] $suggestions */
+        foreach ($suggestions as $suggestion) {
+          $parade_suggestions[] = preg_replace("/^paragraph__/", 'paragraph__' . $machine_name . "__", $suggestion);
+        }
+      }
+      $suggestions = array_merge(['paragraph__parade'], $suggestions, $parade_suggestions);
+    }
+  }
+}
+
+/**
+ * Populates TWIG variables with Parade related data.
+ *
+ * E.g.: $variables['parade']['test'] becomes
+ * {{ parade.test }} in the templates.
+ *
+ * @param array &$variables
+ *   The core $variables passed by reference.
+ * @param array $data
+ *   New data in array format, which will be passed to the template.
+ *
+ * @return bool|array
+ *   The new data.
+ *
+ * @internal
+ */
+function _parade_add_template_variable(array &$variables, array $data = NULL) {
+  if (!$data) {
+    return FALSE;
+  }
+
+  // Array root of Parade related data in TWIG.
+  // Example usage:
+  // {{ parade.background.url }}
+  // {{ parade.layout }}.
+  $variables['parade'] = $data;
+
+  return $data;
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Modify "Add sections".
+ */
+function parade_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // Modify the Paragraphs field.
+  // @todo Check the field formatter instead!
+  /** @var \Drupal\Core\Form\FormStateInterface $form */
+  if (isset($form['parade_onepage_sections'])) {
+    $form['#attached']['library'][] = 'parade/buttons';
+
+    if (isset($form['parade_onepage_sections']['widget']['add_more'])) {
+      foreach ($form['parade_onepage_sections']['widget']['add_more'] as $key => $item) {
+        if (strpos($key, 'add_more') === FALSE) {
+          continue;
+        }
+        $form['parade_onepage_sections']['widget']['add_more'][$key]['#attributes']['class'][] = 'parade-button';
+        if (isset($item['#bundle_machine_name'])) {
+          $type = Html::getClass($item['#bundle_machine_name']);
+          $form['parade_onepage_sections']['widget']['add_more'][$key]['#attributes']['class'][] = 'parade-button-' . $type;
+        }
+      }
+    }
+
+    // If it's a form with parade paragraphs, turn off
+    // 'Enable linkedin autofill' checkbox, if 'linkedin_autofill' module isn't
+    // installed.
+    $autofill_module_enabled = \Drupal::moduleHandler()->moduleExists('linkedin_autofill');
+    if (!$autofill_module_enabled) {
+      foreach ($form['parade_onepage_sections']['widget'] as $key => $paragraph) {
+        if (is_numeric($key) && isset($paragraph['subform']) && isset($paragraph['subform']['parade_enable_linkedin_autofill'])) {
+          $form['parade_onepage_sections']['widget'][$key]['subform']['parade_enable_linkedin_autofill']['#access'] = FALSE;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ */
+function parade_preprocess_field__parade_social_link(&$variables) {
+  foreach ($variables['items'] as $key => $link) {
+    if (strpos($link['content']['#url']->getUri(), 'facebook') !== FALSE) {
+      $type = 'facebook';
+    }
+    elseif (strpos($link['content']['#url']->getUri(), 'twitter') !== FALSE) {
+      $type = 'twitter';
+    }
+    elseif (strpos($link['content']['#url']->getUri(), 'plus.google') !== FALSE) {
+      $type = 'google';
+    }
+    elseif (strpos($link['content']['#url']->getUri(), 'linkedin') !== FALSE) {
+      $type = 'linkedin';
+    }
+    elseif (strpos($link['content']['#url']->getUri(), 'youtube') !== FALSE) {
+      $type = 'youtube';
+    }
+    else {
+      $type = 'unknown';
+    }
+    $variables['items'][$key]['content']['#options']['attributes']['class'] = [
+      'social',
+      'social-' . $type,
+    ];
+  }
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ *
+ * Add field_name class to draggable tables.
+ */
+function parade_preprocess_field_multiple_value_form(&$variables) {
+  if (isset($variables['table'])) {
+    $variables['table']['#attributes']['class'][] = $variables['element']['#field_name'];
+  }
+}
