@@ -1,0 +1,341 @@
+<?php
+
+/**
+ * @file
+ * Contains entity_modifier.module.
+ */
+
+use Drupal\Core\Entity\Entity\EntityFormDisplay;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Field\WidgetBase;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\entity_modifier\Entity\EntityModifier;
+use Drupal\entity_modifier\Entity\EntityModifierType;
+
+/**
+ * Implements hook_help().
+ */
+function entity_modifier_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the entity_modifier module.
+    case 'help.page.entity_modifier':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Add modifiers to entity') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function entity_modifier_theme() {
+  $theme = [];
+  $theme['entity_modifier'] = [
+    'render element' => 'elements',
+    'file' => 'entity_modifier.page.inc',
+    'template' => 'entity_modifier',
+  ];
+  $theme['entity_modifier_content_add_list'] = [
+    'render element' => 'content',
+    'variables' => ['content' => NULL],
+    'file' => 'entity_modifier.page.inc',
+  ];
+  return $theme;
+}
+
+/**
+* Implements hook_theme_suggestions_HOOK().
+*/
+function entity_modifier_theme_suggestions_entity_modifier(array $variables) {
+  $suggestions = [];
+  $entity = $variables['elements']['#entity_modifier'];
+  $sanitized_view_mode = strtr($variables['elements']['#view_mode'], '.', '_');
+
+  $suggestions[] = 'entity_modifier__' . $sanitized_view_mode;
+  $suggestions[] = 'entity_modifier__' . $entity->bundle();
+  $suggestions[] = 'entity_modifier__' . $entity->bundle() . '__' . $sanitized_view_mode;
+  $suggestions[] = 'entity_modifier__' . $entity->id();
+  $suggestions[] = 'entity_modifier__' . $entity->id() . '__' . $sanitized_view_mode;
+  return $suggestions;
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function entity_modifier_form_paragraphs_type_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $settings = $form_state->getBuildInfo()['callback_object']
+    ->getEntity()
+    ->getThirdPartySettings('entity_modifier');
+
+  $entity_modifier_types = \Drupal::entityQuery('entity_modifier_type')
+      ->execute();
+
+  if (empty($entity_modifier_types)) {
+    return;
+  }
+
+  $entity_modifier_types = EntityModifierType::loadMultiple($entity_modifier_types);
+
+  $options = [];
+  foreach ($entity_modifier_types as $entity_modifier_type) {
+    $options[$entity_modifier_type->id()] = $entity_modifier_type->label();
+  }
+
+  $form['modifiers'] = [
+    '#title' => t('Available modifiers'),
+    '#type' => 'checkboxes',
+    '#options' => $options,
+    '#default_value' => !empty($settings['modifiers']) ? $settings['modifiers'] : [],
+  ];
+
+  $form['actions']['submit']['#submit'][] = 'entity_modifier_form_paragraphs_type_form_alter_submit';
+}
+
+/**
+ * Submit handler for entity_modifier_form_paragraphs_type_form_alter().
+ */
+function entity_modifier_form_paragraphs_type_form_alter_submit(array &$form, FormStateInterface $form_state) {
+  $type = $form_state->getBuildInfo()['callback_object']->getEntity();
+  $modifiers = array_filter($form_state->getValue('modifiers'));
+  $type->setThirdPartySetting('entity_modifier', 'modifiers', $modifiers);
+  $type->save();
+}
+
+/**
+* Implements hook_field_widget_form_alter().
+ */
+function entity_modifier_field_widget_form_alter(&$element, FormStateInterface $form_state, $context) {
+  if (!in_array($context['widget']->getPluginId(), ['entity_reference_paragraphs', 'paragraphs']) ) {
+    return;
+  }
+
+  $delta = $element['#delta'];
+  $field_name = $element['#field_name'] = $context['items']->getName();
+  $widget_state = $context['widget']::getWidgetState([], $field_name, $form_state);
+
+  if (!$paragraphs_entity = $context['items'][$delta]->entity) {
+    $paragraphs_entity = isset($widget_state['paragraphs'][$delta]['entity']) ? $widget_state['paragraphs'][$delta]['entity'] : NULL;
+  }
+
+  $edit_mode = isset($widget_state['paragraphs'][$delta]['mode']) ? $widget_state['paragraphs'][$delta]['mode'] : 'closed';
+  if (empty($paragraphs_entity) || $edit_mode != 'edit') {
+    return;
+  }
+
+  $third_party_settings = $paragraphs_entity->getParagraphType()->getThirdPartySettings('entity_modifier');
+  $modifiers = !empty($third_party_settings['modifiers']) ? $third_party_settings['modifiers'] : [];
+
+  // Allow other modules to add/remove modifiers from code.
+  $context['paragraphs_entity'] = $paragraphs_entity;
+  \Drupal::moduleHandler()
+    ->alter('entity_modifiers_modifiers', $modifiers, $context);
+
+  // We have no modifiers options. No action needed.
+  if (empty($modifiers)) {
+    return;
+  }
+
+  $element['subform']['modifiers'] = [
+    '#type' => 'details',
+    '#title' => t('Modifiers'),
+    '#weight' => -1,
+    '#tree' => TRUE,
+  ];
+
+   foreach ($modifiers as $modifier) {
+    if (!empty($paragraphs_entity->modifiers[$modifier])) {
+      $entity = $paragraphs_entity->modifiers[$modifier];
+    }
+    else {
+      $entity = EntityModifier::create([
+        'type' => $modifier,
+      ]);
+    }
+
+    $form_display = EntityFormDisplay::collectRenderDisplay($entity, 'default');
+    $form = [
+      '#parent_entity' => $paragraphs_entity,
+      '#field_parents' => array_merge($element['subform']['#parents'], ['modifiers', $modifier]),
+      '#parents' => array_merge($element['subform']['#parents'], ['modifiers', $modifier])
+    ];
+    $form_display->buildForm($entity, $form, $form_state);
+    $element['subform']['modifiers'][$modifier]['form'] = $form;
+  }
+
+   // See if we can use the #value_callback instead of validate
+  $element['#element_validate'][] = 'entity_modifier_element_validate_classes';
+}
+
+/**
+ * Element Validate for entity_modifier_field_widget_form_alter().
+ */
+function entity_modifier_element_validate_classes(&$element, FormStateInterface $form_state, $form) {
+  $widget_state = WidgetBase::getWidgetState($element['#field_parents'], $element['#field_name'], $form_state);
+
+  $delta = $element['#delta'];
+  $parents = $element['subform']['#parents'];
+  $widget_state['paragraphs'][$delta]['entity']->modifiers_values = $form_state->getValue(array_merge($parents, ['modifiers']));
+}
+
+/**
+ * Implements hook_entity_insert().
+ */
+function entity_modifier_entity_insert(EntityInterface $entity) {
+  if (!in_array($entity->getEntityTypeId(), ['paragraph']) || empty($entity->modifiers_values))  {
+    return;
+  }
+  // Somehow when submitting with ief insert and update are trigger the same
+  // time. So when we are using an inline entity from we ignore the insert.
+  /*if ($entity->ief_submit) {
+    return;
+  }*/
+
+  entity_modifier_entity_update($entity);
+}
+
+
+/**
+ * Implements hook_entity_update().
+ */
+function entity_modifier_entity_update(EntityInterface $entity) {
+  // TODO: Make configurable for content entities
+  if (!in_array($entity->getEntityTypeId(), ['paragraph']) || empty($entity->modifiers_values))  {
+    return;
+  }
+  // TODO: Don't save empty modifiers and remove existing modifiers that
+  // have become empty.
+  foreach ($entity->modifiers_values as $bundle => $modifier_value) {
+    if (!empty($entity->modifiers[$bundle])) {
+      $modifier = $entity->modifiers[$bundle];
+      // Set each value.
+      foreach ($modifier_value as $item => $value) {
+        $modifier->set($item, $value);
+      }
+    }
+    else {
+      $values = [
+        'name' => "{$entity->getEntityTypeId()} - {$entity->id()} - $bundle",
+        'type' => $bundle,
+        'entity_type' => $entity->getEntityTypeId(),
+        'entity' => $entity->id(),
+      ];
+
+      $modifier = EntityModifier::create($values + $modifier_value);
+    }
+
+    // Check if the modifier is empty. We don't want to store empty modifiers
+    if ($modifier->isEmpty()) {
+      $modifier->delete();
+    }
+    else {
+      $modifier->save();
+    }
+    // Remove the saved values.
+    unset($entity->modifiers_values[$bundle]);
+  }
+}
+
+/**
+ * Implements hook_entity_load().
+ */
+function entity_modifier_entity_load(array $entities, $entity_type_id) {
+  if (!in_array($entity_type_id, ['paragraph']))  {
+    return;
+  }
+
+  foreach ($entities as $id => $entity) {
+    $results = \Drupal::entityQuery('entity_modifier')
+      ->condition('entity_type', $entity->getEntityTypeId())
+      ->condition('entity', $entity->id())
+      ->execute();
+
+    if (empty($results)) {
+      continue;
+    }
+
+    foreach ($results as $result) {
+      $entity_modifier = EntityModifier::load($result);
+      $entity->modifiers[$entity_modifier->bundle()] = $entity_modifier;
+    }
+  }
+
+}
+
+/**
+ * Implements hook_entity_delete().
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ */
+function entity_modifier_entity_delete(EntityInterface $entity) {
+  if (empty($entity->modfiers)) {
+    return;
+  }
+
+  foreach ($entity->modifiers as $modifier) {
+    $modifier->delete();
+  }
+}
+
+/**
+ * Implements hook_inline_entity_form_entity_form_alter().
+ */
+function entity_modifier_inline_entity_form_entity_form_alter(&$entity_form, &$form_state) {
+  $entity = $entity_form['#entity'];
+  $modifiers = \Drupal::entityTypeManager()
+    ->getStorage($entity->getEntityType()->getBundleEntityType())
+    ->load($entity->bundle())
+    ->getThirdPartySettings('entity_modifier')['modifiers'];
+
+  if (empty($modifiers)) {
+    return;
+  }
+
+  $entity_form['modifiers'] = [
+    '#type' => 'details',
+    '#title' => t('Modifiers'),
+    '#weight' => -100,
+    '#tree' => TRUE,
+  ];
+
+  foreach ($modifiers as $modifier) {
+    if (!empty($entity->modifiers[$modifier])) {
+      $modifier = $entity->modifiers[$modifier];
+    }
+    else {
+      $modifier = EntityModifier::create([
+        'type' => $modifier,
+      ]);
+    }
+
+    // Check if we have unsaved values and apply them.
+    if (!empty($entity->modifiers_values[$modifier->bundle()])) {
+      foreach ($entity->modifiers_values[$modifier->bundle()] as $property => $modifier_value) {
+        $modifier->set($property, $modifier_value);
+      }
+    }
+
+    $form_display = EntityFormDisplay::collectRenderDisplay($modifier, 'default');
+    $form = [
+      '#field_parents' => array_merge($entity_form['#parents'], ['modifiers', $modifier->bundle()]),
+      '#parents' => array_merge($entity_form['#parents'], ['modifiers', $modifier->bundle()])
+    ];
+    $form_display->buildForm($modifier, $form, $form_state);
+
+    $entity_form['modifiers'][$modifier->bundle()] = $form;
+  }
+
+  $entity_form['#ief_element_submit'] = ['entity_modifier_inline_entity_form_entity_form_submit'] + $entity_form['#ief_element_submit'];
+}
+
+/**
+ * Extra Submit handler for inline entity form submit.
+ */
+function entity_modifier_inline_entity_form_entity_form_submit(array &$entity_form, FormStateInterface $form_state) {
+  $modifiers = $form_state->getValue(array_merge($entity_form['#parents'], ['modifiers']));
+  $entity_form['#entity']->modifiers_values = $modifiers;
+  $entity_form['#entity']->ief_submit = TRUE;
+}
