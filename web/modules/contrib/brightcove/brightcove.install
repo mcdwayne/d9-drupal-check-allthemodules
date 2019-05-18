@@ -1,0 +1,470 @@
+<?php
+
+/**
+ * @file
+ * Brightcove install file.
+ */
+
+use Drupal\brightcove\BrightcoveUtil;
+use Drupal\brightcove\Entity\BrightcoveAPIClient;
+use Drupal\brightcove\Entity\BrightcoveSubscription;
+use Drupal\brightcove\Entity\BrightcoveVideo;
+use Drupal\Core\Database\Query\Condition;
+use Drupal\Core\Field\BaseFieldDefinition;
+
+/**
+ * Implements hook_schema().
+ */
+function brightcove_schema() {
+  return [
+    'brightcove_subscription' => [
+      'description' => 'Brightcove Subscription storage.',
+      'fields' => [
+        'id' => [
+          'description' => 'Internal BrightcoveSubscription entity ID.',
+          'type' => 'serial',
+          'unsigned' => TRUE,
+          'not null' => TRUE,
+        ],
+        'bcsid' => [
+          'description' => 'Brightcove Subscription ID.',
+          'type' => 'char',
+          'length' => 36,
+          'not null' => FALSE,
+        ],
+        'status' => [
+          'description' => 'Status of the subscription.',
+          'type' => 'int',
+          'size' => 'tiny',
+          'not null' => TRUE,
+          'default' => 1,
+          'unsigned' => TRUE,
+        ],
+        'is_default' => [
+          'description' => 'Whether the Subscription is default or not.',
+          'type' => 'int',
+          'size' => 'tiny',
+          'not null' => TRUE,
+          'default' => 0,
+          'unsigned' => TRUE,
+        ],
+        'api_client_id' => [
+          'description' => 'The ID of the API client',
+          'type' => 'varchar',
+          'length' => 255,
+          'not null' => TRUE,
+        ],
+        'endpoint' => [
+          'description' => 'The endpoint for the notification.',
+          'type' => 'varchar',
+          'length' => 2000,
+          'not null' => TRUE,
+        ],
+        'events' => [
+          'description' => 'Notification events.',
+          'type' => 'blob',
+          'not null' => TRUE,
+        ],
+      ],
+      'primary key' => ['id'],
+      'indexes' => [
+        'bcsid' => ['bcsid'],
+        'endpoint' => ['endpoint'],
+        'api_client_id' => ['api_client_id'],
+        'api_client_default' => ['api_client_id', 'is_default'],
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_requirements().
+ */
+function brightcove_requirements($phase) {
+  $requirements = [];
+
+  $requirements['brightcove'] = [
+    'title' => 'Brightcove API',
+  ];
+
+  // Check for API availability.
+  if (!class_exists('Brightcove\API\API')) {
+    $requirements['brightcove'] += [
+      'description' => t('Missing Brightcove API from the vendor folder.'),
+      'severity' => REQUIREMENT_ERROR,
+    ];
+  }
+
+  // If everything passes show that the Brightcove API is installed
+  // successfully.
+  if (!isset($requirements['severity']) || $requirements['severity'] == REQUIREMENT_OK) {
+    $requirements['brightcove'] += [
+      'description' => t('Installed'),
+      'severity' => REQUIREMENT_OK,
+    ];
+  }
+
+  return $requirements;
+}
+
+/**
+ * Copy values from brightcove_callback table to a expirable key value store.
+ */
+function brightcove_update_8100(&$sandbox) {
+  // Get database connection.
+  $database = \Drupal::database();
+
+  if (!isset($sandbox['progress'])) {
+    $sandbox['progress'] = 0;
+    $sandbox['max'] = $database->select('brightcove_callback', 'bc')
+      ->fields('bc', ['id'])
+      ->countQuery()
+      ->execute()
+      ->fetchField();
+  }
+
+  $key_value_expirable = \Drupal::keyValueExpirable('brightcove_callback');
+  $entries = $database->select('brightcove_callback')
+    ->fields('brightcove_callback')
+    ->orderBy('id', 'ASC')
+    ->range($sandbox['progress'], 50)
+    ->execute()
+    ->fetchAll();
+  foreach ($entries as $entry) {
+    $sandbox['progress']++;
+
+    if (REQUEST_TIME < $entry->expires) {
+      $key_value_expirable->setWithExpire($entry->token, $entry->video_id, $entry->expires - REQUEST_TIME);
+    }
+  }
+
+  $sandbox['#finished'] = empty($sandbox['max']) ? 1 : ($sandbox['progress'] / $sandbox['max']);
+}
+
+/**
+ * Drop brightcove_callback table.
+ */
+function brightcove_update_8101() {
+  \Drupal::database()
+    ->schema()
+    ->dropTable('brightcove_callback');
+}
+
+/**
+ * Update BrightcoveAPIClient config entity's schema.
+ */
+function brightcove_update_8102() {
+  $config_factory = \Drupal::configFactory();
+  foreach ($config_factory->listAll('brightcove.brightcove_api_client.') as $brightcove_api_client_config) {
+    $config = $config_factory->getEditable($brightcove_api_client_config);
+    $config->clear('access_token');
+    $config->clear('access_token_expire_date');
+    $config->save(TRUE);
+  }
+  drupal_flush_all_caches();
+}
+
+/**
+ * Sets a default callback for the reference_id.
+ */
+function brightcove_update_8103() {
+  /** @var \Drupal\Core\Field\BaseFieldDefinition $installed_field_definition */
+  $installed_field_definition = \Drupal::entityDefinitionUpdateManager()->getFieldStorageDefinition('reference_id', 'brightcove_video');
+  $installed_field_definition->setDefaultValueCallback('\Drupal\brightcove\Entity\BrightcoveVideo::getDefaultReferenceId');
+  \Drupal::entityDefinitionUpdateManager()->updateFieldStorageDefinition($installed_field_definition);
+
+  /** @var \Drupal\Core\Field\BaseFieldDefinition $installed_field_definition */
+  $installed_field_definition = \Drupal::entityDefinitionUpdateManager()->getFieldStorageDefinition('reference_id', 'brightcove_playlist');
+  $installed_field_definition->setDefaultValueCallback('\Drupal\brightcove\Entity\BrightcovePlaylist::getDefaultReferenceId');
+  \Drupal::entityDefinitionUpdateManager()->updateFieldStorageDefinition($installed_field_definition);
+}
+
+/**
+ * Updates the entity with the video_url base field.
+ */
+function brightcove_update_8104() {
+  $storage_definition = BaseFieldDefinition::create('uri')
+    ->setLabel(t('Video source URL'))
+    ->setDisplayOptions('form', [
+      'type' => 'uri',
+    ])
+    ->setDisplayOptions('view', [
+      'type' => 'uri_link',
+      'label' => 'inline',
+      'settings' => [
+        'trim_length' => 150,
+        'target' => '_blank',
+      ],
+    ])
+    ->setDisplayConfigurable('form', TRUE)
+    ->setDisplayConfigurable('view', TRUE);
+
+  \Drupal::entityDefinitionUpdateManager()
+    ->installFieldStorageDefinition('video_url', 'brightcove_video', 'brightcove_video', $storage_definition);
+}
+
+/**
+ * Update entity definitions.
+ */
+function brightcove_update_8105() {
+  // Migrate brightcove_video entity name field before updating the entity
+  // definitions.
+  $schema = Drupal::database()->schema();
+  /* @var \Drupal\Core\Entity\EntityDefinitionUpdateManagerInterface $entity_definition_update_manager */
+  $entity_definition_update_manager = Drupal::service('entity.definition_update_manager');
+  $entity_type_manager = Drupal::entityTypeManager();
+  $name_column_specifications = [
+    'type' => 'varchar',
+    'length' => 255,
+    'not null' => TRUE,
+  ];
+  $entity_type_definition = $entity_type_manager->getDefinition('brightcove_video');
+  $schema->changeField($entity_type_definition->getBaseTable(), 'name', 'name', $name_column_specifications);
+  $entity_definition_update_manager->installEntityType($entity_type_definition);
+
+  // Apply entity definition updates.
+  \Drupal::entityDefinitionUpdateManager()->applyUpdates();
+}
+
+/**
+ * Create default subscription for each available client.
+ */
+function brightcove_update_8106() {
+  /* @var BrightcoveAPIClient[] $clients */
+  $clients = BrightcoveAPIClient::loadMultiple();
+  $messages = [];
+  foreach ($clients as $client) {
+    // Create new default subscription if not exist yet, only with the old
+    // BrightcoveSubscription entity type.
+    if (get_parent_class(BrightcoveSubscription::class) == 'ConfigEntityBase') {
+      $id = "default_{$client->id()}";
+      $subscription = BrightcoveSubscription::load($id);
+
+      if (empty($subscription)) {
+        BrightcoveSubscription::create([
+          'id' => $id,
+          'status' => FALSE,
+          'default' => TRUE,
+          'api_client_id' => $client->id(),
+          'endpoint' => BrightcoveUtil::getDefaultSubscriptionUrl(),
+          'events' => ['video-change'],
+        ])->save(FALSE);
+      }
+      else {
+        $messages[] = t('Default subscription for "@client" client already exist, skipping...', ['@client' => $client->label()]) . PHP_EOL;
+      }
+    }
+  }
+
+  return implode(PHP_EOL, $messages);
+}
+
+/**
+ * Remove invalid poster/thumbnail image references from BrightcoveVideo entity.
+ */
+function brightcove_update_8107(&$sandbox) {
+  // Condition videos which has at least either poster or thumbnail.
+  $condition = new Condition('OR');
+  $condition->condition('video.poster__target_id', NULL, 'IS NOT')
+    ->condition('video.thumbnail__target_id', NULL, 'IS NOT');
+
+  // Condition for managed files which does not exist.
+  $file_condition = new Condition('OR');
+  $file_condition->condition('poster.fid', NULL, 'IS')
+    ->condition('thumbnail.fid', NULL, 'IS');
+
+  if (!isset($sandbox['progress'])) {
+    $sandbox['progress'] = 0;
+    $sandbox['current_bcvid'] = 0;
+
+    $query = \Drupal::database()->select('brightcove_video', 'video')
+      ->fields('video', ['bcvid']);
+    $query->leftJoin('file_managed', 'poster', '%alias.fid = video.poster__target_id');
+    $query->leftJoin('file_managed', 'thumbnail', '%alias.fid = video.thumbnail__target_id');
+    $sandbox['max'] = $query->condition($condition)
+      ->condition($file_condition)
+      ->countQuery()
+      ->execute()
+      ->fetchField();
+
+    // Nothing to do, exit.
+    if ($sandbox['max'] == 0) {
+      $sandbox['#finished'] = 1;
+      return;
+    }
+  }
+
+  // Get video objects which has invalid poster or thumbnail image reference.
+  $query = \Drupal::database()->select('brightcove_video', 'video')
+    ->fields('video', ['bcvid']);
+  $query->leftJoin('file_managed', 'poster', '%alias.fid = video.poster__target_id');
+  $query->leftJoin('file_managed', 'thumbnail', '%alias.fid = video.thumbnail__target_id');
+  $results = $query->fields('poster', ['fid'])
+    ->fields('thumbnail', ['fid'])
+    ->condition('bcvid', $sandbox['current_bcvid'], '>')
+    ->condition($condition)
+    ->condition($file_condition)
+    ->range(0, 20)
+    ->orderBy('bcvid', 'ASC')
+    ->execute()
+    ->fetchAll();
+
+  foreach ($results as $result) {
+    $video = BrightcoveVideo::load($result->bcvid);
+    if (!empty($video)) {
+      $needs_save = FALSE;
+
+      // Set poster to null if the related file is not exist.
+      if (empty($result->fid)) {
+        $video->setPoster(NULL);
+        $needs_save = TRUE;
+      }
+
+      // Set thumbnail to null if the related file is not exist.
+      if (empty($result->thumbnail_fid)) {
+        $video->setThumbnail(NULL);
+        $needs_save = TRUE;
+      }
+
+      // Save video entity if needed.
+      if ($needs_save) {
+        // Change changed time to re-download the deleted image on the next
+        // sync.
+        $video->setChangedTime($video->getChangedTime() - 1);
+        $video->save();
+      }
+    }
+
+    // Update progress.
+    $sandbox['progress']++;
+    $sandbox['current_bcvid'] = $result->bcvid;
+  }
+
+  $sandbox['#finished'] = $sandbox['progress'] / $sandbox['max'];
+}
+
+/**
+ * Create schema for the BrightcoveSubscription entity.
+ */
+function brightcove_update_8108(&$sandbox) {
+  \Drupal::database()
+    ->schema()
+    ->createTable('brightcove_subscription', [
+      'description' => 'Brightcove Subscription storage.',
+      'fields' => [
+        'id' => [
+          'description' => 'Internal BrightcoveSubscription entity ID.',
+          'type' => 'serial',
+          'unsigned' => TRUE,
+          'not null' => TRUE,
+        ],
+        'bcsid' => [
+          'description' => 'Brightcove Subscription ID.',
+          'type' => 'char',
+          'length' => 36,
+          'not null' => FALSE,
+        ],
+        'status' => [
+          'description' => 'Status of the subscription.',
+          'type' => 'int',
+          'size' => 'tiny',
+          'not null' => TRUE,
+          'default' => 1,
+          'unsigned' => TRUE,
+        ],
+        'is_default' => [
+          'description' => 'Whether the Subscription is default or not.',
+          'type' => 'int',
+          'size' => 'tiny',
+          'not null' => TRUE,
+          'default' => 0,
+          'unsigned' => TRUE,
+        ],
+        'api_client_id' => [
+          'description' => 'The ID of the API client',
+          'type' => 'varchar',
+          'length' => 255,
+          'not null' => TRUE,
+        ],
+        'endpoint' => [
+          'description' => 'The endpoint for the notification.',
+          'type' => 'varchar',
+          'length' => 2000,
+          'not null' => TRUE,
+        ],
+        'events' => [
+          'description' => 'Notification events.',
+          'type' => 'blob',
+          'not null' => TRUE,
+        ],
+      ],
+      'primary key' => ['id'],
+      'indexes' => [
+        'bcsid' => ['bcsid'],
+        'endpoint' => ['endpoint'],
+        'api_client_id' => ['api_client_id'],
+        'api_client_default' => ['api_client_id', 'is_default'],
+      ],
+    ]);
+}
+
+/**
+ * Migrate config entity subscriptions.
+ */
+function brightcove_update_8109(&$sandbox) {
+  $container = \Drupal::getContainer();
+
+  /** @var \Drupal\Core\Database\Connection $connection */
+  $connection = $container->get('database');
+
+  // Get existing brightcove subscription entities. At this point the config
+  // entity does not exist, so it must be acquired through the database.
+  $results = $connection->select('config', 'c')
+    ->fields('c')
+    ->condition('name', 'brightcove.brightcove_subscription.%', 'LIKE')
+    ->execute()
+    ->fetchAll();
+
+  // Migrate subscription entities.
+  if (!empty($results)) {
+    foreach ($results as $result) {
+      // Get data and map to the new fields.
+      $data = unserialize($result->data);
+      $data['bcsid'] = $data['id'];
+      unset($data['id']);
+      $data['is_default'] = $data['default'];
+      unset($data['default']);
+
+      // Save new subscription entity.
+      $brightcove_subscription = BrightcoveSubscription::createFromArray($data);
+      $brightcove_subscription->save();
+    }
+
+    // Remove old subscription config entities.
+    $connection->delete('config')
+      ->condition('name', 'brightcove.brightcove\_subscription.%', 'LIKE')
+      ->execute();
+  }
+  // If there are no subscriptions available from the old entities, let's create
+  // the new default ones for the API clients.
+  else {
+    $clients = BrightcoveAPIClient::loadMultiple();
+    foreach ($clients as $client) {
+      $default = BrightcoveSubscription::loadDefault($client);
+
+      if (empty($default)) {
+        $subscription = new BrightcoveSubscription(TRUE);
+        $subscription->setStatus(FALSE)
+          ->setApiClient($client)
+          ->setEndpoint(BrightcoveUtil::getDefaultSubscriptionUrl())
+          ->setEvents(['video-change'])
+          ->save(FALSE);
+      }
+    }
+  }
+
+  // Clear cached definitions.
+  /** @var \Drupal\Core\Config\TypedConfigManager $typed_config_manager */
+  $typed_config_manager = $container->get('config.typed');
+  $typed_config_manager->clearCachedDefinitions();
+}
