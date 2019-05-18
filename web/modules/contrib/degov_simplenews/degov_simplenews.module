@@ -1,0 +1,319 @@
+<?php
+
+/**
+ * @file
+ * Module file for degov_simplenews.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Url;
+use Drupal\Core\Link;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\StringTranslation\PluralTranslatableMarkup;
+
+/**
+ * Implements hook_form_alter().
+ */
+function degov_simplenews_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+  if ($form_id === 'simplenews_confirm_removal') {
+    $form['#submit'][] = 'degov_simplenews_optout_submitform';
+  }
+  // Extend the Simplenews form block with a data protection checkbox.
+  if (degov_simplenews_is_match_in_array($form_id, ['simplenews_subscriptions_block', 'simplenews_subscriber_page_form'])) {
+    $privacy_policy_pages = \Drupal::config('degov_simplenews.settings')
+      ->get('privacy_policy');
+    $consent_messages = \Drupal::config('degov_simplenews.settings')
+      ->get('consent_message');
+
+    $newsletter_ids = $form_state->getFormObject()->getNewsletterIds();
+    $is_subscribed = TRUE;
+    // Add cache contexts by role.
+    $form['#cache']['contexts'][] = 'user.roles';
+
+    // Hide the form if we don't have a privacy page for the current language.
+    $current_language = \Drupal::languageManager()->getCurrentLanguage();
+    $node_storage = \Drupal::entityTypeManager()->getStorage('node');
+    if (!isset($privacy_policy_pages[$current_language->getId()]) || empty($privacy_policy_pages[$current_language->getId()]) || $node_storage->load($privacy_policy_pages[$current_language->getId()]) === NULL) {
+      $form['#access'] = FALSE;
+      // Notify the admin.
+      if (\Drupal::currentUser()
+        ->hasPermission('administer simplenews settings')) {
+        \Drupal::messenger()->addError(
+          t(
+            'The newsletter signup form is hidden because no privacy policy page was defined for the current language. <a href=:settings_url>Click here to update settings.</a>',
+            [
+              ':settings_url' => \Drupal::urlGenerator()
+                ->generateFromRoute('degov_simplenews.settings'),
+            ]
+          )
+        );
+      }
+    }
+
+    // Require privacy policy settings and newsletters to be configured.
+    if (!empty($privacy_policy_pages) && $newsletter_ids) {
+      // Check if the user is authenticated.
+      if (\Drupal::currentUser()->isAuthenticated()) {
+        $current_user_email = \Drupal::currentUser()->getEmail();
+        /** @var \Drupal\simplenews\Subscription\SubscriptionManager $subscriptionManager */
+        $subscriptionManager = \Drupal::service('simplenews.subscription_manager');
+        foreach ($newsletter_ids as $newsletter_id) {
+          // Check if the user is not subscribed to a newsletter.
+          if (!$subscriptionManager->isSubscribed($current_user_email, $newsletter_id)) {
+            $is_subscribed = FALSE;
+            break;
+          }
+        }
+      }
+      else {
+        $is_subscribed = FALSE;
+      }
+      // Show the required checkbox if the user is not yet subscribed.
+      if (!$is_subscribed) {
+        $language_id = \Drupal::languageManager()
+          ->getCurrentLanguage()
+          ->getId();
+        $url = Url::fromRoute('entity.node.canonical',
+          ['node' => $privacy_policy_pages[$language_id]],
+          ['attributes' => ['target' => '_blank']]
+        );
+        $form['forename'] = [
+          '#type'     => 'textfield',
+          '#title'    => t('Forename'),
+          '#required' => TRUE,
+          '#weight'   => 97,
+        ];
+        $form['surname'] = [
+          '#type'     => 'textfield',
+          '#title'    => t('Surname'),
+          '#required' => TRUE,
+          '#weight'   => 98,
+        ];
+        $consent_message = t('I hereby agree that my personal data transmitted with the contact information may be saved and processed. I confirm to be at least 16 years of age or have made available authorisation from the custodian(s) permitting the use of the contact information and dissemination of the data. I have read the @privacy_policy. The right of withdrawal is known to me.', [
+          '@privacy_policy' => Link::fromTextAndUrl(t('privacy policy'), $url)
+            ->toString(),
+        ]);
+        $form['privacy_policy'] = [
+          '#type'     => 'checkbox',
+          '#title'    => (!empty($consent_messages[$language_id]['value']) && !empty($consent_messages[$language_id]['format'])) ? check_markup($consent_messages[$language_id]['value'], $consent_messages[$language_id]['format']) : $consent_message,
+          '#required' => TRUE,
+          '#weight'   => 99,
+        ];
+      }
+    }
+  }
+
+  if (in_array($form_id, ['simplenews_subscriptions_block', 'simplenews_subscriber_page_form'])) {
+    foreach (array_keys($form['actions']) as $action) {
+      if ($action !== 'preview'
+        && isset($form['actions'][$action]['#type'])
+        && $form['actions'][$action]['#type'] === 'submit'
+      ) {
+        $form['actions'][$action]['#submit'][] = 'degov_simplenews_form_submit';
+      }
+    }
+  }
+
+  if (FALSE !== strpos($form_id, 'simplenews_newsletter_add_form')) {
+    degov_simplenews_option_to_optgroup($form['subscription']['new_account']['#options'], 'silent');
+    degov_simplenews_option_to_optgroup($form['subscription']['opt_inout']['#options'], [
+      'hidden',
+      'single',
+    ]);
+  }
+}
+
+/**
+ * Iterates over an array of needles and returns true if found in the haystack.
+ *
+ * @param string $haystack
+ *   The string we are looking for a match in.
+ * @param array $needles
+ *   The strings we are expecting on of in the haystack.
+ *
+ * @return bool
+ *   Did we find a needle.
+ */
+function degov_simplenews_is_match_in_array(string $haystack, array $needles): bool {
+  foreach ($needles as $needle) {
+    if (preg_match("/$needle/", $haystack)) {
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Transforms a select option to an optgroup.
+ *
+ * @param array $options
+ *   An array of select options.
+ * @param mixed $option_keys
+ *   A string or an array of option key strings.
+ */
+function degov_simplenews_option_to_optgroup(array &$options, $option_keys) {
+  if (!is_array($option_keys)) {
+    $option_keys = [$option_keys];
+  }
+
+  foreach ($option_keys as $option_key) {
+    if (isset($options[$option_key])) {
+      $option_configuration = $options[$option_key];
+      unset($options[$option_key]);
+      $options[(string) $option_configuration] = [];
+    }
+  }
+}
+
+/**
+ * Custom submit handler for the unsubscribe form to redirect to a custom page.
+ */
+function degov_simplenews_optout_submitform(array &$form, FormStateInterface $form_state) {
+  $config = \Drupal::config('simplenews.settings');
+  if (!$path = $config->get('subscription.confirm_unsubscribe_page')) {
+    $form_state->setRedirectUrl(Url::fromRoute('<front>'));
+  }
+  else {
+    $form_state->setRedirectUrl(Url::fromUri("internal:/$path"));
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function degov_simplenews_form_simplenews_subscriber_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+  if ($form_id === 'simplenews_subscriber_form') {
+    $form['subscriber_forename'] = [
+      '#type'          => 'textfield',
+      '#title'         => t('Forename'),
+      '#default_value' => 'keine Angabe',
+      '#disabled'      => 'disabled',
+      '#weight'        => 5,
+    ];
+    $form['subscriber_surname'] = [
+      '#type'          => 'textfield',
+      '#title'         => t('Surname'),
+      '#default_value' => 'keine Angabe',
+      '#disabled'      => 'disabled',
+      '#weight'        => 6,
+    ];
+    $form['data_protection_regulations'] = [
+      '#title'       => t('Data protection regulations'),
+      '#type'        => 'fieldset',
+      '#description' => t('The user has not yet accepted the data protection regulations.'),
+      '#weight'      => 15,
+    ];
+
+    $result = \Drupal::service('database')
+      ->select('simplenews_subscriber', 'ss')
+      ->fields('ss', ['forename', 'surname', 'created'])
+      ->condition('ss.mail', $form['mail']['widget'][0]['value']['#default_value'], '=')
+      ->execute()
+      ->fetchAll();
+    if (!empty($result)) {
+      $subscriberData = array_pop($result);
+      $form['subscriber_forename']['#default_value'] = $subscriberData->forename;
+      $form['subscriber_surname']['#default_value'] = $subscriberData->surname;
+
+      $dateTime = new DateTime();
+      $dateTime->setTimestamp($subscriberData->created);
+      $form['data_protection_regulations']['#description'] =
+        t('Has accepted the data protection regulations at @date @time.', [
+          '@date' => $dateTime->format('d.m.Y'),
+          '@time' => $dateTime->format('H:i'),
+        ]);
+    }
+  }
+}
+
+/**
+ * Custom submit callback for the subscription form.
+ *
+ * Saves a user's first and last name in custom fields in the subcribers table.
+ */
+function degov_simplenews_form_submit(array $form, FormStateInterface $form_state) {
+  /** @var \Drupal\user\Entity\User $user */
+  $user = \Drupal::currentUser();
+
+  $subscriberData = [
+    'mail'     => $form_state->getValues()['mail'][0]['value'],
+    'forename' => $form_state->getValues()['forename'],
+    'surname'  => $form_state->getValues()['surname'],
+  ];
+
+  /** @var \Drupal\degov_simplenews\Service\InsertNameService $insertName */
+  $insertName = \Drupal::service('degov_simplenews.insert_name');
+  $insertName->updateForeAndSurname($user, $subscriberData);
+}
+
+/**
+ * Implements hook_cron().
+ */
+function degov_simplenews_cron() {
+  $subscribers_unconfirmed_lifetime = \Drupal::config('degov_simplenews.settings')
+    ->get('subscribers_unconfirmed_lifetime');
+  if (empty($subscribers_unconfirmed_lifetime)) {
+    $subscribers_unconfirmed_lifetime = 72;
+  }
+  $lifetime_string = sprintf('-%s hours', $subscribers_unconfirmed_lifetime);
+
+  $db_connection = \Drupal::database();
+  $subscribers_with_unconfirmed_old_subscriptions_query = $db_connection->select('simplenews_subscriber', 'sisu');
+  $subscribers_with_unconfirmed_old_subscriptions_query->addJoin('INNER', 'simplenews_subscriber__subscriptions', 'sisusu', 'sisu.id = sisusu.entity_id');
+  $subscribers_with_unconfirmed_old_subscriptions_query->fields('sisu', ['id']);
+  $subscribers_with_unconfirmed_old_subscriptions_query->condition('sisusu.subscriptions_status', SIMPLENEWS_SUBSCRIPTION_STATUS_UNCONFIRMED);
+  $subscribers_with_unconfirmed_old_subscriptions_query->condition('sisusu.subscriptions_timestamp', strtotime($lifetime_string), '<');
+  $subscribers_with_unconfirmed_old_subscriptions_result = $subscribers_with_unconfirmed_old_subscriptions_query->execute()
+    ->fetchCol();
+  $subscribers_with_unconfirmed_old_subscriptions_result = array_unique($subscribers_with_unconfirmed_old_subscriptions_result);
+
+  $deleted_subscribers = 0;
+  foreach ($subscribers_with_unconfirmed_old_subscriptions_result as $subscriber_with_unconfirmed_old_subscriptions_row) {
+    // Fetch count of all subscriptions.
+    $subscriptions_count_query = $db_connection->select('simplenews_subscriber__subscriptions', 'sisusu');
+    $subscriptions_count_query->fields('sisusu');
+    $subscriptions_count_query->condition('sisusu.entity_id', (int) $subscriber_with_unconfirmed_old_subscriptions_row);
+    $all_subscriptions_count = $subscriptions_count_query->countQuery()
+      ->execute()
+      ->fetchField();
+
+    // Fetch count of unconfirmed subscriptions.
+    $subscriptions_count_query->condition('sisusu.subscriptions_status', SIMPLENEWS_SUBSCRIPTION_STATUS_UNCONFIRMED);
+    $unconfirmed_subscriptions_count = $subscriptions_count_query->countQuery()
+      ->execute()
+      ->fetchField();
+
+    if ($all_subscriptions_count === $unconfirmed_subscriptions_count) {
+      $subscriber = \Drupal::entityTypeManager()
+        ->getStorage('simplenews_subscriber')
+        ->load($subscriber_with_unconfirmed_old_subscriptions_row);
+      $subscriber->delete();
+      $deleted_subscribers++;
+    }
+  }
+
+  if ($deleted_subscribers > 0) {
+    \Drupal::logger('degov_simplenews')->info(
+      new PluralTranslatableMarkup(
+        $deleted_subscribers,
+        '@count unconfirmed subscriber deleted.',
+        '@count unconfirmed subscribers deleted.'
+      )
+    );
+  }
+}
+
+/**
+ * Implements hook_help().
+ */
+function degov_simplenews_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.degov_simplenews':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('This module extends Simplenews with some GDPR-related features.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
