@@ -1,0 +1,714 @@
+<?php
+
+function _itsyouonline_display_params($api_scope = false) {
+  return array(
+    'email' => t('Email'),
+    'firstname' => t('Firstname'),
+    'lastname' => t('Lastname'),
+    'phone' => t('Phone'),
+    'address' => t('Address'),
+  );
+}
+
+function _itsyouonline_scope_params($api_scope = false) {
+  $config = \Drupal::config('itsyouonline.fields');
+
+  if ($api_scope) {
+    $scope = array();
+    $scope_params = $config->get('user_scope_fields');
+
+    foreach ($scope_params as $param) {
+      if ($param) {
+        $scope[] = 'user:' . $param;
+      }
+    }
+
+    return implode(',', $scope);
+  }
+
+  return array(
+    'email' => t('Email'),
+    'name' => t('Name'),
+    'address' => t('Address'),
+    'phone' => t('Phone'),
+  //  'bankaccount' => t('Bankaccount')
+  );
+}
+
+function _itsyouonline_scope_params_attributes() {
+  return array(
+    'username',
+    'email',
+    'firstname',
+    'lastname'
+  );
+}
+
+/**
+ * Implements hook_entity_type_alter()
+ */
+function itsyouonline_entity_type_alter(array &$entity_types) {
+  $entity_types['user']->setFormClass('itsyou_register', \Drupal\itsyouonline\Form\UserRegistrationForm::class);
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function itsyouonline_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  // If the integration is not enabled, don't alter any forms.
+  if (!itsyouonline_is_enabled()) {
+    return;
+  } 
+
+  switch ($form_id) {
+    // The standard login form.
+    case 'user_login_block':
+    case 'user_login_form':
+      $config = \Drupal::config('itsyouonline.account');
+
+      // @TODO: use variable fo text
+      $form['account']['itsyouonline'] = array(
+        '#type' => 'item',
+        '#markup' =>  \Drupal::l(
+          t('Connect with itsyou.online'),
+          \Drupal\Core\Url::fromRoute('itsyouonline.process', array('processType' => 'login')),
+          array(
+            'attributes' => array(
+              'class' => array('itsyouonline-connect'),
+            ),
+          )),
+      );
+
+      // Add itsyouonline_enforce_authentication_mode_during_login as first
+      // validation handler.
+      if ($config->get('authentication_login_mode') == 'itsyou') {
+        array_unshift($form['#validate'], 'itsyouonline_enforce_authentication_mode_during_login');
+      }
+      break;
+
+    // The form which allows to reset your password.
+    case 'user_pass':
+      $config = \Drupal::config('itsyouonline.account');
+
+      // Add itsyouonline_enforce_authentication_mode_during_login as first
+      // validation handler.
+      if ($config->get('authentication_login_mode') == 'itsyou') {
+        array_unshift($form['#validate'], 'itsyouonline_enforce_authentication_mode_during_password_reset');
+      }
+
+      break;
+
+
+    // The form shown on the itsyou.online link page when the end-user indicated
+    // that he/she already had a Drupal account.
+    case 'itsyouonline_user_login_form':
+
+      // Change the text on the submit button.
+      $form['submit']['#value'] = t('Link account to itsyou.online');
+
+      // Add a submit handler which links the itsyou.online account to the
+      // logged on user. If authentication fails, the submit handler will not be
+      // called since the request will be stopped by the validation handler(s).
+      $form['#submit'][] = 'itsyouonline_link_user_to_logged_on_user';
+
+      // Add a validation handler which verifies whether the entered user is
+      // already linked to a itsyou.online account.
+      array_unshift($form['#validate'], 'itsyouonline_verify_if_user_already_linked');
+      break;
+
+    // The form shown on the itsyou.online link page when the end-user indicated
+    // that he wants to create a new Drupal account.
+    case 'itsyouonline_new_user_form':
+      $config = \Drupal::config('itsyouonline.account');
+      $tempstore = \Drupal\itsyouonline\ItsyouonlineUtils::session();
+
+
+      // Fill in the email address received from itsyou.online
+      $itsyouonline_uid = $tempstore->get('itsyouonline_uid');
+      $is_auto_create = $config->get('auto_create_account');
+
+      $create_details = _itsyouonline_generate_username_email($itsyouonline_uid);
+      $drupal_email = $create_details['email'];
+      $drupal_username = $create_details['username'];
+
+      $query = db_select('itsyouonline_user_data', 'iud')
+        ->fields('iud', array('attribute_value'))
+        ->condition(db_and()
+          ->condition('itsyou_uid', $itsyouonline_uid)
+          ->condition('attribute_key', 'email'));
+
+      if (empty($drupal_email)) {
+        array_unshift($form['account'], array(
+          '#type' => 'item',
+          '#markup' => t('itsyou.online did not profide your email address. Please type your email address to finalize the registration process.'),
+        ));
+      }
+
+      $form['account']['mail']['#default_value'] = $drupal_email;
+      $form['account']['mail']['#description'] = t('A valid e-mail address. All e-mails from the system will be sent to this address. The e-mail address is not made public and will only be used if you wish to receive certain news or notifications by e-mail.');
+
+      $username_exists = false;
+
+      if ($drupal_username) {
+        $username_exists = ((bool) db_select('users_field_data', 'users')->fields('users', array('uid'))->condition('name', db_like($drupal_username), 'LIKE')->range(0, 1)->execute()->fetchField());
+      }
+
+      if (!$is_auto_create || !$drupal_username || $username_exists) {
+        $form['account']['name']['#default_value'] = (!empty($drupal_username) ? $drupal_username : $drupal_email);
+      } else {
+        $form['account']['name']['#type'] = 'value';
+        $form['account']['name']['#default_value'] = $drupal_username;
+      }
+
+      // The value of the password doesn't really matter since a random
+      // password is created and stored when the user is effectively created.
+      $form['account']['pass']['#type'] = 'value';
+      $form['account']['pass']['#value'] = user_password(32);
+
+      // Change the text on the submit button.
+      $form['actions']['submit']['#value'] = t('Create new account and link to itsyou.online');
+
+      // Add a submit handler which creates a new user and links the
+      // itsyou.online account this new user.
+      // If authentication fails, the submit handler will not be called since
+      // the request will be stopped by the validation handler(s).
+      $form['actions']['submit']['#submit'][] = 'itsyouonline_link_user_to_new_user';
+      break;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * @see user_register_form()
+ */
+function itsyouonline_form_user_register_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  // The standard user registration form.
+  $account = \Drupal::currentUser();
+  $config = \Drupal::config('itsyouonline.account');
+
+  // bypass user with 'administer users' access, since he is creating account.
+  if (!$account->isAnonymous() &&
+      \Drupal::currentUser()->hasPermission('administer users')) {
+    return;
+  }
+
+  // If registration only by itsyouonline.
+  if (($config->get('authentication_register_mode') === 'itsyou')) {
+    foreach ($form as $field => &$field_def) {
+      if (is_array($field_def) && isset($field_def['#type'])) {
+        $field_def['#access'] = false;
+      }
+    }
+
+    $form['itsyouonline'] = array(
+      '#type' => 'container',
+      '#weight' => 10
+    );
+    $form['itsyouonline']['info'] = array(
+      '#type' => 'item',
+      '#markup' => t('Registration is only allowed using itsyou.online, please click on <i>connect with itsyou.online</i> for secure registration')
+    );
+  } else {
+    $form['itsyouonline'] = array(
+      '#type' => 'container',
+      '#weight' => 10
+    );
+  }
+
+  // @TODO: use variable fo text
+  $form['itsyouonline']['connect'] = array(
+    '#type' => 'item',
+    '#markup' =>  \Drupal::l(
+      t('Connect with itsyou.online'),
+      \Drupal\Core\Url::fromRoute('itsyouonline.process', array('processType' => 'register')),
+      array(
+        'attributes' => array(
+          'class' => array('itsyouonline-connect'),
+        ),
+      )),
+  );
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * @see user_profile_form()
+ */
+function itsyouonline_form_user_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  // If the integration is not enabled, don't alter any forms.
+
+  if (!itsyouonline_is_enabled()) {
+    return;
+  }
+
+  $currentaccount = \Drupal::currentUser();
+  $account = \Drupal::routeMatch()->getParameter('user');
+
+  if (!$account) {
+    return;
+  }
+
+  $itsyouonline_profile_url = 'https://itsyou.online/#/profile';
+
+  $form['itsyouonline'] = array(
+    '#type' => 'fieldset',
+    '#title' => 'Itsyou.online',
+  );
+
+  
+  if (itsyouonline_is_user_already_linked($account->id())) {
+    $config = \Drupal::config('itsyouonline.account');
+
+    if (($currentaccount->id() == $account->id()) && $config->get('user_edit_redirect')) {
+      $redirect = new \Symfony\Component\HttpFoundation\RedirectResponse($itsyouonline_profile_url);
+      return $redirect->send();
+    }
+
+    // It is already linked
+    $form['itsyouonline']['link'] = array(
+      '#type' => 'item',
+      '#markup' => t('This user account is linked with itsyouonline.'),
+    );
+   
+    //@see:should we have unlink option?
+
+  }
+  else {
+    // The user is not yet linked with a itsyou.online account.
+    if ($currentaccount->id() == $account->id()) {
+      $form['itsyouonline']['link'] = array(
+        '#type' => 'item',
+        '#markup' => \Drupal::l(
+          t('Connect with itsyou.online'),
+          \Drupal\Core\Url::fromRoute('itsyouonline.process', array('processType' => 'link')),
+          array(
+            'attributes' => array(
+              'class' => array('itsyouonline-connect'),
+            ),
+          )),
+      );
+    }
+    else {
+      // Somebody else than the user himself is viewing the user's profile.
+      $form['itsyouonline']['link'] = array(
+        '#type' => 'item',
+        '#markup' => t('This user account is not linked to a itsyou.online account.'),
+      );
+    }
+  }
+}
+
+
+function itsyouonline_is_enabled() {
+  $config = \Drupal::config('itsyouonline.account');
+  return $config->get('enabled') ? TRUE : FALSE;
+}
+
+function _itsyouonline_generate_username_email($itsyouonline_uid) {
+  $config = \Drupal::config('itsyouonline.account');
+
+  // register a new user
+  $query = db_select('itsyouonline_user_data', 'iud')
+    ->fields('iud', array('attribute_key', 'attribute_value'))
+    ->condition('itsyou_uid', $itsyouonline_uid);
+
+  $itsyou_details = $query->execute()->fetchAllKeyed(0, 1);
+  
+  $return = array(
+    'email' => isset($itsyou_details['email']) ? $itsyou_details['email'] : NULL
+  );
+
+  $param_replacement = array();
+  $param_placeholder = array();
+
+  foreach (_itsyouonline_scope_params_attributes() as $param) {
+    if (!empty($itsyou_details[$param])) {
+      $param_replacement[] = trim($itsyou_details[$param]);
+    } else {
+      $param_replacement[] = '';
+    }
+
+    $param_placeholder[] = '{itsyou.' . $param . '}';
+  }
+
+  $drupal_username = trim(str_replace(
+    $param_placeholder,
+    $param_replacement,
+    $config->get('username_pattern')
+  ));
+
+  $return['username'] = $drupal_username ? $drupal_username : null;
+
+  return $return;
+}
+
+function itsyouonline_link_user_to_new_user(array $form, \Drupal\Core\Form\FormStateInterface $form_state) {
+  $tempstore = \Drupal\itsyouonline\ItsyouonlineUtils::session();
+
+  $itsyouonline_uid = $tempstore->get('itsyouonline_uid');
+  $itsyouonline_auth = $tempstore->get('itsyouonline_auth');
+  
+
+  // Get the Drupal uid of the new user from the database.
+  $query = db_select('users_field_data', 'u')
+    ->fields('u', array('uid'))
+    ->condition('u.name', $form_state->getValue('name'));
+
+  // Previous submit handlers should already have created the user.
+  if ($query->countQuery()->execute()->fetchField() == 1) {
+    // Link the Drupal user to the itsyou.online user.
+    $fields = array(
+      'drupal_uid' => $query->execute()->fetchField(),
+      'itsyou_uid' => $itsyouonline_uid,
+      'auth_data' => serialize($itsyouonline_auth),
+      'updated' => REQUEST_TIME
+    );
+    try {
+      db_insert('itsyouonline_user_link')->fields($fields)->execute();
+    }
+    catch (Exception $e) {
+      watchdog_exception('itsyouonline', $e);
+      drupal_set_message(t('An error occurred while linking the user to itsyou.online.'), 'error');
+      return;
+    }
+    drupal_set_message(t('The user has been successfully linked to itsyou.online.'));
+
+    //@see: should connect back to org?
+  }
+  else {
+    // This situation can occur if other modules are changing the submit
+    // handlers linked to the user_register_form. If this submit handler is
+    // called before the handler which effectively creates the user account,
+    // then this error will always be displayed.
+    drupal_set_message(t("Your itsyou.online account could not be linked because the Drupal user hasn't been created (yet).", 'error'));
+  }
+
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ */
+function itsyouonline_user_delete(Drupal\Core\Entity\EntityInterface $entity) {
+  $query = db_select('itsyouonline_user_link', 'iul')
+    ->fields('iul', array('itsyou_uid'))
+    ->condition('drupal_uid', $entity->id());
+  $itsyou_uid = $query->execute()->fetchField();
+
+
+  if (!$itsyou_uid) {
+    return;
+  }
+
+  db_delete('itsyouonline_user_link')
+    ->condition('drupal_uid', $entity->id())
+    ->execute();
+
+  db_delete('itsyouonline_user_data')
+    ->condition('itsyou_uid', $itsyou_uid)
+    ->execute();
+
+  // @see: do we need to ask unlink for itsyou org (if is already linked)
+
+}
+
+function itsyouonline_verify_if_user_already_linked(array &$form, \Drupal\Core\Form\FormStateInterface $form_state) {
+  $username = $form_state->getValue('name');
+
+  if (itsyouonline_is_user_already_linked(null, $username)) {
+    $form_state->setErrorByName('name', t('The username %name has already been linked to a itsyou.online account.', array('%name' => $username)));
+  }
+}
+
+function itsyouonline_is_user_already_linked($uid = null, $username = null) {
+  if ($username) {
+    $query = db_select('itsyouonline_user_link', 'iul');
+    $query->join('users_field_data', 'u', 'u.uid = iul.drupal_uid');
+    $query->condition('u.name', trim($username))
+      ->fields('iul', array('drupal_uid'));
+    $result = $query->countQuery()->execute()->fetchField();
+
+    return ($result == 1);
+  } else if ($uid) {
+
+    $query = db_select('itsyouonline_user_link', 'iul');
+    $query->condition('iul.drupal_uid', $uid)
+      ->fields('iul', array('drupal_uid'));
+
+    $result = $query->countQuery()->execute()->fetchField();
+
+    return ($result == 1);
+  }
+
+  return false;
+}
+
+function itsyouonline_link_user_to_logged_on_user(array $form, \Drupal\Core\Form\FormStateInterface $form_state) {
+  $account = \Drupal::currentUser();
+  $tempstore = \Drupal\itsyouonline\ItsyouonlineUtils::session();
+
+  $itsyouonline_uid = $tempstore->get('itsyouonline_uid');
+  $itsyouonline_auth = $tempstore->get('itsyouonline_auth');
+
+
+  // Link the Drupal user to the itsyou.online
+  $fields = array(
+    'drupal_uid' => $account->id(),
+    'itsyou_uid' => $itsyouonline_uid,
+    'auth_data' => serialize($itsyouonline_auth),
+    'updated' => REQUEST_TIME
+  );
+
+  try {
+    db_insert('itsyouonline_user_link')->fields($fields)->execute();
+  }
+  catch (Exception $e) {
+    watchdog_exception('itsyouonline', $e);
+    drupal_set_message(t('An error occurred while linking the user to itsyou.online.'), 'error');
+    return;
+  }
+  drupal_set_message(t('The user has been successfully linked to itsyou.online.'));
+
+  //@see: should we back connect user to org?
+}
+
+function itsyouonline_enforce_authentication_mode_during_password_reset($form, &$form_state) {
+  $username = $form_state->getValue('name');
+
+  if (!empty($username)) {
+    $query = db_select('itsyouonline_user_link', 'iul');
+    $query->join('users', 'u', 'u.uid = iul.drupal_uid');
+    $query->fields('iul')
+      ->condition(db_or()
+        ->condition('u.name', $username)
+        ->condition('u.mail', $username));
+
+    $result = $query->countQuery()->execute()->fetchField();
+
+    if ($result == 1) {
+      $form_state->setErrorByName('name', t('This user account has been linked to a itsyou.online account. According to this website\'s policy, an account linked to itsyou.online can only logon via itsyou.online. As such you cannot use the password reset functionality.'));
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_view().
+ */
+function itsyouonline_user_view(array &$build, \Drupal\Core\Entity\EntityInterface $entity, \Drupal\Core\Entity\Display\EntityViewDisplayInterface $display, $view_mode) {
+  // Don't do anything if the integration is not enabled.
+  if (!itsyouonline_is_enabled()) {
+    return;
+  }
+
+  $query = db_select('itsyouonline_user_link', 'iul');
+  $query->condition('iul.drupal_uid', $entity->id())
+    ->fields('iul');
+
+  $result = $query->execute()->fetch();
+
+  if ($result) {
+      module_load_include('inc', 'itsyouonline', 'itsyouonline.authorize');
+
+      $auth_data = unserialize($result->auth_data);
+      $itsyou_details = \Drupal\itsyouonline\ItsyouonlineUtils::getItsyouUserInfo($result->itsyou_uid, $auth_data);
+
+      if (!$itsyou_details) {
+        $build['itsyouonline_user_data'] = array(
+          '#type' => 'fieldset',
+          '#title' => t('Itsyouonline'),
+          '#description' => t('This data is information which was obtained from itsyouonline.'),
+        );
+
+        $build['itsyouonline_user_data']['email'] = array(
+          '#type' => 'item',
+          '#markup' => 'Error while loading your profile data from itsyouonline, please contact administer.',
+          '#attributes' => array('class' => 'profile-email'),
+        );
+
+        return;
+      }
+
+      $config = \Drupal::config('itsyouonline.fields');
+
+      $display_params_selected = $config->get('user_display_fields');
+      $display_params_selected = array_reverse($display_params_selected);
+      usort($display_params_selected, '_itsyouonline_sort_user_display_fields');
+
+      $build['itsyouonline_summary'] = array(
+        '#type' => 'item',
+        '#title' => 'itsyouonline',
+        '#markup' => 'Your account is connected to itsyou.online',
+      );
+
+      $build['itsyouonline_user_data'] = array(
+        '#type' => 'container',
+        '#title' => t('Itsyouonline'),
+        '#description' => t('This data is information which was obtained from itsyouonline.'),
+      );
+
+      foreach ($display_params_selected as $field) {
+        if (!$field['selected']) {
+          continue;
+        }
+
+        $key = $field['name'];
+
+        switch ($key) {
+          case 'firstname':
+          case 'lastname':
+              if (!empty($itsyou_details[$key])) {
+                $build['itsyouonline_user_data'][$key] = array(
+                  '#type' => 'item',
+                  '#title' => isset($field['title']) ? $field['title'] : '',
+                  '#markup' => $itsyou_details[$key],
+                  '#attributes' => array('class' => 'profile-' . $key),
+                );
+              }
+            break;
+          
+          case 'email':
+              if (!empty($itsyou_details['emailaddresses']) && !empty($itsyou_details['emailaddresses'][0])) {
+                $build['itsyouonline_user_data'][$key] = array(
+                  '#type' => 'item',
+                  '#title' => isset($field['title']) ? $field['title'] : '',
+                  '#markup' => $itsyou_details['emailaddresses'][0]['emailaddress'],
+                  '#attributes' => array('class' => 'profile-' . $key),
+                );
+              }
+            break;
+
+          case 'phone':
+              if (!empty($itsyou_details['phonenumbers']) && !empty($itsyou_details['phonenumbers'][0])) {
+                $build['itsyouonline_user_data'][$key] = array(
+                  '#type' => 'item',
+                  '#title' => isset($field['title']) ? $field['title'] : '',
+                  '#markup' => $itsyou_details['phonenumbers'][0]['phonenumber'],
+                  '#attributes' => array('class' => 'profile-' . $key),
+                );
+              }
+            break;
+
+          case 'address':
+              if (!empty($itsyou_details['addresses']) && !empty($itsyou_details['addresses'][0])) {
+                $build['itsyouonline_user_data'][$key] = array(
+                  '#type' => 'item',
+                  '#title' => isset($field['title']) ? $field['title'] : '',
+                  '#markup' => _itsyouonline_format_user_address($itsyou_details['addresses'][0]),
+                  '#attributes' => array('class' => 'profile-' . $key),
+                );
+              }
+            break;
+        }
+      }
+  }
+  else {
+    $build['itsyouonline_summary'] = array(
+      '#type' => 'item',
+      '#title' => 'Itsyou.online',
+      '#markup' => t('This user account is not yet linked to itsyouonline account.'),
+    );
+  }
+}
+
+
+function _itsyouonline_format_user_address($address) {
+  $params = array(
+    'street', 'nr', 'city', 'country', 'other', 'postalcode'
+  );
+
+  $addr = array();
+  foreach ($params as $param) {
+    if (!empty($address[$param])) {
+      $addr[] = $address[$param];
+    }
+  }
+  
+  return implode(' ', $addr);
+}
+
+function _itsyouonline_sort_user_display_fields($firstfield, $secondfield) {
+  if ($firstfield['weight'] == $firstfield['weight']) {
+    return 0;
+  }
+  return ($firstfield['weight'] < $firstfield['weight']) ? -1 : 1;
+}
+
+function itsyouonline_enforce_authentication_mode_during_login(array &$form, \Drupal\Core\Form\FormStateInterface $form_state) {
+
+  $username = $form_state->getValue('name');
+
+  if (!empty($username) &&
+      itsyouonline_is_user_already_linked(null, $username)) {
+    $form_state->setErrorByName('name', t('This user account has been linked to a itsyou.online account. According to this website\'s policy, an account linked to itsyou.online can only logon via itsyou.online.'));
+  }
+}
+
+/**
+ * Allows to check whether the current user is logged in with itsyou.online.
+ *
+ * @return bool
+ *   A boolean indicating whether the user is logged in with itsyou.online. A
+ *   return value of TRUE means that the user is logged in with itsyou.online.
+ */
+function itsyouonline_logged_in_with_itsyou() {
+  $tempstore = \Drupal\itsyouonline\ItsyouonlineUtils::session();
+  $itsyouonline_uid = $tempstore->get('itsyouonline_uid');
+
+  return !empty($itsyouonline_uid);
+}
+
+/**
+ * Implements hook_user_login().
+ */
+function itsyouonline_user_login($account) {
+  // Don't do anything if the integration is not enabled.
+  if (!itsyouonline_is_enabled()) {
+    return;
+  }
+
+  $config = \Drupal::config('itsyouonline.account');
+
+  // Check if this site is configured in login using itsyou.online only mode. If so,
+  // it is important to check if the itsyou.online uid has been set in the
+  // current session. If so, then this indicates that the user has already
+  // been authenticated by itsyou.  online. If the uid is not yet set in the
+  // session, then the user tries to authenticate via some other means which
+  // is not allowed. An occasion in which this may occur is if the user
+  // received an email with a one-time login URL. Skip user 1 for this.
+  if (($account->id() !== 1) &&
+      ($config->get('authentication_login_mode') == 'itsyou')) {
+
+    if (!itsyouonline_logged_in_with_itsyou() &&
+        itsyouonline_is_user_already_linked($account->id())) {
+
+      // Load the anonymous user.
+      drupal_set_message(t('This user account has been linked to a itsyou.online account. According to this website\'s policy, an account linked to itsyou.online can only logon via itsyou.online.'), 'error');
+
+      \Drupal\itsyouonline\ItsyouonlineUtils::logger()->error(
+        t('The session for user {uid} has been destroyed since the user managed to logon by not using itsyouonline.online'),
+        array('uid' => $account->id())
+      );
+
+      user_logout();
+
+      // Redirect the user to the front-page. If this is not done, the user
+      // can receive an access denied page in some cases (e.g. when using a
+      // one-time login.
+      $resp = new \Symfony\Component\HttpFoundation\RedirectResponse(\Drupal::url('<front>'));
+      return $resp->send();
+    }
+  }
+}
+
+function itsyouonline_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'form_alter') {
+    // Move my_module_form_alter() to the end of the list.
+    // \Drupal::moduleHandler()->getImplementations()
+    // iterates through $implementations with a foreach loop which PHP iterates
+    // in the order that the items were added, so to move an item to the end of
+    // the array, we remove it and then add it.
+    $group = $implementations['itsyouonline'];
+    unset($implementations['itsyouonline']);
+    $implementations['itsyouonline'] = $group;
+  }
+}
