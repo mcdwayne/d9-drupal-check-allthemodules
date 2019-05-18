@@ -1,0 +1,309 @@
+<?php
+
+/**
+ * @file Contains some hooks and helper functions.
+ */
+
+use Drupal\field\Field;
+use Drupal\Core\Config\ConfigFactory;
+
+/**
+ * Implements hook_menu().
+ */
+function robotagger_menu() {
+  $items = array();
+  $items['admin/config/robotagger/robotagger'] = array(
+    'title' => 'RoboTagger settings',
+    'description' => 'Global and content type based settings for robotagger',
+    'route_name' => 'robotagger.admin_config_robotagger_robotagger',
+    'weight' => 0,
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function robotagger_permission() {
+  return array(
+    'access robotagger settings' => array(
+      'title' => t('Administer robotagger'),
+    ),
+    'access robotagger node page' => array(
+      'title' => t('Access the robotagger node page'),
+      'description' => t('Allow a user to confirm returned tags by the RoboTagger web service on a seperated page on the content page or request the webservice dependent on your robotagger settings.'),
+    ),
+  );
+}
+
+/**
+ * Helper functions.
+ */
+
+/**
+ *
+ * Returns an array dependent of the source parameter. With "db", it returns the stored vocabularies
+ * from the database. With "list", it returns annotation types aka vocabularies
+ * from the RoboTagger web service.
+ *
+ * @param string $source
+ *   db or list.
+ */
+function _robotagger_get_vocabularies($source = 'list') {
+  switch ($source) {
+    case 'list':
+      return robotagger_api_get_annotype_names();
+      break;
+    case 'db':
+      return _robotagger_get_vocabularies_db();
+      break;
+    default:
+      return array();
+  }
+}
+
+/**
+ * Returns our saved vocabularies.
+ *
+ * @return array $vocs
+ *   An array with the vocabulary as key and the vocabulary name as value.
+ */
+function _robotagger_get_vocabularies_db() {
+  $vocs = array();
+  $vocabularies = entity_load_multiple('taxonomy_vocabulary');
+  if (!empty($vocabularies)) {
+    foreach ($vocabularies as $vocabulary) {
+      if (substr($vocabulary->vid, 0, 4) == 'rtg_') {
+        $vocs[$vocabulary->vid] = $vocabulary->name;
+      }
+    }
+  }
+  return $vocs;
+}
+
+/**
+ * Creates missing vocalularies, fields and field instances which are returned by
+ * _robotagger_get_vocabularies().
+ */
+function _robotagger_install_vocabulary() {
+  $vocabularies_list = _robotagger_get_vocabularies();
+  foreach ($vocabularies_list as $annotype) {
+    $name = _robotagger_prepare_fieldname($annotype['name']);
+    if (entity_load('taxonomy_vocabulary', $name) == null) {
+      $voc = entity_create('taxonomy_vocabulary', array(
+        'vid' => $name,
+        'name' => $annotype['name'],
+        'description' => $annotype['description'],
+        'hierarchy' => TAXONOMY_HIERARCHY_DISABLED,
+      ));
+      $voc->save();
+    }
+  }
+}
+
+function _robotagger_install_node_type() {
+  if ($node_type = entity_load('node_type', 'robotagger_demo_page') && !isset($node_type)) {
+    $node_type = array(
+      'type' => 'robotagger_demo_page',
+      'name' => 'RoboTagger Demo Page',
+    );
+    $node_type = entity_create('node_type', $node_type);
+    $node_type->save();
+  }
+  $vocabularies = _robotagger_get_vocabularies('db');
+  _robotagger_create_instances('robotagger_demo_page', $vocabularies);
+}
+
+/**
+ * Deletes our stored vocabularies and remove the fields.
+ */
+function _robotagger_uninstall_vocabulary() {
+  $vocabularies_db = _robotagger_get_vocabularies('db');
+  foreach ($vocabularies_db as $vid => $vocname) {
+    entity_load('taxonomy_vocabulary', $vid)->delete();
+  }
+  $nodetypes = node_type_get_names();
+  foreach ($nodetypes as $nodetype) {
+    _robotagger_remove_instances($nodetype);
+  }
+}
+
+/**
+ * Create a field instance. If necessary it creates also the field.
+ *
+ * @param string $nodetype
+ *   The node type.
+ * @param array $allowed_terms
+ *   An array with a vocabulary id as key and also as value
+ *   if checked else 0.
+ */
+function _robotagger_create_instances($nodetype, $allowed_vocs) {
+  foreach ($allowed_vocs as $vid => $allow) {
+    if ($allow) {
+      $vocabulary = entity_load('taxonomy_vocabulary', $vid);
+      $field_name = _robotagger_prepare_fieldname($vocabulary->name);
+      $instances = Field::fieldInfo()->getInstances('node');
+      if (isset($instances[$nodetype]) && !array_key_exists($field_name, $instances[$nodetype])) {
+        $field = _robotagger_create_field($vocabulary);
+        $instance = array(
+          'field_name' => $field->getFieldName(),
+          'entity_type' => 'node',
+          'label' => $vocabulary->name,
+          'bundle' => $nodetype,
+        );
+        $new_instance = entity_create('field_instance', $instance);
+        // $new_instance->enforceIsNew(FALSE);
+        $new_instance->save();
+        entity_get_display('node', $nodetype, 'default')->setComponent($field->getFieldName(),
+          array(
+            'label' => 'hidden',
+            'type' => 'taxonomy_term_reference_link',
+            'weight' => 10,
+          )
+        )->save();
+        entity_get_display('node', $nodetype, 'teaser')->setComponent($field->getFieldName(),
+          array(
+            'label' => 'hidden',
+            'type' => 'taxonomy_term_reference_link',
+            'weight' => 10,
+          )
+        )->save();
+      }
+    }
+    else if ($allow === 0) {
+      _robotagger_remove_instances($nodetype, $vid);
+    }
+  }
+}
+
+/**
+ * Deletes all field instances.
+ *
+ * @param string $nodetype
+ *   The nodetype.
+ * @param array $vocabularies
+ *   An array of vocabularies.
+ */
+function _robotagger_remove_instances($nodetype, $vocabulary = FALSE) {
+  $instances = Field::fieldInfo()->getInstances('node');
+  if (isset($instances[$nodetype])) {
+    foreach ($instances[$nodetype] as $instance) {
+      if (substr($instance->getFieldName(), 0, 4) == 'rtg_' && (!$vocabulary || $instance->getFieldName() == $vocabulary)) {
+        $instance->delete();
+      }
+    }
+  }
+}
+
+/**
+ * Creates a field for a vocabulary.
+ *
+ * @param object $vocabulary
+ *   A vocabulary object.
+ *
+ * @return array $field
+ *   The created field.
+ */
+function _robotagger_create_field($vocabulary) {
+  $field = array(
+    'name' => _robotagger_prepare_fieldname($vocabulary->name),
+    'entity_type' => 'node',
+    'type' => 'taxonomy_term_reference',
+    'module' => 'taxonomy',
+    'langcode' => 'und',
+    'cardinality' => -1,
+    'settings' => array(
+      'allowed_values' => array(
+        array(
+          'vocabulary' => _robotagger_prepare_fieldname($vocabulary->name),
+          'parent' => '0',
+        ),
+      ),
+    ),
+  );
+  $existing_field = Field::fieldInfo()->getField('node', $field['name']);
+  if (empty($existing_field)) {
+    $field = entity_create('field_entity', $field);
+    $field->save();
+    return $field;
+  }
+  return $existing_field;
+}
+
+/**
+ * Prepend the string 'rtg_' to the machine name of a vocabulary.
+ *
+ * @param object|string $vocabulary
+ *   A vocabulary object with at least the property machine_name or
+ *   the machine name itself as string.
+ *
+ * @return string $machine_name
+ *   The concated string 'rtg_' + $machine_name.
+ */
+function _robotagger_prepare_fieldname($name) {
+  return drupal_substr('rtg_' . strtolower($name), 0, 32);
+}
+
+/**
+ * Implements hook_node_presave().
+ */
+function robotagger_node_presave($node) {
+  $config = \Drupal::config('robotagger.settings');
+  $nodetype = $node->type->value;
+  if (in_array($nodetype, $config->get('global_nodetypes'))) {
+    if (!$config->get($nodetype . '_use_global')) {
+      $key = $nodetype;
+    }
+    else {
+      $key = 'global';
+    }
+    $supported_fields = $config->get($key . '_supported_fields');
+    $text = '';
+    foreach ($supported_fields as $field_name) {
+      if ($field_name !== 0) {
+        $text .= $node->{$field_name}->value;
+      }
+    }
+    if ($config->get($key . '_use_title')) {
+      $text = $node->title->value . "\n" . $text;
+    }
+    if (empty($text)) {
+      drupal_set_message(t('It\'s not allowed to send empty text to robotagger webservice. Please check your configuration.'));
+      return $node;
+    }
+    $allowed_vocabularies = entity_load_multiple('taxonomy_vocabulary', $config->get('global_vocs'));
+    $annotypes = array();
+    foreach ($allowed_vocabularies as $vocabulary) {
+      $annotypes[] = $vocabulary->name;
+    }
+    $annotations = robotagger_api_call_webservice($text, $annotypes, 'de');
+    foreach ($annotations as $annotype => $annos) {
+      $values = array();
+      foreach ($annos as $annotation) {
+        if ($terms = entity_load_multiple_by_properties('taxonomy_term', array('vid' => _robotagger_prepare_fieldname($annotype), 'name' => $annotation->value))) {
+          $term = array_pop($terms);
+          $values[] = array('target_id' => $term->id());
+        }
+        else {
+          $vocabulary = entity_load('taxonomy_vocabulary', _robotagger_prepare_fieldname($annotype));
+          $term = entity_create('taxonomy_term', array(
+            'vid' => $vocabulary->id(),
+            'name' => $annotation->value,
+          ));
+          $term->save();
+          $values[] = array('target_id' => $term->id(), 'entity' => $term);
+        }
+      }
+      if (isset($node->{_robotagger_prepare_fieldname($annotype)})) {
+        $node->{_robotagger_prepare_fieldname($annotype)}->setValue($values);
+      }
+    }
+  }
+  return $node;
+}
+
+function _robotagger_get_config($key, $default = NULL) {
+  $config = \Drupal::config('robotagger.settings');
+  $value = $config->get($key);
+  return isset($value) ? $value : $default;
+}
