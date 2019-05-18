@@ -1,0 +1,148 @@
+sudo: required
+dist: trusty
+language: php
+
+cache:
+  bundler: true
+  apt: true
+  directories:
+    - "$HOME/.composer/cache"
+    - "$HOME/.drush/cache"
+    - "$HOME/.npm"
+php:
+  - 5.6
+  - 7.1.9
+
+env:
+  - DRUPAL=8.5.x
+
+services:
+  - mysql
+
+mysql:
+  database: drupal
+  username: root
+  encoding: utf8
+
+before_install:
+  #- git config --global github.accesstoken $GITHUB_OAUTH_TOKEN
+  - phpenv config-rm xdebug.ini
+  - composer self-update
+  - composer --version
+
+  # items for phpcs
+  - export MODULE_ROOT=~/build/event
+  - export PROJECT_ROOT=~/build/drupal
+  - export LIGHTNING_ROOT=~/build/drupal/docroot
+  - cd ~/build
+
+  # Build the Lightning code base.
+  - if [[ $DRUPAL == '8.3.x' ]]; then
+    composer create-project acquia/lightning-project:8.4.1 drupal --no-interaction --no-install;
+    cd drupal;
+    composer require acquia/lightning:2.1.8 drupal/core:~8.3.0 --no-update;
+    fi
+  - if [[ $DRUPAL == '8.4.x' ]]; then
+    composer create-project acquia/lightning-project:8.4.1 drupal --no-interaction --no-install;
+    cd drupal;
+    composer require acquia/lightning:3.0.1 drupal/core:~8.4.0 --no-update;
+    fi
+  - if [[ $DRUPAL == '8.5.x' ]]; then
+    composer create-project acquia/lightning-project:~8.5.0 drupal --no-interaction --no-install;
+    cd drupal;
+    composer require acquia/lightning:~3.1 drupal/core:~8.5.0 --no-update;
+    fi
+
+  # add composer's global bin directory to the path
+  # see: https://github.com/drush-ops/drush#install---composer
+  #- export PATH="`composer global config bin-dir --absolute`:$PATH"
+  # debug
+  #- composer global config bin-dir --absolute
+
+install:
+  # PHP conf tweaks
+  - echo 'max_execution_time = 120' >> drupal.php.ini;
+  - echo 'sendmail_path = /bin/true' >> drupal.php.ini;
+  - phpenv config-add drupal.php.ini
+  - phpenv rehash
+
+  # Contenthub local repository needs to be the first one so it doesn't use drupal's contenthub repo.
+  - composer config --unset repositories.drupal
+  - composer config --unset repositories.assets
+  - composer config --unset repositories.dev
+  - composer config repositories.event '{"type":"path","url":"~/build/drupal/event","options":{"symlink":false}}'
+  - composer config repositories.drupal composer https://packages.drupal.org/8
+  - composer config repositories.assets composer https://asset-packagist.org
+  - composer config repositories.dev vcs https://github.com/acquia/lightning-dev
+  - composer require event/event:* --no-update
+
+  - composer require --dev drupal/coder ^8.2@stable --no-update
+  - php -dmemory_limit=-1 /home/travis/.phpenv/versions/$TRAVIS_PHP_VERSION/bin/composer update
+  - composer install
+
+  - vendor/bin/phpcs --config-set installed_paths vendor/drupal/coder/coder_sniffer
+
+  # Add Composer's local bin directory to the PATH so that we will be running
+  # our installed versions of Drush, PHPCS, Behat, PhantomJS, etc.
+  - export PATH="$HOME/.composer/vendor/bin:$PROJECT_ROOT/vendor/bin:$PROJECT_ROOT/vendor/drush/drush:$PATH"
+  - echo $PATH
+
+  #- drupal lightning:subprofile --no-interaction --name="Lightning Extender" --machine-name=subprofile --include=paragraphs,acquia_contenthub --exclude=lightning_search
+  #- SUBPROFILE_TESTS=$TRAVIS_BUILD_DIR/docroot/profiles/custom/subprofile/tests
+  #- mkdir -p $SUBPROFILE_TESTS/features
+  #- curl -o $SUBPROFILE_TESTS/features/subprofile.feature https://gist.githubusercontent.com/balsama/c8c03bb21f7a91a1a87d01ef185a3955/raw
+  #- curl -o $SUBPROFILE_TESTS/behat.partial.yml https://gist.githubusercontent.com/balsama/3a60df268f76e57da79c7f179cf7ceaa/raw/b3f5d81f24cd977e60203c4ba27cf8cee1251c13/behat.partial.yml
+  # settings.php must be writeable in order to reinstall.
+  # - chmod +w ./docroot/sites/default/settings.php
+
+  # Install Lightning.
+  - cd $LIGHTNING_ROOT
+  - patch -p1 < $MODULE_ROOT/2949449-traits-webtestbase-fatal-php56-3.patch
+  - drush site-install lightning --db-url=mysql://root:@127.0.0.1/drupal --yes install_configure_form.enable_update_status_emails=NULL
+  #- cd ../..
+
+  #- lightning install 'mysql\://lightning:lightning@127.0.0.1/drupal' $PROFILE_NAME 'http://127.0.0.1:8080'
+
+  # Record the version of Lightning for the Configuration Updates.
+  #- UPDATE_FROM=$(drupal lightning:version)
+
+  # Update codebase to head and run db updates.
+  # - composer nuke
+  # - composer require acquia/lightning:dev-8.x-3.x --no-update
+  # - composer update
+  # - drupal cache:rebuild all
+  # - drush updatedb --yes
+  # - drupal update:lightning $UPDATE_FROM --no-interaction
+  # Notify all modules that lightning_dev is installed, so that they can set up
+  # the testing environment as needed.
+  # - drush php:eval '\Drupal::moduleHandler()->invokeAll("modules_installed", [["lightning_dev"]])'
+
+  # Generate the Behat config.
+  # - lightning configure:behat 'http://127.0.0.1:8080'
+  # - cd docroot
+
+before_script:
+  # add always_populate_raw_post_data=-1 to php.ini
+  - echo "always_populate_raw_post_data=-1" >> ~/.phpenv/versions/$(phpenv version-name)/etc/php.ini
+
+script:
+
+  #- phpcs --standard=Drupal --warning-severity=2 --extensions=php,module,inc,install,test,profile,theme,js,css,info,txt,md --ignore=ember/assets ./build/acquia
+  - cd $LIGHTNING_ROOT
+  - mkdir themes
+  - cd core
+
+  # Use phpunit assigned require in the composer in drupal. Otherwise drupal 8.3 does not pass all the tests for PHP 7.1.
+  - if [[ ( $DRUPAL == '8.4.x' && ${TRAVIS_PHP_VERSION:0:3} != '5.6' ) || ( $DRUPAL == '8.3.x' ) ]]; then ../../vendor/phpunit/phpunit/phpunit --debug --group acquia_contenthub; fi
+  - if [[ ( $DRUPAL == '8.4.x' && ${TRAVIS_PHP_VERSION:0:3} != '5.6' ) || ( $DRUPAL == '8.3.x' ) ]]; then ../../vendor/phpunit/phpunit/phpunit --debug --group acquia_contenthub_status; fi
+  - cd ..
+
+  # fix this first: The always_populate_raw_post_data PHP setting should be set to -1
+  # - drush pm-enable acquia_contenthub_subscriber -y
+  - drush pm-enable simpletest -y
+  - nohup drush runserver localhost:8080 > /dev/null 2>&1 &
+  - php core/scripts/run-tests.sh --php /home/travis/.phpenv/shims/php --verbose --url http://localhost:8080 acquia_contenthub
+  - php core/scripts/run-tests.sh --php /home/travis/.phpenv/shims/php --verbose --url http://localhost:8080 acquia_contenthub_subscriber
+
+matrix:
+  fast_finish: true
