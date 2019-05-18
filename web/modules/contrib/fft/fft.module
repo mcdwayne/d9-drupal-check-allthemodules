@@ -1,0 +1,429 @@
+<?php
+
+/**
+ * @file
+ * Field formatter template.
+ */
+
+use Drupal\Component\Utility\Html;
+use Drupal\fft\Event\PreProcess;
+use Drupal\image\Entity\ImageStyle;
+
+/**
+ * Get real path with token.
+ *
+ * @param string $file
+ *   File path. Use with {module-name} {theme-name} {theme} {fft}.
+ *
+ * @param string $template_file
+ *   Template file.
+ *
+ * @return string
+ *   Real path.
+ */
+function fft_realpath($file, $template_file = '') {
+  $file = trim($file);
+
+  if (strpos($file, '{') === FALSE) {
+    return $file;
+  }
+
+  if (strpos($file, '{fft}') !== FALSE) {
+    $theme_path = dirname($template_file);
+    $file = str_replace('{fft}', $theme_path, $file);
+    return $file;
+  }
+
+  if (strpos($file, '{theme}') !== FALSE) {
+    $theme_default = $GLOBALS['conf']['theme_default'];
+    $theme_path = drupal_get_path('theme', $theme_default);
+    $file = str_replace('{theme}', $theme_path, $file);
+    return $file;
+  }
+
+  $matches = [];
+  $types = ['module', 'theme'];
+
+  foreach ($types as $type) {
+    $pattern = '/\{' . $type . '-(.+)\}/';
+    preg_match($pattern, $file, $matches);
+    if (count($matches) > 1 && ($path = drupal_get_path($type, $matches[1])) != '') {
+      $file = str_replace($matches[0], $path, $file);
+      return $file;
+    }
+  }
+
+  return $file;
+}
+
+/**
+ * Clear up string.
+ *
+ * @param string $str
+ *   Input string.
+ *
+ * @return string
+ *   Output of clean up string.
+ */
+function fft_cleanup_header_comment($str) {
+  return trim(preg_replace("/\s*(?:\*\/|\?>).*/", '', $str));
+}
+
+/**
+ * Get available templates.
+ *
+ * @param string $start_with
+ *   Prefix template.
+ *
+ * @return array
+ *   List of Field formatter template.
+ */
+function fft_get_templates($start_with = 'fft') {
+  static $page_templates = [];
+  if (empty($page_templates[$start_with])) {
+    $page_templates[$start_with] = [];
+    $extension = fft_theme_extension();
+    $files = file_scan_directory(fft_storage_dir(), '/^.*' . $extension . '$/');
+    foreach ($files as $full_path => $file) {
+      $file_content = file_get_contents($full_path);
+      $header = [];
+      if (!preg_match('/\{\#Template Name:(.*?)\#\}/s', $file_content, $header)) {
+        continue;
+      }
+      $template_file = str_replace(fft_storage_dir() . "/", '', $file->uri);
+      $start_with_len = strlen($start_with);
+      if (substr($template_file, 0, $start_with_len) === $start_with) {
+        $page_templates[$start_with]['templates'][$template_file] = fft_cleanup_header_comment($header[1]);
+        $settings = [];
+        $page_templates[$start_with]['settings'][$template_file] = '';
+        if (preg_match('/\{\#Settings:(.*?)\#\}/s', $file_content, $settings)) {
+          $page_templates[$start_with]['settings'][$template_file] = trim($settings[1]);
+        }
+      }
+    }
+  }
+
+  return $page_templates[$start_with];
+}
+
+/**
+ * Render field formatter.
+ *
+ * @param object $entity
+ *   The entity object.
+ * @param string $field_type
+ *   Field type.
+ * @param $items
+ *   Field items.
+ * @param array $settings
+ *   Settings array data.
+ * @param bool $langcode
+ *   The language code.
+ *
+ * @return array
+ *   Return array builder data.
+ */
+function fft_field_formatter_render($entity, $field_type, $items, array $settings, $langcode = FALSE) {
+  $data = [];
+  $element[0]['#markup'] = '';
+
+  switch ($field_type) {
+    case 'file':
+
+      break;
+    case 'image':
+      foreach ($items as $delta => $item) {
+        $image_uri = $item->entity->getFileUri();
+        $image['uri'] = $image_uri;
+        $image['path'] = file_create_url($image_uri);
+        foreach (['width', 'height', 'alt'] as $key) {
+          $image["$key"] = $item->$key;
+        }
+        for ($i = 1; $i <= 2; $i++) {
+          if (!empty($settings["image_style_{$i}"])) {
+            $image_styled = fft_field_styled_image_url($item, $settings["image_style_{$i}"]);
+            $image["path_{$i}"] = $image_styled['path'];
+            $image["width_{$i}"] = $image_styled['width'];
+            $image["height_{$i}"] = $image_styled['height'];
+          }
+        }
+
+        $data[] = $image;
+      }
+
+      break;
+
+    case 'text':
+    case 'text_long':
+    case 'text_with_summary':
+      foreach ($items as $delta => $item) {
+        /** @var \Drupal\text\Plugin\Field\FieldType\TextWithSummaryItem $item */
+        $data[] = [
+          'text' => !empty($item->processed) ? $item->processed : '',
+          'summary' => !empty($item->summary_processed) ? $item->summary_processed : '',
+        ];
+      }
+
+      break;
+    case 'entity_reference':
+    case 'entity_reference_revisions':
+      $data = $items;
+      break;
+
+    default:
+      foreach ($items as $delta => $item) {
+        $data[] = $item->getValue();
+      }
+
+      break;
+  }
+
+  if (!empty($data)) {
+    $template_file = fft_storage_dir() . "/" . $settings['template'];
+    $settings_extras = drupal_parse_info_format($settings['settings']);
+    $attached = [];
+    foreach (['js', 'css'] as $item) {
+      if (isset($settings_extras[$item])) {
+        foreach ((array) $settings_extras[$item] as $key => $value) {
+          if (is_string($value)) {
+            $attached[$item][] = fft_realpath($value, $template_file);
+          }
+          else {
+            $attached[$item][] = $value;
+          }
+        }
+      }
+    }
+
+    $settings_extras = $attached + $settings_extras;
+    $output = fft_render($template_file, [
+      'data' => $data,
+      'entity' => $entity,
+      'settings' => $settings_extras,
+    ]);
+
+    $element[0] = [
+      '#markup' => $output,
+      '#attached' => $attached,
+    ];
+  }
+
+  return $element;
+}
+
+/**
+ * Get image url with style name.
+ *
+ * @param object $image
+ *   Image uri.
+ * @param string $style
+ *   Image style name.
+ *
+ * @return array
+ *   Return image url.
+ */
+function fft_field_styled_image_url($image, $style) {
+  $image_info = [];
+  $style = ImageStyle::load($style);
+  $image_uri = $image->entity->getFileUri();
+  $image_filepath = $style->buildUri($image_uri);
+  $style->createDerivative($image_uri, $image_filepath);
+  $image_info['path'] = file_create_url($image_filepath);
+  // Determine the dimensions of the styled image.
+  $dimensions = [
+    'width' => $image->width,
+    'height' => $image->height,
+  ];
+  $style->transformDimensions($dimensions, $image_uri);
+  $image_info['width'] = $dimensions['width'];
+  $image_info['height'] = $dimensions['height'];
+
+  return $image_info;
+}
+
+/**
+ * Theme template extension.
+ *
+ * @return string
+ *   Return theme extension format.
+ */
+function fft_theme_extension() {
+  $extension = '.html.twig';
+  global $theme_engine;
+  if (isset($theme_engine)) {
+    $extension_function = $theme_engine . '_extension';
+    if (function_exists($extension_function)) {
+      $extension = $extension_function();
+    }
+  }
+
+  return $extension;
+}
+
+/**
+ * Render template with variables.
+ *
+ * @param string $template_file
+ *   Template name.
+ * @param array $variables
+ *   Variables for template.
+ *
+ * @return string
+ *   Rendered template.
+ */
+function fft_render($template_file, array $variables) {
+  if (!is_file($template_file)) {
+    return "";
+  }
+  $render_function = 'twig_render_template';
+  $twig_debug = \Drupal::getContainer()->get('twig')->isDebug();
+  global $theme_engine;
+  if (isset($theme_engine)) {
+    if (function_exists($theme_engine . '_render_template')) {
+      $render_function = $theme_engine . '_render_template';
+    }
+  }
+  $variables['theme_hook_original'] = '';
+  $event = new PreProcess($template_file, $variables);
+  $event_dispatcher = \Drupal::getContainer()->get('event_dispatcher');
+  $event_dispatcher->dispatch(PreProcess::EVENT, $event);
+  if ($twig_debug) {
+    \Drupal::getContainer()->get('twig')->disableDebug();
+  }
+  $render_output = $render_function($template_file, $variables);
+  if ($twig_debug) {
+    $debug_prefix = "\n\n<!-- THEME DEBUG -->";
+    $debug_prefix .= "\n<!-- THEME HOOK: '" . Html::escape($variables['theme_hook_original']) . "' -->";
+    $debug_prefix .= "\n<!-- BEGIN OUTPUT from '" . Html::escape($template_file) . "' -->\n";
+    $debug_suffix = "\n<!-- END OUTPUT from '" . Html::escape($template_file) . "' -->\n\n";
+    $render_output = $debug_prefix . $render_output . $debug_suffix;
+    \Drupal::getContainer()->get('twig')->enableDebug();
+  }
+  return $render_output;
+}
+
+/**
+ * Get storage directory.
+ *
+ * @return string
+ *   Path of storage dicrectory.
+ */
+function fft_storage_dir() {
+  return \Drupal::config('fft.settings')->get('fft_storage_dir');
+}
+
+/**
+ * Get all available field type.
+ *
+ * @return array
+ *   Return array.
+ */
+function fft_get_field_types() {
+  return array_keys(\Drupal::service('plugin.manager.field.field_type')
+    ->getDefinitions());
+}
+
+/**
+ * Implements hook_field_formatter_info_alter().
+ */
+function fft_field_formatter_info_alter(array &$info) {
+  $field_types = fft_get_field_types();
+  $info['fft_formatter']['field_types'] = $field_types;
+}
+
+
+if (!function_exists('drupal_parse_info_format')) {
+  /**
+   * Parses data in Drupal's .info format.
+   *
+   * Data should be in an .ini-like format to specify values. White-space
+   * generally doesn't matter, except inside values:
+   *
+   * @code
+   * key = value
+   * key = "value"
+   * key = 'value'
+   * key = "multi-line
+   * value"
+   * key = 'multi-line
+   * value'
+   * key
+   * =
+   * 'value'
+   * @endcode
+   *
+   * Arrays are created using a HTTP GET alike syntax:
+   * @code
+   * key[] = "numeric array"
+   * key[index] = "associative array"
+   * key[index][] = "nested numeric array"
+   * key[index][index] = "nested associative array"
+   * @endcode
+   *
+   * PHP constants are substituted in, but only when used as the entire value.
+   * Comments should start with a semi-colon at the beginning of a line.
+   *
+   * @param $data
+   * A string to parse.
+   *
+   * @return
+   * The info array.
+   *
+   */
+  function drupal_parse_info_format($data) {
+    $info = [];
+    $constants = get_defined_constants();
+
+    if (preg_match_all('
+      @^\s*                           # Start at the beginning of a line, ignoring leading whitespace
+      ((?:
+        [^=;\[\]]|                    # Key names cannot contain equal signs, semi-colons or square brackets,
+        \[[^\[\]]*\]                  # unless they are balanced and not nested
+      )+?)
+      \s*=\s*                         # Key/value pairs are separated by equal signs (ignoring white-space)
+      (?:
+        ("(?:[^"]|(?<=\\\\)")*")|     # Double-quoted string, which may contain slash-escaped quotes/slashes
+        (\'(?:[^\']|(?<=\\\\)\')*\')| # Single-quoted string, which may contain slash-escaped quotes/slashes
+        ([^\r\n]*?)                   # Non-quoted string
+      )\s*$                           # Stop at the next end of a line, ignoring trailing whitespace
+      @msx', $data, $matches, PREG_SET_ORDER)) {
+      foreach ($matches as $match) {
+        // Fetch the key and value string.
+        $i = 0;
+        foreach (['key', 'value1', 'value2', 'value3'] as $var) {
+          $$var = isset($match[++$i]) ? $match[$i] : '';
+        }
+        $value = stripslashes(substr($value1, 1, -1)) . stripslashes(substr($value2, 1, -1)) . $value3;
+
+        // Parse array syntax.
+        $keys = preg_split('/\]?\[/', rtrim($key, ']'));
+        $last = array_pop($keys);
+        $parent = &$info;
+
+        // Create nested arrays.
+        foreach ($keys as $key) {
+          if ($key == '') {
+            $key = count($parent);
+          }
+          if (!isset($parent[$key]) || !is_array($parent[$key])) {
+            $parent[$key] = [];
+          }
+          $parent = &$parent[$key];
+        }
+
+        // Handle PHP constants.
+        if (isset($constants[$value])) {
+          $value = $constants[$value];
+        }
+
+        // Insert actual value.
+        if ($last == '') {
+          $last = count($parent);
+        }
+        $parent[$last] = $value;
+      }
+    }
+
+    return $info;
+  }
+}
