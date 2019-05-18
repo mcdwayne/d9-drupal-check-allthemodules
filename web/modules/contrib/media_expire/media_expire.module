@@ -1,0 +1,148 @@
+<?php
+
+/**
+ * @file
+ * The Media Expires Drupal module.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\media\MediaTypeInterface;
+use Drupal\Core\Entity\EntityInterface;
+
+/**
+ * Implements hook_form_BASE_ID_alter().
+ *
+ * Adds expire configuration fields to media bundle form.
+ */
+function media_expire_form_media_type_edit_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+
+  /** @var \Drupal\media\MediaTypeInterface $entity_type */
+  $entity_type = $form_state->getFormObject()->getEntity();
+  $options = [];
+  $allowed_field_types = ['datetime'];
+  foreach (\Drupal::service('entity_field.manager')->getFieldDefinitions('media', $entity_type->id()) as $field_name => $field) {
+    if (in_array($field->getType(), $allowed_field_types) && !$field->getFieldStorageDefinition()->isBaseField()) {
+      $options[$field_name] = $field->getLabel();
+    }
+  }
+
+  $form['#entity_builders'][] = 'media_expire_media_type_form_builder';
+  $form['media_expire'] = [
+    '#type' => 'fieldset',
+    '#title' => t('Expire configuration'),
+  ];
+
+  if (empty($options)) {
+    $form['media_expire']['expire_field'] = [
+      '#type' => 'value',
+      '#value' => NULL,
+    ];
+
+    $form['media_expire']['message'] = [
+      '#markup' => t('There are no date fields on this bundle at the moment. In order to configure expire add at least one such field and come back.'),
+    ];
+  }
+  else {
+    $form['media_expire']['enable_expiring'] = [
+      '#type' => 'checkbox',
+      '#title' => t('Activate media expire'),
+      '#default_value' => $entity_type->getThirdPartySetting('media_expire', 'enable_expiring'),
+    ];
+
+    $form['media_expire']['expire_field'] = [
+      '#type' => 'select',
+      '#title' => t('Expire field'),
+      '#default_value' => $entity_type->getThirdPartySetting('media_expire', 'expire_field'),
+      '#options' => $options,
+      '#description' => t('Select field that stores the expire date.'),
+      '#states' => [
+        'visible' => [
+          [
+            ':input[name="enable_expiring"]' => ['checked' => TRUE],
+          ],
+        ],
+      ],
+    ];
+
+    $defaultValue = $entity_type->getThirdPartySetting('media_expire', 'fallback_media');
+    if ($defaultValue) {
+      $defaultValue = \Drupal::service('entity.repository')
+        ->loadEntityByUuid('media', $defaultValue);
+    }
+
+    $form['media_expire']['fallback_media'] = [
+      '#type' => 'entity_autocomplete',
+      '#title' => t('Fallback @label', ['@label' => strtolower($entity_type->label())]),
+      '#default_value' => $defaultValue,
+      '#target_type' => 'media',
+      '#selection_settings' => ['target_bundles' => [$entity_type->id()]],
+      '#description' => t('Select a fallback @label for unpublished entities.', ['@label' => strtolower($entity_type->label())]),
+      '#states' => [
+        'visible' => [
+          [
+            ':input[name="enable_expiring"]' => ['checked' => TRUE],
+          ],
+        ],
+      ],
+    ];
+  }
+}
+
+/**
+ * Entity builder for Media bundle.
+ *
+ * Adds third party settings to Media bundle config entity.
+ *
+ * @see media_expire_form_media_type_form_alter()
+ */
+function media_expire_media_type_form_builder($entity_type, MediaTypeInterface $bundle, &$form, FormStateInterface $form_state) {
+  $bundle->setThirdPartySetting('media_expire', 'enable_expiring', $form_state->getValue('enable_expiring'));
+  $bundle->setThirdPartySetting('media_expire', 'expire_field', $form_state->getValue('expire_field'));
+  if ($match = $form_state->getValue('fallback_media')) {
+    $mediaStorage = \Drupal::entityTypeManager()->getStorage('media');
+    if ($media = $mediaStorage->load($match)) {
+      $bundle->setThirdPartySetting('media_expire', 'fallback_media', $media->uuid());
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_build_defaults_alter().
+ */
+function media_expire_media_build_defaults_alter(array &$build, EntityInterface $entity, $view_mode) {
+  /** @var \Drupal\media\MediaTypeInterface $bundle */
+  $bundle = \Drupal::entityTypeManager()
+    ->getStorage('media_type')
+    ->load($entity->bundle());
+
+  if ($bundle->getThirdPartySetting('media_expire', 'enable_expiring') && !$entity->status->value) {
+    $fallbackMedia = $bundle->getThirdPartySetting('media_expire', 'fallback_media');
+    if ($fallbackMedia && $media = \Drupal::service('entity.repository')->loadEntityByUuid('media', $fallbackMedia)) {
+      $renderController = \Drupal::entityTypeManager()->getViewBuilder('media');
+      $build = $renderController->view($media, $view_mode);
+    }
+    else {
+      $build = [];
+    }
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function media_expire_cron() {
+
+  /** @var \Drupal\media_expire\MediaExpireService $service */
+  $service = \Drupal::service('media_expire.service');
+  $service->unpublishExpiredMedia();
+}
+
+/**
+ * Implements hook_entity_type_alter().
+ */
+function media_expire_entity_type_alter(array &$entity_types) {
+  if (!empty($entity_types['media'])) {
+    /* @var $entity_types \Drupal\Core\Entity\EntityTypeInterface[] */
+    $entity_types['media']->setAccessClass('Drupal\media_expire\MediaExpireAccessControlHandler');
+  }
+}
