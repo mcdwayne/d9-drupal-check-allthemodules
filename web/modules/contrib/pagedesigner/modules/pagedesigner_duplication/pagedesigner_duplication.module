@@ -1,0 +1,214 @@
+<?php
+
+/**
+ * @file
+ * Contains pagedesigner_duplication.module.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Language\LanguageInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\node\Entity\Node;
+use Drupal\pagedesigner\Entity\Element;
+
+/**
+ * Implements hook_help().
+ */
+function pagedesigner_duplication_help($route_name, RouteMatchInterface $route_match)
+{
+    switch ($route_name) {
+        // Main module help for the pagedesigner_duplication module.
+        case 'help.page.pagedesigner_duplication':
+            $output = '';
+            $output .= '<h3>' . t('About') . '</h3>';
+            $output .= '<p>' . t('Pagedesigner duplication integration') . '</p>';
+            return $output;
+        default:
+    }
+}
+
+/**
+ * Hooks into edit page form.
+ * Adds the copy form to copy content and layout.
+ *
+ * @param array $form
+ * @param FormStateInterface $formState
+ * @param string $form_id
+ * @return void
+ */
+function pagedesigner_duplication_form_node_form_alter(&$form, FormStateInterface $formState, $form_id)
+{
+    pagedesigner_duplication_preprocess_page_form($form, $formState);
+}
+
+/**
+ * Helper function to add the copy form to copy content and layout.
+ *
+ * @param array $form
+ * @param FormStateInterface $formState
+ * @return void
+ */
+function pagedesigner_duplication_preprocess_page_form(&$form, FormStateInterface $formState)
+{
+    $currentNode = Drupal::routeMatch()->getParameter('node');
+    if ($currentNode == null || $currentNode->isNew()) {
+        return;
+    }
+    $currentLanguage = \Drupal::languageManager()->getcurrentLanguage(LanguageInterface::TYPE_CONTENT);
+    $defaultLanguage = \Drupal::languageManager()->getDefaultLanguage();
+    $baseTypes = [];
+    $ref_fields = \Drupal::entityTypeManager()->getStorage('field_storage_config')->loadByProperties(
+        array(
+            'entity_type' => 'node',
+            'type' => 'pagedesigner_item',
+            'deleted' => false,
+            'status' => 1,
+        )
+    );
+    foreach ($ref_fields as $fields) {
+        foreach ($fields->getBundles() as $bundle) {
+            $baseTypes[] = $bundle;
+        }
+    }
+    if (count($baseTypes) < 1 || !in_array($currentNode->getType(), $baseTypes)) {
+        return;
+    }
+    // Get language options
+    $languages = \Drupal::languageManager()->getLanguages();
+    $options = [];
+    $options[$defaultLanguage->getId()] = $defaultLanguage->getId();
+    foreach ($languages as $key => $language) {
+        if ($key != $defaultLanguage->getId()) {
+            $options[$key] = $key;
+        }
+    }
+
+    $copyPageGroup = array(
+        '#type' => 'details',
+        '#title' => t('Copy page'),
+        '#collapsible' => true,
+        '#collapsed' => true,
+        '#tree' => true,
+        '#group' => 'advanced',
+        '#weight' => 99999,
+    );
+
+    $copyPageGroup['other_page'] = array(
+        '#type' => 'fieldset',
+        '#title' => t('Copy layout from other page'),
+        '#collapsible' => true,
+        '#collapsed' => true,
+        '#tree' => true,
+        '#weight' => 1,
+    );
+
+    $copyPageGroup['other_page']['copy_page_source'] = array(
+        '#type' => 'entity_autocomplete',
+        '#title' => t('Select page'),
+        '#target_type' => 'node',
+        '#selection_settings' => ['target_bundles' => $baseTypes],
+        '#tags' => false,
+        '#size' => 30,
+        '#maxlength' => 1024,
+        '#weight' => 1,
+    );
+
+    $copyPageGroup['other_page']['copy_page_language'] = array(
+        '#type' => 'select',
+        '#title' => t('Select language version'),
+        '#options' => $options,
+        '#weight' => 2,
+    );
+    if ($currentLanguage->getId() != $defaultLanguage->getId()) {
+        $copyPageGroup['master_page'] = array(
+            '#type' => 'fieldset',
+            '#collapsible' => true,
+            '#collapsed' => true,
+            '#tree' => true,
+            '#weight' => 0,
+        );
+
+        $copyPageGroup['master_page']['copy_page_master'] = array(
+            '#type' => 'checkbox',
+            '#title' => t('Copy master language layout'),
+            '#options' => array('1' => 'Ja', '0' => 'No'),
+            '#weight' => 1,
+        );
+    }
+
+    // $copyPageGroup['copy_page_content'] = array(
+    //     '#type' => 'checkbox',
+    //     '#title' => t('Copy content too'),
+    //     '#options' => array('1' => 'Ja', '0' => 'No'),
+    //     '#weight' => 2,
+    // );
+
+    $form['copy_page'] = $copyPageGroup;
+    array_unshift($form['actions']['submit']['#submit'], 'pagedesigner_duplication_postprocess_page_form');
+}
+
+/**
+ * Hooks into process page form.
+ * Copies layout and content.
+ *
+ * @param array $form
+ * @param FormStateInterface $formState
+ * @return void
+ */
+function pagedesigner_duplication_postprocess_page_form(&$form, FormStateInterface $formState)
+{
+    $node = \Drupal::routeMatch()->getRawParameter('node');
+    $pageCopy = $formState->getValue('copy_page');
+    $copyOrigin = null;
+    if (isset($pageCopy['master_page'])) {
+        $copyOrigin = ($pageCopy['master_page']['copy_page_master'] == 1) ? $node : null;
+        $copyLanguage = \Drupal::languageManager()->getDefaultLanguage()->getId();
+    }
+
+    if ($copyOrigin == null && $pageCopy['other_page']['copy_page_source'] > 0) {
+        $copyOrigin = $pageCopy['other_page']['copy_page_source'];
+        $copyLanguage = $pageCopy['other_page']['copy_page_language'];
+    }
+
+    if ($copyOrigin != null) {
+        $originNode = Node::load($copyOrigin);
+        if ($originNode != null) {
+            if ($originNode->hasTranslation($copyLanguage)) {
+                pagedesigner_duplication_custom_post_copy_content($node, \Drupal::languageManager()->getcurrentLanguage(LanguageInterface::TYPE_CONTENT)->getId(), $copyOrigin, $copyLanguage);
+                $originNode = $originNode->getTranslation($copyLanguage);
+                $name = $originNode->title->value;
+                $rendered_message = \Drupal\Core\Render\Markup::create(t('Content has been copied from <em>@pagename</em>. You might need to reload the page to see the content.', array('@pagename' => $name)));
+                drupal_set_message($rendered_message);
+            } else {
+                drupal_set_message(t('Could not find the node you wanted to copy in the selected language.'), 'warning');
+            }
+        } else {
+            drupal_set_message(t('Could not find the node you wanted to copy.'), 'warning');
+        }
+    }
+}
+
+/**
+ * Helper function to copy layout and content.
+ *
+ * @param int $node The id of the node to copy into.
+ * @param string $language The language to copy into.
+ * @param int $copyOrigin The id of the node to copy.
+ * @param string $copyLanguage The language to copy.
+ * @param boolean $copyContent Whether to copy the content.
+ * @return void
+ */
+function pagedesigner_duplication_custom_post_copy_content($node, $language, $copyOrigin, $copyLanguage = null)
+{
+
+    \Drupal::logger('pagedesigner')->notice('Copying data from ' . $copyOrigin . ' to ' . $node);
+    $targetEntity = Node::load($node);
+    $targetEntity = $targetEntity->getTranslation($language);
+    $sourceEntity = Node::load($copyOrigin);
+    if ($copyLanguage != null) {
+        $sourceEntity = $sourceEntity->getTranslation($copyLanguage);
+    } else {
+        $sourceEntity = $sourceEntity->getTranslation($language);
+    }
+    \Drupal::service('pagedesigner_duplication.service.duplicator')->duplicate($sourceEntity, $targetEntity);
+}
