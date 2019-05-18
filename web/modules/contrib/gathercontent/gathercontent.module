@@ -1,0 +1,153 @@
+<?php
+
+/**
+ * @file
+ * Main module file for GatherContent module.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\gathercontent\Entity\MappingInterface;
+use Drupal\migrate\Plugin\MigrationInterface;
+use Drupal\gathercontent\MigrateExecutable;
+use Drupal\gathercontent\MigrateMessageCapture;
+
+/**
+ * Implements hook_entity_base_field_info().
+ *
+ * Add a 'GC mapping ID' and 'GC ID fields' base field to all node types.
+ *
+ * {@inheritdoc}
+ */
+function gathercontent_entity_base_field_info(EntityTypeInterface $entity_type) {
+  $fields = [];
+  if ($entity_type->id() === 'file') {
+    $fields['gc_id'] = $storage_definition = BaseFieldDefinition::create('integer')
+      ->setLabel(t('GC ID'))
+      ->setDescription(t('The ID of GatherContent content.'))
+      ->setReadOnly(TRUE);
+  }
+
+  return $fields;
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function gathercontent_entity_delete(EntityInterface $entity) {
+  $entityId = $entity->id();
+  $entityType = $entity->getEntityTypeId();
+
+  /** @var \Drupal\Core\Database\Connection $connection */
+  $connection = \Drupal::service('database');
+  $result = $connection->select('gathercontent_entity_mapping')
+    ->fields('gathercontent_entity_mapping', [
+      'entity_id',
+      'entity_type',
+      'gc_id',
+      'migration_id',
+    ])
+    ->condition('entity_id', $entityId)
+    ->condition('entity_type', $entityType)
+    ->execute()
+    ->fetchAll();
+
+  if (empty($result)) {
+    return;
+  }
+
+  $connection->delete('gathercontent_entity_mapping')
+    ->condition('entity_id', $entityId)
+    ->condition('entity_type', $entityType)
+    ->execute();
+
+  // Rollback id filtering does not work,
+  // because core Migrate does not support it yet.
+  // After release add the new version to the module dependencies.
+  // TODO: remove comment when Drupal 8.7.0 released.
+  // TODO: Dependency: https://www.drupal.org/project/drupal/issues/2999478
+  // TODO: Dependency 2: https://www.drupal.org/project/migrate_tools/issues/2798363
+  /*
+  $result = reset($result);
+
+  $migration = \Drupal::service('plugin.manager.migration')
+    ->createInstance($result->migration_id);
+
+  if ($migration) {
+    $messages = new MigrateMessageCapture();
+    $executable = new MigrateExecutable($migration, $messages, [
+      'idlist' => $result->gc_id,
+    ]);
+
+    $executable->rollback();
+  }
+   */
+}
+
+/**
+ * Batch operation callback for importing items.
+ */
+function gathercontent_import_process($gc_ids, array $import_options, MappingInterface $mapping, &$context = []) {
+  $client = \Drupal::service('gathercontent.client');
+  $migrationIds = $mapping->getMigrations();
+
+  if (!isset($context['results']['success'])) {
+    $context['results']['success'] = 0;
+  }
+
+  if (!isset($context['results']['failed'])) {
+    $context['results']['failed'] = 0;
+  }
+
+  if (!empty($migrationIds)) {
+    foreach ($migrationIds as $migrationId) {
+      /** @var \Drupal\migrate\Plugin\Migration $migration */
+      $migration = \Drupal::service('plugin.manager.migration')
+        ->createInstance($migrationId);
+
+      if ($migration) {
+        $messages = new MigrateMessageCapture();
+        $executable = new MigrateExecutable($migration, $messages, [
+          'idlist' => implode(',', $gc_ids),
+          'import_options' => $import_options,
+          'client' => $client,
+        ]);
+        $status = '';
+
+        try {
+          $status = $executable->import();
+          $context['results']['success'] += $executable->getCreatedCount() + $executable->getUpdatedCount();
+          $context['results']['failed'] += $executable->getFailedCount() + $executable->getIgnoredCount();
+
+          if ($executable->getFailedCount() + $executable->getIgnoredCount() > 0) {
+            // Rollback id filtering does not work,
+            // because core Migrate does not support it yet.
+            // After release add the new version to the module dependencies.
+            // TODO: remove comment when Drupal 8.7.0 released.
+            // TODO: Dependency: https://www.drupal.org/project/drupal/issues/2999478
+            // TODO: Dependency 2: https://www.drupal.org/project/migrate_tools/issues/2798363
+            // $executable->rollback();
+          }
+        }
+        catch (\Exception $e) {
+          \Drupal::logger('gathercontent')->error($e->getMessage());
+        }
+
+        switch ($status) {
+          case MigrationInterface::RESULT_FAILED:
+            if ($migration->getStatus() !== MigrationInterface::STATUS_IDLE) {
+              $migration->setStatus(MigrationInterface::STATUS_IDLE);
+            }
+
+            // Add and log any captured messages.
+            foreach ($messages->getMessages() as $message) {
+              $context['results']['messages'][] = (string) $message;
+              \Drupal::logger('gathercontent')->error($message);
+            }
+            break;
+        }
+      }
+    }
+  }
+}
