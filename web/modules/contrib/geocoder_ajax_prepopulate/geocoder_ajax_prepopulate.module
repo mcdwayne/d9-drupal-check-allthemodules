@@ -1,0 +1,267 @@
+<?php
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * @see geocoder_field_form_field_config_edit_form_alter().
+ */
+function geocoder_ajax_prepopulate_form_field_config_edit_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  if (isset($form['third_party_settings']['geocoder_field'])) {
+    $element = &$form['third_party_settings']['geocoder_field'];
+
+    // Only add the prepopulate option of fields that can be a destination field
+    // for geocoding.
+    if (isset($element['method']['#options']['source'])) {
+
+      // Add the prepopulate method.
+      $element['method']['#options']['prepopulate_from_source'] = t('<b>Prepopulate</b> by  geocoding an existing field');
+
+      // Some fields must also be visible if prepopulate is selected.
+      $element['geocode_field']['#states']['visible'][':input[name="third_party_settings[geocoder_field][method]"]'] =
+        [
+          ['value' => 'source'],
+          ['value' => 'prepopulate_from_source'],
+        ];
+
+      // Some fields are useless if prepopulate is selected.
+      $element['hidden']['#states']['invisible'][':input[name="third_party_settings[geocoder_field][method]"]'] =
+      $element['weight']['#states']['invisible'][':input[name="third_party_settings[geocoder_field][method]"]'] =
+      $element['failure']['handling']['#states']['invisible'][':input[name="third_party_settings[geocoder_field][method]"]'] =
+        [
+          ['value' => 'none'],
+          ['value' => 'prepopulate_from_source'],
+        ];
+      $element['disabled']['#states']['invisible'][] = [':input[name="third_party_settings[geocoder_field][method]"]' => ['value' => 'prepopulate_from_source']];
+    }
+
+  }
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function geocoder_ajax_prepopulate_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'form_alter') {
+    // Move our hook implementation to the end of the list.
+    if (isset($implementations['geocoder_ajax_prepopulate'])) {
+      $group = $implementations['geocoder_ajax_prepopulate'];
+
+      unset($implementations['geocoder_ajax_prepopulate']);
+      $implementations['geocoder_ajax_prepopulate'] = $group;
+    }
+  }
+}
+
+/**
+ * Implements hook_field_widget_form_alter().
+ */
+function geocoder_ajax_prepopulate_field_widget_form_alter(&$element, \Drupal\Core\Form\FormStateInterface $form_state, $context) {
+  /** @var \Drupal\Core\Field\FieldItemListInterface $context ['items'] */
+  $field_config = $context['items']->getFieldDefinition();
+
+  /** @var \Drupal\Core\Field\FieldConfigInterface $field_config */
+  if (!$field_config instanceof \Drupal\field\FieldConfigInterface) {
+    // Only configurable fields are subject of geocoding.
+    return;
+  }
+
+  $geocoder = $field_config->getThirdPartySettings('geocoder_field');
+  if (isset($geocoder['method']) && $geocoder['method'] == 'prepopulate_from_source' && isset($geocoder['geocode_field'])) {
+
+    // Add the AJAX button.
+    $source_field_title = Drupal::service('entity_field.manager')
+      ->getFieldDefinitions($field_config->getTargetEntityTypeId(), $field_config->getTargetBundle())[$geocoder['geocode_field']]->getLabel();
+
+    $element['value']['prepopulate'] = [
+      '#type' => 'button',
+      '#value' => t('Populate from the %source field.', ['%source' => $source_field_title]),
+      // This just prevents the reload of the whole form. It won't be called if
+      // JS is off.
+      '#ajax' => [
+        'callback' => 'geocoder_ajax_prepopulate_ajax',
+        'effect' => 'fade',
+        'progress' => [
+          'type' => 'throbber',
+          'message' => t('Geocoding...'),
+        ],
+      ],
+
+      // We don't even validate the source field, as geocoding may not have the
+      // same limitations as saving. For example, an editor might fill only
+      // the city input of an address field, and can still geocode. Then she
+      // might add the required street info, that might be unknown from geocoding
+      // services.
+      '#limit_validation_errors' => [],
+      // We act on validate, because if it's at submit, the form is then reloaded
+      // from scratch as the values where submitted.
+      '#validate' => ['geocoder_ajax_prepopulate_validate'],
+      '#submit' => [],
+    ];
+    // We store some info in the form, so that it can be retrieved on validate
+    // for geocoding.
+    $element['value']['#geocoding_info'] = [
+      'field_name' => $field_config->getName(),
+    ];
+
+    // Pass info to the validate function.
+    $form_state->set('geocoder_destination_field_config', $field_config);
+  }
+}
+
+function geocoder_ajax_prepopulate_validate(array &$form, \Drupal\Core\Form\FormStateInterface $form_state) {
+  $destination_element = _geocoder_ajax_prepopulate_get_value_element($form, $form_state);
+  $destination_field_name = $destination_element['#geocoding_info']['field_name'];
+  /** @var \Drupal\Core\Field\FieldConfigInterface $destination_field_config */
+  $destination_field_config = $form_state->get('geocoder_destination_field_config');
+
+  // Special handling for the Profile module, which embeds its form inside the
+  // user_register form.
+  $embedded_profile_form = $destination_field_config->getTargetEntityTypeId() == 'profile'
+    && in_array('profile_form_user_register_form_submit', $form['actions']['submit']['#submit']);
+
+  // We build an entity with the submitted values, to be able to get the source
+  // field value.
+  if (!$embedded_profile_form) {
+    /** @var \Drupal\Core\Entity\EntityFormInterface $form_object */
+    $form_object = $form_state->getFormObject();
+    $entity = $form_object->buildEntity($form, $form_state);
+  }
+  else {
+    $bundle = $destination_field_config->getTargetBundle();
+    $entity = $form_state->get(['profiles', $bundle]);
+    // @see profile_form_user_register_form_validate().
+    $form_display = $form_state->get('form_display_' . $bundle);
+    if (isset($form['entity_' . $bundle])) {
+      $form_display->extractFormValues($entity, $form['entity_' . $bundle], $form_state);
+    }
+  }
+  /** @var \Drupal\Core\Entity\ContentEntityInterface $entity */
+  if (!$entity instanceof \Drupal\Core\Entity\ContentEntityInterface) {
+    return;
+  }
+
+
+  if ($result = _geocoder_ajax_prepopulate_geocode($entity, $destination_field_name)) {
+    // We put the result in the entity to be able to get the value in the format
+    // needed by the field.
+    $entity->set($destination_field_name, $result);
+    $value = $entity->get($destination_field_name)->getValue();
+
+    // Update the field input with the geocoding result.
+    $input = $form_state->getUserInput();
+    \Drupal\Component\Utility\NestedArray::setValue($input, $destination_element['#parents'], $value[$destination_element['#delta']]);
+    $form_state->setUserInput($input);
+  }
+}
+
+/**
+ * @see geocoder_field_entity_presave().
+ */
+function _geocoder_ajax_prepopulate_geocode($entity, $field_name) {
+
+  /** @var \Drupal\geocoder_field\PreprocessorPluginManager $preprocessor_manager */
+  $preprocessor_manager = \Drupal::service('plugin.manager.geocoder.preprocessor');
+  /** @var \Drupal\geocoder\DumperPluginManager $dumper_manager */
+  $dumper_manager = \Drupal::service('plugin.manager.geocoder.dumper');
+
+  $geocoder_config = \Drupal::configFactory()->get('geocoder.settings');
+  $geocoder_plugins_options = (array) $geocoder_config->get('plugins_options');
+
+  $field = $entity->get($field_name);
+  /** @var \Drupal\Core\Field\FieldConfigInterface $field_config */
+  $field_config = $field->getFieldDefinition();
+
+  $geocoder = $field_config->getThirdPartySettings('geocoder_field');
+
+  $remote_field = $entity->get($geocoder['geocode_field']);
+
+  if (isset($remote_field)) {
+    if (empty($remote_field->getValue()) && $geocoder['failure']['handling'] == 'preserve') {
+      return NULL;
+    }
+
+    // Pre-process field.
+    $preprocessor_manager->preprocess($remote_field);
+
+    /** @var \Drupal\geocoder\DumperInterface|\Drupal\Component\Plugin\PluginInspectionInterface $dumper */
+    $dumper = $dumper_manager->createInstance($geocoder['dumper']);
+    $default_values = $entity->get($field_name);
+    $result = [];
+
+    foreach ($remote_field->getValue() as $delta => $value) {
+      /* @var \Geocoder\Model\AddressCollection $address_collection */
+
+      $failure_status_message = t("Unable to geocode '@text'.", ['@text' => $value['value']]);
+      $address_collection = \Drupal::service('geocoder')
+        ->geocode($value['value'], $geocoder['plugins'], $geocoder_plugins_options);
+
+      if ($address_collection) {
+        // We only handle default delta handling: just pass one delta to the next.
+
+        $result[$delta] = $dumper->dump($address_collection->first());
+
+        // Check|Fix some incompatibility between Dumper output and
+        // Field Config.
+        $dumper_manager->fixDumperFieldIncompatibility($result[$delta], $dumper, $field_config);
+
+        // If an Address field is being processed, transform its Dumper
+        // string result into array to comply to Address entity->set Api.
+        if ($field_config->getType() == 'address' && $dumper->getPluginId() == 'geojson') {
+          $result[$delta] = $dumper_manager->setAddressFieldFromGeojson($result[$delta]);
+        }
+        // Or an Address Country field is being processed ...
+        if ($field_config->getType() === 'address_country' && $dumper->getPluginId() === 'geojson') {
+          $result[$delta] = $dumper_manager->setCountryFromGeojson($result[$delta]);
+        }
+
+        return $result;
+      }
+      // We always preserve the default value if geocoding fails.
+      $result[$delta] = isset($default_values[$delta]) ? $default_values[$delta]->getValue() : NULL;
+
+      // Display a status message.
+      if ($geocoder['failure']['status_message']) {
+        drupal_set_message($failure_status_message, 'warning');
+      }
+      // Log the failure.
+      if ($geocoder['failure']['log']) {
+        \Drupal::logger('geocoder')
+          ->warning($failure_status_message);
+      }
+    }
+    return $result;
+  }
+  return NULL;
+}
+
+/**
+ * AJAX callback for the button.
+ */
+function geocoder_ajax_prepopulate_ajax(array &$form, \Drupal\Core\Form\FormStateInterface $form_state): \Drupal\Core\Ajax\AjaxResponse {
+  // Simply get the part of the form that has been updated by the validate
+  // callback, and use it as replacement.
+  $element = _geocoder_ajax_prepopulate_get_value_element($form, $form_state);
+  $selector = '[data-drupal-selector="' . $element['#attributes']['data-drupal-selector'] . '"]';
+  $response = new \Drupal\Core\Ajax\AjaxResponse();
+  $response->addCommand(new \Drupal\Core\Ajax\ReplaceCommand($selector, $element));
+
+  // We also make sure that a change event is triggered on all the elements of
+  // the field. This is needed at least for Geofield Map widgets.
+  $response->addCommand(new \Drupal\Core\Ajax\InvokeCommand($selector . ' :input', 'change', []));
+
+  // Show the messages above the field.
+  if ($messages = \Drupal\Core\Render\Element\StatusMessages::renderMessages(NULL)) {
+    $response->addCommand(new \Drupal\Core\Ajax\PrependCommand($selector, $messages));
+  }
+  return $response;
+}
+
+/**
+ * Get the geofield value element from the clicked button.
+ */
+function _geocoder_ajax_prepopulate_get_value_element(array &$form, \Drupal\Core\Form\FormStateInterface $form_state): array {
+  $keys = $form_state->getTriggeringElement()['#array_parents'];
+  array_pop($keys);
+  return \Drupal\Component\Utility\NestedArray::getValue($form, $keys);
+}
+
