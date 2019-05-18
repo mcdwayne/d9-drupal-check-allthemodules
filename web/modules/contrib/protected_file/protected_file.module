@@ -1,0 +1,378 @@
+<?php
+
+/**
+ * @file
+ * Contains protected_file.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Template\Attribute;
+use Drupal\Core\Url;
+use Drupal\Core\Link;
+use Drupal\file\Entity\File;
+use Drupal\Core\Entity\EntityStorageInterface;
+use Drupal\Core\Entity\FieldableEntityInterface;
+use Drupal\Core\Entity\ContentEntityInterface;
+
+/**
+ * Implements hook_help().
+ */
+function protected_file_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the pbf module.
+    case 'help.page.protected_file':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Manage access download to file uploaded under a private file system') . '</p>';
+      $output .= '<pre>' . file_get_contents(__DIR__ . '/README.txt') . '</pre>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function protected_file_theme() {
+  return [
+    'protected_file_link' => [
+      'variables' => [
+        'file' => NULL,
+        'description' => NULL,
+        'entity' => NULL,
+        'field_name' => '',
+        'settings' => [],
+        'protected' => NULL,
+        'attributes' => [],
+      ],
+    ],
+    'protected_file_widget_multiple' => [
+      'render element' => 'element',
+    ],
+  ];
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK_alter().
+ */
+function protected_file_theme_suggestions_protected_file_link_alter(array &$suggestions, array $variables) {
+  $entity = $variables['entity'];
+  if ($entity instanceof ContentEntityInterface) {
+    $bundle = $entity->bundle();
+    $field_name = $variables['field_name'];
+    $suggestions[] = 'protected_file_link__' . $field_name;
+    $suggestions[] = 'protected_file_link__' . $bundle;
+    $suggestions[] = 'protected_file_link__' . $bundle . '__' . $field_name;
+  }
+}
+
+/**
+ * Prepares variables for multi protected file form widget templates.
+ *
+ * Default template: protected-file-widget-multiple.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - element: A render element representing the widgets.
+ *
+ * @See template_preprocess_file_widget_multiple().
+ */
+function template_preprocess_protected_file_widget_multiple(&$variables) {
+  $element = $variables['element'];
+
+  // Special ID and classes for draggable tables.
+  $weight_class = $element['#id'] . '-weight';
+  $table_id = $element['#id'] . '-table';
+
+  // Build up a table of applicable fields.
+  $headers = array();
+  $headers[] = t('File information');
+  if ($element['#display_field']) {
+    $headers[] = array(
+      'data' => t('Display'),
+      'class' => array('checkbox'),
+    );
+  }
+  $headers[] = t('Protected');
+  $headers[] = t('Weight');
+  $headers[] = t('Operations');
+
+  // Get our list of widgets in order (needed when the form comes back after
+  // preview or failed validation).
+  $widgets = array();
+  foreach (Element::children($element) as $key) {
+    $widgets[] = &$element[$key];
+  }
+  usort($widgets, '_field_multiple_value_form_sort_helper');
+
+  $rows = array();
+  foreach ($widgets as $key => &$widget) {
+    // Save the uploading row for last.
+    if (empty($widget['#files'])) {
+      $widget['#title'] = $element['#file_upload_title'];
+      $widget['#description'] = \Drupal::service('renderer')->renderPlain($element['#file_upload_description']);
+      continue;
+    }
+
+    // Delay rendering of the buttons, so that they can be rendered later in the
+    // "operations" column.
+    $operations_elements = array();
+    foreach (Element::children($widget) as $sub_key) {
+      if (isset($widget[$sub_key]['#type']) && $widget[$sub_key]['#type'] == 'submit') {
+        hide($widget[$sub_key]);
+        $operations_elements[] = &$widget[$sub_key];
+      }
+    }
+
+    // Delay rendering of the "Display" option and the weight selector, so that
+    // each can be rendered later in its own column.
+    if ($element['#display_field']) {
+      hide($widget['display']);
+    }
+    hide($widget['protected_file']);
+    hide($widget['_weight']);
+
+    // Render everything else together in a column, without the normal wrappers.
+    $widget['#theme_wrappers'] = array();
+    $information = drupal_render($widget);
+    $display = '';
+    if ($element['#display_field']) {
+      unset($widget['display']['#title']);
+      $display = array(
+        'data' => render($widget['display']),
+        'class' => array('checkbox'),
+      );
+    }
+
+    unset($widget['protected_file']['#title']);
+    $protected = array(
+      'data' => render($widget['protected_file']),
+      'class' => array('checkbox'),
+    );
+
+    $widget['_weight']['#attributes']['class'] = array($weight_class);
+    $weight = render($widget['_weight']);
+
+    // Arrange the row with all of the rendered columns.
+    $row = array();
+    $row[] = $information;
+    if ($element['#display_field']) {
+      $row[] = $display;
+    }
+    $row[] = $protected;
+    $row[] = $weight;
+
+    // Show the buttons that had previously been marked as hidden in this
+    // preprocess function. We use show() to undo the earlier hide().
+    foreach (Element::children($operations_elements) as $key) {
+      show($operations_elements[$key]);
+    }
+    $row[] = array(
+      'data' => $operations_elements,
+    );
+    $rows[] = array(
+      'data' => $row,
+      'class' => isset($widget['#attributes']['class']) ? array_merge($widget['#attributes']['class'], array('draggable')) : array('draggable'),
+    );
+  }
+
+  $variables['table'] = array(
+    '#type' => 'table',
+    '#header' => $headers,
+    '#rows' => $rows,
+    '#attributes' => array(
+      'id' => $table_id,
+    ),
+    '#tabledrag' => array(
+      array(
+        'action' => 'order',
+        'relationship' => 'sibling',
+        'group' => $weight_class,
+      ),
+    ),
+    '#access' => !empty($rows),
+  );
+
+  $variables['element'] = $element;
+}
+
+/**
+ * Prepares variables for file link templates.
+ *
+ * Default template: protected-file-link.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - file: A file object to which the link will be created.
+ *   - icon_directory: (optional) A path to a directory of icons to be used for
+ *     files. Defaults to the value of the "icon.directory" variable.
+ *   - description: A description to be displayed instead of the filename.
+ *   - attributes: An associative array of attributes to be placed in the a tag.
+ */
+function template_preprocess_protected_file_link(&$variables) {
+  $file = $variables['file'];
+  $settings = $variables['settings'];
+  $protected = $variables['protected'];
+  $redirect_path = ($settings['protected_file_path']) ? $settings['protected_file_path'] : 'internal:/user/login';
+  $message = ($settings['protected_file_message']) ? $settings['protected_file_message'] : t('Protected file');
+  $redirect_to_file = $settings['redirect_to_file'];
+  $current_user = \Drupal::currentUser();
+
+  $variables['icon'] = '';
+  $options = array();
+
+  $file_entity = ($file instanceof File) ? $file : File::load($file->fid);
+
+  // @todo Wrap in file_url_transform_relative(). This is currently
+  // impossible. As a work-around, we currently add the 'url.site' cache context
+  // to ensure different file URLs are generated for different sites in a
+  // multisite setup, including HTTP and HTTPS versions of the same site.
+  // Fix in https://www.drupal.org/node/2646744.
+  $url = file_create_url($file_entity->getFileUri());
+  $variables['#cache']['contexts'][] = 'url.site';
+  $variables['#cache']['contexts'][] = 'user.permissions';
+
+  $mime_type = $file->getMimeType();
+  // Set options as per anchor format described at
+  // http://microformats.org/wiki/file-format-examples
+  $options['attributes']['type'] = $mime_type . '; length=' . $file->getSize();
+
+  // Add an aria-label attributes about the file size.
+  $size = $file_entity->getSize();
+  if ($size) {
+    $options['attributes']['aria-label'] = t('File size @size ko', ['@size' => round($size / 1024)]);
+  }
+
+  // Use the description as the link text if available.
+  if (empty($variables['description'])) {
+    $link_text = $file_entity->getFilename();
+  }
+  else {
+    $link_text = $variables['description'];
+    $options['attributes']['title'] = $file_entity->getFilename();
+  }
+
+  // Classes to add to the file field for icons.
+  $classes = [
+    'file',
+    // Add a specific class for each and every mime type.
+    'file--mime-' . strtr($mime_type, ['/' => '-', '.' => '-']),
+    // Add a more general class for groups of well known MIME types.
+    'file--' . file_icon_class($mime_type),
+  ];
+
+  if ($settings['protected_file_new_window']) {
+    $options['attributes']['target'] = '_blank';
+  }
+
+  // Set file classes to the options array.
+  $variables['attributes'] = new Attribute($variables['attributes']);
+  $variables['attributes']->addClass($classes);
+
+  // Display a lock on protected file anyway.
+  if ($protected) {
+    $variables['icon'] = [
+      '#markup' => '<i class="fa fa-lock" aria-hidden="true"></i>',
+    ];
+  }
+
+  if (!$current_user->hasPermission('download protected file') && $protected) {
+    $variables['attributes']->addClass('file--protected');
+    if ($redirect_to_file) {
+      $redirect_uri = file_url_transform_relative(file_create_url($file_entity->getFileUri()));
+    }
+    else {
+      $redirect_uri = \Drupal::request()->getRequestUri();
+    }
+
+    $options['attributes']['title'] = $message;
+    $options['query']['destination'] = $redirect_uri;
+    if ($settings['protected_file_modal']) {
+      $options['attributes']['class'][] = 'use-ajax';
+      $options['attributes']['data-dialog-type'] = 'modal';
+      $variables['#attached']['library'][] = 'core/drupal.dialog.ajax';
+    }
+
+    if ((strpos($redirect_path, '/') !== 0)) {
+      $redirect_path = '/' . $redirect_path;
+    }
+
+    $variables['link'] = Link::fromTextAndUrl($link_text, Url::fromUserInput($redirect_path, $options));
+  }
+
+  else {
+    $variables['link'] = Link::fromTextAndUrl($link_text, Url::fromUri($url, $options));
+  }
+}
+
+/**
+ * Implements hook_file_download().
+ *
+ * @See file_file_download().
+ */
+function protected_file_file_download($uri) {
+  // Get the file record based on the URI. If not in the database just return.
+  /** @var \Drupal\file\FileInterface[] $files */
+  $files = \Drupal::entityTypeManager()
+            ->getStorage('file')
+            ->loadByProperties(array('uri' => $uri));
+
+  if (count($files)) {
+    foreach ($files as $item) {
+      // Since some database servers sometimes use a case-insensitive comparison
+      // by default, double check that the filename is an exact match.
+      if ($item->getFileUri() === $uri) {
+        $file = $item;
+        break;
+      }
+    }
+  }
+  /** @var \Drupal\file\FileInterface $file */
+  if (!isset($file)) {
+    return;
+  }
+
+  // Stop processing if there are no references in order to avoid returning
+  // headers for files controlled by other modules. Make an exception for
+  // temporary files where the host entity has not yet been saved (for example,
+  // an image preview on a node/add form) in which case, allow download by the
+  // file's owner.
+  $references = file_get_file_references($file, NULL, EntityStorageInterface::FIELD_LOAD_CURRENT, 'protected_file');
+  if (empty($references) && ($file->isPermanent() || $file->getOwnerId() != \Drupal::currentUser()->id())) {
+    return;
+  }
+
+  // Find out which (if any) entity  fields of this type contain the file and
+  // fetch the values stored with the field protected_file from the entity.
+  $values = [];
+  if (!empty($references)) {
+    foreach ($references as $field_name => $entities_type) {
+      foreach ($entities_type as $entity_type_id => $entities) {
+        foreach ($entities as $entity_id => $entity) {
+          if ($entity instanceof FieldableEntityInterface) {
+            $values = $entity->{$field_name}->getValue();
+          }
+        }
+      }
+    }
+  }
+
+  // Check if the file is mark as protected.
+  if (!empty($values)) {
+    foreach ($values as $value) {
+      if ($value['target_id'] == $file->id() && $value['protected_file'] == 1) {
+        $current_user = \Drupal::currentUser();
+        // Deny download file for current user without permission.
+        if (!$current_user->hasPermission('download protected file')) {
+          return -1;
+        }
+      }
+    }
+  }
+
+  // Access is granted.
+  $headers = file_get_content_headers($file);
+  return $headers;
+}
