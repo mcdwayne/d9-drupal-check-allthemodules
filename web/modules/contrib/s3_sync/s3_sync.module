@@ -1,0 +1,295 @@
+<?php
+
+use Aws\S3\S3Client;
+use Aws\S3\Transfer;
+use Aws\S3\Exception\S3Exception;
+use Aws\Credentials\Credentials;
+use GuzzleHttp\Promise\Promise;
+
+function s3_sync_rebuild() {
+    syncFiles();
+}
+
+function s3_sync_preprocess_html() {
+    syncFiles();
+}
+
+function s3_sync_css_alter() {
+//    syncFiles();
+}
+
+function s3_sync_js_alter() {
+//    syncFiles();
+}
+
+function s3_sync_file_create() {
+//    syncFiles();
+}
+
+function s3_sync_file_delete() {
+//    syncFiles();
+}
+
+function s3_sync_entity_create() {
+    \Drupal::messenger()->addMessage('Something happened!');
+}
+
+/**
+ * This function updates the trees for the local and s3 filesystems, and stores them in the module's settings.
+ */
+
+function updateTrees() {
+    $config = \Drupal::configFactory()->getEditable('s3_sync.settings');
+    if ($config->get('mode') && $config->get('aws_region') && $config->get('bucket_name') && $config->get('access_key') && $config->get('secret_key')){
+        $localCSS = getFiles('public://css');
+        foreach ($localCSS as $value => $fileKey) {
+            $localCSS[$value] = str_replace('public://', '', $localCSS[$value]);
+        }
+        $localJS = getFiles('public://js');
+        foreach ($localJS as $value => $fileKey) {
+            $localJS[$value] = str_replace('public://', '', $localJS[$value]);
+        }
+        $creds = new Credentials($config->get('access_key'), $config->get('secret_key'));
+        $client = new S3Client([
+            'credentials' => $creds,
+            'region' => $config->get('aws_region'),
+            'version' => 'latest'
+        ]);
+        $s3Keys = $client->listObjects([
+            'Bucket' => $config->get('bucket_name')
+        ])->get('Contents');
+        $s3CSS = [];
+        $s3JS = [];
+        foreach ($s3Keys as $value => $s3Key) {
+            if (strpos($s3Keys[$value], 'css/')) $s3CSS[$value] = $s3Keys[$value]['Key'];
+            if (strpos($s3Keys[$value], 'js/')) $s3JS[$value] = $s3Keys[$value]['Key'];
+        }
+        $config->set('local_css', $localCSS)
+            ->set('local_js', $localJS)
+            ->set('s3_css', $s3CSS)
+            ->set('s3_js', $s3JS)
+            ->save();
+    }
+}
+
+/**
+ * This is the function that actually does the file syncing. It's in a separate function
+ * so that the button on the config menu will work the way it should. Also, it made
+ * the hooks' code look cleaner.
+ */
+
+function syncFiles() {
+    $config = \Drupal::configFactory()->getEditable('s3_sync.settings');
+
+    $values['mode'] = $config->get('mode');
+    $values['aws_region'] = $config->get('aws_region');
+    $values['bucket_name'] = $config->get('bucket_name');
+    $values['access_key'] = $config->get('access_key');
+    $values['secret_key'] = $config->get('secret_key');
+    $values['public_path'] = str_replace(DRUPAL_ROOT . '/', '', \Drupal::service('file_system')->realpath('public://'));
+
+    // Check to see if needed values are set
+    if (!$values['mode'] || !$values['aws_region'] || !$values['bucket_name'] || !$values['access_key'] || !$values['secret_key']) {
+        $errorMessage = 'S3 Sync Error - The following values have not been set: ';
+        if (!$values['mode']) $errorMessage .= 'Sync Mode, ';
+        if (!$values['aws_region']) $errorMessage .= 'AWS Region, ';
+        if (!$values['bucket_name']) $errorMessage .= 'S3 Bucket Name, ';
+        if (!$values['access_key']) $errorMessage .= 'AWS Access Key, ';
+        if (!$values['secret_key']) $errorMessage .= 'AWS Secret Key,';
+        \Drupal::logger('s3_sync')->error($errorMessage);
+        return;
+    }
+
+
+    $creds = new Credentials($values['access_key'], $values['secret_key']);
+    $values['client'] = new S3Client([
+        'credentials' => $creds,
+        'region' => $values['aws_region'],
+        'version' => 'latest'
+    ]);
+
+    // Put all object keys into array.
+    $values['bucket_keys'] = [];
+    try {
+        $objects = $values['client']->listObjects([
+            'Bucket' => $values['bucket_name']
+        ])->get('Contents');
+    }
+    catch (S3Exception $e) {
+        \Drupal::messenger()->addError('Did not start transfer due to exception caught while listing objects. Check recent logs for more details.');
+        \Drupal::logger('s3_sync')->error('Caught S3Exception while listing objects in s3://' . $values['bucket_name'] . ': ' . $e->getMessage());
+        return;
+    }
+    foreach($objects as $object) {
+        $values['bucket_keys'][] = $object['Key'];
+    }
+
+    // Get all files from public file directory in form of keys
+    $values['file_keys'] = getFiles($values['public_path']);
+    foreach ($values['file_keys'] as $key => $file) {
+        $values['file_keys'][$key] = str_replace($values['public_path'] . '/', '', $file);
+    }
+//    $config->set('s3_files', $values['bucket_keys'])
+//        ->set('local_files', $values['file_keys'])
+//        ->save();
+
+    // Main code put in promise, because running this without the promise makes the
+    // site run slowly.
+    $promise = new Promise();
+    switch ($values['mode']) {
+        case 'single_instance':
+            $promise->then(
+                function($values) {
+                    // Check for files to copy to bucket
+                    $exceptionThrown = false;
+                    foreach ($values['file_keys'] as $file) {
+                        if (!in_array($file, $values['bucket_keys'])) {
+                            // Copy file to bucket
+                            try {
+                                $values['client']->putObject([
+                                    'Bucket' => $values['bucket_name'],
+                                    'Key' => $file,
+                                    'SourceFile' => $values['public_path'] . '/' . $file
+                                ]);
+                            }
+                            catch (S3Exception $e) {
+                                \Drupal::logger('s3_sync')->error('Caught S3Exception while copying file ' . $values['public_path'] . '/' . $file . ' to S3: ' . $e->getMessage());
+                                $exceptionThrown = true;
+                            }
+                            catch (Exception $e) {
+                                \Drupal::logger('s3_sync')->error('Caught Exception while copying file ' . $values['public_path'] . '/' . $file . ' to S3: ' . $e->getMessage());
+                                $exceptionThrown = true;
+                            }
+                        }
+                    }
+
+                    // Check for files to delete from bucket
+                    foreach ($values['bucket_keys'] as $bucketKey) {
+                        if (!in_array($bucketKey, $values['file_keys'])) {
+                            try {
+                                $values['client']->deleteObject([
+                                    'Bucket' => $values['bucket_name'],
+                                    'Key' => $bucketKey
+                                ]);
+                            }
+                            catch (S3Exception $e) {
+                                \Drupal::logger('s3_sync')->error('Caught S3Exception while deleting object ' . $bucketKey . ': ' . $e->getMessage());
+                                $exceptionThrown = true;
+                            }
+                            catch (Exception $e) {
+                                \Drupal::logger('s3_sync')->error('Caught Exception while deleting object ' . $bucketKey . ': ' . $e->getMessage());
+                                $exceptionThrown = true;
+                            }
+                        }
+                    }
+
+                    if (!$exceptionThrown) {
+                        \Drupal::logger('s3_sync')->info('Transfer to s3://' . $values['bucket_name'] . ' successful.');
+                    }
+                    else {
+                        \Drupal::logger('s3_sync')->warning('Transfer to s3://' . $values['bucket_name'] . ' finsihed with errors.');
+                    }
+                }
+            );
+//            \Drupal::messenger()->addStatus('Started transfer of public files to s3://' . $values['bucket_name']);
+            break;
+        case 'multi_instance':
+            $promise->then(
+                function($values) {
+                    $exceptionThrown = false; // Variable to check if exception was thrown
+                    $dest = 's3://' . $values['bucket_name'];
+                    $source = $values['public_path'];
+                    try {
+                        $manager = new Transfer($values['client'], $source, $dest);
+                        $manager->transfer();
+                    }
+                    catch (S3Exception $e) {
+                        \Drupal::logger('s3_sync')->error('Caught S3Exception while uploading to S3: ' . $e->getMessage());
+                        $exceptionThrown = true;
+                    }
+                    catch (Exception $e) {
+                        \Drupal::logger('s3_sync')->error('Caught Exception while uploading to S3: ' . $e->getMessage());
+                        $exceptionThrown = true;
+                    }
+
+                    $directories = getDirs($values['bucket_keys']);
+                    foreach($directories as $directory) {
+                        $realpath = $values['public_path'] . '/' . $directory;
+                        if (!file_exists($realpath)) {
+                            mkdir($realpath, 0755, TRUE);
+                        }
+                    }
+                    foreach($values['bucket_keys'] as $bucketKey) {
+                        if (!file_exists($values['public_path'] . '/' . $bucketKey)) {
+                            try {
+                                $values['client']->getObject([
+                                    'Bucket' => $values['bucket_name'],
+                                    'Key' => $bucketKey,
+                                    'SaveAs' => $values['public_path'] . '/' . $bucketKey
+                                ]);
+                            }
+                            catch (S3Exception $e) {
+                                \Drupal::logger('s3_sync')->error('Caught S3Exception while getting object ' . $bucketKey . ': ' . $e->getMessage());
+                                $exceptionThrown = true;
+                            }
+                            catch (Exception $e) {
+                                \Drupal::logger('s3_sync')->error('Caught Exception while getting object ' . $bucketKey . ': ' . $e->getMessage());
+                                $exceptionThrown = true;
+                            }
+
+                        }
+                    }
+
+                    if (!$exceptionThrown) {
+                        \Drupal::logger('s3_sync')->info('Transfer to s3://' . $values['bucket_name'] . ' successful.');
+                    }
+                    else {
+                        \Drupal::logger('s3_sync')->warning('Transfer to s3://' . $values['bucket_name'] . ' finished with errors.');
+                    }
+                }
+            );
+            break;
+        default:
+            \Drupal::messenger()->addError('Please set sync mode for S3 Sync');
+            return;
+    }
+
+    $promise->resolve($values);
+//    \Drupal::messenger()->addStatus('Started transfer of public files to s3://' . $values['bucket_name']);
+}
+
+/**
+ * Recursively gets every filename with the relative path to the path parameter passed
+ * in. This is for use with syncing the local directory with our S3 bucket.
+ *
+ * @param string $path Path to directory to recursively search.
+ * @param array $results Results array purely for making the recursion work.
+ * @return array Array of files with their paths.
+ */
+
+function getFiles($path, &$results = []) {
+    $files = scandir($path);
+    foreach ($files as $file) {
+        $realpath = $path . '/' . $file;
+        if (is_file($realpath) && $file != '.' && $file != '..') {
+            $results[] = $realpath;
+        }
+        else if ($file != '.' && $file != '..') {
+            getFiles($realpath, $results);
+        }
+    }
+    return $results;
+}
+
+function getDirs(array $files) {
+    $directories = [];
+    foreach ($files as $key => $file) {
+        $tmpVar = explode('/', $file);
+        array_pop($tmpVar);
+        $directory = implode('/', $tmpVar);
+        if (!in_array($directory, $directories)) {
+            $directories[] = $directory;
+        }
+    }
+    return $directories;
+}
