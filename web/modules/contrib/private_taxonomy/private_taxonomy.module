@@ -1,0 +1,896 @@
+<?php
+
+/**
+ * @file
+ * A module to enable taxonomy terms per user.
+ *
+ * Vocabularies can be marked as private, enabling users to create and maintain
+ * their own terms for those vocabularies.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\Access\AccessResult;
+use Drupal\taxonomy\Entity\Vocabulary;
+use Drupal\taxonomy\Entity\Term;
+use Drupal\Component\Utility\Html;
+use Drupal\user\Entity\User;
+
+/**
+ * Implements hook_ENTITY_TYPE_access() for taxonomy_vocabulary().
+ */
+function private_taxonomy_taxonomy_vocabulary_access(
+  EntityInterface $entity,
+  $operation,
+  AccountInterface $account) {
+
+  if ($entity->getEntityTypeId() == 'taxonomy_vocabulary' &&
+    $operation == 'view') {
+
+    if ($account->hasPermission('administer own taxonomy') ||
+      $account->hasPermission('view private taxonomies')) {
+
+      return AccessResult::allowed();
+    }
+  }
+  // No opinion.
+  return AccessResult::neutral();
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_access() for taxonomy_term().
+ */
+function private_taxonomy_taxonomy_term_access(
+  EntityInterface $entity,
+  $operation,
+  AccountInterface $account) {
+
+  $tid = $entity->id();
+  $term = Term::load($tid);
+  if ($operation == 'update') {
+    if ($account->hasPermission('edit own terms in ' .
+      $term->bundle())) {
+
+      return AccessResult::allowed();
+    }
+  }
+  if ($operation == 'delete') {
+    if ($account->hasPermission('delete own terms in ' .
+      $term->bundle())) {
+
+      return AccessResult::allowed();
+    }
+  }
+  // No opinion.
+  return AccessResult::neutral();
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_create_access() for taxonomy_term().
+ */
+function private_taxonomy_taxonomy_term_create_access(
+  $account,
+  array $context,
+  $entity_bundle) {
+
+  if ($account->hasPermission('administer own taxonomy')) {
+    return AccessResult::allowed();
+  }
+  // No opinion.
+  return AccessResult::neutral();
+}
+
+/**
+ * Clone terms to existing users.
+ *
+ * @param string $user_name
+ *   Terms belonging to this user are cloned to all other users.
+ *
+ * @return int
+ *   Number of users which received cloned terms.
+ */
+function private_taxonomy_create_terms($user_name) {
+  $sql = \Drupal::database()->select('user_term', 'user_term');
+  $sql->join('users_field_data', 'users', 'user_term.uid = users.uid');
+  $count = $sql->condition('users.name', $user_name)
+    ->countQuery()
+    ->execute()
+    ->fetchField();
+  if ($count == 0) {
+    return $count;
+  }
+  // Iterates over all the users other than the anonymous user.
+  $accounts = \Drupal::database()->select('users', 'u')
+    ->fields('u', ['uid'])
+    ->condition('u.uid', 0, '>')
+    ->execute();
+  $count = 0;
+  foreach ($accounts as $account) {
+    if (private_taxonomy_clone_terms($account->uid)) {
+      $count++;
+    }
+  }
+  return $count;
+}
+
+/**
+ * Implements hook_query_QUERY_ID_alter().
+ *
+ * For term_access.
+ */
+function private_taxonomy_query_term_access_alter($query) {
+  $conditions =& $query->conditions();
+  // Condition could be vocabulary ID or term ID.
+  foreach ($conditions as $condition) {
+    if (is_array($condition) && is_string($condition['field']) &&
+      !empty($condition['field'])) {
+
+      if (strpos($condition['field'], ".")) {
+        list($table, $field) = explode('.', $condition['field']);
+      }
+      else {
+        $field = $condition['field'];
+      }
+      if ($field == 'vid') {
+        if (is_array($condition['value'])) {
+          $flag = FALSE;
+          foreach ($condition['value'] as $vid) {
+            if (private_taxonomy_is_vocabulary_private($vid)) {
+              $flag = TRUE;
+              break;
+            }
+          }
+          if (!$flag) {
+            return;
+          }
+        }
+        else {
+          $vid = $condition['value'];
+          if (!private_taxonomy_is_vocabulary_private($vid)) {
+            return;
+          }
+        }
+      }
+      if ($field == 'tid') {
+        $tid = $condition['value'];
+        if (!private_taxonomy_is_term_private($tid)) {
+          return;
+        }
+      }
+      if ($field == 'parent') {
+        if ($condition['value'] === 0) {
+          return;
+        }
+        else {
+          if (!private_taxonomy_is_term_private($condition['value'])) {
+            return;
+          }
+        }
+      }
+      if ($field == 'uuid') {
+        if (is_array($condition['value'])) {
+          $flag = FALSE;
+          foreach ($condition['value'] as $uuid) {
+            if (private_taxonomy_is_term_uuid_private($uuid)) {
+              $flag = TRUE;
+              break;
+            }
+          }
+          if (!$flag) {
+            return;
+          }
+        }
+        else {
+          $uuid = $condition['value'];
+          if (!private_taxonomy_is_term_uuid_private($uuid)) {
+            return;
+          }
+        }
+      }
+    }
+  }
+
+  $tables =& $query->getTables();
+  // Get the term alias.
+  $term_alias = '';
+  foreach ($tables as $table) {
+    if ($table['table'] == 'taxonomy_term_field_data') {
+      if (!is_array($table) || !is_string($table['alias'])) {
+        // Should always exist but if it does not bail out.
+        return;
+      }
+      $term_alias = $table['alias'];
+    }
+  }
+
+  $user = \Drupal::currentUser();
+  if ($user->hasPermission('administer taxonomy') ||
+    $user->hasPermission('view private taxonomies')) {
+
+    if (isset($_SESSION['private_taxonomy']['filter']) &&
+      mb_substr(\Drupal::service('path.current')->getPath(), 0, 25) == 'admin/structure/taxonomy/') {
+
+      $name = $_SESSION['private_taxonomy']['filter'];
+      $uid = \Drupal::database()->select('users_field_data', 'ufd')
+        ->condition('ufd.name', $name)
+        ->fields('ufd', ['uid'])
+        ->execute()
+        ->fetchField();
+      $query->leftJoin('user_term', 'user_term',
+        $term_alias . '.tid=user_term.tid');
+      $query->condition('user_term.uid', $uid);
+    }
+  }
+  else {
+    $query->leftJoin('user_term', 'user_term',
+      $term_alias . '.tid=user_term.tid');
+    $query->condition('user_term.uid', $user->id());
+  }
+}
+
+/**
+ * Implements hook_taxonomy_term_insert().
+ */
+function private_taxonomy_taxonomy_term_insert($term) {
+  private_taxonomy_taxonomy_term_update($term);
+}
+
+/**
+ * Implements hook_taxonomy_term_update().
+ */
+function private_taxonomy_taxonomy_term_update($term) {
+  if (private_taxonomy_is_term_private($term->id())) {
+    $user = \Drupal::currentUser();
+    $count = \Drupal::database()->select('user_term', 'user_term')
+      ->condition('tid', $term->id())
+      ->countQuery()
+      ->execute()
+      ->fetchField();
+    if ($count == 0) {
+      // If owner has not been set yet do it here.
+      $result = \Drupal::database()->insert('user_term')
+        ->fields(['uid' => $user->id(), 'tid' => $term->id()])
+        ->execute();
+    }
+  }
+}
+
+/**
+ * Implements hook_taxonomy_term_delete().
+ */
+function private_taxonomy_taxonomy_term_delete($term) {
+  if (private_taxonomy_is_term_private($term->id())) {
+    \Drupal::database()->delete('user_term')
+      ->condition('tid', $term->id())
+      ->execute();
+  }
+}
+
+/**
+ * Retrieves the public or private status of a vocabulary.
+ *
+ * Returns TRUE if the vocabulary is private.
+ *
+ * @param string $vid
+ *   Vocabulary Id.
+ *
+ * @return bool
+ *   TRUE if the specified vocabulary is private; otherwise, FALSE.
+ */
+function private_taxonomy_is_vocabulary_private($vid) {
+  if ($vid == '') {
+    return FALSE;
+  }
+  $vocabulary = Vocabulary::load($vid);
+  $private = $vocabulary->getThirdPartySetting('private_taxonomy', 'private');
+  if (!is_null($private)) {
+    return $private;
+  }
+  return FALSE;
+}
+
+/**
+ * Retrieves the public or private status of a vocabulary for terms.
+ *
+ * Returns TRUE if the terms belong to a private vocabulary.
+ *
+ * @param array/int $tid
+ *   Term Id(s).
+ *
+ * @return bool
+ *   TRUE if the term(s) belong to a private vocabulary; otherwise, FALSE.
+ */
+function private_taxonomy_is_term_private($tid) {
+  $sql = \Drupal::database()->select('taxonomy_term_field_data', 'term_data')
+    ->fields('term_data', ['vid']);
+  if (is_array($tid)) {
+    $vids = [];
+    foreach ($tid as $value) {
+      $vids[] = $sql->condition('term_data.tid', $value)
+        ->execute()
+        ->fetchField();
+    }
+    $vids = array_unique($vids);
+    if (count($vids) > 1) {
+      return FALSE;
+    }
+    else {
+      $vid = $vids[0];
+    }
+  }
+  else {
+    $vid = $sql->condition('term_data.tid', $tid)
+      ->execute()
+      ->fetchField();
+  }
+  return private_taxonomy_is_vocabulary_private($vid);
+}
+
+/**
+ * Retrieves the public or private status of a vocabulary for terms.
+ *
+ * Returns TRUE if the terms belong to a private vocabulary.
+ *
+ * @param array/int $uuid
+ *   Term uuid(s).
+ *
+ * @return bool
+ *   TRUE if the term(s) belong to a private vocabulary; otherwise, FALSE.
+ */
+function private_taxonomy_is_term_uuid_private($uuid) {
+  $sql = \Drupal::database()->select('taxonomy_term_data', 'term_data')
+    ->fields('term_data', ['vid']);
+  if (is_array($uuid)) {
+    $vids = [];
+    foreach ($uuid as $value) {
+      $vids[] = $sql->condition('term_data.uuid', $value)
+        ->execute()
+        ->fetchField();
+    }
+    $vids = array_unique($vids);
+    if (count($vids) > 1) {
+      return FALSE;
+    }
+    else {
+      $vid = $vids[0];
+    }
+  }
+  else {
+    $vid = $sql->condition('term_data.uuid', $uuid)
+      ->execute()
+      ->fetchField();
+  }
+  return private_taxonomy_is_vocabulary_private($vid);
+}
+
+/**
+ * Retrieve the user that owns a term.
+ *
+ * Returns the user uid that owns a particular term in a private vocabulary.
+ *
+ * @param int $tid
+ *   Term Id.
+ *
+ * @return int
+ *   User uid.
+ */
+function private_taxonomy_term_get_user($tid) {
+  $uid = \Drupal::database()->select('user_term', 'ut')
+    ->condition('ut.tid', $tid)
+    ->fields('ut', ['uid'])
+    ->execute()
+    ->fetchField();
+  return $uid;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for taxonomy_overview_vocabularies().
+ */
+function private_taxonomy_form_taxonomy_overview_vocabularies_alter(
+  &$form,
+  FormStateInterface $form_state,
+  $form_id) {
+
+  $user = \Drupal::currentUser();
+  if (!$user->hasPermission('administer taxonomy')) {
+    foreach ($form['vocabularies'] as $key => $value) {
+      if (is_array($value) && isset($value['operations']) &&
+        mb_substr($key, 0, 1) != '#') {
+
+        if (!private_taxonomy_is_vocabulary_private($key)) {
+          unset($form['vocabularies'][$key]);
+          continue;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for taxonomy_overview_terms().
+ */
+function private_taxonomy_form_taxonomy_overview_terms_alter(
+  &$form,
+  FormStateInterface $form_state,
+  $form_id) {
+
+  $user = \Drupal::currentUser();
+  $storage = $form_state->getStorage();
+  $vid = $storage['taxonomy']['vocabulary']->id();
+  if (private_taxonomy_is_vocabulary_private($vid)) {
+    if ($user->hasPermission('administer taxonomy') ||
+      $user->hasPermission('view private taxonomies')) {
+      // Users that can view terms for all users need filtering.
+      $form['filter'] = [
+        '#type' => 'textfield',
+        '#title' => t('Filter by user'),
+        '#size' => 20,
+        '#autocomplete_path' => 'user/autocomplete',
+        '#weight' => 0,
+      ];
+      if (isset($_SESSION['private_taxonomy']['filter'])) {
+        $form['filter']['#default_value']
+          = $_SESSION['private_taxonomy']['filter'];
+      }
+      foreach ($form['terms'] as $key => $item) {
+        if (mb_substr($key, 0, 3) == 'tid') {
+          $tid = (int) $item['#term']->id();
+          $sql = \Drupal::database()->select('user_term', 'user_term');
+          $sql->join('users_field_data', 'ufd', 'ufd.uid = user_term.uid');
+          $name = $sql->condition('user_term.tid', $tid)
+            ->fields('ufd', ['name'])
+            ->execute()
+            ->fetchField();
+          if (strlen($name) > 0) {
+            $form['terms'][$key]['term']['#suffix'] = ' %start_username%' .
+              Html::escape($name) . '%end_username%';
+          }
+        }
+      }
+    }
+    // If there is only one term than taxonomy does not display the Save button.
+    if (!isset($form['actions']['submit'])) {
+      if (isset($form['filter'])) {
+        $form['actions']['submit'] = [
+          '#type' => 'submit',
+          '#value' => t('Save'),
+        ];
+      }
+      $form['#submit'] = [];
+    }
+    $form['#submit'][] = 'private_taxonomy_user_filter';
+    $form['#post_render'][] = 'private_taxonomy_post_render';
+  }
+}
+
+/**
+ * Form post render handler for taxonomy_overview_terms().
+ */
+function private_taxonomy_post_render($html) {
+  $user = \Drupal::currentUser();
+  if ($user->hasPermission('administer taxonomy') ||
+    $user->hasPermission('view private taxonomies')) {
+
+    $html = str_replace('<th>Name</th>', '<th>Name</th><th>Owner</th>', $html);
+    $html = preg_replace('/ %start_username%(.*)%end_username%/', '</td><td>$1', $html);
+  }
+  return $html;
+}
+
+/**
+ * Form submission handler for taxonomy_overview_terms().
+ */
+function private_taxonomy_user_filter($form, FormStateInterface $form_state) {
+  $values = $form_state->getValues();
+  if (isset($values['filter'])) {
+    if (mb_strlen($values['filter']) == 0) {
+      unset($_SESSION['private_taxonomy']['filter']);
+    }
+    else {
+      $_SESSION['private_taxonomy']['filter'] = $values['filter'];
+    }
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function private_taxonomy_form_alter(
+  &$form,
+  FormStateInterface $form_state,
+  $form_id) {
+
+  if (preg_match('/^node_.*_edit_form$/', $form_id)) {
+    // Need to prepend submission handler.
+    $form['actions']['submit']['#submit'] = array_merge(
+      ['private_taxonomy_term_submit'],
+      $form['actions']['submit']['#submit']
+    );
+
+    $user = \Drupal::currentUser();
+    $buildInfo = $form_state->getBuildInfo();
+    $node = $buildInfo['callback_object']->getEntity();
+    foreach ($form as $key => &$value) {
+      if (is_array($value) &&
+        isset($value['#attributes']['class'][0]) &&
+        $value['#attributes']['class'][0] ==
+          'field--type-private-taxonomy-term-reference' &&
+        isset($value['#attributes']['class'][2]) &&
+        $value['#attributes']['class'][2] ==
+          'field--widget-private-taxonomy-autocomplete') {
+
+        $tids = $node->{$key}->getValue();
+        $allowed_values = $node->getFieldDefinition($key)->getSetting('allowed_values')[0]['users'];
+        $terms = [];
+        foreach ($tids as $tid) {
+          if ($user->id() == private_taxonomy_term_get_user($tid['target_id']) || $allowed_values != 'owner') {
+
+            $sql = \Drupal::database()->select('taxonomy_term_field_data', 't');
+            $sql->join('user_term', 'ut', 't.tid = ut.tid');
+            $sql->join('users_field_data', 'u', 'ut.uid = u.uid');
+            $sql->addField('t', 'name', 'term');
+            $sql->addField('u', 'name', 'user');
+            $term = $sql->condition('t.tid', $tid['target_id'])
+              ->execute()
+              ->fetchObject();
+            $terms[] = $term->term . ' (' . $term->user . ')';
+          }
+        }
+        $value['widget']['value']['#default_value'] = implode(', ', $terms);
+      }
+    }
+  }
+
+  if (preg_match('/^taxonomy_term_.*_form$/', $form_id)) {
+    if (private_taxonomy_is_vocabulary_private($form['vid']['#value'])) {
+      if (!empty($form['tid']['#value']) && private_taxonomy_term_get_user($form['tid']['#value'])) {
+        $uid = private_taxonomy_term_get_user($form['tid']['#value']);
+      }
+      else {
+        $uid = \Drupal::currentUser()->id();
+      }
+      $user = User::load($uid);
+      $form['uid'] = [
+        '#type' => 'entity_autocomplete',
+        '#target_type' => 'user',
+        '#selection_settings' => ['include_anonymous' => FALSE],
+        '#title' => t('Owner'),
+        '#maxlength' => 60,
+        '#default_value' => $user,
+        '#weight' => 10,
+        '#access' => \Drupal::currentUser()->hasPermission('administer taxonomy'),
+      ];
+      $form['#validate'][] = 'private_taxonomy_form_term_validate';
+      $form['actions']['submit']['#submit'][] = 'private_taxonomy_form_term_submit';
+    }
+  }
+}
+
+/**
+ * Validate handler for taxonomy term form.
+ */
+function private_taxonomy_form_term_validate($form, FormStateInterface $form_state) {
+  $uid = $form_state->getValue('uid');
+  if (!$uid) {
+    $form_state->setError($form['uid'], t('The user does not exist.'));
+    return;
+  }
+  $owner = User::load($uid);
+  if (!$owner) {
+    $form_state->setError($form['owner'], t('The user does not exist.'));
+    return;
+  }
+}
+
+/**
+ * Submit handler for taxonomy term form.
+ */
+function private_taxonomy_form_term_submit($form, FormStateInterface $form_state) {
+  // Should run after standard submit handler.  Set owner here.
+  $term = $form_state->getFormObject()->getEntity();
+  $tid = $term->id();
+  $uid = $form_state->getValue('uid');
+  \Drupal::database()->merge('user_term')
+    ->key(['tid' => $tid])
+    ->fields([
+      'uid' => $uid,
+    ])
+    ->execute();
+}
+
+/**
+ * Submit handler for node edit forms.
+ */
+function private_taxonomy_term_submit($form, FormStateInterface $form_state) {
+  $owner = \Drupal::currentUser();
+  // Need to restore terms for other users.
+  $buildInfo = $form_state->getBuildInfo();
+  $node = $buildInfo['callback_object']->getEntity();
+  $input = &$form_state->getUserInput();
+  foreach ($form as $key => &$value) {
+    if (is_array($value) &&
+      isset($value['#attributes']['class'][0]) &&
+      $value['#attributes']['class'][0] ==
+        'field--type-private-taxonomy-term-reference') {
+
+      $allowed_values = $node->getFieldDefinition($key)->getSetting('allowed_values')[0]['users'];
+      if ($allowed_values == 'owner') {
+        $update = $form_state->getValue($key);
+        $class = $form[$key]['#attributes']['class'][2];
+        if ($class == 'field--widget-private-taxonomy-autocomplete') {
+          $terms = explode(',', $update['value']);
+          foreach ($terms as $term_key => $value) {
+            $term = trim($value);
+            $matches = [];
+            preg_match('/\((.*)\)$/', $term, $matches, PREG_OFFSET_CAPTURE);
+            if (isset($matches[1])) {
+              $user_name = $matches[1][0];
+              if ($owner->getAccountName() != $user_name) {
+                $name = trim(mb_substr($term, 0, $matches[0][1]));
+                \Drupal::messenger()->addMessage(t('Cannot enter term @term for user @user',
+                  ['@term' => $name, '@user' => $user_name]), 'error');
+                unset($terms[$term_key]);
+              }
+            }
+          }
+          $update['value'] = implode(', ', $terms);
+        }
+        // Add back in terms belonging to other users.
+        $tids = $node->{$key}->getValue();
+        foreach ($tids as $tid) {
+          if ($owner->id() != private_taxonomy_term_get_user($tid['target_id'])) {
+
+            if ($class == 'field--widget-private-taxonomy-autocomplete') {
+              $term_name = Term::load($tid['target_id'])->getName();
+              $uid = private_taxonomy_term_get_user($tid['target_id']);
+              $user_name = User::load($uid)->getAccountName();
+              if (strlen($update['value']) == 0) {
+                $update['value'] = $term_name . ' (' . $user_name . ')';
+              }
+              else {
+                $update['value'] .= ',' . $term_name . ' (' . $user_name . ')';
+              }
+            }
+            else {
+              $update[] = $tid;
+            }
+          }
+        }
+        $input[$key] = $update;
+        $form_state->setValue($key, $update);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for taxonomy_form_vocabulary().
+ */
+function private_taxonomy_form_taxonomy_vocabulary_form_alter(
+  &$form,
+  FormStateInterface $form_state,
+  $form_id) {
+
+  // Add the private field to the Vocabulary edit form.
+  $form['private'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Private'),
+    '#weight' => 1,
+    '#description' => t('If enabled, user will be able to manage their own terms and only be able to see their own terms. <strong>Enabling this on an existing vocabulary will associate all existing terms with the enabling user.</strong>'),
+  ];
+  if (array_key_exists('vid', $form)) {
+    $vid = $form['vid']['#default_value'];
+    $form['private']['#default_value']
+      = private_taxonomy_is_vocabulary_private($vid);
+  }
+  // Add submit function.
+  $form['actions']['submit']['#submit'][]
+    = 'private_taxonomy_vocabulary_form_submit';
+}
+
+/**
+ * Form submission handler for taxonomy_form_vocabulary().
+ *
+ * Sets this vocabulary to be private, if necessary.
+ */
+function private_taxonomy_vocabulary_form_submit($form, FormStateInterface $form_state) {
+  $user = \Drupal::currentUser();
+  $vid = $form_state->getValue('vid');
+  $vocabulary = Vocabulary::load($vid);
+  $private = $form_state->getValue('private');
+  $vocabulary->setThirdPartySetting('private_taxonomy', 'private', $private);
+  $vocabulary->save();
+  if ($private) {
+    // Now we need to check if any terms exist for this vocabulary which don't
+    // have records in the user_term table.
+    $result = \Drupal::database()->select('taxonomy_term_data', 't')
+      ->condition('t.vid', $vid)
+      ->fields('t', ['tid'])
+      ->execute();
+    foreach ($result as $term) {
+      $count = \Drupal::database()->select('user_term', 'u')
+        ->condition('u.tid', $term->tid)
+        ->countQuery()
+        ->execute()
+        ->fetchField();
+      if ($count == 0) {
+        // Associate each term with the current user.
+        \Drupal::database()->insert('user_term')
+          ->fields(['uid' => $user->id(), 'tid' => $term->tid])
+          ->execute();
+      }
+    }
+  }
+  else {
+    // Remove data for the current vocabulary from the user_term table.
+    \Drupal::database()->delete('user_term')
+      ->where('EXISTS (SELECT 1 FROM {taxonomy_term_field_data} t WHERE t.tid = {user_term}.tid AND t.vid = :vid)', [':vid' => $vid])
+      ->execute();
+  }
+}
+
+/**
+ * Gets all private vocabularies from the database.
+ *
+ * Returns all the private vocabularies.
+ *
+ * @return array
+ *   Array of vocabulary objects.
+ */
+function private_taxonomy_get_private_vocabularies() {
+  $private_vocabularies = [];
+  $vocabularies = Vocabulary::loadMultiple();
+  foreach ($vocabularies as $vocabulary) {
+    if (private_taxonomy_is_vocabulary_private($vocabulary->id())) {
+      $private_vocabularies[] = $vocabulary;
+    }
+  }
+  return $private_vocabularies;
+}
+
+/**
+ * Implements hook_user_insert().
+ */
+function private_taxonomy_user_insert($account) {
+  $config = \Drupal::config('private_taxonomy.settings');
+  if ($config->get('enable_new_users')) {
+    private_taxonomy_clone_terms($account->id());
+  }
+}
+
+/**
+ * Implements hook_user_delete().
+ */
+function private_taxonomy_user_delete($account) {
+  $items = \Drupal::database()->select('user_term', 'ut')
+    ->fields('ut', ['tid'])
+    ->condition('ut.uid', $account->id())
+    ->execute();
+  foreach ($items as $item) {
+    $term = Term::load($item->tid);
+    $term->delete();
+  }
+}
+
+/**
+ * Clone default terms to a user.
+ *
+ * Retrieves the terms for the default user and clones them for the user.
+ *
+ * @param object $aid
+ *   Account ID of the user for which the terms are to be generated.
+ */
+function private_taxonomy_clone_terms($aid) {
+  $config = \Drupal::config('private_taxonomy.settings');
+  $user_name = $config->get('cloning_user_name');
+  $uid = \Drupal::database()->select('users_field_data', 'users')
+    ->condition('users.name', $user_name)
+    ->fields('users', ['uid'])
+    ->execute()
+    ->fetchField();
+  if ($aid == $uid) {
+    return FALSE;
+  }
+  \Drupal::logger('private_taxonomy')->notice(t('Cloning terms for :uid',
+    [':uid' => $aid]));
+  $vocabularies = private_taxonomy_get_private_vocabularies();
+  foreach ($vocabularies as $vocabulary) {
+    $mapping = [];
+    $sql = \Drupal::database()->select('taxonomy_term_field_data', 'term_data');
+    $sql->join('user_term', 'user_term', 'term_data.tid = user_term.tid');
+    $results = $sql->condition('user_term.uid', $uid)
+      ->condition('term_data.vid', $vocabulary->id())
+      ->fields('term_data', ['tid'])
+      ->execute();
+    foreach ($results as $item) {
+      $old_term = Term::load($item->tid);
+      $term = Term::create([
+        'name' => $old_term->getName(),
+        'vid' => $old_term->bundle(),
+      ]);
+      $term->save();
+      $result = \Drupal::database()->update('user_term')
+        ->fields(['uid' => $aid])
+        ->condition('tid', $term->id())
+        ->execute();
+      $mapping[$item->tid] = $term->id();
+    }
+    $sql = \Drupal::database()->select('taxonomy_term_data', 'term_data');
+    $sql->leftJoin('taxonomy_term__parent', 'hierarchy', 'hierarchy.entity_id = term_data.tid');
+    $sql->leftJoin('user_term', 'user_term', 'term_data.tid = user_term.tid');
+    $sql->addField('term_data', 'tid', 'tid');
+    $sql->addField('hierarchy', 'parent_target_id', 'parent');
+    $sql->condition('hierarchy.parent_target_id', 0, '!=')
+      ->condition('user_term.uid', $uid)
+      ->condition('term_data.vid', $vocabulary->id())
+      ->execute();
+    foreach ($results as $item) {
+      // Parent may not belong to the same user.
+      if (isset($mapping[$item->parent])) {
+        \Drupal::database()->update('taxonomy_term__parent')
+          ->fields(['parent' => $mapping[$item->parent]])
+          ->condition('taxonomy_term__parent.tid', $mapping[$item->tid])
+          ->execute();
+      }
+    }
+  }
+  return TRUE;
+}
+
+/**
+ * Implements hook_field_widget_info_alter().
+ */
+function private_taxonomy_field_widget_info_alter(&$info) {
+  if (isset($info['options_select'])) {
+    $info['options_select']['field_types'][] = 'private_taxonomy_term_reference';
+  }
+  if (isset($info['options_buttons'])) {
+    $info['options_buttons']['field_types'][] = 'private_taxonomy_term_reference';
+  }
+}
+
+/**
+ * Implements hook_field_is_empty().
+ */
+function private_taxonomy_field_is_empty($item, $field) {
+  return !is_array($item) || (empty($item['tid']) && empty($item['entity']));
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function private_taxonomy_node_insert($node) {
+  // Add taxonomy index entries for the node.
+  taxonomy_build_node_index($node);
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function private_taxonomy_node_update($node) {
+  // Always rebuild the node's taxonomy index entries on node save.
+  // Taxonomy's delete function should work but the build specifically checks
+  // for taxonomy fields and does not work.
+  taxonomy_build_node_index($node);
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function private_taxonomy_module_implements_alter(&$module_list, $context) {
+  // We need to have the core taxonomy update first so it does the delete
+  // before the insert.
+  if ($context === "node_update") {
+    $temp = $module_list['private_taxonomy'];
+    unset($module_list['private_taxonomy']);
+    $module_list['private_taxonomy'] = $temp;
+  }
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function private_taxonomy_views_api() {
+  return ['api' => 3];
+}
