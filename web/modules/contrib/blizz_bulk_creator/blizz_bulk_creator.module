@@ -1,0 +1,172 @@
+<?php
+
+/**
+ * @file
+ * Contains module hooks for drupal/blizz_bulk_creator.
+ */
+
+use Drupal\Core\Entity\Plugin\DataType\EntityAdapter;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Render\Element;
+
+/**
+ * Implements hook_form_alter().
+ *
+ * TODO
+ * - The implementation of this hook is just temporary. It will be
+ *   replaced with a custom field in the future for performance reasons.
+ */
+function blizz_bulk_creator_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+
+  /* @var \Drupal\blizz_bulk_creator\Services\BulkcreateAdministrationHelperInterface $administrationHelper */
+  $administrationHelper = \Drupal::service('blizz_bulk_creator.administration_helper');
+
+  // Determine the currently (possibly logged in) user.
+  $currentUser = \Drupal::currentUser();
+
+  foreach ($administrationHelper->getBulkcreateUsagesForForm($form, $form_state) as $delta => $bulkcreateUsage) {
+
+    // Extract the bulkcreate configuration for this usage.
+    $bulkcreateConfiguration = $bulkcreateUsage->getBulkcreateConfiguration();
+
+    // If the current user does not have permission
+    // to use the bulkcreation, skip it.
+    if (!$currentUser->hasPermission("use bulkcreation {$bulkcreateConfiguration->id()}")) {
+      continue;
+    }
+
+    // Preparatory work.
+    $entityTypeManager = \Drupal::service('entity_type.manager');
+
+    // Set the root container.
+    $form["bulkcreation_{$bulkcreateUsage->id()}"] = [
+      '#weight' => 99999 + $delta,
+      '#type' => 'details',
+      '#title' => $bulkcreateConfiguration->label(),
+      '#open' => FALSE,
+      '#tree' => TRUE,
+      'bulkcreateUsage' => [
+        '#type' => 'value',
+        '#value' => $bulkcreateUsage,
+      ],
+    ];
+
+    // Inject a textfield carrying a custom name for the
+    // bulk-created entities (if desired).
+    if ($bulkcreateConfiguration->get('custom_entity_name')) {
+      $form["bulkcreation_{$bulkcreateUsage->id()}"]['entity_name_prefix'] = [
+        '#type' => 'textfield',
+        '#title' => t('Entity name prefix'),
+        '#description' => t('Please enter the name you would like to prefix to the generated entity names.'),
+        '#required' => FALSE,
+        '#weight' => -99,
+      ];
+    }
+
+    // Create a pseudo media entity object.
+    /* @var \Drupal\Core\Entity\ContentEntityInterface $media_entity */
+    $media_entity = $entityTypeManager->getStorage('media')->create([
+      'bundle' => $bulkcreateConfiguration->get('target_bundle'),
+    ]);
+
+    // Create an entity adapter for the target entity of the bulkcreation.
+    $entityAdapter = EntityAdapter::createFromEntity($media_entity);
+
+    // Get the field definition of the configured bulkcreate field.
+    $bulkcreateFieldDefinition = $media_entity->getFieldDefinition($bulkcreateConfiguration->get('bulkcreate_field'));
+
+    // Set the bulkcreate field to accept multiple values.
+    $bulkcreateFieldDefinition->getFieldStorageDefinition()->setCardinality(-1);
+
+    // Unset potential required flags in order to make
+    // the bulkcreation optional to use.
+    $bulkcreateFieldDefinition->set('required', FALSE);
+
+    // Get the default form configuration object of the target media bundle.
+    $form_config = \Drupal::config("core.entity_form_display.media.{$bulkcreateConfiguration->get('target_bundle')}.default");
+
+    // Extract the field form settings from the configuration object.
+    $field_form_settings = $form_config->get('content');
+
+    // Set the bulkcreate field element.
+    $form["bulkcreation_{$bulkcreateUsage->id()}"][$bulkcreateConfiguration->get('bulkcreate_field')] = $administrationHelper->getFieldWidget(
+      $bulkcreateConfiguration->get('bulkcreate_field'),
+      $bulkcreateFieldDefinition,
+      $entityAdapter,
+      $form,
+      $form_state,
+      $field_form_settings[$bulkcreateConfiguration->get('bulkcreate_field')]['type'] ?: 'default_widget'
+    );
+
+    // If there should be fields provided to enter default values...
+    if (!empty($bulkcreateConfiguration->getDefaultPropertyFields())) {
+
+      // ...build a container for the default value fields...
+      $form["bulkcreation_{$bulkcreateUsage->id()}"]['defaults'] = [
+        '#weight' => -10,
+        '#title' => t('Default values'),
+        '#type' => 'fieldset',
+      ];
+
+      // ...and create each default value field form
+      // definition in this container.
+      foreach ($bulkcreateConfiguration->getDefaultPropertyFields() as $fieldname => $definition) {
+
+        // Extract the field definition of the desired default field.
+        $field_definition = $media_entity->getFieldDefinition($fieldname);
+
+        // Set this field to not be required in order to make the use optional.
+        $field_definition->set('required', FALSE);
+
+        // Inject the field widget of the default field.
+        $form["bulkcreation_{$bulkcreateUsage->id()}"]['defaults'][$fieldname] = $administrationHelper->getFieldWidget(
+          $fieldname,
+          $field_definition,
+          $entityAdapter,
+          $form,
+          $form_state,
+          $field_form_settings[$fieldname]['type'] ?: 'default_widget'
+        );
+
+      }
+
+    }
+
+    // Re-define the parent structure to prevent messing up data.
+    blizz_bulk_creator_re_set_parents(
+      $form["bulkcreation_{$bulkcreateUsage->id()}"],
+      ["bulkcreation_{$bulkcreateUsage->id()}"]
+    );
+
+    // Inject the custom submit handler (if not already present).
+    $submitHandler = '\Drupal\blizz_bulk_creator\Services\BulkcreateService::initializeBulkcreations';
+    if (!in_array($submitHandler, $form['#submit'])) {
+      $form['#submit'][] = $submitHandler;
+      foreach (array_keys($form['actions']) as $action) {
+        if (!in_array($action, ['preview', 'delete']) && isset($form['actions'][$action]['#type']) && $form['actions'][$action]['#type'] === 'submit') {
+          $form['actions'][$action]['#submit'][] = $submitHandler;
+        }
+      }
+    }
+
+  }
+
+}
+
+/**
+ * Re-sets the #parents-properties on generated bulkcreate-fields.
+ *
+ * @param array $elements
+ *   The elements on which to re-set the parents array.
+ * @param array $parents
+ *   The parents (inherited in recursive calls).
+ */
+function blizz_bulk_creator_re_set_parents(array &$elements, array $parents) {
+  foreach (Element::children($elements) as $key) {
+    $subparents = array_merge($parents, [$key]);
+    $elements[$key]['#tree'] = TRUE;
+    $elements[$key]['#parents'] = $subparents;
+    unset($elements[$key]['#name']);
+    blizz_bulk_creator_re_set_parents($elements[$key], $subparents);
+  }
+}
