@@ -1,0 +1,141 @@
+<?php
+
+/**
+ * @file
+ * Code for the access conditions field group module.
+ */
+
+use Drupal\Core\Cache\Cache;
+use Drupal\Core\Form\FormStateInterface;
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function access_conditions_field_group_module_implements_alter(&$implementations, $hook) {
+  if (array_key_exists('access_conditions_field_group', $implementations) && $hook == 'form_alter') {
+    // Move to the end of the list.
+    $group = $implementations['access_conditions_field_group'];
+    unset($implementations['access_conditions_field_group']);
+    $implementations['access_conditions_field_group'] = $group;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for case 'entity_form_display_edit_form'.
+ */
+function access_conditions_field_group_form_entity_form_display_edit_form_alter(&$form, FormStateInterface $form_state) {
+  access_conditions_field_group_field_ui_display_form_alter($form, $form_state);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for case 'entity_view_display_edit_form'.
+ */
+function access_conditions_field_group_form_entity_view_display_edit_form_alter(&$form, FormStateInterface $form_state) {
+  access_conditions_field_group_field_ui_display_form_alter($form, $form_state);
+}
+
+/**
+ * Alters the field UI display form.
+ *
+ * @param $form
+ *   Nested array of form elements that comprise the form.
+ * @param $form_state
+ *   The current state of the form.
+ *
+ * @throws \Drupal\Component\Plugin\Exception\InvalidPluginDefinitionException
+ * @throws \Drupal\Component\Plugin\Exception\PluginNotFoundException
+ */
+function access_conditions_field_group_field_ui_display_form_alter(&$form, FormStateInterface $form_state) {
+  $plugin_name = $form_state->get('plugin_settings_edit');
+  foreach ($form['#fieldgroups'] as $name) {
+    /** @var \Drupal\Core\Entity\Entity\EntityViewDisplay $display */
+    $display = $form['#context'];
+    $settings = $display->getThirdPartySetting('field_group', $name);
+
+    // Add our settings for the field group we are editing..
+    if ($plugin_name == $name) {
+      $default_value = NULL;
+      if (!empty($settings['format_settings']['access_models'])) {
+        $access_models = array_column($settings['format_settings']['access_models'], 'target_id');
+        $default_value = \Drupal::entityTypeManager()
+          ->getStorage('access_model')
+          ->loadMultiple($access_models);
+      }
+
+      $form['fields'][$name]['format']['format_settings']['settings']['access_models'] = [
+        '#type' => 'entity_autocomplete',
+        '#title' => t('Visible to certain access models'),
+        '#description' => t('Leave blank for all users.'),
+        '#target_type' => 'access_model',
+        '#default_value' => $default_value,
+        '#tags' => TRUE,
+        '#weight' => 100,
+      ];
+    }
+    // Otherwise just update the field group format configuration summary.
+    // @see field_group_format_settings_summary().
+    else {
+      if (!empty($settings['format_settings']['access_models'])) {
+        $group = $form_state->get('field_group')[$name];
+        $formatter_manager = \Drupal::service('plugin.manager.field_group.formatters');
+        $plugin = $formatter_manager->getInstance([
+          'format_type' => $settings['format_type'],
+          'configuration' => [
+            'label' => $settings['label'],
+            'settings' => $settings['format_settings']
+          ],
+          'group' => $group,
+        ]);
+
+        $summary = $plugin->settingsSummary();
+        $summary[] = t('Visible to certain access models');
+
+        $form['fields'][$name]['settings_summary']['#markup']  = '<div class="field-plugin-summary">' . implode('<br />', $summary) . '</div>';
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_field_group_pre_render_alter().
+ */
+function access_conditions_field_group_field_group_pre_render_alter(&$element, &$group, &$rendering_object) {
+  // If there are configured access models, we should evaluate them.
+  $access_models = empty($group->format_settings['access_models']) ? [] : array_column($group->format_settings['access_models'], 'target_id');
+  if (count($access_models)) {
+    /** @var \Drupal\access_conditions\AccessChecker $access_checker */
+    $access_checker = \Drupal::service('access_conditions.access_checker');
+
+    // Initialize the element cache.
+    $element['#cache'] = [
+      'contexts' => $access_checker->getCacheContexts(),
+      'tags' => $access_checker->getCacheTags(),
+      'max-age' => $access_checker->getCacheMaxAge(),
+    ];
+
+    /** @var \Drupal\access_conditions\Entity\AccessModelInterface[] $access_models */
+    $access_models = \Drupal::entityTypeManager()->getStorage('access_model')->loadMultiple($access_models);
+    foreach ($access_models as $access_model) {
+      // Return TRUE if access is granted.
+      if ($access_checker->checkAccess($access_model)) {
+        // Reset the element cache to the current access model.
+        $element['#cache'] = [
+          'contexts' => $access_checker->getCacheContexts(),
+          'tags' => $access_checker->getCacheTags(),
+          'max-age' => $access_checker->getCacheMaxAge(),
+        ];
+        return TRUE;
+      }
+
+      // Merge caches.
+      $element['#cache'] = [
+        'contexts' => Cache::mergeContexts($element['#cache']['contexts'], $access_checker->getCacheContexts()),
+        'tags' => Cache::mergeTags($element['#cache']['tags'], $access_checker->getCacheTags()),
+        'max-age' => Cache::mergeMaxAges($element['#cache']['max-age'], $access_checker->getCacheMaxAge()),
+      ];
+    }
+
+    // If there are not granted access models, return FALSE.
+    $element['#access'] = FALSE;
+  }
+}
