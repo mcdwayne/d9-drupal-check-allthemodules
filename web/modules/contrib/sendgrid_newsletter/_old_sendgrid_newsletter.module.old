@@ -1,0 +1,410 @@
+<?php
+
+/**
+ * @file
+ * This simple Module provides ability to sign-up to SendGrid.com newsletters.
+ */
+
+/**
+ * Implements hook_permission().
+ */
+function sendgrid_newsletter_permission() {
+  return array(
+    'administer sendgrid newsletter module' => array(
+      'title' => t('Administer SendGrid Newsletter module settings'),
+      'description' => t('Perform administration tasks for SendGrid Newsletter.'),
+      'restrict access' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function sendgrid_newsletter_menu() {
+  $items['admin/config/sendgrid-newsletter-config'] = array(
+    'title' => 'SendGrid Newsletter settings',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('_sendgrid_newsletter_admin_config'),
+    'access arguments' => array('administer sendgrid newsletter module'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  $items['admin/config/sendgrid-newsletter-config/lists'] = array(
+    'title' => 'SendGrid Newsletter Lists',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('_sendgrid_newsletter_lists'),
+    'access arguments' => array('administer sendgrid newsletter module'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  $items['sendgrid/%ctools_js'] = array(
+    'page callback' => 'sendgrid_newsletter_ajax_callback',
+    'page arguments' => array(1),
+    // There is no access restirction. Anyone can see the pop-up (modal)
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_page_build().
+ */
+function sendgrid_newsletter_page_build(&$page) {
+  $current_path = current_path();
+  $paths = explode(',', variable_get('sendgrid_newsletter_modal_paths', ''));
+  foreach ($paths as $path) {
+    $path = preg_replace('/\s+/', '', $path);
+    if (($current_path == $path) || ($path == '<front>' && drupal_is_front_page())) {
+      ctools_include('modal');
+      ctools_modal_add_js();
+      $page['content']['#attached']['js'][] = array(
+        'type' => 'file',
+        'data' => drupal_get_path('module', 'sendgrid_newsletter') . '/js/sendgrid_newsletter.js',
+      );
+      $page['content']['sendgrid_modal'] = array(
+        '#markup' => '<div id="sendgrid-modal-link">' . l(t('SendGridModal'), 'sendgrid/nojs', array('attributes' => array('class' => 'ctools-use-modal', 'style' => 'display:none;'))) . '</div>',
+      );
+    }
+  }
+
+}
+
+/**
+ * Ajax Menu callback.
+ */
+function sendgrid_newsletter_ajax_callback($ajax) {
+  if ($ajax) {
+    ctools_include('ajax');
+    ctools_include('modal');
+
+    $form_state = array(
+      'ajax' => TRUE,
+      'title' => t('SendGrid Newsletter Signup Form'),
+    );
+
+    $output = ctools_modal_form_wrapper('sendgrid_newsletter_ajax_form', $form_state);
+
+    if (!empty($form_state['ajax_commands'])) {
+      $output = $form_state['ajax_commands'];
+    }
+
+    // Return the ajax instructions to the browser via ajax_render().
+    print ajax_render($output);
+    drupal_exit();
+  }
+  else {
+    return drupal_get_form('sendgrid_newsletter_ajax_form');
+  }
+}
+
+/**
+ * Creates a form for lists.
+ */
+function _sendgrid_newsletter_lists($form, $form_state) {
+  $form = array();
+
+  // Getting All lists from Sendgrid api.
+  $get_lists_url = 'https://api.sendgrid.com/v3/contactdb/lists';
+  $headers = array(
+    'Content-Type' => 'application/json',
+    'Accept' => 'application/json',
+    'Authorization' => 'Bearer ' . variable_get('sendgrid_newsletter_api', ''),
+  );
+  $options = array(
+    'method' => 'GET',
+    'headers' => $headers,
+  );
+
+  $lists = drupal_http_request($get_lists_url, $options);
+  $lists_data = json_decode($lists->data);
+
+  $header = array(
+    'list_id' => array('data' => t('List ID')),
+    'list_name' => array('data' => t('List Name')),
+    'recipient_count' => array('data' => t('Recipient Count')),
+  );
+
+  $options = array();
+
+  foreach ($lists_data->lists as $list) {
+    $options[$list->id] = array(
+      'list_name' => $list->name,
+      'list_id' => $list->id,
+      'recipient_count' => $list->recipient_count,
+    );
+  }
+  // Build the tableselect.
+  $form['sendgrid_newsletter_lists'] = array(
+    '#type' => 'tableselect',
+    '#header' => $header,
+    '#options' => $options,
+    '#empty' => t('No content available.'),
+  );
+
+  $form['sendgrid_newsletter_lists_name'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Enter a name of list you want to add.'),
+    '#description' => t('Enter the name of the list you want to add to SendGrid anc click "Add new list" button on the bottom of this page. Leave this field empty if you do not want to add list to Sendgrid.'),
+    '#empty' => t('No content available.'),
+  );
+
+  $form['sendgrid_newsletter_lists_add'] = array(
+    '#type' => 'submit',
+    '#value' => t('Add new list'),
+    '#validate' => array('_sendgrid_newsletter_lists_add_validate'),
+    '#submit' => array('_sendgrid_newsletter_lists_add_submit'),
+  );
+
+  $form['sendgrid_newsletter_lists_delete'] = array(
+    '#type' => 'submit',
+    '#value' => t('Delete'),
+    '#validate' => array('_sendgrid_newsletter_lists_delete_validate'),
+    '#submit' => array('_sendgrid_newsletter_lists_delete_submit'),
+  );
+
+  return $form;
+}
+
+/**
+ * Validate function for Add button.
+ */
+function _sendgrid_newsletter_lists_add_validate($form, $form_state) {
+  $new_list_name = $form_state['values']['sendgrid_newsletter_lists_name'];
+  if (empty($new_list_name)) {
+    form_set_error('sendgrid_newsletter_lists_name', t('Please add the name of the list you want to add and try again.'));
+  }
+}
+
+/**
+ * Submit handler for lists page add button.
+ */
+function _sendgrid_newsletter_lists_add_submit($form, $form_state) {
+
+  $new_list_name = $form_state['values']['sendgrid_newsletter_lists_name'];
+  if ($new_list_name) {
+    $add_lists_url = 'https://api.sendgrid.com/v3/contactdb/lists';
+    $headers = array(
+      'Content-Type' => 'application/json',
+      'Accept' => 'application/json',
+      'Authorization' => 'Bearer ' . variable_get('sendgrid_newsletter_api', ''),
+    );
+    $data = array(
+      'name' => $new_list_name,
+    );
+    $options = array(
+      'method' => 'POST',
+      'data' => json_encode($data),
+      'headers' => $headers,
+    );
+    drupal_http_request($add_lists_url, $options);
+  }
+}
+
+/**
+ * Validation handler for lists page delete button.
+ */
+function _sendgrid_newsletter_lists_delete_validate($form, $form_state) {
+
+  $selected_lists = array_filter($form_state['values']['sendgrid_newsletter_lists']);
+  if (empty($selected_lists)) {
+    drupal_set_message(t('Please select a row(s) from the table.'), 'error');
+  }
+
+}
+
+/**
+ * Submit handler for lists page delete button.
+ */
+function _sendgrid_newsletter_lists_delete_submit($form, $form_state) {
+
+  $selected_lists = $form_state['values']['sendgrid_newsletter_lists'];
+  foreach ($selected_lists as $selected_list) {
+    if ($selected_list != 0) {
+      $delete_lest_url = 'https://api.sendgrid.com/v3/contactdb/lists/' . $selected_list . '?delete_contacts=false';
+      $headers = array(
+        'Content-Type' => 'application/json',
+        'Accept' => 'application/json',
+        'Authorization' => 'Bearer ' . variable_get('sendgrid_newsletter_api', ''),
+      );
+      $options = array(
+        'method' => 'DELETE',
+        'headers' => $headers,
+      );
+      drupal_http_request($delete_lest_url, $options);
+    }
+  }
+}
+
+/**
+ * Drupal form to be put in the modal.
+ */
+function sendgrid_newsletter_ajax_form($form, $form_state) {
+  $form = array();
+  $form['#prefix'] = "<div id='sendgrid-modal-form'>";
+  $form['#suffix'] = "</div>";
+  $form['sendgrid_signup_first_name'] = array(
+    '#type' => 'textfield',
+    '#title' => t('First Name'),
+    '#required' => TRUE,
+  );
+
+  $form['sendgrid_signup_last_name'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Last Name'),
+    '#required' => TRUE,
+  );
+
+  $form['sendgrid_signup_email'] = array(
+    '#type' => 'textfield',
+    '#title' => t('E-mail'),
+    '#required' => TRUE,
+  );
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Submit'),
+  );
+
+  return $form;
+}
+
+/**
+ * Ajax submit hanlder for the signup form.
+ */
+function sendgrid_newsletter_ajax_form_submit(&$form, &$form_state) {
+
+  $fname = $form_state['values']['sendgrid_signup_first_name'];
+  $lname = $form_state['values']['sendgrid_signup_last_name'];
+  $email = $form_state['values']['sendgrid_signup_email'];
+
+  // First request: Adding Recipient to the
+  // contact list as a recipient and getting the id value.
+  $add_recipient_url = 'https://api.sendgrid.com/v3/contactdb/recipients';
+  $headers = array(
+    'Content-Type' => 'application/json',
+    'Accept' => 'application/json',
+    'Authorization' => 'Bearer ' . variable_get('sendgrid_newsletter_api', ''),
+  );
+  $data[] = array(
+    'email' => $email,
+    'first_name' => $fname,
+    'last_name' => $lname,
+  );
+  $options = array(
+    'method' => 'POST',
+    'data' => json_encode($data),
+    'headers' => $headers,
+  );
+
+  $result = drupal_http_request($add_recipient_url, $options);
+  $add_recipient = json_decode($result->data);
+  $recipient_id = $add_recipient->persisted_recipients['0'];
+
+  // Second request: Adding the newly created recipient
+  // to the newsletter list which is defined in admin config form.
+  $add_recipient_to_list_url = 'https://api.sendgrid.com/v3/contactdb/lists/' . variable_get('sendgrid_newsletter_lists', '') . '/recipients/' . $recipient_id;
+  $headers = array(
+    'Content-Type' => 'application/json',
+    'Accept' => 'application/json',
+    'Authorization' => 'Bearer ' . variable_get('sendgrid_newsletter_api', ''),
+  );
+  $options = array(
+    'method' => 'POST',
+    'headers' => $headers,
+  );
+
+  $final_result = drupal_http_request($add_recipient_to_list_url, $options);
+
+  json_decode($final_result->data);
+
+  $form_state['ajax_commands'][] = ctools_modal_command_dismiss();
+  $form_state['ajax_commands'][] = ajax_command_replace('#sendgrid-modal-form', drupal_set_message(t('Thank you for subscribing to our newsletter'), 'status'));
+  $form_state['ajax_commands'][] = ajax_command_after('#main-content', theme('status_messages'));
+
+}
+
+/**
+ * Admin config form.
+ */
+function _sendgrid_newsletter_admin_config($form, $form_state) {
+
+  // Sends request to api to get all subscrition lists.
+  $url = 'https://api.sendgrid.com/v3/contactdb/lists';
+  $headers = array(
+    'Content-Type' => 'application/json',
+    'Accept' => 'application/json',
+    'Authorization' => 'Bearer ' . variable_get('sendgrid_newsletter_api', ''),
+  );
+  $options = array(
+    'method' => 'GET',
+    'headers' => $headers,
+  );
+
+  $options_array = array();
+  $result = drupal_http_request($url, $options);
+  if (isset($result->data)) {
+    $select_options = json_decode($result->data);
+    foreach ($select_options->lists as $options) {
+      $key = $options->id;
+      $options_array[$key] = $options->name;
+    }
+  }
+  if (empty($options_array)) {
+    $desc = t('If you do not see any items, then please add them first from <a href="/admin/config/sendgrid-newsletter-config/lists">here</a>.');
+  }
+  else {
+    $desc = t('Select one of the lists form the select box.');
+  }
+
+  $form['sendgrid_newsletter_api'] = array(
+    '#type' => 'textfield',
+    '#title' => t('API key'),
+    '#required' => TRUE,
+    '#default_value' => variable_get('sendgrid_newsletter_api', '') ? variable_get('sendgrid_newsletter_api', '') : '',
+  );
+
+  $form['sendgrid_newsletter_lists'] = array(
+    '#type' => 'select',
+    '#title' => t('Newsletters lists'),
+    '#required' => TRUE,
+    '#description' => $desc,
+    '#options' => $options_array,
+    '#default_value' => variable_get('sendgrid_newsletter_lists', '') ? variable_get('sendgrid_newsletter_lists', '') : '',
+  );
+
+  $form['sendgrid_newsletter_modal_paths'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Sign-up form path'),
+    '#description' => t('Specify a comma-delimited list of internal relative paths to display modal on.'),
+    '#required' => TRUE,
+    '#default_value' => variable_get('sendgrid_newsletter_modal_paths', '') ? variable_get('sendgrid_newsletter_modal_paths', '') : '',
+  );
+
+  $form['sendgrid_newsletter_api_submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Submit'),
+  );
+
+  return $form;
+}
+
+/**
+ * Submit handler for config form.
+ */
+function _sendgrid_newsletter_admin_config_submit($form, $form_state) {
+
+  $api_key = $form_state['values']['sendgrid_newsletter_api'];
+  variable_set('sendgrid_newsletter_api', $api_key);
+
+  $list_id = $form_state['values']['sendgrid_newsletter_lists'];
+  variable_set('sendgrid_newsletter_lists', $list_id);
+
+  $paths = $form_state['values']['sendgrid_newsletter_modal_paths'];
+  variable_set('sendgrid_newsletter_modal_paths', $paths);
+
+  drupal_set_message(t('Thank you! Your settings were saved.'), 'status');
+
+  return $form;
+}
