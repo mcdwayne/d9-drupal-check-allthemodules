@@ -1,0 +1,231 @@
+<?php
+
+/**
+ * @file
+ * Issue crawler/scraper and display module.
+ */
+
+use GuzzleHttp\Client;
+use Drupal\node\Entity\Node;
+use Drupal\taxonomy\Entity\Term;
+
+/**
+ * Implements hook_cron().
+ */
+function rocketship_cron() {
+  $config = \Drupal::configFactory()->getEditable('rocketship.settings');
+  // An hour should pass at least inbetween local cache refreshes.
+  if ($config->get('last_parse_time', 0) < REQUEST_TIME - 60*60) {
+    rocketship_parse_all();
+    $config->set('last_parse_time', time())->save();
+  }
+}
+
+/**
+ * Crawler for drupal.org issue listings.
+ */
+function rocketship_parse_all() {
+  $config = \Drupal::config('rocketship.settings');
+  $client = new Client();
+
+  // Grab the first page of the listings of issues for this tag.
+  $issue_page = 'https://drupal.org/project/issues/search/drupal?issue_tags=' . urlencode($config->get('master_tag'));
+  $response = $client->get($issue_page);
+  if ($response->getStatusCode() == 200 && ($body = (string) $response->getBody())) {
+    // Parse this page for issue links and grab those issue nodes.
+    \Drupal::logger('rocketship')->notice('Parsing first page.');
+    $next_page = rocketship_parse_issue_page($body);
+
+    // If we have more pages, go on to the rest of the pages as well.
+    while (!empty($next_page)) {
+      $response = $client->get($issue_page . '&page='. $next_page);
+      if ($response->getStatusCode() == 200 && ($body = (string) $response->getBody())) {
+        \Drupal::logger('rocketship')->notice('Parsing page ' . $next_page);
+        $next_page = rocketship_parse_issue_page($body);
+      }
+      else {
+        $next_page = NULL;
+      }
+    }
+  }
+
+  // Make note of the data update in watchdog.
+  \Drupal::logger('rocketship')->notice('All pages parsed.');
+
+  // Save all username counts.
+  $config = \Drupal::configFactory()->getEditable('rocketship.settings');
+  list ($user_names, $user_uids, $recent_uids) = rocketship_stat_add_username();
+  $config->set('participant_stats', $user_names);
+  $config->set('participant_uids', $user_uids);
+  $config->set('participant_recent', $recent_uids);
+  $config->save();
+
+  // Make note of the data update in watchdog.
+  \Drupal::logger('rocketship')->notice('Contributor data updated.');
+}
+
+/**
+ * Simple stat collector to summarize users participating.
+ */
+function rocketship_stat_add_username($username = NULL, $uid = NULL, $time = NULL) {
+  static $user_names = array();
+  static $user_uids = array();
+  static $recent_uids = array();
+
+  if (isset($username)) {
+    $username = rocketship_clear_username($username);
+    @$user_names[$username]++;
+    @$user_uids[$username] = $uid;
+    // Consider this a recent user if the time of activity was within 2 weeks.
+    if ($time > (REQUEST_TIME - (14 * 24 * 60 * 60)) && !in_array($uid, $recent_uids)) {
+      @$recent_uids[] = $uid;
+    }
+  }
+  return array($user_names, $user_uids, $recent_uids);
+}
+
+/**
+ * Quick hack so we can store usernames as config keys.
+ *
+ * @param string $name
+ *   Username.
+ * @return string
+ *   The username in a form that can be stored as a config key.
+ */
+function rocketship_clear_username($name) {
+  return str_replace('.', ' ', $name);
+}
+
+/**
+ * Data scraper for a drupal.org issue listing page.
+ *
+ * @todo
+ *   Does not drop outdated nodes (if master tag is removed), only updates old
+ *   ones and create new ones. Also does not drop unused tags.
+ * @todo
+ *  Does not consider multi-page issues. Yeah.
+ */
+function rocketship_parse_issue_page(&$issue_page_content) {
+  $config = \Drupal::config('rocketship.settings');
+  $client = new Client();
+
+  // Figure out the next page number from the pager.
+  $next_page_num = 0;
+  if (preg_match('!class="pager-next"><a title="Go to next page" href="([^"]+)"!', $issue_page_content, $next_page)) {
+    if (preg_match('!page=(\d+)$!', $next_page[1], $next_page_find)) {
+      $next_page_num = $next_page_find[1];
+    }
+  }
+  $node_type = $config->get('issue_node_type');
+  $field_issue_tags = $config->get('issue_tags_field');
+  $field_issue_assigned = $config->get('issue_assigned_field');
+  $field_issue_number = $config->get('issue_number_field');
+
+  // Issue links are contained in table cells on the page.
+  // <td class="views-field views-field-title" >
+  // <a href="/node/851362">Add hash column to {locales_source} to query faster locale strings</a>
+  if (preg_match_all('!<td class="views-field views-field-title"[^>]*>[^<]*<a href="/node/(\d+)">!', $issue_page_content, $matches)) {
+    foreach($matches[1] as $match) {
+
+      // Load the concrete issue page for this issue (anonymously). This might
+      // be cached by drupal.org, but we are already putting some load on d.o
+      // so its fine to get the cached data here.
+      $response = $client->get('https://drupal.org/node/' . (int) $match);
+      if ($response->getStatusCode() == 200 && ($body = (string) $response->getBody())) {
+
+        $query = \Drupal::entityQuery('node')->condition('type', $node_type);
+        if ($nids = $query->condition($field_issue_number, (int) $match)->execute()) {
+          $node = Node::load(current($nids));
+        }
+        else {
+          $node = Node::create(
+            array(
+              'type' => $node_type,
+              $field_issue_number => (int) $match,
+            )
+          );
+        }
+
+        // Grab node title based on drupal.org HTML markup.
+        if (preg_match('!<h1 id="page-subtitle">([^<]+)</h1>!', $body, $page_title)) {
+          $node->title = '#'. (int) $match . ': '. htmlspecialchars_decode($page_title[1], ENT_QUOTES);
+        }
+
+        // Grab time/user for submission based on the markup.
+        if (preg_match('!Posted by <a[^>]+data-uid="(\d+)"[^>]+>([^<]+)</a> on <time[^>]*>(.+)</time>!', $body, $posted_data)) {
+          $node->created = strtotime(str_replace(' at ', ', ', $posted_data[3]));
+          rocketship_stat_add_username($posted_data[2], $posted_data[1], (int) $node->created);
+        }
+
+        // Find all participants and count their comments with time.
+        if (preg_match_all('!<a[^>]+data-uid="(\d+)"[^>]+>([^<]+)</a> <span[^</span>].* commented <time[^>]* datetime="(.+)"!', $body, $participants)) {
+          foreach ($participants[2] as $i => $participant) {
+            rocketship_stat_add_username($participant, $participants[1][$i], strtotime($participants[3][$i]));
+          }
+        }
+
+        // Assumes an assigned text field is present on this node type.
+        if (preg_match(rocketship_metadata_regex('Assigned'), $body, $assigned)) {
+          $node->{$field_issue_assigned} = rocketship_clear_username(strip_tags($assigned[1]));
+        }
+
+        // Store all kinds of metadata as plain tags on this node. We can then
+        // do listings based on the presence of these tags "easily".
+        $tags = array();
+        if (preg_match(rocketship_metadata_regex('Version'), $body, $tag)) {
+          $tags[] = $tag[1];
+        }
+        if (preg_match(rocketship_metadata_regex('Category'), $body, $tag)) {
+          $tags[] = $tag[1];
+        }
+        if (preg_match(rocketship_metadata_regex('Priority'), $body, $tag)) {
+          $tags[] = $tag[1];
+        }
+        if (preg_match('!<div class="field field-name-field-issue-status[^"]*"><div class="field-items"><div class="field-item even">([^<]+)</div>!', $body, $tag)) {
+          // "Decode" for "Reviewed & tested by the community".
+          $tags[] = str_replace('&amp;', '&', $tag[1]);
+        }
+        if (preg_match(rocketship_metadata_regex('Issue tags'), $body, $tag)) {
+          if (preg_match_all('!>([^<]+)</a>!', $tag[1], $more_tags)) {
+            foreach ($more_tags[1] as $tag) {
+              $tags[] = $tag;
+            }
+          }
+        }
+
+        // Now try and find existing tags with matching names if present or
+        // create the new tags if needed.
+        $node->{$field_issue_tags} = array();
+        $issue_tags_vocabulary = $config->get('tags_vocabulary');
+        foreach ($tags as $tag) {
+          if ($result = \Drupal::entityQuery('taxonomy_term')->condition('name', $tag)->condition('vid', $issue_tags_vocabulary)->execute()) {
+            $tid = current($result);
+          }
+          else {
+            $term = Term::create(
+              array(
+                'name' => $tag,
+                'vid' => $issue_tags_vocabulary,
+              )
+            );
+            $term->save();
+            $tid = $term->id();
+          }
+          $node->{$field_issue_tags}[] = array('target_id' => $tid);
+        }
+
+        // Save our updated / created node.
+        $node->save();
+      }
+    }
+  }
+
+  return $next_page_num;
+}
+
+/**
+ * Constructs a pattern for metadata lookups.
+ */
+function rocketship_metadata_regex($label) {
+  return '!<div class="field-label">' . $label . ':&nbsp;</div><div class="field-items"><div class="field-item even">(.*?)</div></div>!';
+}
