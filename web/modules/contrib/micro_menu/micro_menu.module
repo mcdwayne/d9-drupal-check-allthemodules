@@ -1,0 +1,290 @@
+<?php
+
+/**
+ * @file
+ * Contains micro_menu.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Render\Element;
+use Drupal\menu_ui\Form\MenuLinkEditForm;
+use Drupal\menu_ui\MenuForm;
+use Drupal\menu_link_content\Form\MenuLinkContentForm;
+use Drupal\micro_site\Entity\SiteInterface;
+use Drupal\system\MenuInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\system\Entity\Menu;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\Access\AccessResult;
+use Drupal\micro_site\entity\Site;
+use Drupal\micro_site\SiteUsers;
+use Drupal\Core\Block\BlockPluginInterface;
+
+/**
+ * Implements hook_help().
+ */
+function micro_menu_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the micro_menu module.
+    case 'help.page.micro_menu':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Manage menu per site') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ */
+function micro_menu_site_insert(EntityInterface $entity) {
+  /** @var \Drupal\micro_site\Entity\SiteInterface $entity */
+  if (!$entity->hasMenu()) {
+    return;
+  }
+  $site_menu = $entity->getSiteMenu();
+  if (empty($site_menu)) {
+    /** @var \Drupal\system\Entity\Menu $menu */
+    $menu = Menu::create([
+      'id' => 'site-' . $entity->id(),
+      'label' => 'Menu ' . $entity->label(),
+      'description' => t('The menu for the site @label (id: @id)', ['@label' => $entity->label(), '@id' => $entity->id()]),
+      'locked' => TRUE,
+      'third_party_settings' => ['micro_menu' => ['site_id' => $entity->id()]],
+    ])->save();
+
+    $menu = Menu::load('site-' . $entity->id());
+    if ($menu instanceof MenuInterface) {
+      _micro_menu_generate_simple_sitemap_settings($menu);
+    }
+
+    if (empty($menu)) {
+      throw new \Exception('Main menu not created and saved for site entity id' . $entity->id() . ' (' . $entity->label() . ')');
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ */
+function micro_menu_site_update(EntityInterface $entity) {
+  /** @var \Drupal\micro_site\Entity\SiteInterface $entity */
+  if (!$entity->hasMenu()) {
+    return;
+  }
+  $site_menu = $entity->getSiteMenu();
+  if (empty($site_menu)) {
+    /** @var \Drupal\system\Entity\Menu $menu */
+    $menu = Menu::create([
+      'id' => 'site-' . $entity->id(),
+      'label' => 'Menu ' . $entity->label(),
+      'description' => t('The menu for the site @label (id: @id)', ['@label' => $entity->label(), '@id' => $entity->id()]),
+      'locked' => TRUE,
+      'third_party_settings' => ['micro_menu' => ['site_id' => $entity->id()]],
+    ])->save();
+
+    $menu = Menu::load('site-' . $entity->id());
+    if ($menu instanceof MenuInterface) {
+      _micro_menu_generate_simple_sitemap_settings($menu);
+    }
+
+    if (empty($menu)) {
+      throw new \Exception('Main menu not created and saved for site entity id' . $entity->id() . ' (' . $entity->label() . ')');
+    }
+  }
+}
+
+function _micro_menu_generate_simple_sitemap_settings(MenuInterface $menu) {
+  $simple_sitemap_enabled = \Drupal::moduleHandler()->moduleExists('simple_sitemap');
+  if (!$simple_sitemap_enabled) {
+    return;
+  }
+
+  $settings = [
+    'index' => 1,
+    'priority' => '1.0',
+    'changefreq' => 'weekly',
+    'include_images' => 0,
+  ];
+
+  /** @var \Drupal\simple_sitemap\Simplesitemap $generator */
+  $generator = \Drupal::service('simple_sitemap.generator');
+  $generator->setBundleSettings('menu_link_content', $menu->id(), $settings);
+}
+
+/**
+ * Implements hook_entity_access().
+ */
+function micro_menu_menu_link_content_access(EntityInterface $entity, $operation, AccountInterface $account) {
+  $site = NULL;
+  /** @var \Drupal\menu_link_content\Entity\MenuLinkContent $entity */
+  $menu_name = $entity->getMenuName();
+  $menu = Menu::load($menu_name);
+  if ($menu instanceof MenuInterface) {
+    $site_id = $menu->getThirdPartySetting('micro_menu', 'site_id');
+    if ($site_id) {
+      $site = Site::load($site_id);
+    }
+  }
+
+  if ($site instanceof SiteInterface && !$site->isRegistered() && !$account->hasPermission('administer micro menus')) {
+    return AccessResult::forbidden('Menu link content can be managed only on site registered and so from the site url.')->addCacheableDependency($entity)->addCacheableDependency($site);
+  }
+
+  // Allow the site owner and administrators to administer menu link content attached to the site menu.
+  if ($site instanceof SiteInterface && ($site->getOwnerId() == $account->id() || in_array($account->id(), $site->getUsersId(SiteUsers::MICRO_SITE_ADMINISTRATOR)))) {
+    return AccessResult::allowed()->addCacheableDependency($entity)->addCacheableDependency($site);
+  }
+
+  return AccessResult::neutral();
+}
+
+/**
+ * Implements hook_entity_type_alter().
+ */
+//function micro_menu_entity_type_alter(array &$entity_types) {
+//  $entity_types['menu']
+//    ->setFormClass('add', 'Drupal\micro_menu\Form\SiteMenuForm')
+//    ->setFormClass('edit', 'Drupal\micro_menu\Form\SiteMenuForm');
+//}
+
+/**
+ * Implements hook_theme().
+ */
+function micro_menu_theme() {
+  return [
+    'micro_menu' => [
+      'render element' => 'children',
+    ],
+  ];
+}
+
+/**
+ * Implementation of hook_form_alter().
+ */
+function micro_menu_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $form_object = $form_state->getFormObject();
+  if ($form_object instanceof MenuLinkEditForm
+    || $form_object instanceof MenuLinkContentForm) {
+    // We check if we are in a site entity context, and so get the site
+    // parameter into the route.
+    $site = \Drupal::routeMatch()->getParameter('site');
+    $menu = \Drupal::routeMatch()->getParameter('menu');
+
+    if ($site instanceof SiteInterface && $menu instanceof MenuInterface) {
+      if ($site->id() == $menu->getThirdPartySetting('micro_menu', 'site_id')) {
+        micro_menu_filter_menu_parent_options_per_site($form['menu_parent']['#options'], $menu->id());
+      }
+    }
+
+  }
+  if ($form_object instanceof MenuForm) {
+    $account = \Drupal::currentUser();
+    if (!$account->hasPermission('administer menu')) {
+      $form['id']['#access'] = FALSE;
+      $form['label']['#disabled'] = TRUE;
+      $form['description']['#disabled'] = TRUE;
+    }
+  }
+}
+
+/**
+ * Deletes not allowed menu items from select element for current user.
+ *
+ * @param array &$element
+ *   Reference to form select element with menu items.
+ * @param string $menu_id
+ *   The menu id on which filter the options.
+ *
+ * @return bool
+ *   FALSE if there is no allowed menu items,
+ *   TRUE if we have some allowed menu items.
+ */
+function micro_menu_filter_menu_parent_options_per_site(&$element, $menu_id) {
+  if (is_array($element)) {
+    $option_keys = array_keys($element);
+    foreach ($option_keys as $option_key) {
+      list($menu, $item) = explode(':', $option_key);
+      if ($menu != $menu_id) {
+        unset($element[$option_key]);
+      }
+    }
+    return count($element);
+  }
+  return FALSE;
+}
+
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter() for node_form.
+ */
+function micro_menu_form_node_form_alter(&$form, FormStateInterface $form_state) {
+  $account = \Drupal::currentUser();
+  $node = $form_state->getFormObject()->getEntity();
+  /** @var \Drupal\node\NodeTypeInterface $node_type */
+  $node_type = $node->type->entity;
+  /** @var \Drupal\micro_site\SiteNegotiatorInterface $negotiator */
+  $negotiator = \Drupal::service('micro_site.negotiator');
+  $site = $negotiator->getSite();
+  if (!$site instanceof SiteInterface) {
+
+    // Try to load the site entity if we are on a node edit form.
+    if ($node->hasField('site_id')) {
+      $site = $node->get('site_id')->referencedEntities();
+    }
+
+    if (empty($site)) {
+      return;
+    }
+    $site = reset($site);
+    if (!$site instanceof SiteInterface) {
+      return;
+    }
+  }
+
+  // We have a site entity. See if it has a menu.
+  $menu = $site->getSiteMenu();
+  if (empty($menu)) {
+    return;
+  }
+
+  // Site owner, administrators and manager can link node to the site menu. We
+  // store this information into the form to retrieve it in the process callback.
+  if ($account->id() == $site->getOwnerId() ||
+    in_array($account->id(), $site->getUsersId(SiteUsers::MICRO_SITE_ADMINISTRATOR)) ||
+    in_array($account->id(), $site->getUsersId(SiteUsers::MICRO_SITE_MANAGER)) ||
+    in_array($account->id(), $site->getUsersId(SiteUsers::MICRO_SITE_CONTRIBUTOR))) {
+    $form['site_menu_access'] = [
+      '#type' => 'hidden',
+      '#default_value' => TRUE,
+    ];
+  }
+  // This module fire before menu_ui module. We alter the menu available
+  // with the site menu found.
+  $node_type->setThirdPartySetting('menu_ui', 'available_menus', [$menu]);
+  $node_type->setThirdPartySetting('menu_ui', 'parent', "$menu:");
+  // And we add a process callback which will be fire after menu_ui, to alter
+  // the #access value of the menu form.
+  $form['#process'][] = 'micro_menu_node_form_process';
+}
+
+
+/**
+ * This process methods is fire after other methods, and so we can override
+ * the access property set by the menu module which requires the permission
+ * "administer menu".
+ *
+ * @param $form
+ *   The node form.
+ *
+ * @return mixed
+ */
+function micro_menu_node_form_process($form) {
+  if (isset($form['site_menu_access']) && $form['site_menu_access']['#default_value']) {
+    $form['menu']['#access'] = TRUE;
+  }
+  return $form;
+}
