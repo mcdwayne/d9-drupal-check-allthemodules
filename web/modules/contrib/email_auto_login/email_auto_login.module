@@ -1,0 +1,115 @@
+<?php
+/**
+ * @file
+ * This file is the main module file for Email Auto Login
+ *
+ * The integration with Drupal comes on hook_mail_alter.
+ */
+
+/**
+ * Implements hook_mail_alter().
+ */
+function email_auto_login_mail_alter(&$message) {
+  $account = user_load_by_mail($message['to']->getValue()[0]['value']);
+
+  // Don't add tokens for admin, anonymous or blocked.
+  if ($account->isAnonymous() || $account->id() == 1 || $account->isBlocked()) {
+    return;
+  }
+
+  $token = _email_auto_login_generate_token($account);
+
+  foreach ($message['body'] as &$body) {
+    $body = _email_auto_login_add_token($body, $token);
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function email_auto_login_cron() {
+  _email_auto_login_invalidate();
+}
+
+/**
+ * Invalidates all existing tokens.
+ *
+ * @TODO: Move it to services.
+ */
+function _email_auto_login_invalidate() {
+  $password_reset_timeout = \Drupal::config('user.settings')->get('password_reset_timeout');
+  $timeout = \Drupal::config('email_auto_login.settings')->get('expiration_time');
+
+  $timeout = $timeout ? $timeout : $password_reset_timeout;
+
+  db_delete('email_auto_login_tokens')
+    ->condition('created', REQUEST_TIME - $timeout, '<')
+    ->execute();
+}
+
+/**
+ * Generates and saves to database a secure token.
+ *
+ * @param $account
+ *   User object.
+ *
+ * @return string
+ *   A secure token.
+ */
+function _email_auto_login_generate_token($account) {
+  $token = \Drupal::csrfToken()->get($account->getEmail());
+
+  // The transaction opens here.
+  $txn = db_transaction();
+
+  try {
+    db_merge('email_auto_login_tokens')
+      ->key(array(
+        'uid' => $account->id(),
+        'token' => $token,
+      ))
+      ->fields(array(
+        'uid' => $account->id(),
+        'token' => $token,
+        'created' => REQUEST_TIME
+      ))
+      ->execute();
+  }
+  catch (Exception $e) {
+    // Something went wrong somewhere, so roll back now.
+    $txn->rollback();
+    // Log the exception to watchdog.
+    watchdog_exception('email_auto_login', $e);
+  }
+
+  return $token;
+}
+
+/**
+ * Utility function to add a token to URLs we find in emails.
+ *
+ * @param $body
+ *   HTML body of message.
+ * @param $token
+ *   A secure token.
+ *
+ * @return string
+ *   HTML body of message with tokens.
+ */
+function _email_auto_login_add_token($body, $token) {
+  $parsed_base_url = parse_url($GLOBALS['base_url']);
+
+  $html_dom = filter_dom_load($body);
+  $links = $html_dom->getElementsByTagName('a');
+  foreach ($links as $link) {
+    $url = $link->getAttribute('href');
+    $url_link = parse_url($url);
+
+    // If link is internal.
+    if (isset($url_link['host']) && $url_link['host'] == $parsed_base_url['host']) {
+      $url = url($url, array('query' => array('l' => $token)));
+      $link->setAttribute('href', $url);
+    }
+  }
+  return filter_dom_serialize($html_dom);
+}
