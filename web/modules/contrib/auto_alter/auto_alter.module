@@ -1,0 +1,123 @@
+<?php
+
+/**
+ * @file
+ * Contains auto_alter.module.
+ */
+
+use Drupal\Core\Url;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Entity\ContentEntityInterface;
+
+/**
+ * Implements hook_modules_installed().
+ */
+function auto_alter_modules_installed($modules) {
+  if (in_array('auto_alter', $modules)) {
+    drupal_set_message(t('Microsoft Azure API key and Endpoint URL is not set and it is required for the module to work. Please set it up at the <a href=":settings">Image Automatic Alternative Text settings page</a>.', [
+      ':settings' => Url::fromRoute('auto_alter.settings')->toString(),
+    ]));
+  }
+}
+
+/**
+ * Implements hook_entity_presave().
+ */
+function auto_alter_entity_presave(EntityInterface $entity) {
+  if ($entity instanceof ContentEntityInterface) {
+    $entity_manager = \Drupal::service('entity_field.manager');
+    foreach ($entity_manager->getFieldDefinitions($entity->getEntityTypeId(), $entity->bundle()) as $field_name => $field_definition) {
+      if (!empty($field_definition->getTargetBundle())) {
+        if ($field_definition->getType() == 'image') {
+          $images = $entity->get($field_name);
+          foreach ($images as $key => $image) {
+            if (empty($image->alt)) {
+              $images[$key]->alt = auto_alter_get_description($image->target_id);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function auto_alter_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $suggestion = \Drupal::config('auto_alter.settings')->get('suggestion');
+  if ($suggestion && isset($form['#entity_builders'])) {
+    $entity = $form_state->getFormObject()->getEntity();
+    $entity_manager = \Drupal::service('entity_field.manager');
+    foreach ($entity_manager->getFieldDefinitions($entity->getEntityTypeId(), $entity->bundle()) as $field_name => $field_definition) {
+      if (!empty($field_definition->getTargetBundle())) {
+        if ($field_definition->getType() == 'image') {
+          $images = $entity->get($field_name);
+          foreach ($images as $key => $image) {
+            $entity_manager = \Drupal::entityTypeManager();
+            if (isset($form[$field_name]['widget'][$key]) && $form[$field_name]['widget'][$key]['#alt_field'] && isset($form[$field_name]['widget'][$key]['#default_value']['alt']) && empty($form[$field_name]['widget'][$key]['#default_value']['alt'])) {
+              $form[$field_name]['widget'][$key]['#default_value']['alt'] = auto_alter_get_description($form[$field_name]['widget'][$key]['#default_value']['fids'][0]);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements auto_alter_get_description($fid).
+ *
+ * @param int $fid
+ *   File ID.
+ */
+function auto_alter_get_description($fid) {
+  if (\Drupal::service('auto_alter.get_description')->checksetup() === FALSE) {
+    drupal_set_message(
+      t('Microsoft Azure API key and Endpoint URL is not set and it is required for the module to work. Please set it up at the <a href=":settings">Image Automatic Alternative Text settings page</a>.', [
+        ':settings' => Url::fromRoute('auto_alter.settings')->toString(),
+      ])
+    );
+    return '';
+  }
+  $entity_manager = \Drupal::entityTypeManager();
+  $status = \Drupal::config('auto_alter.settings')->get('status');
+  $file = $entity_manager->getStorage('file')->load($fid);
+  $uri = \Drupal::service('auto_alter.get_description')->geturi($file);
+  $path = \Drupal::service('file_system')->realpath($uri);
+  $request = \Drupal::service('auto_alter.get_description')->getdescription($path);
+  if ($request->getStatusCode() == 200) {
+    $response = json_decode($request->getBody());
+    if (isset($response->description->captions[0]->text)) {
+      $alternate_text = $response->description->captions[0]->text;
+    }
+    else if (isset($response->description->tags)) {
+      $alternate_text = rtrim(implode(',', $response->description->tags), ',');
+    }
+    $moduleHandler = \Drupal::service('module_handler');
+    if ($moduleHandler->moduleExists('auto_alter_translate')) {
+      $active = \Drupal::config('auto_alter_translate.settings')->get('active');
+      if ($active) {
+        $request = \Drupal::service('auto_alter_translate.get_translation')->gettranslation($alternate_text);
+        if (!empty($request) && $request->getStatusCode() == 200) {
+          $trans = (array) json_decode($request->getBody());
+          $alternate_text = $trans[0]->translations[0]->text;
+        }
+      }
+    }
+    if ($status) {
+      $percent_friendly = number_format($response->description->captions[0]->confidence * 100, 2) . '%';
+      drupal_set_message(t('Alternate text has been changed to: %text" by a confidence of :confidence', ['%text' => $alternate_text, ':confidence' => $percent_friendly]), 'status');
+    }
+    return $alternate_text;
+
+  }
+  else {
+    if ($status) {
+      drupal_set_message(t('Automatic generation of Alternate text has failed'), 'warning');
+    }
+    return '';
+  }
+
+}                     
