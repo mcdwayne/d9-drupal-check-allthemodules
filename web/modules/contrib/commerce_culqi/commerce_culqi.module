@@ -1,0 +1,816 @@
+<?php
+/**
+ * @file
+ * Implements culqi.com payment services for use with Drupal Commerce.
+ */
+
+define('COMMERCE_CULQI_URL_PRODUCTION', 'https://checkout.culqi.com/plugins/v2/');
+define('COMMERCE_CULQI_URL_TEST', 'https://checkout.culqi.com/plugins/v2/');
+define('COMMERCE_CULQI_URL_CONFIRMATION', 'culqi/confirmation');
+define('COMMERCE_CULQI_URL_RESPONSE', 'culqi/response');
+define('COMMERCE_CULQI_DESCRIPTION', 'Purchase order number @order_id');
+define('COMMERCE_CULQI_MERCHANTID', 'demo');
+define('COMMERCE_CULQI_NAME', 'Culqi demo');
+define('COMMERCE_CULQI_APIKEY', 'sk_test_zSx3B7eZVHivsFQy');
+define('COMMERCE_CULQI_APIKEY_PUBLIC', 'pk_test_c1bEz4ZIxKD12kCn');
+define('COMMERCE_CULQI_ALIAS', 'CULQI-');
+define('RESPONSE_CULQI_SUCCESS', 'AUT0000');
+
+
+/**
+ * Implemenst hook_entity_info().
+ */
+function commerce_culqi_entity_info() {
+  return array(
+    'commerce_culqi' => array(
+      'label' => t('Commerce Culqi'),
+      'controller class' => 'CommerceCulqiEntityController',
+      'views controller class' => 'EntityDefaultViewsController',
+      'base table' => 'commerce_culqi',
+      'fieldable' => FALSE,
+      'entity keys' => array(
+        'id' => 'id',
+      ),
+      'bundles' => array(),
+      'view modes' => array(
+        'default' => array(
+          'label' => t('Full Record'),
+          'custom settings' => TRUE,
+        ),
+      ),
+    ),
+  );
+}
+
+/**
+ * Implements hook_permission().
+ */
+function commerce_culqi_permission() {
+  return array(
+    'commerce culqi view transaction' => array(
+      'title' => t('View transaction'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_culqi_menu() {
+  $items = array();
+
+  $items[COMMERCE_CULQI_URL_RESPONSE . '/%commerce_order/%/%'] = array(
+    'title' => 'Transaction summary',
+    'page callback' => 'commerce_culqi_response',
+    'page arguments' => array(2, 3),
+    //'access callback' => 'commerce_culqi_access_page',
+    'access callback' => true,
+    //'access arguments' => array(2, 3, 4, 1),
+    'type' => MENU_CALLBACK,
+    'file' => 'commerce_culqi.inc',
+  );
+
+  $items[COMMERCE_CULQI_URL_CONFIRMATION . '/%commerce_order/%/%'] = array(
+    'page callback' => 'commerce_culqi_confirmation',
+    'page arguments' => array(2),
+    //'access callback' => 'commerce_culqi_access_page',
+  //  'access arguments' => array(2, 3, 4, 1),
+    'access callback' => true,
+    'type' => MENU_CALLBACK,
+    'file' => 'commerce_culqi.inc',
+  );
+
+  $items['admin/commerce_culqi/%entity_object/view'] = array(
+    'title' => 'View Transaction',
+    'page callback' => 'commerce_culqi_page_view',
+    'page arguments' => array(2),
+    'load arguments' => array('commerce_culqi'),
+    'access arguments' => array('commerce culqi view transaction'),
+    'type' => MENU_CALLBACK,
+  );
+
+    $items['respuesta'] = array(
+    'title' => 'Transaction summary',
+    'page callback' => 'commerce_culqi_response11',
+    //'page arguments' => array(2, 3),
+    'access callback' => true,
+    //'access arguments' => array(2, 3, 4, 1),
+   // 'access arguments' => array('commerce alignetsoles view transaction'),
+    'type' => MENU_CALLBACK,
+    'file' => 'commerce_culqi.inc',
+  );
+
+  return $items;
+}
+
+
+function commerce_culqi_page_view($entity) {
+  return entity_view('commerce_culqi', array($entity));
+}
+
+/**
+ * Access callback page confirmation/response.
+ */
+function commerce_culqi_access_page($order, $token, $option, $page) {
+  $is_valid = commerce_culqi_validate_signature($order, $page);
+  return $option == commerce_culqi_get_md5($order->order_id, $token, $page) && $is_valid;
+}
+
+/**
+ * Load parameters.
+ */
+function commerce_culqi_json_param($order) {
+  $path = drupal_get_path('module', 'commerce_culqi');
+  require_once $path.'/lib/culqi.php';
+  $payment = commerce_payment_method_instance_load($order->data['payment_method']);
+  Culqi::$codigoComercio = $payment['settings']['py_commerce_code'];
+  Culqi::$llaveSecreta = $payment['settings']['py_api_key'];
+
+  $baseServer = $payment['settings']['py_action_url_production'];
+  if($payment['settings']['py_testing'] == 1) {
+    $baseServer = $payment['settings']['py_action_url_test'];
+  }
+  Culqi::$servidorBase = $baseServer; //$payment['settings']['py_action_url_production'];
+  $param = array();
+  $inputJSON = file_get_contents('php://input');
+  $input= json_decode( $inputJSON, TRUE );
+  $response = json_decode(Culqi::decifrar($input['response']), TRUE);
+  if(!is_array($response) || $response == NULl) {
+    $param['response'] = $input['response'];
+    $param['response_accion'] = $input['response'];
+  }
+  else {
+    $param = $response;
+    $param['response'] = 'response_culqi';
+  }
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $currency_code = $wrapper->commerce_order_total->currency_code->value();
+  $amount = $wrapper->commerce_order_total->amount->value();
+  $param['signature'] = $input['signature'];
+  $param['referenceCode'] = str_replace(' ', '', $input['referenceCode']);
+  $param['instance_id'] = $payment['instance_id'];
+  $param['currency_code'] = $currency_code;
+  $param['amount'] = $amount;
+  $url_page = commerce_culqi_get_url($order->order_id);
+  $param['confirmationUrl'] = $url_page['confirmation'];
+  $param['description'] = t($payment['settings']['py_description'], array(
+    '@order_id' => $order->order_id,
+  ));
+
+
+  return $param;
+}
+
+/**
+ * Validate signature generate from CULQI.
+ */
+function commerce_culqi_validate_signature($order, $page) {
+  module_load_include('inc', 'commerce_culqi');
+
+  $instance_id = $order->data['payment_method'];
+  $payment_method = commerce_payment_method_instance_load($instance_id);
+
+  $param = commerce_culqi_json_param($order);
+  $params = array(
+    $payment_method['settings']['py_api_key'],
+    $payment_method['settings']['py_commerce_code'],
+  );
+  $amount = number_format(commerce_currency_amount_to_decimal($param['amount'], $param['currency_code']), 1, '.', '');
+  switch ($page) {
+    case 'response':
+      if($order->status != 'checkout_payment') {
+        return TRUE;
+      }
+      break;
+    case 'confirmation':
+      $params = array_merge($params, array(
+        $param['referenceCode'],
+        $amount,
+        $param['currency_code'],
+      ));
+      $signature = md5(implode('~', $params));
+      $key = 'signature';
+      break;
+    case 'validate':
+      if($order->status == 'checkout_payment') {
+        return TRUE;
+      }
+      break;
+  }
+  return strtoupper($param[$key]) == strtoupper($signature);
+}
+
+/**
+ * Returns an array of alignet payment methods.
+ */
+function commerce_culqi_payment_methods() {
+  return array(
+    'culqi' => t('Culqi'),
+    'visa' => t('Visa'),
+    'mc' => t('Mastercard'),
+    'amex' => t('American Express'),
+    'diners' => t('Diners club'),
+   /* 'cmr' => t('CMR'),
+    'oh' => t('OH'),
+    'presta' => t('Presta'),
+    'ripley' => t('Ripley'),
+    'up' => t('UnionPay'),
+    'cencosud' => t('Cencosud'),*/
+  );
+}
+
+/**
+ * Returns an array of alignet payment method icon img elements.
+ *
+ * @param $methods
+ *   An array of alignet payment method names to include in the icons array; if
+ *   empty, all icons will be returned.
+ *
+ * @return
+ *   The array of themed payment method icons keyed by name: visa, mastercard,
+ *   amex, discover, echeck, alignet
+ */
+function commerce_culqi_icons($methods = array()) {
+  $icons = array();
+
+  foreach (commerce_culqi_payment_methods() as $name => $title) {
+    if (empty($methods) || in_array($name, $methods, TRUE)) {
+        $variables = array(
+          'path' => drupal_get_path('module', 'commerce_culqi') . '/images/' . $name . '.png',
+          'title' => $title,
+          'alt' => $title,
+          'attributes' => array(
+            'class' => array('commerce-culqi-icon','icon-'.$name),
+          ),
+        );
+        if($name == 'culqi') {
+          $icons['logo'][$name] = theme('image', $variables);
+        }
+        else {
+          $icons['cards'][$name] = theme('image', $variables);
+        }
+    }
+  }
+
+  return $icons;
+}
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_culqi_commerce_payment_method_info() {
+  $payment_methods = array();
+  $payment_methods['culqi_payment'] = array(
+    'base' => 'commerce_culqi',
+    'title' => t('CULQI'),
+    'short_title' => t('CULQI'),
+    'description' => t('CULQI Payments Standard'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => FALSE,
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function commerce_culqi_form_commerce_checkout_form_alter(&$form, &$form_state) {
+  // If this checkout form contains the payment method radios...
+  if (!empty($form['commerce_payment']['payment_method']['#options'])) {
+    // Loop over its options array looking for a alignet payme option.
+    foreach ($form['commerce_payment']['payment_method']['#options'] as $key => &$value) {
+      list($method_id, $rule_name) = explode('|', $key);
+      // If we find culqi payme...
+      if ($method_id == 'culqi_payment') {
+        // Prepare the replacement radio button text with icons.
+        $icons = commerce_culqi_icons();
+        $value = t('Pay with Credit card, Debit or Prepaid', array('!logo' => $icons['logo']['culqi']));
+         $value .= '<div class="commerce-culqi-icons"><span class="label">' . t('Includes:') . '</span>' . implode(' ', $icons['cards']) . '</div>';
+        break;
+      }
+    }
+  }
+}
+
+/**
+ * Payment method callback: settings form.
+ */
+function commerce_culqi_settings_form($settings = array()) {
+  $form = array();
+  $form['py_name'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Name commerce'),
+    '#required' => TRUE,
+    '#default_value' => isset($settings['py_name']) ? $settings['py_name'] : COMMERCE_CULQI_NAME,
+  );
+
+  $form['py_api_key'] = array(
+    '#type' => 'textfield',
+    '#title' => t('API KEY Private'),
+    '#required' => TRUE,
+    '#default_value' => isset($settings['py_api_key']) ? $settings['py_api_key'] : COMMERCE_CULQI_APIKEY,
+  );
+
+    $form['py_api_key_public'] = array(
+    '#type' => 'textfield',
+    '#title' => t('API KEY Public'),
+    '#required' => TRUE,
+    '#default_value' => isset($settings['py_api_key_public']) ? $settings['py_api_key_public'] : COMMERCE_CULQI_APIKEY_PUBLIC,
+  );
+
+  $form['py_commerce_code'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Commerce code'),
+    '#required' => TRUE,
+    '#default_value' => isset($settings['py_commerce_code']) ? $settings['py_commerce_code'] : COMMERCE_CULQI_MERCHANTID,
+  );//no usar
+
+  $form['py_account_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Account Id'),
+    '#default_value' => isset($settings['py_account_id']) ? $settings['py_account_id'] : NULL,
+  );
+
+  $py_action = COMMERCE_CULQI_URL_PRODUCTION;
+  if (isset($settings['py_action_url_production'])) {
+    $py_action = $settings['py_action_url_production'];
+  }
+
+  $form['py_action_url_production'] = array(
+    '#title' => t('Path Form Action'),
+    '#type' => 'textfield',
+    '#size' => 50,
+    '#default_value' => $py_action,
+    '#required' => TRUE,
+  );
+
+  $py_action_test = COMMERCE_CULQI_URL_TEST;
+  if (isset($settings['py_action_url_test'])) {
+    $py_action_test = $settings['py_action_url_test'];
+  }
+
+  $form['py_action_url_test'] = array(
+    '#title' => t('Test Path Form Action'),
+    '#type' => 'textfield',
+    '#size' => 50,
+    '#default_value' => $py_action_test,
+    '#required' => TRUE,
+  );
+
+  $items = array();
+  if (function_exists('commerce_tax_rates')) {
+    $items = commerce_tax_rates();
+  }
+
+  $options = array();
+  foreach ($items as $name => $item) {
+    $options[$name] = $item['title'];
+  }
+  $py_alias = isset($settings['py_alias']) ? $settings['py_alias'] : COMMERCE_CULQI_ALIAS;
+  $form['py_alias'] = array(
+    '#title' => t('Alias'),
+    '#description' => t('Is concatenated with the order number, example: @example', array(
+      '@example' => '"' . $py_alias . '1"',
+    )),
+    '#type' => 'textfield',
+    '#size' => 20,
+    '#default_value' => $py_alias,
+  );
+
+  $description = isset($settings['py_description']) ? $settings['py_description'] : COMMERCE_CULQI_DESCRIPTION;
+
+  $form['py_description'] = array(
+    '#title' => t('Description'),
+    '#description' => t('CULQI purchase description, use @order_id to obtain the order number'),
+    '#type' => 'textfield',
+    '#size' => 50,
+    '#default_value' => $description,
+    '#required' => TRUE,
+  );
+
+  $form['py_url_terms'] = array(
+    '#title' => t('Terms & Conditions'),
+    '#type' => 'textfield',
+    '#size' => 50,
+    '#default_value' => isset($settings['py_url_terms']) ? $settings['py_url_terms'] : '',
+    '#required' => TRUE,
+  );
+  $status = commerce_order_status_options_list();
+
+  $form['py_assign_status'] = array(
+    '#title' => t('Assign Status'),
+    '#type' => 'radios',
+    '#options' => array(
+      'A' => t('Automatic'),
+      'M' => t('Manual'),
+    ),
+    '#default_value' => isset($settings['py_assign_status']) ? $settings['py_assign_status'] : 'M',
+    '#required' => TRUE,
+  );
+
+  $form['py_status_' . COMMERCE_PAYMENT_STATUS_SUCCESS] = array(
+    '#title' => t('Status Success'),
+    '#type' => 'select',
+    '#options' => $status,
+    '#default_value' => isset($settings['py_status_' . COMMERCE_PAYMENT_STATUS_SUCCESS]) ? $settings['py_status_' . COMMERCE_PAYMENT_STATUS_SUCCESS] : 'pending',
+    //'#required' => TRUE,
+    '#states' => array(
+      'visible' => array('input[name*="py_assign_status"]' => array('value' => 'M')),
+    ),
+  );
+
+  $form['py_status_' . COMMERCE_PAYMENT_STATUS_FAILURE] = array(
+    '#title' => t('Status Failure'),
+    '#type' => 'select',
+    '#options' => $status,
+    '#default_value' => isset($settings['py_status_' . COMMERCE_PAYMENT_STATUS_FAILURE]) ? $settings['py_status_' . COMMERCE_PAYMENT_STATUS_FAILURE] : 'canceled',
+    //'#required' => TRUE,
+    '#states' => array(
+      'visible' => array('input[name*="py_assign_status"]' => array('value' => 'M')),
+    ),
+  );
+
+  $form['py_description'] = array(
+    '#title' => t('Description'),
+    '#description' => t('CULQI purchase description, use @order_id to obtain the order number'),
+    '#type' => 'textfield',
+    '#size' => 50,
+    '#default_value' => $description,
+    '#required' => TRUE,
+  );
+
+  $form['py_testing'] = array(
+    '#title' => t('Test Enabled'),
+    '#type' => 'select',
+    '#options' => array(
+      '0' => t('No'),
+      '1' => t('Yes'),
+    ),
+    '#required' => TRUE,
+    '#default_value' => isset($settings['py_testing']) ? $settings['py_testing'] : NULL,
+  );
+
+  return $form;
+}
+
+/**
+ * Add parameters method culqi
+ */
+function commerce_culqi_redirect_form($form, &$form_state, $order, $payment_method) {
+
+  $settings = $payment_method['settings'];
+  //dpm($settings);
+  if (!isset($settings['py_api_key']) || empty($settings['py_commerce_code'])) {
+    drupal_set_message(t('CULQI is not configured for use. No user Id has been specified.'), 'error');
+    return array();
+  }
+  module_load_include('inc', 'commerce_culqi');
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $address = $wrapper->commerce_customer_billing->commerce_customer_address->value();
+
+  /*--CUSTOM-*/
+  $profile_id = $wrapper->commerce_customer_billing->profile_id->value();
+  $profile = commerce_customer_profile_load($profile_id);
+
+ // $tid = $profile->field_departamento['und'][0]['tid'];
+ // $term = taxonomy_term_load($tid);
+  $locality = $profile->commerce_customer_address['und'][0]['locality'];
+
+  $currency_code = $wrapper->commerce_order_total->currency_code->value();
+
+  $settings['currency_code'] = $currency_code;
+
+  $amount = $wrapper->commerce_order_total->amount->value();
+  $settings['amount'] = number_format(commerce_currency_amount_to_decimal($amount, $currency_code), 1, '.', '');
+  // $settings['sale_reference'] = commerce_culqi_get_reference($settings['py_alias'], $order->order_id);
+ // $signature = commerce_culqi_get_firm($settings);
+  $url_page = commerce_culqi_get_url($order->order_id);
+  $description = t($settings['py_description'], array(
+    '@order_id' => $order->order_id,
+  ));
+  $jsBaseServer = $settings['py_action_url_production'];
+  if($settings['py_testing'] == 1) {
+    $jsBaseServer = $settings['py_action_url_test'];
+  }
+  // Structure required for CULQI.
+  $data = array(
+    'title' => $settings['py_name'],
+    'order_id' => $order->order_id,
+    'jsBaseServer' => $jsBaseServer,
+    'public_keySecret' => $settings['py_api_key_public'],
+    //'commerceId' => $settings['py_commerce_code'],
+  //  'referenceCode' => $settings['sale_reference'],
+    'description' => $description,
+    'country' => $address['country'],
+    'amount' => $amount,
+    'currency' => $settings['currency_code'],
+   // 'signature' => $signature,
+    'Name' => $address['first_name'],
+    'Lastname' => $address['last_name'],
+    //'Phone' => $address['phone_number'],
+    'Address' => $address['thoroughfare'] ,
+    'City' => $locality,
+    'iduser' => $order->uid,
+    'email' => $order->mail,
+    'confirmationUrl' => $url_page['confirmation'],
+    'responseUrl' => $url_page['response'],
+    'instance_id' => $payment_method['instance_id'],
+  );
+
+  $html = '';
+  //dpm($data);
+  if(validate_culqi_data($data)) {
+      //drupal_add_js($baseServer.'/plugins/v2/', 'external');
+      //commerce_culqi_button_pay($data, $html);
+    $html = theme('culqi_pay', array('data' => $data));
+  }
+  else {
+     //drupal_set_message(t('These fields are required'), 'error');
+     if($order->status == 'checkout_payment')
+        commerce_payment_redirect_pane_previous_page($order);
+
+       drupal_goto("/checkout/".$order->order_id);
+  }
+  $url_term = $settings['py_url_terms'];
+
+
+  $form['message_div'] = array(
+    '#type' => 'markup',
+    '#disabled' => TRUE,
+    '#markup' => '',
+    '#prefix' => '<div id="message_div">',
+    '#suffix' => '</div>',
+    '#tree' => true,
+  );
+  $form['term_conditiones'] = array(
+    '#type' => 'radio',
+    '#title' => t('I have read and agree to the !url.', array('!url' => l(t('Terms & Conditions'), $url_term, array('attributes'=> array('target'=>"_blank"))))),
+    '#default_value' => 1,
+    '#required'=>TRUE,
+    '#states' => array(
+      // Mark this checkbox checked if the "more_info" textarea has something
+      // in it, if it's 'filled'.
+      'checked' => array(
+        ':input[name="term_conditiones"]' => array('filled' => TRUE),
+      ),
+    ),
+  );
+
+  $form['cancel'] = array(
+    '#type' => 'hidden',
+    '#value' => TRUE,
+    '#title' => t('cancel')
+  );
+
+  $form['post_cancel'] = array(
+    '#type' => 'hidden',
+    '#value' => $url_page['confirmation'],
+    '#title' => t('url cancel'),
+  );
+
+   $form['actions']['cancel'] = array(
+    '#type' => 'submit', 
+    '#value' => t('Cancel'), 
+    '#weight' => 15, 
+    '#submit' => array('commerce_culqi_cancel_form_submit'),
+    '#attributes' => array('class' => array('cancel-pay-culqi'))
+  );
+
+  $form['html'] = array(
+  '#type' => 'markup',
+  '#disabled' => TRUE,
+  '#markup' => $html,
+  '#tree' => true,
+  );
+//dpm($form);
+
+  return $form;
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function commerce_culqi_views_api() {
+  return array(
+    'api' => 3,
+    'path' => drupal_get_path('module', 'commerce_culqi') . '/views',
+  );
+}
+
+/**
+ * hook_entity_property_info().
+ */
+function commerce_culqi_entity_property_info() {
+  $info = array();
+
+  $properties = &$info['commerce_culqi']['properties'];
+
+  $properties['py_id'] = array(
+    'label' => t('Id'),
+    'type' => 'integer',
+    'description' => t('The unique ID'),
+    'schema field' => 'id',
+  );
+
+  $properties['py_order_id'] = array(
+    'label' => t('Order'),
+    'type' => 'commerce_order',
+    'description' => t('Commerce order'),
+    'schema field' => 'order_id',
+  );
+
+  $properties['py_created'] = array(
+    'label' => t('Date created'),
+    'type' => 'date',
+    'schema field' => 'created',
+    'description' => t('The date created record'),
+  );
+
+  $properties['py_state_transaction'] = array(
+    'label' => t('State transaction'),
+    'type' => 'integer',
+    'description' => t('The state transaction ID'),
+    'schema field' => 'state_transaction',
+  );
+
+  $properties['py_reference_culqi'] = array(
+    'label' => t('Reference Culqi'),
+    'type' => 'integer',
+    'description' => t('The reference culqi'),
+    'schema field' => 'reference_culqi',
+  );
+
+  $properties['py_value'] = array(
+    'label' => t('Value'),
+    'type' => 'decimal',
+    'description' => t('The value transaction'),
+    'schema field' => 'value',
+  );
+
+  $properties['py_response'] = array(
+    'label' => t('Response'),
+    'type' => 'text',
+    'description' => t('The response'),
+    'schema field' => 'response',
+  );
+
+  return $info;
+}
+
+class CommerceCulqiEntityController extends EntityAPIController {
+
+  public function buildContent($entity, $view_mode = 'full', $langcode = NULL, $content = array()) {
+    $rows = array();
+
+    $rows[] = array(t('Id'), $entity->id);
+    $rows[] = array(t('Order'), l($entity->order_id, 'admin/commerce/orders/' . $entity->order_id . '/view'));
+
+    $rows[] = array(t('Created'), format_date($entity->created, 'custom', 'Y-m-d H:i:s'));
+
+    $rows[] = array(t('State Transaction'), $entity->state_transaction);
+
+    $rows[] = array(t('Reference Culqi'), $entity->reference_culqi);
+
+    $rows[] = array(t('Value'), number_format($entity->value, 2, ',', '.'));
+
+    $rows[] = array(t('Response'), '<pre>' . print_r($entity->response, TRUE) . '</pre>');
+
+    $content['table_transaction'] = array(
+      '#markup' => theme('table', array(
+        'rows' => $rows,
+        'header' => array(
+          t('Item'),
+          t('Value'),
+        ),
+      ))
+    );
+
+    return parent::buildContent($entity, $view_mode, $langcode, $content);
+  }
+}
+
+/**
+ * Implements hook_form().
+ */
+function commerce_culqi_cancel_form($form, &$form_state, $arguments = array()) {
+  $form['message'] = array(
+    '#type' => 'hidden',
+    '#value' => $arguments['message'],
+    '#title' => t('Message'),
+  );
+  $form['status'] = array(
+    '#type' => 'hidden',
+    '#value' => $arguments['status'],
+    '#title' => t('status'),
+  );
+
+  /*if($arguments['action']) {
+      $form['#action'] = url($arguments['action']); // Information will now be submitted to this URL other than Drupal. 
+      $form['#method'] = 'POST'; // Just for clarification. This is the default value.
+      $form['cancel'] = array(
+        '#type' => 'hidden',
+        '#value' => TRUE,
+        '#title' => t('status'),
+      );
+  }*/
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => $arguments['textbtn'],
+  );
+  return $form;
+}
+/**
+ * Add a submit handler/function to the form.
+ *
+ * This will add a completion message to the screen when the
+ * form successfully processes
+ */
+function commerce_culqi_cancel_form_submit($form, &$form_state) {
+
+  
+  if(isset($form_state['values']['cancel'])) {
+      $form_state['rebuild'] = TRUE;
+     // dpm($form_state);
+      $url_temp = $form_state['values']['post_cancel'];
+      $url = url($url_temp,array('absolute'=>TRUE));
+      $data = 'token=cancel';
+
+      $options = array(
+                      'method' => 'POST',
+                      'data' => $data,
+                      'timeout' => 5,
+                      'headers' => array('Content-Type' => 'application/x-www-form-urlencoded'),
+              );
+      $result = drupal_http_request($url, $options);
+
+   //   if ($result->code == 200) {
+         // drupal_goto('/');
+          $form_state['redirect'] = '/';
+      //  }
+          drupal_set_message(t('Order canceled'), 'warning');
+          drupal_goto('/');
+  }
+  else {
+      $message = $form_state['values']['message'];
+      $status = $form_state['values']['status'];
+      drupal_set_message(t($message), $status);
+      drupal_goto('/');
+  }
+  //
+  //drupal_goto('/mymodule/search');
+  /*if($form_state['#action']) {
+      $requestar['cancel'] = $form_state['values']['cancel'];
+
+      //forming an array to post
+      $onestr = '';
+      //foreach ($requestar as $key => $value) {
+      $onestr .= 'cancel'."=".TRUE;
+     // }
+      $resstr = chop($onestr, '&');
+
+       //or via http_request
+       $result = drupal_http_request($form_state['#action'], array('Content-Type' => 'application/x-www-form-urlencoded'), 'POST', $resstr);
+       //drupal_set_message($result->request);
+  }*/
+
+
+  
+}
+
+/**
+* Implements hook_theme().
+*/
+function commerce_culqi_theme() {
+  return array(
+    'culqi_pay' => array(
+      'template' => 'culqi_pay',
+      'variables' => array(
+        'data' => array()
+      ),
+    )
+  );
+}
+
+function commerce_culqi_preprocess_culqi_pay(&$variables) {
+ // $variables['streaming'] = streaming_drupal_data_html();
+  $path = drupal_get_path('module', 'commerce_culqi');
+  drupal_add_css($path . '/css/waitMe.min.css');
+  drupal_add_css($path . '/css/payalert.css');
+
+  $file_js = $variables['data']['jsBaseServer'];
+
+  drupal_add_js($file_js, "external");
+  drupal_add_js($path . '/js/waitMe.min.js');
+
+
+  $data = array(
+    'public_keySecret' => $variables['data']['public_keySecret'],
+    'title' => $variables['data']['title'],
+    'currency' => $variables['data']['currency'],
+    'description' => $variables['data']['description'],
+    'amount' => $variables['data']['amount'],
+    );
+  drupal_add_js(array('commerce_culqi' => array('data' => $data)), 'setting');
+  drupal_add_js($path . '/js/culqi.js');
+}
