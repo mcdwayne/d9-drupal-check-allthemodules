@@ -1,0 +1,133 @@
+<?php
+
+/**
+ * @file
+ * Handles automatically adding entities to entityqueues.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\entityqueue\Entity\EntityQueue;
+use Drupal\entityqueue\Entity\EntitySubqueue;
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Adds an additional option allowing entities to be added upon creation.
+ */
+function auto_entityqueue_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  if (preg_match('/^entity_queue_(add|edit)_form$/', $form_id)) {
+    // Get entity settings from the queue.
+    $entity_settings = $form_state->getFormObject()->getEntity()->getEntitySettings();
+
+    $form['entity_settings']['settings']['handler_settings']['auto_entityqueue'] = array(
+      '#title' => t('Auto Entityqueue'),
+      '#type' => 'fieldset',
+    );
+
+    // Add a checkbox setting for automatically adding entities.
+    $form['entity_settings']['settings']['handler_settings']['auto_entityqueue']['auto_add'] = array(
+      '#default_value' => isset($entity_settings['handler_settings']['auto_entityqueue']['auto_add']) ? $entity_settings['handler_settings']['auto_entityqueue']['auto_add'] : FALSE,
+      '#description' => t('New entities of selected types will be automatically added to the queue.'),
+      '#title' => t('Automatically add entities to queue'),
+      '#type' => 'checkbox',
+    );
+
+    // Add a checkbox setting for insert position.
+    $form['entity_settings']['settings']['handler_settings']['auto_entityqueue']['insert_front'] = array(
+      '#default_value' => isset($entity_settings['handler_settings']['auto_entityqueue']['insert_front']) ? $entity_settings['handler_settings']['auto_entityqueue']['insert_front'] : FALSE,
+      '#description' => t('By default items are added at the back of the queue. If checked, items will be added at the front of the queue.'),
+      '#title' => t('Insert entities at front of queue'),
+      '#states' => array(
+        'invisible' => array(
+          ':input[name="entity_settings[handler_settings][auto_entityqueue][auto_add]"]' => array('checked' => FALSE),
+        ),
+      ),
+      '#type' => 'checkbox',
+    );
+  }
+}
+
+/**
+ * Implements hook_entity_insert().
+ */
+function auto_entityqueue_entity_insert(EntityInterface $entity) {
+  $type = $entity->getEntityTypeId();
+  $bundle = $entity->bundle();
+
+  // Get queues for this entity type and bundle combo.
+  $queues = auto_entityqueue_get_queues_by_type_and_bundle($type, $bundle);
+  if (count($queues)) {
+    // Add the entity to each queues returned.
+    foreach ($queues as $queue) {
+      auto_entityqueue_add_entity_to_queue($entity, $queue);
+    }
+  }
+}
+
+/**
+ * Add an entity to a queue.
+ *
+ * @param $entity
+ * @param EntityQueue $queue
+ */
+function auto_entityqueue_add_entity_to_queue($entity, EntityQueue $queue) {
+  // Get the entity id.
+  $entity_id = $entity->id();
+
+  // Get the queue entity settings.
+  $entity_settings = $queue->getEntitySettings();
+  $queue_settings = $queue->getQueueSettings();
+
+  // Get the subqueues.
+  $query = \Drupal::entityQuery('entity_subqueue')->condition('queue', $queue->id());
+  $result = $query->execute();
+  $subqueues = EntitySubqueue::loadMultiple($result);
+
+  // Add entity to each subqueue.
+  foreach ($subqueues as $subqueue) {
+    $items = $subqueue->get('items')->getValue();
+
+    // Deetermine if we should remove an item from the list to avoid exceeding
+    // the maximum number of items.
+    $remove_item = !empty($queue_settings['max_size']) && count($items) >= $queue_settings['max_size'];
+
+    if (isset($entity_settings['handler_settings']['auto_entityqueue']['insert_front']) && $entity_settings['handler_settings']['auto_entityqueue']['insert_front']) {
+      !$remove_item or array_pop($items);
+      array_unshift($items, array('target_id' => $entity_id));
+    } 
+    else {
+      !$remove_item or array_shift($items);
+      array_push($items, array('target_id' => $entity_id));
+    }
+    $subqueue->set('items', $items);
+    $subqueue->save();
+  }
+}
+
+/**
+ * Load queues with specific type and bundle.
+ *
+ * @param string $type
+ * @param string $bundle
+ *
+ * @return array
+ */
+function auto_entityqueue_get_queues_by_type_and_bundle($type, $bundle) {
+  $target_queues = array();
+
+  // Load entity queues by type.
+  $queues = EntityQueue::loadMultipleByTargetType($type);
+  foreach ($queues as $queue) {
+    $entity_settings = $queue->getEntitySettings();
+    if (in_array($bundle, $entity_settings['handler_settings']['target_bundles']) // Check bundle.
+      && (isset($entity_settings['handler_settings']['auto_entityqueue']['auto_add'])
+      && $entity_settings['handler_settings']['auto_entityqueue']['auto_add']) // Check if auto add is enabled.
+      && $queue->status() // Check if queue is enabled.
+    ) {
+      $target_queues[] = $queue;
+    }
+  }
+
+  return $target_queues;
+}
