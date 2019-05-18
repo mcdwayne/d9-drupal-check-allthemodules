@@ -1,0 +1,341 @@
+<?php
+
+/**
+ * @file
+ * Implements the Google Cloud Vision API properties.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\field\FieldConfigInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\taxonomy\Entity\Vocabulary;
+use Drupal\Core\Url;
+use Drupal\Core\Routing\RouteMatchInterface;
+
+/**
+ * Implements hook_help().
+ */
+function google_vision_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.google_vision':
+      $help = '';
+      $help .= '<h2><strong>' . t('About') . '</strong></h2>';
+      $help .= '<p>' . t('Google Vision API enables developers to understand the content of an image by encapsulating powerful machine learning models in an easy to use REST API. It integrates the features offered by the <a href = ":vision">Google Cloud Vision API</a>', array(':vision' => 'https://cloud.google.com/vision/')) . '</p>';
+      $help .= '<br/>';
+      $help .= '<h2><strong>' . t('Uses') . '</strong></h2>';
+      $help .= '<h4><strong>' . t('Tagging of Image files') . '</strong></h4>';
+      $help .= '<p>' . t('Google Vision API module allows to create and manage taxonomy terms based on the response returned by the Google Cloud Vision API for a particular image. These terms can be used to tag images based on categories such as flowers, jewellery, animals, etc.') . '</p>';
+      $help .= '<h4><strong>' . t('Safe Search Detection') . '</strong></h4>';
+      $help .= '<p>' . t('It also allows detection of explicit or violent contents within an image and ask for moderation if the feature is enabled for the site. The feature is configured to be used on per image field basis, and the user can control the fields on which he wants to allow safe search or not.') . '</p>';
+      $help .= '<h4><strong>' . t('Filling Alt Text attribute of image file') . '</strong></h4>';
+      $help .= '<p>' . t('The Alt Text attribute of an image field can be filled using four ways, namely, Label Detection, Landmark Detection, Logo Detection and Optical Character Detection; as per the user choice. This can be implemented and configured from the Alt Text field configuration of the image file entity.') . '</p>';
+      $help .= '<h4><strong>' . t('User Emotion Detection') . '</strong></h4>';
+      $help .= '<p>' . t('Another feature offered by the Google Vision API is the detection of the emotions in the uploaded user profile pictures. On enabling this feature for the User Picture field, the Google Vision API detects the emotion in the uploaded user face and notifies if the person looks unhappy, and asks to reupload a happy image. However, it does not prevents the creation of new account.') . '</p>';
+      $help .= '<h4><strong>' . t('Displaying the similar image files') . '</strong></h4>';
+      $help .= '<p>' . t('This automatically creates a new taxonomy vocabulary named Dominant Colors, and enter the terms, Red, Blue or Green, depending on the dominant color component in the uploaded image file. It creates a new tab named Similar Contents for each image file, and displays all the images sharing the same dominant color component.') . '</p>';
+      $help .= '<br/>';
+      $help .= '<p>' . t('<em>Note:</em> Google Vision API key must be set in the <a href = ":settings">Google Vision module settings page</a>.', array(
+        ':settings' => Url::fromRoute('google_vision.settings')->toString(),
+        ));
+      return ['#markup' => $help];
+  }
+}
+
+/**
+ * Implements hook_modules_installed().
+ */
+function google_vision_modules_installed($modules) {
+  if (in_array('google_vision', $modules)) {
+    drupal_set_message(t('Google Vision needs a correct API Key in order to work. Please set it up at the <a href=":settings">Google Vision module settings page</a>.', [
+      ':settings' => Url::fromRoute('google_vision.settings')->toString(),
+    ]));
+  }
+}
+
+/**
+ * Implements hook_entity_presave().
+ */
+function google_vision_entity_presave(EntityInterface $entity) {
+  if ($entity->getEntityTypeId() == 'file') {
+    $mimetype = $entity->get('filemime')->getValue()[0]['value'];
+    // If it's image.
+    if (in_array($mimetype, ['image/jpeg', 'image/png', 'image/jpg'])) {
+      // Try to find fields which should be used for Google labels.
+      foreach ($entity->getFieldDefinitions() as $field) {
+        // If this field is reference to taxonomy term.
+        if ($field->getType() == 'entity_reference'
+          && $field->getSettings()['target_type'] == 'taxonomy_term'
+          && !empty($field->getSettings()['handler_settings']['target_bundles'])) {
+          // If google vision is enabled for this field.
+          $settings = $field->getThirdPartySettings('google_vision');
+          if (!empty($settings['google_vision'])) {
+            // Take first referenced vocabulary.
+            $vid = reset($field->getSettings()['handler_settings']['target_bundles']);
+            google_vision_file_entity_add_labels($entity, $field, $vid);
+
+            // Use a new taxonomy vocabulary to group the objects by their dominant color.
+            $vid = 'dominant_color';
+            $vocabulary = Vocabulary::load($vid);
+            // Create a vocabulary if not already present.
+            if (!isset($vocabulary)) {
+              $vocabulary = Vocabulary::create(array(
+                'vid' => $vid,
+                'machine_name' => $vid,
+                'name' => 'Dominant Color',
+              ));
+              $vocabulary->save();
+            }
+            if (!empty($field->getSettings()['handler_settings']['target_bundles']['dominant_color'])) {
+              google_vision_file_entity_dominant_color($entity, $field, $vid);
+            }
+          }
+        }
+        // If this field is the alt text field.
+        if ($field->getName() == 'field_image_alt_text') {
+          $value = $entity->get($field->getName())->getValue();
+          $google_vision_helper = \Drupal::service('google_vision.helper');
+          // Set the Alt Text using Vision API.
+          if (empty($value)) {
+            $google_vision_helper->setAltText($entity, $field);
+          }
+          else {
+            // Change the alt text if required.
+            $google_vision_helper->editAltText($entity, $field, $value);
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function google_vision_form_field_config_edit_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  $field_entity = $form_state->getFormObject()->getEntity();
+  // If this field is reference to taxonomy vocabulary.
+  if ($field_entity->getType() == 'entity_reference' && $field_entity->getSettings()['target_type'] == 'taxonomy_term') {
+    $settings = $form_state->getFormObject()->getEntity()->getThirdPartySettings('google_vision');
+    $form['google_vision'] = [
+      '#type' => 'checkbox',
+      '#title' => 'Enable Google Vision',
+      '#default_value' => !empty($settings['google_vision']) ? $settings['google_vision'] : FALSE,
+    ];
+
+    $form['#entity_builders'][] = 'google_vision_form_field_config_form_taxonomy_builder';
+  }
+
+  if ($field_entity->getType() == 'image') {
+    $settings = $form_state->getFormObject()->getEntity()->getThirdPartySettings('google_vision');
+    $form['safe_search'] = [
+      '#type' => 'checkbox',
+      '#title' => t('Enable Safe Search'),
+      '#description' => t('Detects and avoids explicit contents.'),
+      '#default_value' => !empty($settings['safe_search']) ? $settings['safe_search'] : FALSE,
+    ];
+
+    $form['emotion_detect'] = [
+      '#type' => 'checkbox',
+      '#title' => t('Enable Emotion Detection'),
+      '#description' => t('Detects and notifies if the image looks not happy.'),
+      '#default_value' => !empty($settings['emotion_detect']) ? $settings['emotion_detect'] : FALSE,
+    ];
+
+
+    $form['#entity_builders'][] = 'google_vision_form_field_config_form_image_builder';
+  }
+
+  // If this field is the alt text field.
+  if ($field_entity->getName() == 'field_image_alt_text') {
+    $settings = $form_state->getFormObject()
+      ->getEntity()
+      ->getThirdPartySettings('google_vision');
+    $form['fill_alt'] = [
+      '#type' => 'details',
+      '#title' => t('Fill Alt Text by'),
+      '#open' => TRUE,
+    ];
+    $form['fill_alt']['alt_auto_filling'] = [
+      '#type' => 'radios',
+      '#title' => t('Detection Type'),
+      '#title_display' => 'invisible',
+      '#options' => [
+        'labels' => t('Label Detection'),
+        'landmark' => t('Landmark Detection'),
+        'logo' => t('Logo Detection'),
+        'ocr' => t('Optical Character Detection'),
+        'none' => t('None'),
+      ],
+      '#default_value' => !empty($settings['alt_auto_filling']) ? $settings['alt_auto_filling'] : FALSE,
+    ];
+
+    $form['#entity_builders'][] = 'google_vision_form_field_config_form_alt_text_builder';
+  }
+}
+
+/**
+ * Form builder to save the settings for entity reference.
+ */
+function google_vision_form_field_config_form_taxonomy_builder($entity_type, FieldConfigInterface $type, &$form, FormStateInterface $form_state) {
+  $type->setThirdPartySetting('google_vision', 'google_vision', $form_state->getValue('google_vision'));
+}
+
+/**
+ * Implements hook_entity_bundle_field_info_alter().
+ */
+function google_vision_entity_bundle_field_info_alter(&$fields, EntityTypeInterface $entity_type, $bundle) {
+  foreach ($fields as $field) {
+    if ($field->getType() == 'image') {
+      $fields[$field->getName()]->addConstraint('SafeSearch');
+      $fields[$field->getName()]->addConstraint('UserEmotion');
+    }
+  }
+}
+
+/**
+ * Form builder to save the settings for images.
+ */
+function google_vision_form_field_config_form_image_builder($entity_type, FieldConfigInterface $type, &$form, FormStateInterface $form_state) {
+  $type->setThirdPartySetting('google_vision', 'safe_search', $form_state->getValue('safe_search'));
+  $type->setThirdPartySetting('google_vision', 'emotion_detect', $form_state->getValue('emotion_detect'));
+}
+
+/**
+ * Form builder to save the settings for the alt text of image file.
+ */
+function google_vision_form_field_config_form_alt_text_builder($entity_type, FieldConfigInterface $type, &$form, FormStateInterface $form_state) {
+  $type->setThirdPartySetting('google_vision', 'alt_auto_filling', $form_state->getValue('alt_auto_filling'));
+}
+
+/**
+ * Add the terms to the corresponding taxonomy vocabulary and save the
+ * values in files.
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $file
+ *  The file entity.
+ * @param \Drupal\Core\Field\FieldDefinitionInterface $field
+ *  The field definition.
+ * @param string $vid
+ *  The vocabulary machine name.
+ * @param array $labels
+ *  An indexed array with the values to be added to the vocabulary.
+ *  For each value received in $labels, this function will use the
+ *  existing TID if the value already exists on the vocabulary, or
+ *  will create a new term if it is new. All TIDs then that
+ *  correspond to the $labels received will be stored into the
+ *  $fileentity passed in.
+ */
+function google_vision_add_terms_to_vocabulary($file, $field, $vid, $labels) {
+  // Get existing values from field.
+  $values = $file->get($field->getName())->getValue();
+
+  // Try to find an existing terms by these labels.
+  $query = \Drupal::database()->select('taxonomy_term_field_data', 'tfd');
+  $query->fields('tfd', ['tid', 'name']);
+  $query->condition('tfd.vid', $vid);
+  $query->condition('tfd.name', $labels, 'IN');
+  $existing_terms = $query->execute()->fetchAllKeyed();
+
+  // Handle retrieved labels.
+  foreach ($labels as $label) {
+    // Use existing term.
+    if ($existing_tid = array_search($label, $existing_terms)) {
+      $already_have = FALSE;
+      // If we already have this label in this field. Just skip.
+      foreach ($values as $value) {
+        if ($value['target_id'] == $existing_tid) {
+          $already_have = TRUE;
+        }
+      }
+      // Add existing label into field if we haven't it yet.
+      if (!$already_have) {
+        $values[] = ['target_id' => $existing_tid];
+      }
+    }
+    // Create new term and add into field.
+    else {
+      $taxonomy_term_storage = \Drupal::entityTypeManager()
+        ->getStorage('taxonomy_term');
+      $label_term = $taxonomy_term_storage->create([
+        'name' => $label,
+        'vid' => $vid
+      ]);
+      $label_term->enforceIsNew();
+      $label_term->save();
+      $values[] = ['target_id' => $label_term->id()];
+    }
+  }
+  // Save collected values.
+  $file->set($field->getName(), $values);
+}
+
+/**
+ * Try to get and add labels for the file entity.
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $file
+ *  The file entity.
+ * @param \Drupal\Core\Field\FieldDefinitionInterface $field
+ *  The field definition.
+ * @param string $vid
+ *  The vocabulary machine name.
+ */
+function google_vision_file_entity_add_labels($file, $field, $vid) {
+  // Try to retrieve file URI.
+  $file_uri = $file->getFileUri();
+  if ($filepath = \Drupal::service('file_system')->realpath($file_uri)) {
+    $data = \Drupal::service('google_vision.api')->labelDetection($filepath);;
+    // If we have retrieved labels.
+    if (!empty($data['responses'][0]['labelAnnotations'])) {
+      $labels = [];
+      foreach ($data['responses'][0]['labelAnnotations'] as $item) {
+        $labels[] = $item['description'];
+      }
+
+      // Add the terms to vocabulary, and set the values to fields in files.
+      google_vision_add_terms_to_vocabulary($file, $field, $vid, $labels);
+    }
+  }
+}
+
+/**
+ * Try to get the dominant color.
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $file
+ *  The file entity.
+ * @param \Drupal\Core\Field\FieldDefinitionInterface $field
+ *  The field definition.
+ * @param string $vid
+ *  The vocabulary machine name.
+ */
+function google_vision_file_entity_dominant_color($file, $field, $vid) {
+  $file_uri = $file->getFileUri();
+  if ($filepath = \Drupal::service('file_system')->realpath($file_uri)) {
+    $data = \Drupal::service('google_vision.api')
+      ->imageAttributesDetection($filepath);
+    // If we have retrieved labels.
+    if (!empty($data['responses'][0]['imagePropertiesAnnotation'])) {
+      foreach ($data['responses'][0]['imagePropertiesAnnotation']['dominantColors']['colors'] as $item) {
+        $red = $item['color']['red'];
+        $green = $item['color']['green'];
+        $blue = $item['color']['blue'];
+      }
+      // Create an array of the colors along with their values.
+      $color = array(
+        'red' => $red,
+        'green' => $green,
+        'blue' => $blue
+      );
+      if ($red == $green && $green == $blue) {
+        $dominant_color = ['red', 'green', 'blue'];
+      }
+      else {
+        $max_value = max($red, $green, $blue);
+        // Get the dominant color based on the maximum value.
+        $dominant_color = array_keys($color, $max_value);
+      }
+      // Add the terms to vocabulary, and set the values to fields in files.
+      google_vision_add_terms_to_vocabulary($file, $field, $vid, $dominant_color);
+    }
+  }
+}
