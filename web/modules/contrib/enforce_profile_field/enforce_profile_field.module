@@ -1,0 +1,238 @@
+<?php
+
+/**
+ * @file
+ * Enforce Profile Field module.
+ */
+
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\FieldableEntityInterface;
+use Drupal\Core\Field\FieldStorageDefinitionInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\enforce_profile_field\EnforceProfile;
+
+/**
+ * Provide the allowed values for a 'enforce_profile_field' field.
+ *
+ * Callback for options_allowed_values().
+ *
+ * 'list_*' fields can specify a callback to define the set of their allowed
+ * values using the 'allowed_values_function' storage setting.
+ *
+ * That function will be called:
+ *  - either in the context of a specific entity, which is then provided as the
+ *    $entity parameter,
+ *  - or for the field generally without the context of any specific entity or
+ *    entity bundle (typically, Views needing a list of values for an exposed
+ *    filter), in which case the $entity parameter is NULL.
+ * This lets the callback restrict the set of allowed values or adjust the
+ * labels depending on some conditions on the containing entity.
+ *
+ * For consistency, the set of values returned when an $entity is provided
+ * should be a subset of the values returned when no $entity is provided.
+ *
+ * @param \Drupal\Core\Field\FieldStorageDefinitionInterface $definition
+ *   The field storage definition.
+ * @param \Drupal\Core\Entity\FieldableEntityInterface|null $entity
+ *   (optional) The entity context if known, or NULL if the allowed values are
+ *   being collected without the context of a specific entity.
+ * @param bool &$cacheable
+ *   (optional) If an $entity is provided, the $cacheable parameter should be
+ *   modified by reference and set to FALSE if the set of allowed values
+ *   returned was specifically adjusted for that entity and cannot not be reused
+ *   for other entities. Defaults to TRUE.
+ *
+ * @return array
+ *   The array of allowed values. Keys of the array are the raw stored values
+ *   (number or text), values of the array are the display labels. If $entity
+ *   is NULL, you should return the list of all the possible allowed values in
+ *   any context so that other code (e.g. Views filters) can support the allowed
+ *   values for all possible entities and bundles.
+ *
+ * @ingroup callbacks
+ * @see options_allowed_values()
+ * @see options_test_allowed_values_callback()
+ * @see options_test_dynamic_values_callback()
+ */
+function enforce_profile_field_allowed_values(FieldStorageDefinitionInterface $definition, FieldableEntityInterface $entity = NULL, &$cacheable = TRUE) {
+  // Init variables.
+  $values = [];
+
+  // Get form mode settings from field definition.
+  if (!empty($entity)) {
+    $field_name = $definition->getName();
+    $form_mode = enforce_profile_field_get_form_mode($entity, $field_name);
+  }
+
+  // Form mode must be selected.
+  if (!empty($form_mode)) {
+    $entity_type_id = 'user';
+    $bundle = 'user';
+    $form_mode_id = $entity_type_id . '.' . $bundle . '.' . $form_mode;
+
+    // Get the selected entity form display.
+    /** @var \Drupal\Core\Entity\Display\EntityFormDisplayInterface $entity_form_display */
+    $entity_form_display = \Drupal::entityTypeManager()
+      ->getStorage('entity_form_display')
+      ->load($form_mode_id);
+
+    // The form display must still exists.
+    if (!empty($entity_form_display)) {
+      // Get fields definitions.
+      $fields_definition = $entity_form_display->get('fieldDefinitions');
+      $fields = $entity_form_display->get('content');
+
+      // Get all fields <key,value> pairs.
+      foreach ($fields as $machine_name => $field_settings) {
+        // Process only standard fields.
+        if (isset($fields_definition[$machine_name])) {
+          /** @var \Drupal\Core\Field\FieldDefinitionInterface $field */
+          $field = $fields_definition[$machine_name];
+          $field_label = $field->getLabel();
+
+          $values[$machine_name] = $field_label;
+        }
+      }
+    }
+  }
+
+  return $values;
+}
+
+/**
+ * Get Enforce Profile field form mode.
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ *   An entity holding the field.
+ * @param string $field_name
+ *   A field name.
+ *
+ * @return string
+ *   A form mode.
+ */
+function enforce_profile_field_get_form_mode(EntityInterface $entity, $field_name) {
+  $form_mode = '';
+
+  $field_definition = $entity->getFieldDefinition($field_name);
+  if (isset($field_definition)) {
+    $form_mode = $field_definition->getSetting('form_mode');
+  }
+
+  return $form_mode;
+}
+
+/**
+ * Get Enforce Profile field active view modes.
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ *   An entity holding the field.
+ * @param string $field_name
+ *   A field name.
+ *
+ * @return array
+ *   An array of active view modes.
+ */
+function enforce_profile_field_get_active_view_modes(EntityInterface $entity, $field_name) {
+  $active_view_modes = '';
+
+  $field_definition = $entity->getFieldDefinition($field_name);
+  if (isset($field_definition)) {
+    $active_view_modes = $field_definition->getSetting('active_view_modes');
+  }
+
+  return $active_view_modes;
+}
+
+/**
+ * Implements hook_field_widget_info_alter().
+ *
+ * Perform alterations on Field API widget types to let the Enforce profile
+ * field type re-use an existing widget.
+ */
+function enforce_profile_field_field_widget_info_alter(array &$info) {
+  $info['options_select']['field_types'][] = 'enforce_profile_field';
+}
+
+/**
+ * Implements hook_entity_view_alter().
+ *
+ * Enforce extraction of additional profile data in order to provide access to
+ * the node.
+ */
+function enforce_profile_field_entity_view_alter(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display) {
+  // Process only fieldable entities.
+  if (($entity instanceof FieldableEntityInterface)) {
+    $fields_definition = $entity->getFieldDefinitions();
+
+    // Process all "enforce_profile_field" fields.
+    foreach ($fields_definition as $definition) {
+      $type = $definition->getType();
+      if ($type == 'enforce_profile_field') {
+        $field_name = $definition->getName();
+        $active_view_modes = enforce_profile_field_get_active_view_modes($entity, $field_name);
+
+        $view_mode = enforce_profile_field_get_view_mode($entity, $display);
+
+        // Process only active view modes.
+        if (in_array($view_mode, $active_view_modes)) {
+          $form_mode = enforce_profile_field_get_form_mode($entity, $field_name);
+
+          $enforce_profile = new EnforceProfile($form_mode);
+
+          // Validate required profile fields.
+          $field = $entity->get($field_name);
+          $enforce_profile->validate($field);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Get entity display view mode.
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ *   An entity.
+ * @param \Drupal\Core\Entity\Display\EntityViewDisplayInterface $display
+ *   A display.
+ *
+ * @return int|null|string
+ *   The last part of view mode machine name.
+ */
+function enforce_profile_field_get_view_mode(EntityInterface $entity, EntityViewDisplayInterface $display) {
+  $entity_type_id = $entity->getEntityTypeId();
+  $bundle = $entity->bundle();
+  $prefix = $entity_type_id . '.' . $bundle . '.';
+
+  $view_mode = $display->id();
+
+  // Remove the prefix if it is present.
+  if (isset($view_mode) && substr($view_mode, 0, strlen($prefix)) == $prefix) {
+    $view_mode = substr($view_mode, strlen($prefix));
+  }
+
+  return $view_mode;
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Force multi-value field storage cardinality.
+ */
+function enforce_profile_field_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  switch ($form_id) {
+    // Disable cardinality settings and set it as unlimited by default.
+    case 'field_storage_config_edit_form':
+      /** @var \Drupal\field\Entity\FieldConfig $field_config */
+      $field_config = $form_state->getStorage()['field_config'];
+      // Only for enforce profile field.
+      if ($field_config->getType() == 'enforce_profile_field') {
+        // Set the cardinality to be unlimited.
+        $form['cardinality_container']['cardinality']['#default_value'] = '-1';
+        // Disable editing by user.
+        $form['cardinality_container']['#disabled'] = TRUE;
+      }
+      break;
+  }
+}
