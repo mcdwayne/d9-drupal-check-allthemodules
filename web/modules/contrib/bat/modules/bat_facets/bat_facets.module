@@ -1,0 +1,114 @@
+<?php
+
+/**
+ * @file
+ */
+
+use Drupal\Core\Database\Database;
+
+use Roomify\Bat\Calendar\Calendar;
+use Roomify\Bat\Event\Event;
+use Roomify\Bat\Store\DrupalDBStore;
+use Roomify\Bat\Unit\Unit;
+use Drupal\search_api\Query\QueryInterface;
+
+/**
+ * Implements hook_search_api_query_alter().
+ */
+function bat_facets_search_api_query_alter(QueryInterface &$query) {
+  $database = Database::getConnectionInfo('default');
+
+  $prefix = (isset($database['default']['prefix']['default'])) ? $database['default']['prefix']['default'] : '';
+
+  foreach ($query->getIndex()->getDatasources() as $datasource_id => $datasource) {
+    if ($datasource->getEntityTypeId() == 'bat_unit_type') {
+      $facet_manager = \Drupal::service('facets.manager');
+      $facets = $facet_manager->getEnabledFacets();
+
+      if (isset($facets['id'])) {
+        $settings = $facets['id']->getWidget()['config'];
+
+        // Get URL parameters.
+        $params = \Drupal::request()->query->all();
+
+        // See if we have dates to search.
+        if (isset($params['bat_start_date']) &&
+            !empty($params['bat_start_date']) &&
+            isset($params['bat_end_date']) &&
+            !empty($params['bat_end_date'])) {
+          $start_date = new DateTime($params['bat_start_date']);
+          $end_date = new DateTime($params['bat_end_date']);
+          // Remove a minute because BAT considers as included.
+          $end_date->sub(new DateInterval('PT1M'));
+
+          $event_type = $settings['event_type'];
+
+          $state_store = new DrupalDBStore($event_type, DrupalDBStore::BAT_STATE, $prefix);
+
+          $valid_states = $settings['state'];
+
+          $valid_type_ids = [];
+
+          // We need to narrow the query to all unit types configured for this datasource
+          // with Units that have the requested state over the requested dates.
+          // First, we retrieve all types.
+          $type_ids = [];
+          foreach (array_keys($datasource->getBundles()) as $bundle) {
+            $type_ids += bat_type_ids($bundle);
+          }
+
+          $available_unit_count = [];
+          foreach ($type_ids as $type_id => $name) {
+            // Get the units of this type.
+            $drupal_units = bat_unit_load_multiple(FALSE, ['unit_type_id' => $type_id]);
+            $bat_units = [];
+            foreach ($drupal_units as $unit_id => $unit) {
+              $bat_units[] = new Unit($unit_id, $unit->getEventDefaultValue($event_type));
+            }
+
+            // If this type has associated units, see if any of its units are
+            // in the states being searched for over the search period.
+            if (count($bat_units)) {
+              $calendar = new Calendar($bat_units, $state_store);
+
+              $constraints = [];
+              foreach (bat_event_constraints_get_info() as $constraint) {
+                $constraints[] = $constraint['constraint'];
+              }
+
+              $response = $calendar->getMatchingUnits($start_date, $end_date, $valid_states, $constraints);
+              $valid_unit_ids = array_keys($response->getIncluded());
+
+              // If there are available units, mark this type as valid.
+              if (count($valid_unit_ids)) {
+                $valid_type_ids[] = $type_id;
+              }
+              $available_unit_count[$type_id] = count($valid_unit_ids);
+
+            }
+          }
+
+          $context = [
+            'types_before_search' => $type_ids,
+            'start_date' => $start_date,
+            'end_date' => $end_date,
+            'event_type' => $event_type,
+            'valid_states' => $valid_states,
+            'available_unit_count' => $available_unit_count,
+          ];
+
+          \Drupal::moduleHandler()->alter('bat_facets_search_results', $valid_type_ids, $context);
+
+          // If no types are available, zero out results.
+          if (empty($valid_type_ids)) {
+            $query->addCondition('id', 1, '<');
+          }
+          else {
+            // Limit the search API query to entity ids with availability.
+            $query->addCondition('id', $valid_type_ids, 'IN');
+          }
+        }
+      }
+    }
+  }
+}
