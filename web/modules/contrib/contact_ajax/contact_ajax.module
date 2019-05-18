@@ -1,0 +1,324 @@
+<?php
+
+/**
+ * @file
+ * Overrides core contact form functionality
+ */
+
+use Drupal\contact\MessageForm;
+use Drupal\contact\ContactFormInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\contact\Entity\ContactForm;
+use Drupal\Core\Ajax\AjaxResponse;
+use Drupal\Core\Ajax\HtmlCommand;
+use Drupal\Core\Ajax\ReplaceCommand;
+use Drupal\node\Entity\Node;
+use Drupal\Core\Render\Element\StatusMessages;
+use Drupal\views\Ajax\ScrollTopCommand;
+
+/**
+ * Contact ajax form prefix.
+ */
+const CONTACT_AJAX_PREFIX = 'contact_ajax_';
+
+/**
+ * Reload the default message after submit.
+ */
+const CONTACT_AJAX_LOAD_DEFAULT_MESSAGE = 1;
+
+/**
+ * Load the content from another node.
+ */
+const CONTACT_AJAX_LOAD_FROM_URI = 2;
+
+/**
+ * Load the content from the message.
+ */
+const CONTACT_AJAX_LOAD_FROM_MESSAGE = 3;
+
+/**
+ * Load the default message and an empty form.
+ */
+const CONTACT_AJAX_LOAD_CLEAN_FORM = 4;
+
+/**
+ * Implements hook_form_FORM_ID_alter() for contact_form_form().
+ */
+function contact_ajax_form_contact_form_form_alter(&$form, FormStateInterface $form_state) {
+  /** @var \Drupal\contact\ContactFormInterface $contact_form */
+  $contact_form = $form_state->getFormObject()->getEntity();
+
+  $form['contact_ajax'] = [
+    '#type' => 'fieldset',
+    '#title' => t('Contact ajax'),
+  ];
+
+  $form['contact_ajax']['contact_ajax_enabled'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Ajax Form'),
+    '#description' => t('Send this form using ajax.'),
+    '#default_value' => $contact_form->getThirdPartySetting('contact_ajax', 'enabled', FALSE),
+  ];
+
+  $form['contact_ajax']['contact_ajax_confirmation_type'] = [
+    '#type' => 'select',
+    '#title' => t('On submit load'),
+    '#description' => t('Select which content have to be loaded after submit.'),
+    '#options' => [
+      CONTACT_AJAX_LOAD_DEFAULT_MESSAGE => t('Default message'),
+      CONTACT_AJAX_LOAD_CLEAN_FORM => t('Default message and empty form'),
+      CONTACT_AJAX_LOAD_FROM_URI => t('Node content'),
+      CONTACT_AJAX_LOAD_FROM_MESSAGE => t('Custom message'),
+    ],
+    '#default_value' => $contact_form->getThirdPartySetting('contact_ajax', 'confirmation_type', FALSE),
+    '#states' => [
+      'visible' => [
+        ':input[name="contact_ajax_enabled"]' => ['checked' => TRUE],
+      ],
+    ],
+  ];
+
+  // Default entity_autocomplete get a node object as default value.
+  $node_id = $contact_form->getThirdPartySetting('contact_ajax', 'load_from_uri', FALSE);
+  $node = $node_id ? Node::load($node_id) : FALSE;
+  $form['contact_ajax']['contact_ajax_load_from_uri'] = [
+    '#type' => 'entity_autocomplete',
+    '#target_type' => 'node',
+    '#default_value' => $node,
+    '#title' => t('Node to load'),
+    '#description' => t('This node will load its content after the form Submit.'),
+    '#states' => [
+      'visible' => [
+        ':input[name="contact_ajax_enabled"]' => ['checked' => TRUE],
+        ':input[name="contact_ajax_confirmation_type"]' => ['value' => CONTACT_AJAX_LOAD_FROM_URI],
+      ],
+    ],
+  ];
+
+  $confirmation_message = $contact_form->getThirdPartySetting('contact_ajax', 'load_from_message', FALSE);
+  $confirmation_message_value = $confirmation_message ? $confirmation_message['value'] : '';
+  $confirmation_message_format = $confirmation_message ? $confirmation_message['format'] : filter_default_format();
+  $form['contact_ajax']['contact_ajax_load_from_message'] = [
+    '#type' => 'text_format',
+    '#title' => t('Message to load'),
+    '#description' => t('This message will load after form submit.'),
+    '#default_value' => $confirmation_message_value,
+    '#format' => $confirmation_message_format,
+    '#states' => [
+      'visible' => [
+        ':input[name="contact_ajax_enabled"]' => ['checked' => TRUE],
+        ':input[name="contact_ajax_confirmation_type"]' => ['value' => CONTACT_AJAX_LOAD_FROM_MESSAGE],
+      ],
+    ],
+  ];
+
+  $form['contact_ajax']['advanced'] = [
+    '#type' => 'details',
+    '#title' => t('ADVANCED SETTINGS'),
+    '#open' => FALSE,
+    '#states' => [
+      'visible' => [
+        ':input[name="contact_ajax_enabled"]' => ['checked' => TRUE],
+      ],
+    ],
+  ];
+
+  $form['contact_ajax']['advanced']['contact_ajax_prefix_id'] = [
+    '#type' => 'textfield',
+    '#title' => t('Prefix id'),
+    '#description' => t('When contact ajax is enabled, a wrapper is created around the form, with this settings you can choose a custom ID from the HTML wrapper element. Leave empty if you don\'t need it'),
+    '#default_value' => $contact_form->getThirdPartySetting('contact_ajax', 'prefix_id', FALSE),
+    '#states' => [
+      'visible' => [
+        ':input[name="contact_ajax_enabled"]' => ['checked' => TRUE],
+      ],
+    ],
+  ];
+
+  $form['contact_ajax']['advanced']['contact_ajax_render_selector'] = [
+    '#type' => 'textfield',
+    '#title' => t('Render into this HTML element class/id'),
+    '#description' => t('If you need to load the response into an element different from Prefix_id you can write here the class id. i.e : .render-here , #render-here.'),
+    '#default_value' => $contact_form->getThirdPartySetting('contact_ajax', 'render_selector', FALSE),
+    '#states' => [
+      'visible' => [
+        ':input[name="contact_ajax_enabled"]' => ['checked' => TRUE],
+      ],
+    ],
+  ];
+
+  $form['#entity_builders'][] = 'contact_ajax_contact_form_form_builder';
+}
+
+/**
+ * Entity builder for the contact form edit form with third party options.
+ *
+ * @see contact_ajax_test_form_contact_form_edit_form_alter()
+ */
+function contact_ajax_contact_form_form_builder($entity_type, ContactFormInterface $contact_form, &$form, FormStateInterface $form_state) {
+  $contact_form->setThirdPartySetting('contact_ajax', 'enabled', $form_state->getValue('contact_ajax_enabled'));
+  $contact_form->setThirdPartySetting('contact_ajax', 'prefix_id', $form_state->getValue('contact_ajax_prefix_id'));
+  $contact_form->setThirdPartySetting('contact_ajax', 'render_selector', $form_state->getValue('contact_ajax_render_selector'));
+
+  // Get the confirmation type.
+  $confirmation_type = $form_state->getValue('contact_ajax_confirmation_type');
+  $contact_form->setThirdPartySetting('contact_ajax', 'confirmation_type', $confirmation_type);
+
+  switch ($confirmation_type) {
+    case CONTACT_AJAX_LOAD_FROM_URI:
+      $contact_form->setThirdPartySetting('contact_ajax', 'load_from_uri', $form_state->getValue('contact_ajax_load_from_uri'));
+      break;
+
+    case CONTACT_AJAX_LOAD_FROM_MESSAGE:
+      $contact_form->setThirdPartySetting('contact_ajax', 'load_from_message', $form_state->getValue('contact_ajax_load_from_message'));
+      break;
+
+    case CONTACT_AJAX_LOAD_CLEAN_FORM:
+      $contact_form->setThirdPartySetting('contact_ajax', 'load_clean_form', $form_state->getValue('contact_ajax_load_clean_form'));
+      break;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for contact_form_form().
+ */
+function contact_ajax_form_contact_message_form_alter(&$form, &$form_state, $form_id) {
+  /** @var \Drupal\Core\Entity\ContentEntityForm $form_object */
+  $form_object = $form_state->getFormObject();
+  /* @var \Drupal\contact\MessageInterface $contact_message */
+  $contact_message = $form_object->getEntity();
+
+  $contact_form = ContactForm::load($contact_message->bundle());
+
+  /** @var \Drupal\Core\Entity\Display\EntityFormDisplayInterface $form_mode */
+  if ($form_object instanceof MessageForm) {
+
+    $ajax_enabled = $contact_form->getThirdPartySetting('contact_ajax', 'enabled', FALSE);
+    $prefix_id = $contact_form->getThirdPartySetting('contact_ajax', 'prefix_id');
+    $element_id = $prefix_id ? $prefix_id : CONTACT_AJAX_PREFIX . $form_id;
+
+    if ($ajax_enabled) {
+
+      $form['#prefix'] = '<div id="' . $element_id . '">';
+      $form['#suffix'] = '</div>';
+
+      // Adjust the form to use ajax submit.
+      $form['actions']['submit']['#ajax'] = [
+        'callback' => 'contact_ajax_contact_site_form_ajax_callback',
+        'wrapper' => $element_id,
+        'effect' => 'fade',
+      ];
+      if (\Drupal::moduleHandler()->moduleExists('views')) {
+        $form['#attached']['library'][] = 'views/views.ajax';
+      }
+    }
+  }
+}
+
+/**
+ * Ajax callback for contact form.
+ *
+ * @param array $form
+ *   The form.
+ * @param \Drupal\core\Form\FormStateInterface $form_state
+ *   The current state of the form.
+ *
+ * @return \Drupal\core\Ajax\AjaxResponse
+ *   The ajax response.
+ */
+function contact_ajax_contact_site_form_ajax_callback($form, FormStateInterface &$form_state) {
+
+  /** @var \Drupal\Core\Entity\ContentEntityForm $form_object */
+  $form_object = $form_state->getFormObject();
+  /* @var \Drupal\contact\MessageInterface $contact_message */
+  $contact_message = $form_object->getEntity();
+  $contact_form = ContactForm::load($contact_message->bundle());
+  $confirmation_type = $contact_form->getThirdPartySetting('contact_ajax', 'confirmation_type', FALSE);
+  $prefix_id = $contact_form->getThirdPartySetting('contact_ajax', 'prefix_id', FALSE);
+  $element_id = $prefix_id ? $prefix_id : CONTACT_AJAX_PREFIX . $form_object->getFormId();
+
+  // Used to display results of drupal_set_message() calls.
+  $messages = StatusMessages::renderMessages(NULL);
+
+  // Create AJAX Response object.
+  $response = new AjaxResponse();
+
+  $output = [
+    '#type' => 'container',
+    '#attributes' => ['id' => $element_id],
+  ];
+
+  if (!$form_state->getErrors()) {
+    switch ($confirmation_type) {
+      case CONTACT_AJAX_LOAD_FROM_URI:
+        // load_from_uri is configured, so load the node content.
+        $node_id = $contact_form->getThirdPartySetting('contact_ajax', 'load_from_uri', FALSE);
+        $node = Node::load($node_id);
+        if ($node) {
+          $view_builder = \Drupal::entityTypeManager()->getViewBuilder('node');
+          $renderarray = $view_builder->view($node, 'full');
+          $output['#markup'] = \Drupal::service('renderer')->renderRoot($renderarray);
+        }
+        break;
+
+      case CONTACT_AJAX_LOAD_FROM_MESSAGE:
+        // Load the custom message from the config field.
+        $confirmation_message = $contact_form->getThirdPartySetting('contact_ajax', 'load_from_message', FALSE);
+        $output['#markup'] = $confirmation_message ? $confirmation_message['value'] : '';
+        break;
+
+      case CONTACT_AJAX_LOAD_CLEAN_FORM:
+        // Load the default status message and a clean form.
+        $output[] = $messages;
+
+        // Create a new contact message and set it as the form entity.
+        $bundle_key = $contact_message->getEntityType()->getKey('bundle');
+        $bundle = $contact_message->bundle();
+        $new_message = \Drupal::service('entity_type.manager')->getStorage('contact_message')->create([$bundle_key => $bundle]);
+        $form_object->setEntity($new_message);
+
+        // Clear user input, skipping system items.
+        $input = $form_state->getUserInput();
+        $keys = $form_state->getCleanValueKeys();
+        $keys[] = 'ajax_page_state';
+        foreach ($input as $key => $item) {
+          if (!in_array($key, $keys) && substr($key, 0, 1) !== '_') {
+            unset($input[$key]);
+          }
+        }
+        $form_state->setUserInput($input);
+
+        // Rebuild the form state values.
+        $form_state->setRebuild();
+        $form_state->setStorage([]);
+        $form = \Drupal::service('form_builder')->rebuildForm($form['#form_id'], $form_state);
+        $output[] = $form;
+        break;
+
+      default:
+        // CONTACT_AJAX_LOAD_DEFAULT_MESSAGE
+        // Load the default status message only.
+        $output[] = $messages;
+    }
+  }
+  elseif ($form_state->getErrors()) {
+    $output[] = $messages;
+    $output[] = $form;
+  }
+
+  $prefix = '#' . $element_id;
+  $render_here = $contact_form->getThirdPartySetting('contact_ajax', 'render_selector', FALSE);
+  $render_selector = $render_here ? $render_here : $prefix;
+  if ($render_selector != $prefix) {
+    // If a custom selector is configured hide the form in its old position.
+    $response->addCommand(new ReplaceCommand($prefix, ''));
+  }
+  $response->addCommand(new HtmlCommand($render_selector, $output));
+
+  if (\Drupal::moduleHandler()->moduleExists('views')) {
+    $response->addCommand(new ScrollTopCommand($render_selector));
+  }
+
+  return $response;
+}
+
