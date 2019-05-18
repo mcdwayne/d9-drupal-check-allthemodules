@@ -1,0 +1,191 @@
+<?php
+
+/**
+ * @file
+ * Update functions for the dynamic_entity_reference module.
+ */
+
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Entity\Sql\SqlContentEntityStorageException;
+use Drupal\Core\Entity\Sql\SqlEntityStorageInterface;
+
+/**
+ * Changes target_id column to string and creates target_id_int.
+ *
+ * This is immensely complicated because
+ * \Drupal\Core\Entity\Sql\SqlContentEntityStorageSchema::updateDedicatedTableSchema()
+ * throws a
+ * \Drupal\Core\Entity\Exception\FieldStorageDefinitionUpdateForbiddenException
+ * when there is a column change even if the change is doable without problem --
+ * like this update here which changes the int target_id column to string. So
+ * this routine needs to find all target_id columns and cast them manually.
+ * After that,
+ * \Drupal\Core\Entity\Sql\SqlContentEntityStorageSchema::saveFieldSchemaData()
+ * is protected so the field storage schema needs to be saved into the key-value
+ * storage. On top of this, shared tables store the field definition objects in
+ * yet another key-value storage which also needs to be manually kept
+ * up-to-date.
+ *
+ * Finally
+ * \Drupal\dynamic_entity_reference\EventSubscriber\FieldStorageSubscriber::handleEntityType()
+ * is called to add the triggers.
+ */
+function dynamic_entity_reference_update_8201() {
+  /** @var \Drupal\Core\Entity\EntityFieldManagerInterface $entity_field_manager */
+  $schema = \Drupal::database()->schema();
+  $entity_field_manager = \Drupal::service('entity_field.manager');
+  $entity_type_manager = \Drupal::entityTypeManager();
+  // The key-value collection for tracking installed storage schema.
+  $entity_storage_schema_sql = \Drupal::keyValue('entity.storage_schema.sql');
+  $entity_definitions_installed = \Drupal::keyValue('entity.definitions.installed');
+  // DER field storage subscriber service to create integer column and add
+  // triggers for target_id column.
+  /** @var \Drupal\dynamic_entity_reference\EventSubscriber\FieldStorageSubscriber $service */
+  $service = \Drupal::service('dynamic_entity_reference.entity_type_subscriber');
+  // Only update dynamic_entity_reference fields.
+  foreach ($entity_field_manager->getFieldMapByFieldType('dynamic_entity_reference') as $entity_type_id => $map) {
+    $entity_type = $entity_type_manager->getDefinition($entity_type_id);
+    $entity_storage = $entity_type_manager->getStorage($entity_type_id);
+    // Only SQL storage based entities are supported.
+    if ($entity_storage instanceof SqlEntityStorageInterface) {
+      $field_storage_definitions = $entity_field_manager->getFieldStorageDefinitions($entity_type_id);
+      /** @var \Drupal\Core\Entity\Sql\DefaultTableMapping $table_mapping */
+      $table_mapping = $entity_storage->getTableMapping($field_storage_definitions);
+      $field_storage_definition = FALSE;
+      // Only need field storage definitions of dynamic_entity_reference fields.
+      /** @var \Drupal\Core\Field\FieldStorageDefinitionInterface $field_storage_definition */
+      foreach (array_intersect_key($field_storage_definitions, $map) as $field_storage_definition) {
+        $field_name = $field_storage_definition->getName();
+        try {
+          $table = $table_mapping->getFieldTableName($field_name);
+          $column = $table_mapping->getFieldColumnName($field_storage_definition, 'target_id');
+        }
+        catch (SqlContentEntityStorageException $e) {
+          // Custom storage? Broken site? No matter what, if there is no table
+          // or column, there's little we can do.
+          continue;
+        }
+        $dedicated = $table_mapping->requiresDedicatedTableStorage($field_storage_definition);
+        $spec = [
+          'description' => 'The ID of the target entity.',
+          'type' => 'varchar_ascii',
+          'length' => 255,
+          'not null' => $dedicated,
+        ];
+        // Name of the column is not changed only specifications are changed.
+        $schema->changeField($table, $column, $column, $spec);
+        // For the sake of completeness change the target type to ASCII as well.
+        $type_spec = [
+          'description' => 'The Entity Type ID of the target entity.',
+          'type' => 'varchar_ascii',
+          'length' => EntityTypeInterface::BUNDLE_MAX_LENGTH,
+          'not null' => $dedicated,
+        ];
+        $type_column = $table_mapping->getFieldColumnName($field_storage_definition, 'target_type');
+        $schema->changeField($table, $type_column, $type_column, $type_spec);
+        $revision_table = NULL;
+        if ($entity_type->isRevisionable() && $field_storage_definition->isRevisionable()) {
+          if ($table_mapping->requiresDedicatedTableStorage($field_storage_definition)) {
+            $revision_table = $table_mapping->getDedicatedRevisionTableName($field_storage_definition);
+          }
+          elseif ($table_mapping->allowsSharedTableStorage($field_storage_definition)) {
+            $revision_table = $entity_type->getRevisionDataTable() ?: $entity_type->getRevisionTable();
+          }
+          $schema->changeField($revision_table, $column, $column, $spec);
+          $schema->changeField($revision_table, $type_column, $type_column, $type_spec);
+        }
+        // Update the installed storage schema for this field as well.
+        $key = "$entity_type_id.field_schema_data.$field_name";
+        if ($field_schema_data = $entity_storage_schema_sql->get($key)) {
+          $field_schema_data[$table]['fields'][$column] = $spec;
+          $field_schema_data[$table]['fields'][$type_column] = $type_spec;
+          $entity_storage_schema_sql->set($key, $field_schema_data);
+          if ($revision_table) {
+            $field_schema_data[$revision_table]['fields'][$column] = $spec;
+            $field_schema_data[$revision_table]['fields'][$type_column] = $type_spec;
+            $entity_storage_schema_sql->set($key, $field_schema_data);
+          }
+        }
+        if ($table_mapping->allowsSharedTableStorage($field_storage_definition)) {
+          $key = "$entity_type_id.field_storage_definitions";
+          if ($definitions = $entity_definitions_installed->get($key)) {
+            $definitions[$field_name] = $field_storage_definition;
+            $entity_definitions_installed->set($key, $definitions);
+          }
+        }
+      }
+      if ($field_storage_definition) {
+        // Add the integer columns after converting all original columns to
+        // string.
+        $service->handleEntityType($entity_type_id);
+      }
+    }
+  }
+
+}
+
+/**
+ * Create index on all target_id_int fields.
+ *
+ * By creating the index, joins on this column will be speed up significantly.
+ *
+ * @return string
+ *   The update message.
+ */
+function dynamic_entity_reference_update_8202() {
+  $schema = \Drupal::database()->schema();
+  $entity_field_manager = \Drupal::service('entity_field.manager');
+  $entity_type_manager = \Drupal::entityTypeManager();
+
+  // The _int column spec needed for creating the index.
+  $column_spec = [
+    'type' => 'int',
+    'unsigned' => TRUE,
+    'not null' => FALSE,
+  ];
+
+  // Only update dynamic_entity_reference fields.
+  $return = [];
+  foreach ($entity_field_manager->getFieldMapByFieldType('dynamic_entity_reference') as $entity_type_id => $map) {
+    $entity_storage = $entity_type_manager->getStorage($entity_type_id);
+    // Only SQL storage based entities are supported.
+    if ($entity_storage instanceof SqlEntityStorageInterface) {
+      $field_storage_definitions = $entity_field_manager->getFieldStorageDefinitions($entity_type_id);
+      /** @var \Drupal\Core\Entity\Sql\DefaultTableMapping $table_mapping */
+      $table_mapping = $entity_storage->getTableMapping($field_storage_definitions);
+      // Only need field storage definitions of dynamic_entity_reference fields.
+      /** @var \Drupal\Core\Field\FieldStorageDefinitionInterface $field_storage_definition */
+      foreach (array_intersect_key($field_storage_definitions, $map) as $field_storage_definition) {
+        $field_name = $field_storage_definition->getName();
+        try {
+          $table = $table_mapping->getFieldTableName($field_name);
+          $column = $table_mapping->getFieldColumnName($field_storage_definition, 'target_id_int');
+          $index_column = $table_mapping->getFieldColumnName($field_storage_definition, 'target_type');
+        }
+        catch (SqlContentEntityStorageException $e) {
+          // Custom storage? Broken site? No matter what, if there is no table
+          // or column, there's little we can do.
+          continue;
+        }
+        $schema_info = $field_storage_definition->getSchema();
+        if ($schema->fieldExists($table, $column)) {
+          $spec = [
+            'fields' => [
+              $column => $column_spec,
+              $index_column => $schema_info['columns']['target_type'],
+            ],
+          ];
+          if (!$schema->indexExists($table, $column)) {
+            $schema->addIndex($table, $column, [$column, $index_column], $spec);
+            $args = [
+              ':fields' => implode(', ', [$column, $index_column]),
+              ':table' => $table,
+            ];
+            $return[] = t('Added index on ":fields" fields from ":table" table.', $args);
+          }
+        }
+      }
+    }
+  }
+  return implode("\n", $return);
+}
