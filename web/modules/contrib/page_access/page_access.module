@@ -1,0 +1,339 @@
+<?php
+
+/**
+ * @file
+ * Allows administrators to customize page level access.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\page_access\Entity\PageAccess;
+use Drupal\user\Entity\User;
+use Drupal\Core\Access\AccessResult;
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter() for \Drupal\node\NodeForm.
+ *
+ * Adds page access fields to the node form.
+ *
+ * @see page_access_form_node_form_submit()
+ */
+function page_access_form_node_form_alter(&$form, FormStateInterface &$form_state) {
+  // Get current form node.
+  $node = $form_state->getFormObject()->getEntity();
+  // Get default values.
+  $defaults = page_access_get_node_defaults($node);
+  // Get available user roles.
+  $user_roles = user_role_names(TRUE);
+  // Remove administrator role from available user roles.
+  unset($user_roles['administrator']);
+  $form['page_access'] = [
+    '#type' => 'details',
+    '#title' => t('Page access settings'),
+    '#access' => \Drupal::currentUser()->hasPermission('administer menu'),
+    '#open' => (bool) $defaults['id'],
+    '#group' => 'advanced',
+    '#attached' => [
+      'library' => ['page_access/drupal.page_access.adminforms'],
+    ],
+    '#tree' => TRUE,
+    '#attributes' => ['class' => ['page-access-form']],
+  ];
+  $form['page_access_entity_id'] = [
+    '#type' => 'hidden',
+    '#value' => $defaults['id'],
+  ];
+  $form['page_access']['enabled'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Enable page access control'),
+    '#default_value' => (int) (bool) $defaults['id'],
+  ];
+  $form['page_access']['roles'] = [
+    '#type' => 'checkboxes',
+    '#options' => $user_roles,
+    '#title' => t('Roles'),
+    '#description' => t('Select user roles, who can view or update.'),
+    '#states' => [
+      'invisible' => [
+        'input[name="page_access[enabled]"]' => ['checked' => FALSE],
+      ],
+    ],
+    '#default_value' => $defaults['page_access']['roles'],
+  ];
+  $form['page_access']['users'] = [
+    '#type' => 'item',
+    '#title' => 'Users',
+    '#description' => t('Add users, who can view or update.'),
+    '#states' => [
+      'invisible' => [
+        'input[name="page_access[enabled]"]' => ['checked' => FALSE],
+      ],
+    ],
+  ];
+  $form['page_access']['list'] = [
+    '#type' => 'container',
+    '#parents' => ['page_access'],
+    '#states' => [
+      'invisible' => [
+        'input[name="page_access[enabled]"]' => ['checked' => FALSE],
+      ],
+    ],
+    '#attributes' => ['id' => ['page_access_user_list']],
+  ];
+  if (empty($form_state->get('page_access_users_count'))) {
+    if (!empty($defaults['page_access'])) {
+      $form_state->set('page_access_users_count', count($defaults['page_access']['users']));
+    }
+    else {
+      $form_state->set('page_access_users_count', 1);
+    }
+    $form_state->set('page_access_users_to_remove', []);
+  }
+  $page_access_users_count = $form_state->get('page_access_users_count');
+  $page_access_users_to_remove = $form_state->get('page_access_users_to_remove');
+  for ($i = 0; $i < $page_access_users_count; $i++) {
+    if (in_array($i, $page_access_users_to_remove)) {
+      unset($form['page_access']['list'][$i]);
+      continue;
+    }
+    $user_reference = _get_user_reference_default_value($defaults['page_access']['users'][$i]['user_autocomplete']);
+    $form['page_access']['list'][$i]['user_autocomplete'] = [
+      '#type' => 'entity_autocomplete',
+      '#target_type' => 'user',
+      '#selection_settings' => ['include_anonymous' => FALSE],
+      '#attributes' => [
+        'class' => ['page-access-user-autocomplete'],
+        'placeholder' => 'Username',
+      ],
+      '#prefix' => '<div class="container-inline" id="page-access-' . $i . '">',
+      '#default_value' => $user_reference,
+    ];
+    $form['page_access']['list'][$i]['edit_permission'] = [
+      '#type' => 'checkbox',
+      '#default_value' => 0,
+      '#title' => 'Edit',
+      '#attributes' => ['class' => ['page-access-edit-access']],
+      '#default_value' => (int) (bool) $defaults['page_access']['users'][$i]['edit_permission'],
+    ];
+    if ($i) {
+      $form['page_access']['list'][$i]['remove'] = [
+        '#type' => 'submit',
+        '#value' => 'X',
+        '#submit' => array('page_access_remove_user'),
+        '#ajax' => [
+          'callback' => 'page_access_add_or_remove_user_callback',
+          'wrapper' => 'page_access_user_list',
+          'options' => [
+            'query' => [
+              'triggering_element_index' => $i,
+            ],
+          ],
+        ],
+        '#attributes' => ['class' => ['page-access-remove-user']],
+        '#suffix' => '</div>',
+      ];
+    }
+    else {
+      $form['page_access']['list'][$i]['edit_permission']['#suffix'] = '</div>';
+    }
+  }
+  $form['page_access']['list']['add_user'] = [
+    '#type' => 'submit',
+    '#value' => t('Add user'),
+    '#submit' => array('page_access_add_user'),
+    '#ajax' => [
+      'callback' => 'page_access_add_or_remove_user_callback',
+      'wrapper' => 'page_access_user_list',
+    ],
+    '#attributes' => ['class' => ['page-access-add-user']],
+  ];
+
+  foreach (array_keys($form['actions']) as $action) {
+    if ($action != 'preview' && isset($form['actions'][$action]['#type']) && $form['actions'][$action]['#type'] === 'submit') {
+      $form['actions'][$action]['#submit'][] = 'page_access_form_node_form_submit';
+    }
+  }
+}
+
+/**
+ * Add more user submit handler.
+ *
+ * @param array $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+function page_access_add_user(array $form, FormStateInterface &$form_state) {
+  $page_access_users_count = $form_state->get('page_access_users_count');
+  $form_state->set('page_access_users_count', $page_access_users_count + 1);
+  $form_state->setRebuild();
+}
+
+/**
+ * Remove user submit handler.
+ *
+ * @param array $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+function page_access_remove_user(array $form, FormStateInterface &$form_state) {
+  $triggering_element_index = \Drupal::request()->query->get('triggering_element_index');
+  $page_access_users_to_remove = $form_state->get('page_access_users_to_remove');
+  $page_access_users_to_remove[] = $triggering_element_index;
+  $form_state->set('page_access_users_to_remove', $page_access_users_to_remove);
+  $form_state->setRebuild();
+}
+
+/**
+ * Ajax callback for add and remove user.
+ *
+ * @param array $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *
+ * @return mixed
+ */
+function page_access_add_or_remove_user_callback(array $form, FormStateInterface &$form_state) {
+  return $form['page_access']['list'];
+}
+
+/**
+ * Returns the definition for page access for the given node.
+ *
+ * @param \Drupal\node\NodeInterface $node
+ *   The node entity.
+ *
+ * @return array
+ *   An array that contains default values for the page access form.
+ */
+function page_access_get_node_defaults($node) {
+  $node_id = $node->id();
+  $defaults = [];
+  if (empty($node_id)) {
+    return $defaults;
+  }
+  $page_access_entity = PageAccess::loadByNid($node_id);
+  if (!empty($page_access_entity)) {
+    $id = $page_access_entity->id();
+    $page_access = $page_access_entity->value();
+    $defaults += [
+      'id' => $id,
+      'page_access' => $page_access,
+    ];
+  }
+  else {
+    $defaults += [
+      'id' => '',
+      'page_access' => [],
+    ];
+  }
+  return $defaults;
+}
+
+/**
+ * Node page settings form submit handler.
+ *
+ * @param $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+function page_access_form_node_form_submit($form, FormStateInterface $form_state) {
+  $node_id = $form_state->getFormObject()->getEntity()->id();
+  if (!$form_state->isValueEmpty('page_access')) {
+    $values = $form_state->getValue('page_access');
+    $entity_id = $form_state->getValue('page_access_entity_id');
+    if (empty($values['enabled'])) {
+      if ($entity_id) {
+        $entity = PageAccess::load($entity_id);
+        $entity->delete();
+      }
+    }
+    else {
+      _page_access_node_save($node_id, $values, $entity_id);
+    }
+  }
+}
+
+/**
+ * Method to save page access settings.
+ *
+ * @param $node_id
+ *   Node Id.
+ * @param $values
+ *   Setting values.
+ */
+function _page_access_node_save($node_id, $values, $entity_id) {
+  unset($values['enabled']);
+  unset($values['users']);
+  if ($entity_id) {
+    $entity = PageAccess::load($entity_id);
+  }
+  else {
+    $entity = PageAccess::create();
+  }
+  $roles = array_shift($values);
+  $roles = array_filter($roles, function ($value) {
+    if ($value) {
+      return TRUE;
+    }
+    return FALSE;
+  });
+  $entity->value = [
+    'roles' => array_values($roles),
+    'users' => array_values($values),
+  ];
+  $entity->nid = $node_id;
+  $entity->save();
+}
+
+/**
+ * Method to get use object for user autocomplete field.
+ *
+ * @param $uid
+ *
+ * @return \Drupal\Core\Entity\EntityInterface|null|string|static
+ */
+function _get_user_reference_default_value($uid) {
+  if (is_numeric($uid)) {
+    $user = User::load($uid);
+    if ($user instanceof User) {
+      return $user;
+    }
+  }
+  return '';
+}
+
+/**
+ * Controls access to a node.
+ *
+ * Decide on access to view/update, if page access settings is been enabled for
+ * the node entity based on current user.
+ *
+ * @param \Drupal\node\NodeInterface|string $node
+ *   Node entity.
+ * @param string $op
+ *   The operation to be performed.
+ * @param \Drupal\Core\Session\AccountInterface $account
+ *   User object.
+ *
+ * @return \Drupal\Core\Access\AccessResultInterface
+ *    The access result.
+ *
+ * @ingroup node_access
+ */
+function page_access_node_access(\Drupal\node\NodeInterface $node, $op, \Drupal\Core\Session\AccountInterface $account) {
+
+  switch ($op) {
+    case 'view':
+    case 'update':
+      $access = \Drupal::service('page_access.default')->get_user_node_access($node, $account);
+
+      if ($access === NULL) {
+        return AccessResult::neutral();
+      }
+      elseif (in_array($op, $access)) {
+        return AccessResult::allowed();
+      }
+      else {
+        return AccessResult::forbidden();
+      }
+
+    default:
+      // No opinion.
+      return AccessResult::neutral();
+  }
+}
