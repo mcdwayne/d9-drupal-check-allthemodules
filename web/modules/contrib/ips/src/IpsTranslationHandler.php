@@ -1,0 +1,14 @@
+<?php
+
+namespace Drupal\ips;
+
+use Drupal\content_translation\ContentTranslationHandler;
+
+/**
+ * Defines the translation handler for ips.
+ */
+class IpsTranslationHandler extends ContentTranslationHandler {
+
+  // Override here the needed methods from ContentTranslationHandler.
+
+}
