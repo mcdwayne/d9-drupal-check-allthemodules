@@ -1,0 +1,221 @@
+diff --git a/core/lib/Drupal/Core/Database/Connection.php b/core/lib/Drupal/Core/Database/Connection.php
+index 2002e9e..c3b0d7e 100644
+--- a/core/lib/Drupal/Core/Database/Connection.php
++++ b/core/lib/Drupal/Core/Database/Connection.php
+@@ -1092,6 +1092,10 @@ public function rollback($savepoint_name = 'drupal_transaction') {
+         if ($rolled_back_other_active_savepoints) {
+           throw new TransactionOutOfOrderException();
+         }
++
++        // Dispatch event for transaction rollback.
++        $event = new TransactionEvent($savepoint, $this);
++        \Drupal::service('event_dispatcher')->dispatch(DatabaseEvents::ROLLBACK, $event);
+         return;
+       }
+       else {
+@@ -1102,6 +1106,11 @@ public function rollback($savepoint_name = 'drupal_transaction') {
+     if ($rolled_back_other_active_savepoints) {
+       throw new TransactionOutOfOrderException();
+     }
++    else {
++      // Dispatch event for transaction rollback.
++      $event = new TransactionEvent($savepoint, $this);
++      \Drupal::service('event_dispatcher')->dispatch(DatabaseEvents::ROLLBACK, $event);
++    }
+   }
+ 
+   /**
+@@ -1132,6 +1141,10 @@ public function pushTransaction($name) {
+       $this->connection->beginTransaction();
+     }
+     $this->transactionLayers[$name] = $name;
++
++    // Dispatch event for transaction begin.
++    $event = new TransactionEvent($name, $this);
++    \Drupal::service('event_dispatcher')->dispatch(DatabaseEvents::START_TRANSACTION, $event);
+   }
+ 
+   /**
+@@ -1179,6 +1192,7 @@ protected function popCommittableTransactions() {
+ 
+       // If there are no more layers left then we should commit.
+       unset($this->transactionLayers[$name]);
++
+       if (empty($this->transactionLayers)) {
+         if (!$this->connection->commit()) {
+           throw new TransactionCommitFailedException();
+@@ -1187,6 +1201,11 @@ protected function popCommittableTransactions() {
+       else {
+         $this->query('RELEASE SAVEPOINT ' . $name);
+       }
++
++      // Dispatch event for transaction commit.
++      $event = new TransactionEvent($name, $this);
++      $dispatcher = \Drupal::service('event_dispatcher');
++      $dispatcher->dispatch(DatabaseEvents::COMMIT, $event);
+     }
+   }
+ 
+diff --git a/core/lib/Drupal/Core/Database/DatabaseEvents.php b/core/lib/Drupal/Core/Database/DatabaseEvents.php
+new file mode 100644
+index 0000000..91c06ce
+--- /dev/null
++++ b/core/lib/Drupal/Core/Database/DatabaseEvents.php
+@@ -0,0 +1,60 @@
++<?php
++
++/**
++ * @file
++ * Contains \Drupal\Core\Database\DatabaseEvents.
++ */
++
++namespace Drupal\Core\Database;
++
++/**
++ * Contains all events thrown while performing database actions.
++ */
++final class DatabaseEvents {
++
++  /**
++   * The name of the event triggered when a transaction is started.
++   *
++   * This event allows modules to react to a transaction being started. The
++   * event listener method receives a \Drupal\Core\Database\TransactionEvent
++   * instance.
++   *
++   * @Event
++   *
++   * @see \Drupal\Core\Database\TransactionEvent
++   *
++   * @var string
++   */
++  const START_TRANSACTION = 'database.transaction.start';
++
++  /**
++   * The name of the event triggered when a transaction is committed.
++   *
++   * This event allows modules to react to a transaction being committed. The
++   * event listener method receives a \Drupal\Core\Database\TransactionEvent
++   * instance.
++   *
++   * @Event
++   *
++   * @see \Drupal\Core\Database\TransactionEvent
++   *
++   * @var string
++   */
++  const COMMIT = 'database.transaction.commit';
++
++  /**
++   * The name of the event triggered when a transaction is rolled back.
++   *
++   * This event allows modules to react to a transaction being rolled back. The
++   * event listener method receives a \Drupal\Core\Database\TransactionEvent
++   * instance.
++   *
++   * @Event
++   *
++   * @see \Drupal\Core\Database\TransactionEvent
++   *
++   * @var string
++   */
++  const ROLLBACK = 'database.transaction.rollback';
++
++}
+diff --git a/core/lib/Drupal/Core/Database/Driver/mysql/Connection.php b/core/lib/Drupal/Core/Database/Driver/mysql/Connection.php
+index dead7ab..7344e5b 100644
+--- a/core/lib/Drupal/Core/Database/Driver/mysql/Connection.php
++++ b/core/lib/Drupal/Core/Database/Driver/mysql/Connection.php
+@@ -5,8 +5,10 @@
+ use Drupal\Core\Database\DatabaseExceptionWrapper;
+ 
+ use Drupal\Core\Database\Database;
++use Drupal\Core\Database\DatabaseEvents;
+ use Drupal\Core\Database\DatabaseNotFoundException;
+ use Drupal\Core\Database\TransactionCommitFailedException;
++use Drupal\Core\Database\TransactionEvent;
+ use Drupal\Core\Database\DatabaseException;
+ use Drupal\Core\Database\Connection as DatabaseConnection;
+ use Drupal\Component\Utility\Unicode;
+@@ -325,6 +327,10 @@ protected function popCommittableTransactions() {
+           }
+         }
+       }
++
++      // Dispatch event for transaction commit.
++      $event = new TransactionEvent($name, $this);
++      \Drupal::service('event_dispatcher')->dispatch(DatabaseEvents::COMMIT, $event);
+     }
+   }
+ 
+diff --git a/core/lib/Drupal/Core/Database/TransactionEvent.php b/core/lib/Drupal/Core/Database/TransactionEvent.php
+new file mode 100644
+index 0000000..b7756fc
+--- /dev/null
++++ b/core/lib/Drupal/Core/Database/TransactionEvent.php
+@@ -0,0 +1,65 @@
++<?php
++
++/**
++ * @file
++ * Contains \Drupal\Core\Database\TransactionEvent.
++ */
++
++namespace Drupal\Core\Database;
++
++use Symfony\Component\EventDispatcher\GenericEvent;
++use Drupal\Core\Database\Connection as DatabaseConnection;
++
++/**
++ * Defines a base class for all database transaction events.
++ */
++class TransactionEvent extends GenericEvent {
++
++  /**
++   * The name of the transaction started/ended.
++   *
++   * @var int
++   */
++  protected $transactionName;
++
++  /**
++   * The connection the event occurred on.
++   *
++   * @var int
++   */
++  protected $databaseConnection;
++
++  /**
++   * Constructs a new TransactionEvent.
++   *
++   * @param string $transaction_name
++   *   The name of the transaction started/ended.
++   * @param DatabaseConnection $database_connection
++   *   The depth of the transaction started/ended.
++   */
++  public function __construct($transaction_name, DatabaseConnection $database_connection) {
++    $this->transactionName = $transaction_name;
++    $this->databaseConnection = $database_connection;
++  }
++
++  /**
++   * The name of the transaction started/ended.
++   *
++   * @return int
++   *   The name of the transaction started/ended.
++   */
++  public function getTransactionName() {
++    return $this->transactionName;
++  }
++
++  /**
++   * The database connection the event occurred on.
++   *
++   * @return \Drupal\Core\Database\Connection
++   *   The database connection object.
++   */
++  public function getDatabaseConnection() {
++    return $this->databaseConnection;
++  }
++
++}
