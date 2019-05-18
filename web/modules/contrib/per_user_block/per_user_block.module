@@ -1,0 +1,141 @@
+<?php
+/**
+ * @file
+ * Per User Block module file.
+ */
+
+use Drupal\Component\Utility\SafeMarkup;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\block\Entity\Block;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\Access\AccessResult;
+
+/**
+ * Users cannot control whether or not they see this block.
+ */
+define('PER_USER_BLOCK_CUSTOM_FIXED', 0);
+
+/**
+ *  Shows this block by default, but lets individual users hide it.
+ */
+define('PER_USER_BLOCK_CUSTOM_ENABLED', 1);
+
+/**
+ * Hides this block by default but lets individual users show it.
+ */
+define('PER_USER_BLOCK_CUSTOM_DISABLED', 2);
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function per_user_block_form_block_form_alter(&$form, FormStateInterface $form_state) {
+  /** @var \Drupal\block\Entity\Block $block */
+  $block = $form_state->getFormObject()->getEntity();
+
+  $form['third_party_settings']['per_user_block'] = array(
+    '#type' => 'details',
+    '#title' => 'Per User',
+    '#group' => 'visibility_tabs',
+  );
+  $form['third_party_settings']['per_user_block']['visibility'] = array(
+    '#type' => 'radios',
+    '#title' => t('Customizable per user'),
+    '#description' => t('Allow individual users to customize the visibility of this block in their account settings.'),
+    '#default_value' => $block->getThirdPartySetting('per_user_block', 'visibility', PER_USER_BLOCK_CUSTOM_FIXED),
+    '#options' => array(
+      PER_USER_BLOCK_CUSTOM_FIXED => t('Not customizable'),
+      PER_USER_BLOCK_CUSTOM_ENABLED => t('Customizable, visible by default'),
+      PER_USER_BLOCK_CUSTOM_DISABLED => t('Customizable, hidden by default'),
+    ),
+  );
+  $form['#attached']['library'][] = 'per_user_block/per_user_block';
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function per_user_block_form_user_form_alter(&$form, FormStateInterface $form_state) {
+
+  // Load all the block info for the current default theme.
+  $theme = $default_theme = \Drupal::config('system.theme')->get('default');
+  $entities = \Drupal::entityManager()->getStorage('block')->loadByProperties(['theme' => $theme]);
+
+  // Load any existing user data.
+  $account = $form_state->getFormObject()->getEntity();
+  $user_block_info = Drupal::service('user.data')->get('per_user_block', $account->id(), 'blocks');
+
+  $default_values = array();
+  $options = array();
+  /** @var \Drupal\block\BlockInterface $block */
+  foreach ($entities as $entity_id => $block) {
+    $block_visibility = $block->getThirdPartySetting('per_user_block', 'visibility', PER_USER_BLOCK_CUSTOM_FIXED);
+
+    // If this block is customisable by the user.
+    if ($block_visibility != PER_USER_BLOCK_CUSTOM_FIXED) {
+      // Build our options.
+      $configuration = $block->getPlugin()->getConfiguration();
+      $options[$entity_id] = SafeMarkup::checkPlain($configuration['label']);
+
+      // Build our default values using either the user value or the default
+      // value based on the block settings.
+      if (isset($user_block_info[$entity_id]) && $user_block_info[$entity_id] || $block_visibility == PER_USER_BLOCK_CUSTOM_ENABLED) {
+        $default_values[] = $entity_id;
+      }
+    }
+  }
+  $form['per_user_block'] = array(
+    '#type' => 'details',
+    '#title' => t('Personalize Blocks'),
+    '#weight' => 10,
+  );
+  $form['per_user_block']['blocks'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Customizable Blocks'),
+    '#options' => $options,
+    '#default_value' => $default_values,
+  );
+  $form['actions']['submit']['#submit'][] = 'per_user_block_user_form_submit';
+}
+
+/**
+ * Submit callback for the user form to save the block settings.
+ */
+function per_user_block_user_form_submit(&$form, FormStateInterface $form_state) {
+  $account = $form_state->getFormObject()->getEntity();
+  if ($account->id() && $form_state->getValue('blocks')) {
+    \Drupal::service('user.data')->set('per_user_block', $account->id(), 'blocks', $form_state->getValue('blocks'));
+  }
+}
+
+/**
+ * Implements hook_block_access().
+ */
+function per_user_block_block_access(Block $block, $operation, AccountInterface $account) {
+
+  $visibility = $block->getThirdPartySetting('per_user_block', 'visibility', PER_USER_BLOCK_CUSTOM_FIXED);
+
+  // If the block visibility can not be changed we have nothing to add.
+  if ($visibility == PER_USER_BLOCK_CUSTOM_FIXED) {
+    return;
+  }
+
+  // If it's an admin path we don't care. This is currently just so we don't
+  // impact the block overview page.
+  if (\Drupal::service('router.admin_context')->isAdminRoute()) {
+    return;
+  }
+
+  $user_block_settings = \Drupal::service('user.data')->get('per_user_block', $account->id(), 'blocks');
+
+  // Use the on/off flag stored in the user settings if they have one.
+  if (isset($user_block_settings[$block->id()])) {
+    // We store 0 if the block is disabled otherwise the block id.
+    $access = $user_block_settings[$block->id()] === 0;
+  }
+  else {
+    // Use the default selected visibility.
+    $access = $visibility != PER_USER_BLOCK_CUSTOM_ENABLED;
+  }
+
+  return AccessResult::forbiddenIf($access)->cachePerUser();
+}
