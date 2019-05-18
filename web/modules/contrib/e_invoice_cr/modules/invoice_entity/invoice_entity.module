@@ -1,0 +1,183 @@
+<?php
+
+/**
+ * @file
+ * Contains invoice_entity.module.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Url;
+use Drupal\customer_entity\Entity\CustomerEntity;
+use Drupal\file\Entity\File;
+use Drupal\invoice_entity\Entity\InvoiceEntityInterface;
+
+/**
+ * Implements hook_theme().
+ */
+function invoice_entity_theme() {
+  return [
+    'invoice_entity' => [
+      'render element' => 'elements',
+    ],
+    'paragraph__invoice_row' => [
+      'render element' => 'elements',
+    ],
+  ];
+}
+
+/**
+ * Error messages.
+ */
+function invoice_entity_config_error() {
+  $message = t('The document key could not be generated because there are not configuration data yet, to set those go to /admin/e-invoice-cr/settings.');
+  drupal_set_message($message, 'error');
+}
+
+/**
+ * Implements hook_entity_operation().
+ */
+function invoice_entity_entity_operation(EntityInterface $entity) {
+  $type = $entity->getEntityType();
+  if ($type->id() === "invoice_entity") {
+    $status = $entity->get('moderation_state')->value;
+    if ($status === "draft") {
+      $key = $entity->get('field_numeric_key')->value;
+      $operations = [];
+      $operations['validate'] = [
+        'title' => t('Validate'),
+        'url' => Url::fromRoute("invoice_entity.validate", ["key" => $key, "id" => $entity->id()]),
+        'weight' => 0,
+      ];
+      return $operations;
+    }
+    if ($status === "published") {
+      $operations = [];
+      $operations['View'] = [
+        'title' => t('View'),
+        'url' => Url::fromRoute("entity.invoice_entity.canonical", ["invoice_entity" => $entity->id()]),
+        'weight' => 0,
+      ];
+      return $operations;
+    }
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function invoice_entity_cron() {
+  // Update the invoices states.
+  $query = \Drupal::entityQuery('invoice_entity');
+  $nids = $query->execute();
+  if (count($nids) > 0) {
+    $entity_manager = \Drupal::entityManager();
+    foreach ($nids as $index => $item) {
+      $entity = $entity_manager->getStorage('invoice_entity')->load($item);
+      if ($entity->get('moderation_state')->value === 'draft') {
+        /** @var \Drupal\invoice_entity\InvoiceService $invoice_service */
+        $invoice_service = \Drupal::service('invoice_entity.service');
+        $invoice_service->validateInvoiceEntity($entity);
+        // Show a notification massage.
+        drupal_set_message(t("The invoices have been verified during the cron process."), 'status');
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_page().
+ */
+function invoice_entity_preprocess_page(&$variables) {
+  // Validate the route and the library.
+  $variables['page']['#cache']['contexts'][] = 'route';
+  $route = "entity.invoice_entity.canonical";
+  if (\Drupal::routeMatch()->getRouteName() === $route) {
+    $variables['#attached']['library'][] = 'invoice_entity/invoice';
+  }
+}
+
+/**
+ * Implements hook_field_display_alter().
+ */
+function invoice_entity_preprocess_field(&$variables, $hook) {
+  if ($variables['entity_type'] === "invoice_entity" || $variables['entity_type'] === "paragraph") {
+    $name = $variables['field_name'];
+    $fields = [
+      "field_total_invoice",
+      "field_total_discount",
+      "field_net_sale",
+      "field_total_tax",
+      "field_unit_price",
+      "field_total_amount",
+      "field_subtotal",
+      "field_line_total_amount",
+    ];
+    if (in_array($name, $fields)) {
+      $settings = \Drupal::config('e_invoice_cr.settings');
+      $currency = $settings->get("currency") === "crc" ? " ₡" : " $";
+      $variables['label'] = $variables['label'] . $currency;
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_invoice_entity().
+ */
+function invoice_entity_preprocess_invoice_entity(&$variables, $hook) {
+  // Emitter data.
+  $emitter = [];
+  $customer = [];
+  $config = \Drupal::config('e_invoice_cr.settings');
+  $file = $config->get('invoice_logo_file');
+  if (!is_null($file) && count($file) !== 0) {
+    $file_uri = File::load($file[0])->getFileUri();
+    $logo_path = file_url_transform_relative(file_create_url($file_uri));
+    $emitter['logo_url'] = $logo_path;
+  }
+  $emitter['name'] = $config->get('name');
+  $emitter['commercial_name'] = $config->get('commercial_name');
+  $emitter['id'] = $config->get('id');
+  $emitter['email'] = $config->get('email');
+  $emitter['phone'] = $config->get('phone');
+  $emitter['fax'] = $config->get('fax');
+  $emitter['postal_code'] = $config->get('postal_code');
+  $emitter['address'] = $config->get('address');
+  $currency_code = $variables['elements']['#invoice_entity']->get('field_currency')->value;
+  $emitter['currency'] = InvoiceEntityInterface::AVAILABLE_CURRENCY[$currency_code]['symbol'];
+  // Client data.
+  if (isset($variables['elements']['field_client'][0]['#options']['entity'])) {
+    $entity = $variables['elements']['field_client'][0]['#options']['entity'];
+    if (!is_null($entity)) {
+      $client_id = $entity->id();
+      $client = CustomerEntity::load($client_id);
+      $customer['id'] = $client->get('field_customer_id')->value;
+      $customer['id_label'] = $client->getFieldDefinition('field_customer_id')->label();
+      $customer['name'] = $client->get('name')->value;
+      $customer['email'] = $client->get('field_email')->value;
+      $customer['email_label'] = $client->getFieldDefinition('field_email')->label();
+      $customer['phone'] = $client->get('field_phone')->value;
+      $customer['phone_label'] = $client->getFieldDefinition('field_phone')->label();
+      $address = $client->get('field_address')->getValue();
+      if (count($address) !== 0) {
+        $customer['address'] = $address[0]['province'] . ", " . $address[0]['canton'] . ", " . $address[0]['district'] . ".";
+      }
+      $customer['zipcode'] = $address[0]['zipcode'];
+    }
+  }
+  $module_handler = \Drupal::service('module_handler');
+  $moduel_path = $module_handler->getModule('invoice_entity')->getPath();
+  // Send the data.
+  $variables['emitter'] = $emitter;
+  $variables['customer'] = $customer;
+  $variables['base_path'] = $moduel_path;
+}
+
+/**
+ * Implements hook_preprocess_paragraph__row().
+ */
+function invoice_entity_preprocess_paragraph__invoice_row(&$variables) {
+  /** @var \Drupal\paragraphs\Entity\Paragraph $paragraph */
+  $paragraph = $variables['elements']['#paragraph'];
+  $parent = $paragraph->getParentEntity();
+  $variables['currency'] = InvoiceEntityInterface::AVAILABLE_CURRENCY[$parent->get('field_currency')->value]['symbol'];
+}
