@@ -1,0 +1,483 @@
+<?php
+
+/**
+ * @file
+ * The ji_quickbooks.module file.
+ */
+
+use Drupal\ji_quickbooks\JIQuickBooksService;
+use Drupal\ji_quickbooks\JIQuickBooksSupport;
+use Drupal\commerce_order\Entity\Order;
+use Drupal\user\Entity\User;
+
+function ji_quickbooks_op_match_by_field($operation_details, &$context) {
+  if (empty($context['sandbox'])) {
+    try {
+      $quickbooks_service = new JIQuickBooksService(FALSE);
+      if ($quickbooks_service->settingErrorMessage) {
+        \Drupal::logger('JI QuickBooks sendQuickBooksData')
+          ->error($quickbooks_service->settingErrorMessage);
+        return;
+      }
+
+      $response = $quickbooks_service->dataService->Query("select count(*) from Item");
+      $count = 0;
+      if ($response) {
+        $count = $response;
+      }
+      $context['sandbox'] = [];
+      $context['sandbox']['progress'] = 0;
+      $context['sandbox']['current_node'] = 0;
+
+      // Save node count for the termination message.
+      $context['sandbox']['max'] = $count;
+    } catch (\Exception $e) {
+      watchdog_exception('ji_quickbooks_op_match_by_field', $e);
+    }
+  }
+
+  try {
+    $quickbooks_service = new JIQuickBooksService(FALSE);
+    // Avoid crashing the checkout process.
+    if ($quickbooks_service->settingErrorMessage) {
+      \Drupal::logger('JI QuickBooks sendQuickBooksData')
+        ->error($quickbooks_service->settingErrorMessage);
+      return;
+    }
+
+    $position = $context['sandbox']['current_node'] + 1;
+    $response = $quickbooks_service->dataService->Query("select * from Item STARTPOSITION " . $position . ' MAXRESULTS 1000');
+    $response_count = 0;
+    if (isset($response)) {
+      $response_count = count($response);
+      foreach ($response as $row) {
+        if (isset($row->Sku)) {
+          $query = \Drupal::entityQuery('commerce_product_variation');
+          $query->condition('sku', $row->Sku);
+          $result = $query->execute();
+          if ($result) {
+            $product = \Drupal\commerce_product\Entity\ProductVariation::load(key($result));
+            if (isset($product)) {
+              $quickbooks_service->prepareQboProductId($product, $row->Id);
+              // Ugly but it prevents an infinite loop.
+              global $ji_commerce_prevent_hook_entity_presave;
+              $ji_commerce_prevent_hook_entity_presave = TRUE;
+              $product->save();
+            }
+          }
+        }
+      }
+
+      // We can add any error messages here.
+      //$context['results'][] = $response_count . ' ' . $operation_details;
+
+      // Update our progress information.
+      $context['sandbox']['progress'] += $response_count;
+      $context['sandbox']['current_node'] += $response_count;
+      $context['message'] = t('Matching products first @details. Synced @count of @total.',
+        [
+          '@count' => $context['sandbox']['progress'],
+          '@total' => $context['sandbox']['max'],
+          '@details' => $operation_details,
+        ]
+      );
+    }
+    else {
+      // We've finished.
+      $context['sandbox']['progress'] = $context['sandbox']['max'];
+    }
+
+    // Inform the batch engine that we are not finished,
+    // and provide an estimation of the completion level we reached.
+    if ($context['sandbox']['progress'] != $context['sandbox']['max']) {
+      $context['finished'] = ($context['sandbox']['progress'] >= $context['sandbox']['max']);
+    }
+  } catch (\Exception $e) {
+    watchdog_exception('ji_quickbooks_op_match_by_field', $e);
+  }
+}
+
+function ji_quickbooks_op_sync_products($operation_details, &$context) {
+  if (empty($context['sandbox'])) {
+    $total = \Drupal::entityQuery('commerce_product_variation')
+      ->condition('status', 1)
+      ->count()
+      ->execute();
+
+    $context['sandbox'] = [];
+    $context['sandbox']['progress'] = 0;
+    $context['sandbox']['current_node'] = 0;
+
+    // Save node count for the termination message.
+    $context['sandbox']['max'] = (int) $total;
+  }
+
+  $start = $context['sandbox']['current_node'];
+  $length = 30;
+  $pids = \Drupal::entityQuery('commerce_product_variation')
+    ->condition('status', 1)
+    ->range($start, $length)
+    ->execute();
+  $products = \Drupal\commerce_product\Entity\ProductVariation::loadMultiple($pids);
+
+  $results = [];
+  try {
+    $quickbooks_service = new JIQuickBooksService(FALSE);
+    // Avoid crashing the checkout process.
+    if ($quickbooks_service->settingErrorMessage) {
+      \Drupal::logger('JI QuickBooks sendQuickBooksData')
+        ->error($quickbooks_service->settingErrorMessage);
+      return;
+    }
+    $results = $quickbooks_service->sendCommerceBatchProducts($products);
+  } catch (\Exception $e) {
+    watchdog_exception('ji_quickbooks_op_sync_products', $e);
+  }
+
+  $row_counter = $start;
+
+  //$context['results'][] = $row_counter . ' ' . $operation_details;
+
+  // Update our progress information.
+  $context['sandbox']['progress'] += $length;
+  $context['sandbox']['current_node'] += $length;
+  if (count($results)) {
+    $message = '';
+    $counter = 0;
+    foreach ($results as $result) {
+      if ($counter == 5) {
+        break;
+      }
+
+      $message .= empty($message) ? $result : ', ' . $result;
+      $counter++;
+    }
+
+    $context['message'] = t('@count error(s) reported by QuickBooks:  @messages. Processed @process_count of @total.',
+      [
+        '@count' => count($results),
+        '@messages' => $message,
+        '@process_count' => $row_counter + 1,
+        '@total' => $context['sandbox']['max'],
+      ]
+    );
+  }
+  else {
+    $context['message'] = t('Running product sync batch @details. Synced @count of @total.',
+      [
+        '@count' => $row_counter + 1,
+        '@total' => $context['sandbox']['max'],
+        '@details' => $operation_details,
+      ]
+    );
+  }
+
+  // Inform the batch engine that we are not finished,
+  // and provide an estimation of the completion level we reached.
+  if ($context['sandbox']['progress'] != $context['sandbox']['max']) {
+    $context['finished'] = ($context['sandbox']['progress'] >= $context['sandbox']['max']);
+  }
+}
+
+function ji_quickbooks_op_sync_customers_and_orders($operation_details, &$context) {
+  if (empty($context['sandbox'])) {
+    $query = \Drupal::entityQuery('commerce_order')
+      ->condition('state', 'completed');
+    $ignore_date_end = \Drupal::state()
+      ->get('ji_quickbooks_process_orders_newer_than');
+    if ($ignore_date_end) {
+      $timestamp = strtotime($ignore_date_end);
+      $query->condition('created', $timestamp, '>');
+    }
+
+    $ignore_date_start = \Drupal::state()
+      ->get('ji_quickbooks_process_orders_older_than');
+    if ($ignore_date_start) {
+      $timestamp = strtotime($ignore_date_start);
+      $query->condition('created', $timestamp, '<');
+    }
+    $count = $query->count()
+      ->execute();
+
+    $context['sandbox'] = [];
+    $context['sandbox']['progress'] = 0;
+    $context['sandbox']['current_node'] = 0;
+
+    // Save node count for the termination message.
+    $context['sandbox']['max'] = (int) $count;
+    //$context['sandbox']['max'] = 20;
+  }
+
+  $start = $context['sandbox']['current_node'];
+  $length = 1;
+  $query = \Drupal::entityQuery('commerce_order')
+    ->range($start, $length)
+    ->condition('state', 'completed');
+
+  $ignore_date_end = \Drupal::state()
+    ->get('ji_quickbooks_process_orders_newer_than');
+  if ($ignore_date_end) {
+    $timestamp = strtotime($ignore_date_end);
+    $query->condition('created', $timestamp, '>');
+  }
+
+  $ignore_date_start = \Drupal::state()
+    ->get('ji_quickbooks_process_orders_older_than');
+  if ($ignore_date_start) {
+    $timestamp = strtotime($ignore_date_start);
+    $query->condition('created', $timestamp, '<');
+  }
+
+  $order_ids = $query->execute();
+
+  $orders = [];
+  foreach ($order_ids as $order_id) {
+    $orders[] = \Drupal\commerce_order\Entity\Order::load($order_id);
+  }
+
+  $results = [];
+  try {
+    $quickbooks_service = new JIQuickBooksService(FALSE);
+    if ($quickbooks_service->settingErrorMessage) {
+      \Drupal::logger('JI QuickBooks sendQuickBooksData')
+        ->error($quickbooks_service->settingErrorMessage);
+      return;
+    }
+    $quickbooks_service->sendCommerceBatchCustomersAndOrders($orders);
+  } catch (\Exception $e) {
+    watchdog_exception('ji_quickbooks_op_sync_products', $e);
+  }
+
+  $row_counter = $start;
+
+  //$context['results'][] = $row_counter . ' ' . $operation_details;
+
+  // Update our progress information.
+  $context['sandbox']['progress'] += $length;
+  $context['sandbox']['current_node'] += $length;
+  if (count($results)) {
+    $message = '';
+    $counter = 0;
+    foreach ($results as $result) {
+      if ($counter == 5) {
+        break;
+      }
+
+      $message .= empty($message) ? $result : ', ' . $result;
+      $counter++;
+    }
+
+    $context['message'] = t('@count error(s) reported by QuickBooks:  @messages. Processed @process_count of @total.',
+      [
+        '@count' => count($results),
+        '@messages' => $message,
+        '@process_count' => $row_counter + 1,
+        '@total' => $context['sandbox']['max'],
+      ]
+    );
+  }
+  else {
+    $context['message'] = t('Running order sync batch @details. Synced @count of @total.',
+      [
+        '@count' => $row_counter + 1,
+        '@total' => $context['sandbox']['max'],
+        '@details' => $operation_details,
+      ]
+    );
+  }
+
+  // Inform the batch engine that we are not finished,
+  // and provide an estimation of the completion level we reached.
+  if ($context['sandbox']['progress'] != $context['sandbox']['max']) {
+    $context['finished'] = ($context['sandbox']['progress'] >= $context['sandbox']['max']);
+  }
+}
+
+function ji_quickbooks_op_2_finished($success, $results, $operations) {
+  $messenger = \Drupal::messenger();
+  if ($success) {
+    // Here we could do something meaningful with the results.
+    // We just display the number of nodes we processed...
+    $messenger->addMessage(t('Finished batch sync.'));
+    //$messenger->addMessage(t('@count items processed.', ['@count' => count($results)]));
+    //$messenger->addMessage(t('The final result was "%final"', ['%final' => end($results)]));
+
+  }
+  else {
+    // An error occurred.
+    // $operations contains the operations that remained unprocessed.
+    $error_operation = reset($operations);
+    $messenger->addMessage(
+      t('An error occurred while processing @operation with arguments : @args',
+        [
+          '@operation' => $error_operation[0],
+          '@args' => print_r($error_operation[0], TRUE),
+        ]
+      )
+    );
+  }
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Reattempt failed syncs.
+ */
+function ji_quickbooks_cron() {
+  // Only execute the cron if the realm_id was saved.
+  // See ji_quickbooks.admin.inc.
+  //  if (\Drupal::state()->get('ji_quickbooks_cron_start_on')) {
+  //    // We've past the five month marker, begin auto-renewal
+  //    // of tokens. Send email if we cannot renew.
+  //    if (ji_quickbooks_five_months()) {
+  //      $quickbooks_service = new JIQuickBooksService(TRUE);
+  //      // Avoid crashing the cron.
+  //      if ($quickbooks_service->settingErrorMessage) {
+  //        \Drupal::logger('JI QuickBooks Cron')
+  //          ->error($quickbooks_service->settingErrorMessage);
+  //        return;
+  //      }
+  //
+  //      //$response = $quickbooks_service->oauthRenew();
+  //
+  //      if ($response->ErrorCode == '0') {
+  //        // Renewal worked, reset started_on variable so cron
+  //        // will reattempt five months from now.
+  //        \Drupal::state()->set('ji_quickbooks_cron_started_on', \Drupal::time()
+  //          ->getRequestTime());
+  //
+  //        // Replace existing tokens with new ones.
+  //        \Drupal::state()
+  //          ->set('ji_quickbooks_settings_access_token', $response->OAuthToken);
+  //        \Drupal::state()
+  //          ->set('ji_quickbooks_settings_access_token_secret', $response->OAuthTokenSecret);
+  //        return;
+  //      }
+  //
+  //      if ($response->ErrorCode == '270') {
+  //        $code_message = 'Error code 270 — The OAuth access token has expired.';
+  //      }
+  //      if ($response->ErrorCode == '212') {
+  //        $code_message = 'Error code 212 — The request is made outside the 30-day window bounds.';
+  //      }
+  //      if ($response->ErrorCode == '24') {
+  //        $code_message = 'Error code 24 — The app is not approved for the API.';
+  //      }
+  //      if ($response->ErrorCode == '22') {
+  //        $code_message = 'Error code 22 — The API requires authorization.';
+  //      }
+  //
+  //      // Critical failure occurred, delete variable so cron doesn't
+  //      // continue the re-attempt.
+  //      if ($response->ErrorCode != '0' && $response->ErrorCode != '212') {
+  //        // Tokens are invalid. Remove variable so cron doesn't
+  //        // continue re-attempts.
+  //        \Drupal::state()->delete('ji_quickbooks_cron_started_on');
+  //        \Drupal::logger('JI QuickBooks Cron')->error($code_message);
+  //      }
+  //    }
+  //  }
+
+  /**
+   * @todo: Disabled until I can spend more time building an interface
+   * where a user can make adjustments to attempt to resync otherwise
+   * this will just continually build and slow down the system.
+   */
+
+  // Retrieve the error record. We'll begin there.
+  //  $error_record = \Drupal::database()
+  //    ->select('ji_quickbooks_realm_index', 'r')
+  //    ->condition('r.is_error', TRUE, '=')
+  //    ->fields('r')
+  //    ->range(0, 9)
+  //    ->orderBy('updated', 'ASC')
+  //    ->execute()
+  //    ->fetchAll();
+  //
+  //  if (!empty($error_record)) {
+  //    $quickbooks_service = new JIQuickBooksService();
+  //    if (!empty($quickbooks_service->settingErrorMessage)) {
+  //      return;
+  //    }
+  //
+  //    foreach ($error_record as $record) {
+  //      $order = Order::load($record->oid);
+  //      if ($order instanceof \Drupal\commerce_order\Entity\Order) {
+  //        $account = User::load($order->get('uid')->getString());
+  //
+  //        // Sync needs to start from customer and trickle down to
+  //        // order then payment.
+  //        switch ($record->process) {
+  //          case 'customer':
+  //            $qbo_customer_id = $quickbooks_service->sendCustomer($order, $account);
+  //            if ($qbo_customer_id) {
+  //              $qbo_invoice_id = $quickbooks_service->sendInvoice($order, $qbo_customer_id);
+  //              if ($qbo_invoice_id) {
+  //                $quickbooks_service->sendPayment($order, $qbo_customer_id, $qbo_invoice_id);
+  //              }
+  //            }
+  //            break;
+  //
+  //          case 'invoice':
+  //            $qbo_customer_id = JIQuickBooksSupport::getResponseId($record->realm_id, $order->get('uid')
+  //              ->getString());
+  //            if ($qbo_customer_id) {
+  //              $qbo_invoice_id = $quickbooks_service->sendInvoice($order, $qbo_customer_id);
+  //              if ($qbo_invoice_id) {
+  //                $quickbooks_service->sendPayment($order, $qbo_customer_id, $qbo_invoice_id);
+  //              }
+  //            }
+  //            break;
+  //
+  //          case 'payment':
+  //            $qbo_customer_id = JIQuickBooksSupport::getResponseId($record->realm_id, $order->get('uid')
+  //              ->getString());
+  //            if ($qbo_customer_id) {
+  //              $qbo_invoice_id = JIQuickBooksSupport::getResponseId($record->realm_id, $order->get('uid')
+  //                ->getString(), 'invoice', $record->oid);
+  //              if ($qbo_invoice_id) {
+  //                $quickbooks_service->sendPayment($order, $qbo_customer_id, $qbo_invoice_id);
+  //              }
+  //            }
+  //            break;
+  //
+  //          case 'void invoice':
+  //            ji_quickbooks_process_void_request('invoice', 'void invoice', $record, $order, $quickbooks_service);
+  //            break;
+  //
+  //          case 'void payment':
+  //            ji_quickbooks_process_void_request('payment', 'void payment', $record, $order, $quickbooks_service);
+  //            break;
+  //        }
+  //      }
+  //      else {
+  //        \Drupal::logger('JI QuickBooks ji_quickbooks_cron')
+  //          ->error("Appears we can't create an order object");
+  //      }
+  //    }
+  //  }
+}
+
+/**
+ * Voids either an invoice or payment.
+ */
+function ji_quickbooks_process_void_request($type, $process_name, $record, $order, $quickbooks_service) {
+  $qbo_payment_id = JIQuickBooksSupport::getResponseId($record->oid, $record->realm_id, $type);
+  if ($qbo_payment_id) {
+    $void_payment_response = $quickbooks_service->voidPayment($qbo_payment_id);
+    JIQuickBooksSupport::logProcess($order->order_id, $quickbooks_service->realmId, $order->get('uid')
+      ->getString(), $process_name, $void_payment_response);
+  }
+}
+
+/**
+ * Test if over five months.
+ *
+ * Returns TRUE if it's past the five month period since
+ * this Drupal instance was connected to QuickBooks.
+ */
+function ji_quickbooks_five_months() {
+  $installed_on = \Drupal::state()->get('ji_quickbooks_cron_started_on');
+  $five_months = $installed_on + (60 * 60 * 24 * 30 * 5);
+  return (\Drupal::time()->getRequestTime() > $five_months);
+}
