@@ -1,0 +1,135 @@
+<?php
+
+/**
+ * @file
+ * Module file for ONF Capture Entity Changes.
+ *
+ * This module captures all the changes that occur in a node.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Entity\EntityInterface;
+
+use Drupal\Core\Database\Database;
+
+include __DIR__ . '/src/obtainValues.inc';
+
+/**
+ * Implements hook_help() for capture_entity_changes.
+ */
+function capture_entity_changes_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.capture_entity_changes':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('This module and submodules are maintained by Óscar Novas (hola@oscarnovas.com).') . '</p>';
+      $output .= '<p>' . t('If you need help or want a customized module for your website, you can contact me at https://oscarnovas.com.') . '</p>';
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_entity_presave() for capture_entity_changes.
+ */
+function capture_entity_changes_entity_presave(EntityInterface $entity) {
+
+  /* Compruebo si debo o no capturar los datos */
+  $user = \Drupal::currentUser();
+  if (!$user->hasPermission('avoid data capture')) {
+    /* Obtengo listado de los bundles a revisar */
+    $database = Database::getConnection();
+    $query = $database->select('cec_config', 'c')
+      ->distinct()
+      ->fields('c', ['bundle']);
+
+    $_types = $query->execute()->fetchAllAssoc('bundle');
+    $_currentType = $entity->bundle();
+
+    if (array_key_exists($_currentType, $_types)) {
+      /* Obtengo los nodos que quiero monitorizar */
+      $query = $database->select('cec_config', 'c')
+        ->fields('c', ['field_name'])
+        ->condition('c.bundle', $_currentType, '=');
+      $_nodes = $query->execute()->fetchAllAssoc('field_name');
+
+      $_values = [];
+      foreach ($_types as $_type) {
+        if ($_currentType == (string) $_type->bundle) {
+          foreach ($_nodes as $key => $miField) {
+            // Obtener el tipo de entidad.
+            if ($entity->getFieldDefinition($key)) {
+              $field_type = $entity->getFieldDefinition($key)->getType();
+            }
+            else {
+              continue;
+            }
+
+            // Obtener los valores.
+            $_aux = [];
+            $_aux['current'] = $entity->get($key)->getValue();
+            $_aux['original'] = $entity->original->get($key)->getValue();
+            $_aux['updated'] = [];
+
+            // Obtengo los valores según el tipo de campo.
+            switch ($field_type) {
+              case 'boolean':
+              case 'email':
+              case 'datetime':
+              case 'timestamp':
+              case 'list_string':
+              case 'list_float':
+              case 'text':
+              case 'text_with_summary':
+                $_values[$key] = obtain_string_values($_values, $_aux);
+                break;
+
+              case 'link':
+                $_values[$key] = obtain_link_values($_values, $_aux);
+                break;
+
+              default:
+                // Campo no contemplado.
+                $_values[$key] = obtain_no_supported_values($_values, $_aux);
+            }
+          }
+        }
+      }
+    }
+
+    /* Guardo los valores que han sido cambiados
+     * en la base de datos */
+    $insert = $database->insert('cec_audit')
+      ->fields([
+        'timestamp',
+        'uid',
+        'ip',
+        'field_name',
+        'bundle',
+        'before_value',
+        'after_value',
+        'type',
+        'group',
+      ]);
+
+    if (isset($_values) and is_array($_values)) {
+      $fecha = new DateTime();
+      $group = base64_encode($fecha->getTimestamp() . $_currentType . $user->id());
+      foreach ($_values as $key => $value) {
+        if ($value['updated'][0]) {
+          $insert->values([
+            'timestamp' => $fecha->getTimestamp(),
+            'uid' => $user->id(),
+            'ip' => \Drupal::request()->getClientIP(),
+            'field_name' => $key,
+            'bundle' => $_currentType,
+            'before_value' => implode(", ", $value['original']),
+            'after_value' => implode(", ", $value['current']),
+            'type' => $entity->getFieldDefinition($key)->getType(),
+            'group' => $group,
+          ]);
+        }
+      }
+      $insert->execute();
+    }
+  }
+}
