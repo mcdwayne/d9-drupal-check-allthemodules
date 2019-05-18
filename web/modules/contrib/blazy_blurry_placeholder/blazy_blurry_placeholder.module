@@ -1,0 +1,150 @@
+<?php
+
+use Drupal\image\Entity\ImageStyle;
+use Drupal\file\Entity\File;
+use Drupal\Core\Entity\Entity\EntityViewDisplay;
+
+/**
+ * Implements hook_preprocess_image().
+ */
+function blazy_blurry_placeholder_preprocess_image(&$variables) {
+  if (empty($variables['attributes']['class'])
+    || empty($variables['attributes']['uri'])
+    || strpos(implode(' ', $variables['attributes']['class']), 'b-lazy') === FALSE
+    || empty($variables['attributes']['use_blurry_placeholder'])
+    || !$variables['attributes']['use_blurry_placeholder']) {
+    return;
+  }
+
+  // Change the default placeholder shown while loading a blazy image
+  // with a compressed version of the image.
+  $placeholder_style = 'blazy_blurry_placeholder';
+
+  $image_style = $variables['attributes']['image_style'];
+  // Original image uri (no image style).
+  $uri = $variables['attributes']['uri'];
+  // Original image with image style if available.
+  $current_uri_with_style = !empty($image_style) ? ImageStyle::load($image_style)->buildUri($uri) : $uri;
+
+  // Use the blazy placeholder image style to create a much smaller
+  // version of the image which will then be stretched to fit the container
+  // and blurred with css.
+  $img = ImageStyle::load($placeholder_style)->buildUri($current_uri_with_style);
+  ImageStyle::load($placeholder_style)->createDerivative($current_uri_with_style, $img);
+
+  if (file_exists($uri) && file_exists($img)) {
+    // Encode the image in base64 to speed up loading times.
+    $img_binary = fread(fopen($img, "r"), filesize($img));
+    $file_type = mime_content_type($img);
+    $img_base64 = 'data:' . $file_type . ';base64,' . base64_encode($img_binary);
+
+    // Update the placeholder URI.
+    $variables['attributes']['src'] = $img_base64;
+
+    unset($variables['attributes']['image_style']);
+    unset($variables['attributes']['uri']);
+  }
+}
+
+/**
+ * Implements hook_preprocess_field().
+ */
+function blazy_blurry_placeholder_preprocess_field(&$variables) {
+  $entity = $variables['element']['#object'];
+  $view_mode = $variables['element']['#view_mode'];
+  $field_name = $variables['element']['#field_name'];
+
+  if (!empty($variables['items'])) {
+    foreach ($variables['items'] as &$item) {
+      if (!empty($item['content']['#theme']) && $item['content']['#theme'] == 'blazy') {
+        // Get the field formatter settings.
+        $entity_display = EntityViewDisplay::collectRenderDisplay($entity, $view_mode);
+        $field_display = $entity_display->getComponent($field_name);
+        if (!empty($field_display['third_party_settings']['blazy_blurry_placeholder']['use_blurry_placeholder'])) {
+          $use_blurry_placeholder = $field_display['third_party_settings']['blazy_blurry_placeholder']['use_blurry_placeholder'];
+        }
+        else {
+          $use_blurry_placeholder = 0;
+        }
+        // BlazyManager takes the attributes from
+        // ['content']['#build']['item']->_attributes
+        // and replaces ['content']['#item_attributes'] with them.
+        /** @var \Drupal\image\Plugin\Field\FieldType\ImageItem $build_item */
+        $build_item = $item['content']['#build']['item'];
+        $value = $build_item->getValue();
+        $file = File::load($value['target_id']);
+        $value['_attributes']['uri'] = $file->getFileUri();
+        $value['_attributes']['use_blurry_placeholder'] = $use_blurry_placeholder;
+        $value['_attributes']['image_style'] = $item['content']['#image_style'];
+        $build_item->setValue($value);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_blazy_attach_alter().
+ */
+function blazy_blurry_placeholder_blazy_attach_alter(&$load, $settings = []) {
+  if (!\Drupal::config('blazy.settings')->get('blazy_blurry_placeholder_disable_style')) {
+    $load['library'][] = 'blazy_blurry_placeholder/placeholder.style';
+  }
+}
+
+/**
+ * Implements hook_field_formatter_settings_summary_alter().
+ */
+function blazy_blurry_placeholder_field_formatter_settings_summary_alter(&$summary, $context) {
+  // Append a message to the summary when blazy formatter has
+  // use_blurry_placeholder set to TRUE for the current view mode.
+  if ($context['formatter']->getPluginId() == 'blazy') {
+    if ($context['formatter']->getThirdPartySetting('blazy_blurry_placeholder', 'use_blurry_placeholder')) {
+      $summary[] = t('Use blurry placeholder enabled.');
+    }
+  }
+}
+
+/**
+ * Implements hook_field_formatter_third_party_settings_form().
+ */
+function blazy_blurry_placeholder_field_formatter_third_party_settings_form($plugin, $field_definition, $view_mode, $form, $form_state) {
+  $element = array();
+  // Add a 'use_blurry_placeholder' option to the blazy formatter settigns.
+  if ($plugin->getPluginId() == 'blazy') {
+    $element['use_blurry_placeholder'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Use blurry placeholder'),
+      '#default_value' => $plugin->getThirdPartySetting('blazy_blurry_placeholder', 'use_blurry_placeholder'),
+    );
+  }
+  return $element;
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Update the Blazy settings page adding the option to disable
+ * this module's styling.
+ */
+function blazy_blurry_placeholder_form_alter(&$form, $form_state, $form_id) {
+  $config = \Drupal::config('blazy.settings');
+  if ($form_id == 'blazy_settings') {
+    $form['blazy_blurry_placeholder_disable_style'] = [
+      '#type'          => 'checkbox',
+      '#title'         => t('Disable Blazy Blurry Placeholder styling'),
+      '#default_value' => $config->get('blazy_blurry_placeholder_disable_style'),
+      '#description'   => t('Check to disable custom styling added by the Blazy Blurry Placeholder module. By using the default
+      Blazy styling, placeholders are invisible due to opacity being set to 0.'),
+    ];
+    $form['actions']['submit']['#submit'][] = 'blazy_blurry_placeholder_form_alter_submit';
+  }
+}
+
+/**
+ * Form submission handler for blazy_blurry_placeholder_form_alter().
+ */
+function blazy_blurry_placeholder_form_alter_submit($form, $form_state) {
+  \Drupal::configFactory()->getEditable('blazy.settings')
+    ->set('blazy_blurry_placeholder_disable_style', $form_state->getValue('blazy_blurry_placeholder_disable_style'))
+    ->save();
+}
