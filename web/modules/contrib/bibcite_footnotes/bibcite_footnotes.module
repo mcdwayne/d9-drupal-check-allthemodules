@@ -1,0 +1,362 @@
+<?php
+
+/**
+ * @file
+ * Contains bibcite_footnotes.module.
+ */
+
+use Drupal\Core\Field\EntityReferenceFieldItemListInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Url;
+use Drupal\Core\Link;
+use Drupal\bibcite_footnotes\CitationTools;
+use Drupal\bibcite_footnotes\Plugin\Filter\ReferenceFootnotesFilter;
+use Drupal\field\Entity\FieldConfig;
+
+/**
+ * Implements hook_theme().
+ */
+function bibcite_footnotes_theme() {
+  return [
+    'bibcite_footnote_link' => [
+      'render element' => 'fn',
+      'template' => 'bibcite-footnote-link',
+    ],
+    'bibcite_footnote_list' => [
+      'render element' => 'footnotes',
+      'path' => drupal_get_path('module', 'bibcite_footnotes') . '/templates',
+      'template' => 'bibcite-footnote-list',
+      'variables' => [
+        'notes' => [],
+        'note_type' => [],
+        'config' => [],
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_help().
+ */
+function bibcite_footnotes_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the bibcite_footnotes module.
+    case 'help.page.bibcite_footnotes':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Inline footnote links for BibCite References') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implementation of hook_preprocess_bibcite_footnote_list().
+ *
+ * Gatehrs all notes and prints out Notes and References as separate lists.
+ *
+ * @param $variables Theme variables.
+ *
+ * @throws \Drupal\Component\Plugin\Exception\InvalidPluginDefinitionException
+ * @throws \Drupal\Component\Plugin\Exception\PluginNotFoundException
+ */
+function bibcite_footnotes_preprocess_bibcite_footnote_list(&$variables) {
+  $config = $variables['config'];
+  $footnotes = $variables['notes'];
+
+  $notes = [
+    '#theme' => 'item_list',
+    '#list_type' => 'ul',
+    '#title' => $variables['note_type'] == $config['notes_section_label'],
+    '#attributes' => ['class' => 'footnotes'],
+    '#wrapper_attributes' => ['class' => 'container'],
+  ];
+
+  $notes['#attached']['library'][] = 'bibcite_footnotes/reference_footnote';
+  $dont_show_backlink_text = $config['reference_dont_show_backlink_text'];
+  $sort_references_by = $config['reference_sort_by'];
+  $citation_tools = new CitationTools();
+  if (empty($footnotes)) {
+    return;
+  }
+  foreach ($footnotes as $fn) {
+    $item = [
+      '#id' => $fn['fn_id'],
+      '#wrapper_attributes' => [
+        'class' => ['footnote'],
+      ],
+    ];
+    $build = [];
+    $reference_entity_id = $fn['reference'];
+
+    $footnote_link_text = ($dont_show_backlink_text) ? '^' : $fn['value'];
+    if (!is_array($fn['ref_id'])) {
+      $url = Url::fromUserInput('#' . $fn['ref_id'], ['attributes' => ['id' => $fn['fn_id'], 'class' => 'footnote-link']]);
+      $link = Link::fromTextAndUrl(($footnote_link_text), $url)->toRenderable();
+      $build['footnote-link'] = $link;
+      $override_page_in_citation = $fn['page'] ? $fn['page'] : FALSE;
+    }
+    else {
+      // Output footnote that has more than one reference to it in the body.
+      // The only difference is to insert backlinks to all references.
+      // Helper: we need to enumerate a, b, c...
+      $abc = str_split("abcdefghijklmnopqrstuvwxyz");
+      $i = 0;
+
+      $url = Url::fromUserInput('#' . $fn['ref_id'][0], ['attributes' => ['id' => $fn['fn_id'], 'class' => 'footnote-link']]);
+      $build['footnote-link'] = Link::fromTextAndUrl($footnote_link_text, $url)->toRenderable();
+
+      foreach ($fn['ref_id'] as $ref) {
+        $url = Url::fromUserInput( '#' . $ref, ['attributes' => ['id' => $fn['fn_id'], 'class' => 'footnote-multi']]);
+        $build[] = Link::fromTextAndUrl($abc[$i], $url)->toRenderable();
+
+        $i++;
+      }
+      $override_page_in_citation = FALSE;
+    }
+
+    if (isset($fn['ibid']) && $fn['ibid']) {
+      $build['footnote-text'] = [
+        '#type' => 'markup',
+        '#markup' => ' <span class="endnote-text"><span class="ibid">'
+          . t('Ibid') . '.</span>'
+          . (!empty($fn['page']) ? ', ' . $fn['page'] : '')
+          . '</span>',
+      ];
+    }
+    else if (!empty($fn['text'])) {
+      $build['footnote-link'] = Link::fromTextAndUrl($footnote_link_text, $url)->toRenderable();
+      $build['footnote-text'] = [
+        '#type' => 'markup',
+        '#markup' => ' <span class="endnote-text">' . $fn['text'] . '</span>',
+      ];
+
+    }
+
+    if (!empty($reference_entity_id)) {
+      if (empty($fn['ibid'])) {
+        $citation_build = $citation_tools->getRenderableReference($reference_entity_id);
+        if ($override_page_in_citation) {
+          $citation_build['#data']['page'] = $override_page_in_citation;
+        }
+
+        $build[] = $citation_build;
+      }
+
+      $render = render($build);
+      $item['sort'] = trim(strip_tags(render($citation_build)));
+    }
+
+//    $item['#markup'] = $render;
+    $notes['#items'][] = $build;
+    $reference_entity_id = FALSE;
+    $render = FALSE;
+  }
+
+  $variables['notes'] = $notes;
+}
+
+/**
+ * Comparator function for sorting lists of references.
+ *
+ * @param $a First item to compare
+ * @param $b Second item to compare
+ * @return int Result of the comparison.
+ */
+function _bibcite_footnotes_reference_array_cmp($a, $b) {
+  $a1 = (!empty($a['sort']) ? strtolower($a['sort']) : '');
+  $b1 = (!empty($b['sort']) ? strtolower($b['sort']) : '');
+  return strcmp($a1, $b1);
+}
+
+/**
+ * Implementation of hook_preprocess_bibcite_footnote_link().
+ *
+ * Construct a link inside a block of text so that it points to the reference list.
+ *
+ * @param $variables
+ */
+function bibcite_footnotes_preprocess_bibcite_footnote_link(&$variables) {
+//  $variables['fn']['fn']['#type'] = 'markeup';
+//  $variables['fn']['fn']['#markup'] = '<h2>Hello!</h2>';
+  $fn = $variables['fn']['fn'];
+  // TODO: Make a more formal way to denote inline citations.
+
+  $class = 'see-footnote';
+  // Generate the hover text
+  $citation_tools = new CitationTools();
+  $citation_entity_id = $fn['reference'];
+  $citation_data = $citation_tools->getRenderableReference($citation_entity_id);
+
+  // Citation contains a page reference, so construct parenthetical footnote.
+  // @TODO: Make it explicit.
+  if (!empty($fn['page'] && !is_numeric($fn['value']))) {
+    $fn['value'] = "({$fn['value']}, {$fn['page']})";
+    $citation_data['#data']['page'] = $fn['page'];
+    $class .= '-inline';
+  }
+
+  $title = trim(strip_tags(render($citation_data)));
+  $url = Url::fromUserInput('#' . $fn['fn_id'], ['attributes' => ['id' => $fn['ref_id'], 'class' => $class, 'title' => $title]]);
+  
+
+  $link = Link::fromTextAndUrl($fn['value'], $url)->toRenderable();
+  unset($variables['fn']['fn']);
+  $variables['fn']['fn'] = $link;
+//  $variables['fn']['fn'][] = $link;
+}
+
+/**
+ * Implementation of hook_inline_entity_form_entity_form_alter().
+ *
+ * Force all entities to be saved once they are created.
+ *
+ * @TODO: Add cleanup batch task for orphaned References.
+ *
+ * @param $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+function bibcite_footnotes_inline_entity_form_entity_form_alter(&$form, FormStateInterface &$form_state) {
+  $form['#save_entity'] = TRUE;
+}
+
+/**
+ * Implementation of hook_form_node_form_alter().
+ *
+ * This function populates the Reference list drop-down in the CKEditor drop-down.
+ * It gathers all referenced entities of type bibcite_reference and puts them
+ * into a JavaScript setting under drupalSettings.bibcite_footnotes.references.
+ *
+ * @param $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+function bibcite_footnotes_form_node_form_alter(&$form, FormStateInterface &$form_state) {
+  $ief = $form_state->get('inline_entity_form');
+  if ($ief) {
+    // Inline entity storage uses hashes to separate out the field instances.
+    $bibcite_references = [];
+    foreach ($ief as $ief_instance) {
+      /**
+       * @var FieldConfig $field_config
+       */
+      $field_config = $ief_instance['instance'];
+
+      // Check if this is a bibcite_reference field type.
+      if ($field_config->getSetting('handler') == 'default:bibcite_reference') {
+        $field_name = $field_config->get('field_name');
+        if (!empty($ief_instance['entities'])) {
+
+          foreach ($ief_instance['entities'] as $entity_wrapper) {
+            /**
+             * @var \Drupal\core\Entity\EntityInterface $entity
+             */
+            $entity = $entity_wrapper['entity'];
+            if ($entity->getEntityTypeId() == 'bibcite_reference') {
+              list($citation_text, $citation_key) = bibcite_footnotes_get_ckeditor_select_item($entity);
+              $bibcite_references[] = [$citation_text, $citation_key];
+            }
+          }
+        }
+      }
+    }
+
+    $triggering_element = $form_state->getTriggeringElement();
+    if (!$triggering_element) {
+      $form['#attached']['drupalSettings']['bibcite_footnotes']['references'] = $bibcite_references;
+    }
+    else {
+      $form[$triggering_element['#parents'][0]]['widget']['#attached']['library'][] = 'bibcite_footnotes/replace_citations';
+      $form[$triggering_element['#parents'][0]]['widget']['#attached']['drupalSettings']['bibcite_footnotes']['references'] = $bibcite_references;
+    }
+  }
+  else {
+    // Not using Inline Entity Form, get the references if they exist
+    $entity = $form_state->getFormObject()->getEntity();
+    $fields = $entity->getFields();
+    $reference_field = FALSE;
+    foreach ($fields as $field) {
+      $type = $field->getFieldDefinition();
+      if ($type->getType() == 'entity_reference') {
+        if ($type->getSetting('handler') == 'default:bibcite_reference') {
+          $referenced_entities = $field->referencedEntities();
+          $bibcite_references = [];
+          foreach ($referenced_entities as $referenced_entity) {
+            list($citation_text, $citation_key) = bibcite_footnotes_get_ckeditor_select_item($referenced_entity);
+            $bibcite_references[] = [$citation_text, $citation_key];
+          }
+          $form['#attached']['drupalSettings']['bibcite_footnotes']['references'] = $bibcite_references;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Construct an item to go into the CKEditor Reference drop-down list.
+ *
+ * @param $entity
+ *
+ * @return array
+ *   The form of the array is ["Citation string", [reference entity id].
+ */
+function bibcite_footnotes_get_ckeditor_select_item($entity): array {
+  $serializer = \Drupal::service('serializer');
+
+  $data = $serializer->normalize($entity, 'csl');
+  $build = ['#theme' => 'bibcite_citation', '#data' => $data];
+  $citation_text = trim(strip_tags(render($build)));
+  // Attempt to match up pre-saved entities with the eventual saved ones.
+  $citation_key = $entity->id->first()->getValue()['value'];
+  return [$citation_text, $citation_key];
+}
+
+/**
+ * Implementation of hook_preprocess_field().
+ * Sort the works cited list by rendered text, which results in author(s) then title.
+ *
+ * @param $variables
+ * @param $hook
+ */
+function bibcite_footnotes_preprocess_field(&$variables, $hook) {
+  $citation_tools = new CitationTools();
+  if ($variables['field_name'] == 'field_bibcite_fn_works_cited') {
+
+    foreach($variables['element'] as $index => $element) {
+      if (is_numeric($index)) {
+        $renderable = $citation_tools->getRenderableReference($element['#bibcite_reference']);
+        $items[] = [
+          'orig_index' => $index,
+          'orig_element' => $element,
+          'rendered' => trim(strip_tags(render($renderable))),
+        ];
+      }
+    }
+    uasort($items, '_bibcite_footnotes_sort_rendered_references');
+    $i = 0;
+    foreach ($items as $item) {
+      $variables['element'][$i] = $item['orig_element'];
+      $variables['element']['#items'][$i] = $item['orig_element'];
+      $variables['items'][$i]['content'] = $item['orig_element'];
+      $i += 1;
+    }
+  }
+}
+
+/**
+ * Comparator function for theme field preprocess.
+ *
+ * @param $a
+ *   The first renderable element.
+ * @param $b
+ *   The second renderable element.
+ *
+ * @return int
+ */
+function _bibcite_footnotes_sort_rendered_references($a, $b) {
+  if ($a['rendered'] == $b['rendered']) {
+    return 0;
+  }
+  return strtolower($a['rendered']) < strtolower($b['rendered']) ? -1 : 1;
+}
