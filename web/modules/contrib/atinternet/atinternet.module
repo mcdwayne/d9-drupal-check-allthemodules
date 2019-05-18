@@ -1,0 +1,198 @@
+<?php
+
+/**
+ * @file
+ * Contains atinternet.module.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Component\Utility\Unicode;
+use Drupal\Core\Url;
+use Drupal\Core\Menu\MenuLinkInterface;
+use Drupal\Component\Plugin\Exception\PluginNotFoundException;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\node\Entity\Node;
+
+/**
+ * Implements hook_form_menu_link_content_menu_link_content_form_alter().
+ *
+ * Adding entity autocomplete input for level2 ID.
+ */
+function atinternet_form_menu_link_content_menu_link_content_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+
+    $menu_link = $form_state->getFormObject()->getEntity();
+    $menu_link_options = $menu_link->link->first()->options ?: [];
+    $menu_link_attributes = isset($menu_link_options['at_internet_level2']) ? $menu_link_options['at_internet_level2'] : [];
+
+    $form['options']['at_internet_level2'] = [
+        '#type' => 'entity_autocomplete',
+        '#target_type' => 'level2',
+        '#title' => 'AT Internet Level 2',
+        '#description' => t('Set the AT Internet Level 2 for this link.'),
+        '#default_value' => entity_load('level2', $menu_link_attributes[0]['target_id']),
+        '#tags' => TRUE,
+        '#weight' => '0',
+    ];
+    $form['actions']['submit']['#submit'][] = 'atinternet_menu_link_content_form_submit';
+
+}
+/**
+ * Implements hook_menu_link_content_form_submit().
+ */
+function atinternet_menu_link_content_form_submit($form, FormStateInterface $form_state) {
+    $menu_link = $form_state->getFormObject()->getEntity();
+    $options = ['at_internet_level2' => $form_state->getValue('at_internet_level2')];
+    $menu_link_options = $menu_link->link->first()->options;
+    $menu_link->link->first()->options = array_merge($menu_link_options, $options);
+    $menu_link->save();
+}
+
+/**
+ * Implements hook_page_attachments_alter().
+ */
+function atinternet_page_attachments_alter(&$page) {
+    // Get all config value of atinternet
+    $config = \Drupal::config('atinternet.settings');
+
+    /***** Tracking scope for specific user *****/
+
+    // Get the current user status
+    $account = \Drupal::currentUser();
+    // Get role tracking mode (selected roles only / every role except the selected ones)
+    $enabled = $visibility_user_role_mode = $config->get('visibility_user_role_mode');
+    // Get all selected roles
+    $visibility_user_role_roles = $config->get('visibility_user_role_roles');
+    // If specific role(s) is/are selected
+    if (count($visibility_user_role_roles) > 0) {
+        foreach (array_values($account->getRoles()) as $user_role) {
+            // Is the current user a member of one of these roles?
+            if (in_array($user_role, $visibility_user_role_roles)) {
+                // Current user is a member of a role that should be tracked/excluded from tracking.
+                $enabled = !$visibility_user_role_mode;
+            }
+        }
+    }
+    else {
+        // No role is selected for tracking, therefore all roles should be tracked.
+        $enabled = TRUE;
+    }
+
+    /***** Tracking scope for specific/exclued page *****/
+
+    // Get all path which should be tracked / exclued from tracking
+    $requested_page = $config->get('visibility_request_path_pages');
+    // Get current path
+    $path = \Drupal::service('path.current')->getPath();
+    $pages = Unicode::strtolower($requested_page);
+    $path_alias = Unicode::strtolower(\Drupal::service('path.alias_manager')->getAliasByPath($path));
+    $page_match = \Drupal::service('path.matcher')->matchPath($path_alias, $pages) || (($path != $path_alias) && \Drupal::service('path.matcher')->matchPath($path, $pages));
+    // Get if we want to track / exclude from tracking
+    $page_path_mode = $config->get('visibility_request_path_mode');
+    // Include / Exclude page in terms of $page_path_mode
+    $page_match = !($page_path_mode xor $page_match);
+
+    // If current page and current user is tracked
+    if($page_match && $enabled) {
+
+        $default_level2 = '0';
+
+        if (!$config->get('smarttag_manual')) {
+            $smarttag_js = $config->get('smarttag_file');
+
+            $smarttag_url = "";
+
+            if($config->get('smarttag_url')) {
+                $smarttag_url = $config->get('smarttag_url');
+            } else {
+                if ($smarttag_js[0]) {
+                    $file = \Drupal\file\Entity\File::load($smarttag_js[0]);
+                    if ($file) {
+                        if($file->getFileUri() != "public://atinternet/smarttag.js") {
+                            file_move($file, "public://atinternet/smarttag.js", FILE_EXISTS_REPLACE);
+                        }
+                        $uri = $file->getFileUri();
+                        $url = file_create_url($uri);
+                        $url = parse_url($url);
+                        $smarttag_url = $url['path'];
+                    }
+                }
+            }
+
+            $page['#attached']['html_head'][] = [
+                      [
+                        '#type' => 'html_tag',
+                        '#tag' => 'script',
+                          '#attributes' => [
+                            'src' => $smarttag_url,
+                          ],
+                      ], 'at-internet-js',
+                    ];
+
+        }
+
+        $page['#attached']['library'][] = 'atinternet/atinternet';
+        $request = \Drupal::request();
+        $route_match = \Drupal::routeMatch();
+        $page_name = \Drupal::service('title_resolver')->getTitle($request, $route_match->getRouteObject());
+        $breadcrumb[] = '';
+
+        if ($node = \Drupal::routeMatch()->getParameter('node')){
+            /* Get the node id of the current page in ordre to find all parents node */
+            $node_id = $node->id();
+
+            $menu_link_manager = \Drupal::service('plugin.manager.menu.link');
+            $links = $menu_link_manager->loadLinksByRoute('entity.node.canonical', array('node' => $node_id));
+
+            /* function to get up to 4 titles of parent link and the at internet level2 var */
+            function get_parent ($service_menu, $element, $levels=[], $i, $at_internet_level2) {
+                if ($i < 4) {
+                    $current = $i == 0 ? $element : $element->getParent();
+                    if ($current) {
+                        $current = $i == 0 ? $current : $service_menu->createInstance($current);
+                        $current_title = $current->getTitle();
+                        $current_options = $current->getOptions();
+                        /* get the first level2 value we find */
+                        if ($current_options && isset($current_options['at_internet_level2']) && $at_internet_level2 == "") {
+                            $current_at_internet_level2 = $current_options['at_internet_level2'];
+                        } else {
+                            $current_at_internet_level2 = $at_internet_level2;
+                        }
+                        $levels[] = $current_title;
+                        $i++;
+                        return get_parent($service_menu, $current, $levels, $i, $current_at_internet_level2);
+                    }
+                }
+                return array($levels, $at_internet_level2);
+            }
+            if ($link = reset($links)) {
+                $breadcrumb = get_parent($menu_link_manager, $link, $levels=[], $i=0, $at_internet_level2='');
+            }
+
+            if($config->get('default_level2')) {
+                $default_level2 = $config->get('default_level2');
+            }
+        }
+
+        $page['#attached']['drupalSettings']['atinternet'] = [
+          'page_name' => $page_name,
+          'breadcrumb' => $breadcrumb[0] ? $breadcrumb[0] : '',
+          'level2' => (isset($breadcrumb[1][0]) ? (entity_load('level2', $breadcrumb[1][0]['target_id']) ? entity_load('level2', $breadcrumb[1][0]['target_id'])->get('id') : $default_level2) : $default_level2)
+        ];
+    }
+}
+
+/**
+ * Implements hook_help().
+ */
+function atinternet_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the atinternet module.
+    case 'help.page.atinternet':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('AT Internet integration for Drupal') . '</p>';
+      return $output;
+
+    default:
+  }
+}
