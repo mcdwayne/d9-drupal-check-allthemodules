@@ -1,0 +1,241 @@
+<?php
+
+/**
+ * @file
+ * Main functions for "Content Guide" module.
+ */
+
+use Drupal\Component\Utility\Crypt;
+use Drupal\Core\Field\FieldDefinitionInterface;
+use Drupal\Core\Field\PluginSettingsInterface;
+use Drupal\Core\Field\WidgetInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Url;
+use Drupal\paragraphs\Entity\Paragraph;
+
+/**
+ * Implements hook_field_widget_third_party_settings_form().
+ */
+function cg_field_widget_third_party_settings_form(WidgetInterface $plugin, FieldDefinitionInterface $field_definition, $form_mode, $form, FormStateInterface $form_state) {
+  return cg_settings_form($plugin, $form, $form_state);
+}
+
+/**
+ * Create a third party settings form for the content guide settings.
+ *
+ * @param \Drupal\Core\Field\PluginSettingsInterface $plugin
+ *   The plugin holding the third party settings (i.e. field config).
+ * @param array $form
+ *   The form to append the settings to.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   The current form state.
+ */
+function cg_settings_form(PluginSettingsInterface $plugin, array $form, FormStateInterface $form_state) {
+  $settings_link = \Drupal::linkGenerator()->generate(t('Content Guide'), Url::fromRoute('cg.settings'));
+  $settings = $plugin->getThirdPartySettings('cg');
+  if (!empty($settings['cg']) ) {
+    $cg_settings = $settings['cg'];
+  }
+  $element['cg'] = [
+    '#type' => 'fieldset',
+    '#title' => t('Content Guide'),
+  ];
+  $element['cg']['document_path'] = [
+    '#type' => 'textfield',
+    '#title' => t('Document path'),
+    '#description' => t('Enter the path to the content guide document for this field relative to the main @documentation path.', ['@documentation' => $settings_link]),
+    '#default_value' => empty($cg_settings) ? '' : $cg_settings['document_path'],
+    '#element_validate' => ['_cg_validate_document_path'],
+    '#autocomplete_route_name' => 'cg.artist.autocomplete_md_files',
+  ];
+  $element['cg']['display_type'] = [
+    '#type' => 'select',
+    '#title' => t('Display as ...'),
+    '#options' => [
+      'tooltip' => t('Tooltip'),
+      'description' => t('Field description'),
+    ],
+    '#default_value' => empty($cg_settings) ? '' : $cg_settings['display_type'],
+  ];
+
+  return $element;
+}
+
+/**
+ * Implements hook_field_widget_settings_summary_alter().
+ */
+function cg_field_widget_settings_summary_alter(&$summary, $context) {
+  $widget = $context['widget'];
+  $settings = $widget->getThirdPartySettings('cg');
+  if (empty($settings['cg']) && empty($settings['cg']['document_path'])) {
+    return;
+  }
+  $options = [
+    'tooltip' => t('Tooltip'),
+    'description' => t('Field description'),
+  ];
+  $summary[] = t('Content guide: %file (@type)', [
+    '%file' => $settings['cg']['document_path'],
+    '@type' => $options[$settings['cg']['display_type']],
+  ]);
+  return $summary;
+}
+
+/**
+ * Form element validation handler for document_path setting.
+ *
+ * @param array $element
+ *   The form element to process.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   The form state.
+ * @param array $form
+ *   The complete form structure.
+ */
+function _cg_validate_document_path(array &$element, FormStateInterface &$form_state, array $form) {
+  $document_path = trim($element['#value']);
+  if (empty($document_path)) {
+    return;
+  }
+  if ('.md' !== substr($document_path, -3)) {
+    $form_state->setError($element, t('%name must have the extension %extension.', ['%name' => empty($element['#title']) ? $element['#parents'][0] : $element['#title'], '%extension' => '.md']));
+  }
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ *
+ * Our cg_field_widget_multivalue_form_alter() needs to be run after all other
+ * implementations so we have a chance to react on custom modifications (i.e.
+ * like media does).
+ */
+function cg_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'field_widget_multivalue_form_alter' && isset($implementations['cg'])) {
+    $group = $implementations['cg'];
+    unset($implementations['cg']);
+    $implementations['cg'] = $group;
+  }
+}
+
+/**
+ * Implements hook_field_widget_multivalue_form_alter().
+ */
+function cg_field_widget_multivalue_form_alter(array &$elements, FormStateInterface $form_state, array $context) {
+  // Do not alter the default settings form.
+  if ($context['default']) {
+    return;
+  }
+
+  $widget = $context['widget'];
+  $settings = $widget->getThirdPartySettings('cg');
+  if (empty($settings) || empty($settings['cg']['document_path'])) {
+    return;
+  }
+  /** @var \Drupal\Core\Field\FieldItemListInterface $items */
+  $items = $context['items'];
+
+  /** @var \Drupal\Core\Entity\Display\EntityFormDisplayInterface $form_display */
+  $form_display = $form_state->get('form_display');
+
+  $field_name_original = $items->getName();
+  $field_name = strtr($field_name_original, ['_' => '-']);
+  $display_type = $settings['cg']['display_type'] ?: 'tooltip';
+  $settings_js = array_merge([
+    'field_name' => $field_name_original,
+    'field_selector' => ".field--name-{$field_name}",
+    'attach_selector' => ('tooltip' === $display_type) ? 'label' : '.description',
+    'entity_type' => $form_display->getTargetEntityTypeId(),
+    'bundle' => $form_display->getTargetBundle(),
+    'form_display' => $form_display->getMode(),
+  ], $settings['cg']);
+
+  // Allow other modules to alter the settings of this field.
+  $alter_context = [
+    'field_name' => $field_name_original,
+    'entity_type' => $form_display->getTargetEntityTypeId(),
+    'bundle' => $form_display->getTargetBundle(),
+    'form_display' => $form_display->getMode(),
+    'elements' => $elements,
+    'widget' => $widget,
+    'items' => $context['items'],
+  ];
+  \Drupal::moduleHandler()->alter(['cg_field_settings', "cg_field_{$field_name_original}_settings"], $settings_js, $alter_context);
+
+  $identifier = $field_name_original . '--' . Crypt::randomBytesBase64(8);
+  $elements['#attached']['library'][] = "cg/cg.admin.{$display_type}";
+  $elements['#attached']['drupalSettings']['content_guide']['fields'][$identifier] = $settings_js;
+}
+
+/**
+ * Implements hook_cg_field_settings_alter() for media.module.
+ */
+function media_cg_field_settings_alter(array &$settings_js, array $context) {
+  $elements = $context['elements'];
+  if (empty($elements['#theme']) || ('media_reference_help' !== $elements['#theme'])) {
+    return;
+  }
+  switch ($settings_js['display_type']) {
+    case 'tooltip':
+      // Attach tooltips to fieldset legend of media field.
+      $settings_js['attach_selector'] = 'legend:first-of-type';
+      break;
+
+    case 'description':
+      // Attach description to fieldset description.
+      $settings_js['attach_selector'] = '.description:first-of-type';
+      break;
+  }
+}
+
+/**
+ * Implements hook_cg_field_settings_alter() for paragraphs.module.
+ */
+function paragraphs_cg_field_settings_alter(array &$settings_js, array $context) {
+  if (is_object($context['widget']) && method_exists($context['widget'], 'getPluginDefinition') && ('paragraphs' === $context['widget']->getPluginDefinition()['provider'])) {
+    switch ($settings_js['display_type']) {
+      case 'tooltip':
+        // Attach tooltips to title of paragraphs field.
+        $settings_js['attach_selector'] = 'strong:first-of-type, thead .label';
+        break;
+
+      case 'description':
+        // Attach description to field description.
+        $settings_js['attach_selector'] = '.description:first-of-type';
+        break;
+    }
+  }
+  if (!empty($context['items']) && (is_object($context['items']) && method_exists($context['items'], 'getEntity') && $context['items']->getEntity() instanceof Paragraph)) {
+    // We are inside a paragraphs form so override the used form display values.
+    if (($form_display = \Drupal::entityTypeManager()
+      ->getStorage('entity_form_display')
+      ->load($context['entity_type'] . '.' . $context['bundle'] . '.' . $context['form_display']))) {
+      /** @var \Drupal\paragraphs\ParagraphInterface $paragraph */
+      $paragraph = $context['items']->getEntity();
+      $widget = $form_display->getComponent($paragraph->get('parent_field_name')->value);
+
+      $settings_js['entity_type'] = $paragraph->getEntityTypeId();
+      $settings_js['bundle'] = $paragraph->bundle();
+      $settings_js['form_display'] = $widget['settings']['form_display_mode'];
+    }
+  }
+}
+
+/**
+ * Implements hook_cg_field_settings_alter() for entity_reference.module.
+ */
+function entity_reference_cg_field_settings_alter(array &$settings_js, array $context) {
+  if (is_object($context['widget']) && method_exists($context['widget'], 'getPluginDefinition') && (in_array('entity_reference', $context['widget']->getPluginDefinition()['field_types']))) {
+    switch ($settings_js['display_type']) {
+      case 'tooltip':
+        // Attach tooltips to title of entity reference fields.
+        $settings_js['attach_selector'] = '.label';
+        break;
+
+      case 'description':
+        // Attach description to field description.
+        $settings_js['attach_selector'] = '.description:first-of-type';
+        break;
+    }
+  }
+}
+
+

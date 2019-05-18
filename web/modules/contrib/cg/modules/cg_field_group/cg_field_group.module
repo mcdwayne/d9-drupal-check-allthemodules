@@ -1,0 +1,136 @@
+<?php
+
+/**
+ * @file
+ * Main functions for "Content Guide: Field Group" module.
+ */
+
+use Drupal\Component\Utility\Crypt;
+use Drupal\Core\Form\FormStateInterface;
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function cg_form_entity_form_display_edit_form_alter(&$form, FormStateInterface $form_state) {
+  // Only start altering the form if there are field groups.
+  if ((empty($form['#fields']) && empty($form['#extra'])) || empty($form['#fieldgroups'])) {
+    return;
+  }
+
+  $name = $form_state->get('plugin_settings_edit');
+  if (!empty($name) && in_array($name, $form['#fieldgroups'])) {
+    // Load fieldgroup plugin and build third-party settings form.
+    $table = &$form['fields'];
+    $group = $form_state->get('field_group')[$name];
+    $manager = \Drupal::service('plugin.manager.field_group.formatters');
+    $plugin = $manager->getInstance([
+      'format_type' => $group->format_type,
+      'configuration' => ['label' => $group->label, 'settings' => $group->format_settings],
+      'group' => $group,
+    ]);
+
+    $element = cg_settings_form($plugin, $form, $form_state);
+    if (!empty($group->third_party_settings)) {
+      // Use third party settings from group instance instead of plugin.
+      foreach ($group->third_party_settings['cg'] as $key => $value) {
+        $element['cg'][$key]['#default_value'] = $value;
+      }
+    }
+    $table[$name]['format']['format_settings']['third_party_settings'] = $element;
+  }
+
+  $form_state_values = $form_state->getValues();
+  foreach ($form['#fieldgroups'] as $name) {
+    // Save the group when the configuration is submitted.
+    if (!empty($form_state_values[$name . '_plugin_settings_update'])) {
+      $group = $form_state->get('field_group')[$name];
+      $group->third_party_settings = $form_state_values['fields'][$name]['settings_edit_form']['third_party_settings'];
+    }
+  }
+}
+
+/**
+ * Implements hook_field_group_group_save_alter().
+ */
+function cg_field_group_field_group_group_save_alter(&$group, $context) {
+  if (empty($context['field_group_form_state'][$group->group_name]->third_party_settings)) {
+    return;
+  }
+  $group->third_party_settings = $context['field_group_form_state'][$group->group_name]->third_party_settings;
+}
+
+/**
+ * Implements hook_field_group_format_settings_summary_alter().
+ */
+function cg_field_group_field_group_format_settings_summary_alter(&$summary, $context) {
+  if (empty($context['group']->third_party_settings) || empty($context['group']->third_party_settings['cg']['document_path'])) {
+    return;
+  }
+  $settings = $context['group']->third_party_settings;
+  $options = [
+    'tooltip' => t('Tooltip'),
+    'description' => t('Field description'),
+  ];
+  $summary[] = t('Content guide: %file (@type)', [
+    '%file' => $settings['cg']['document_path'],
+    '@type' => $options[$settings['cg']['display_type']],
+  ]);
+}
+
+/**
+ * Implements hook_field_group_form_process_build_alter().
+ */
+function cg_field_group_field_group_form_process_build_alter(array &$element, FormStateInterface $form_state, array &$form) {
+  /** @var \Drupal\Core\Entity\Display\EntityFormDisplayInterface $form_display */
+  $form_display = $form_state->get('form_display');
+
+  foreach ($element['#fieldgroups'] as $group_name => $group) {
+    if (empty($group->third_party_settings) || empty($group->third_party_settings['cg']['document_path'])) {
+      continue;
+    }
+
+    $settings = $group->third_party_settings;
+    $field_name_original = $group_name;
+    $field_name = strtr($field_name_original, ['_' => '-']);
+    // Add custom class to field_group.
+    $form[$group_name]['#attributes']['class'][] = 'cg-field--' . $field_name;
+
+    $display_type = $settings['cg']['display_type'] ?: 'tooltip';
+    $settings_js = array_merge([
+      'field_name' => $field_name_original,
+      'field_selector' => ".cg-field--{$field_name}",
+      'attach_selector' => ('tooltip' === $display_type) ? 'legend' : '.description',
+      'entity_type' => $form_display->getTargetEntityTypeId(),
+      'bundle' => $form_display->getTargetBundle(),
+      'form_display' => $form_display->getMode(),
+    ], $settings['cg']);
+
+    // Allow other modules to alter the settings of this field.
+    $alter_context = [
+      'field_name' => $field_name_original,
+      'entity_type' => $form_display->getTargetEntityTypeId(),
+      'bundle' => $form_display->getTargetBundle(),
+      'form_display' => $form_display->getMode(),
+      'elements' => $element,
+      'widget' => $group,
+      'items' => $element['#fieldgroups'],
+    ];
+    \Drupal::moduleHandler()->alter(['cg_field_settings', "cg_field_{$field_name_original}_settings"], $settings_js, $alter_context);
+
+    $identifier = $field_name_original . '--' . Crypt::randomBytesBase64(8);
+    $element['#attached']['library'][] = "cg/cg.admin.{$display_type}";
+    $element['#attached']['drupalSettings']['content_guide']['fields'][$identifier] = $settings_js;
+  }
+}
+
+/**
+ * Implements hook_cg_controller_widget_settings_alter().
+ */
+function cg_field_group_cg_controller_widget_settings_alter(array &$settings, array $context) {
+  extract($context);
+  $field_groups = field_group_info_groups($entity_type, $bundle, 'form', $mode);
+  if (empty($field_groups[$field]) || empty($field_groups[$field]->third_party_settings['cg']['document_path'])) {
+    return;
+  }
+  $settings = $field_groups[$field]->third_party_settings['cg'];
+}
