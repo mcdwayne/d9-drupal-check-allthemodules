@@ -1,0 +1,237 @@
+<?php
+
+namespace Drupal\baidu_map_geofield\Element;
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\geofield\Element\GeofieldElementBase;
+use Drupal\Core\Url;
+use Drupal\Component\Utility\NestedArray;
+
+/**
+ * Provides a Geofield Baidu Map form element.
+ *
+ * @FormElement("geofield_baidu_map")
+ */
+class GeofieldBaiduMap extends GeofieldElementBase {
+
+  /**
+   * {@inheritdoc}
+   */
+  public static $components = [
+    'lat' => [
+      'title' => 'Latitude',
+      'range' => 90,
+    ],
+    'lon' => [
+      'title' => 'Longitude',
+      'range' => 180,
+    ],
+  ];
+
+  /**
+   * {@inheritdoc}
+   */
+  public function getInfo() {
+    $class = get_class($this);
+    return [
+      '#input' => TRUE,
+      '#process' => [
+        [$class, 'latLonProcess'],
+      ],
+      '#element_validate' => [
+        [$class, 'elementValidate'],
+      ],
+      '#theme_wrappers' => ['fieldset'],
+    ];
+  }
+
+  /**
+   * Generates the Geofield Map form element.
+   *
+   * @param array $element
+   *   An associative array containing the properties and children of the
+   *   element. Note that $element must be taken by reference here, so processed
+   *   child elements are taken over into $form_state.
+   * @param \Drupal\Core\Form\FormStateInterface $form_state
+   *   The current state of the form.
+   * @param array $complete_form
+   *   The complete form structure.
+   *
+   * @return array
+   *   The processed element.
+   */
+  public static function latLonProcess(array &$element, FormStateInterface $form_state, array &$complete_form) {
+
+    // Conditionally use the Leaflet library from the D8 Module, if enabled.
+    if ($element['#map_library'] == 'leaflet') {
+      $element['#attached']['library'][] = \Drupal::moduleHandler()->moduleExists('leaflet') ? 'leaflet/leaflet' : 'geofield_map/leaflet';
+    }
+
+    $mapid = 'map-' . $element['#id'];
+
+    $element['map'] = [
+      '#type' => 'fieldset',
+      '#weight' => 0,
+    ];
+
+    if (strlen($element['#bmap_api_key']) > 0) {
+      $element['map']['geocode'] = [
+        '#prefix' => '<label>' . t("Address search") . '</label>',
+        '#type' => 'textfield',
+        '#autocomplete_route_name' => 'geofield_baidu_map.place',
+        '#description' => t("Use this to geocode your search location."),
+        '#size' => 60,
+        '#maxlength' => 128,
+        '#attributes' => [
+          'id' => 'search-' . $element['#id'],
+          'class' => ['form-text', 'form-autocomplete', 'geofeld_baidumap-search'],
+        ],
+      ];
+
+      if (\Drupal::currentUser()->hasPermission('configure geofield_map')) {
+        $element['map']['geocode']['#description'] .= '<div class="geofield-map-message">' . t('@google_places_autocomplete_message<br>@message_recipient', [
+          '@google_places_autocomplete_message' => !$element['#gmap_places'] ? 'Baidu Places Autocomplete Service disabled. Might be enabled in the Geofield Widget configuration.' : 'Google Places Autocomplete Service enabled.',
+          '@message_recipient' => t('(This message is only shown to the Geofield Map module administrator).'),
+        ]) . '</div>';
+      }
+
+    }
+    elseif (\Drupal::currentUser()->hasPermission('configure geofield_map')) {
+      $element['map']['geocode_missing'] = [
+        '#type' => 'html_tag',
+        '#tag' => 'div',
+        '#value' => t("Baidu Map Api Key missing. <br>@settings_page_link", [
+          '@settings_page_link' => \Drupal::linkGenerator()->generate(t('Set it in the Geofield Map Configuration Page'), Url::fromRoute('baidu_map.settings', [], [
+            'query' => [
+              'destination' => Url::fromRoute('<current>')
+                ->toString(),
+            ],
+          ])),
+        ]),
+        '#attributes' => [
+          'class' => ['geofield-map-message'],
+        ],
+      ];
+    }
+
+    $element['map']['baidu_map_geofield'] = [
+      '#theme' => 'baidu_map_geofield_widget',
+      '#mapid' => $mapid,
+      '#width' => isset($element['#map_dimensions']['width']) ? $element['#map_dimensions']['width'] : '100%',
+      '#height' => isset($element['#map_dimensions']['height']) ? $element['#map_dimensions']['height'] : '450px',
+    ];
+
+    $element['map']['actions'] = [
+      '#type' => 'actions',
+    ];
+
+    if (!empty($element['#click_to_find_marker']) && $element['#click_to_find_marker'] == TRUE) {
+      $element['map']['actions']['click_to_find_marker'] = [
+        '#type' => 'button',
+        '#value' => t('Find marker'),
+        '#name' => 'geofield-map-center',
+        '#attributes' => [
+          'id' => $element['#id'] . '-click-to-find-marker',
+        ],
+      ];
+      $element['#attributes']['class'] = ['geofield-map-center'];
+    }
+
+    if (!empty($element['#click_to_place_marker']) && $element['#click_to_place_marker'] == TRUE) {
+      $element['map']['actions']['click_to_place_marker'] = [
+        '#type' => 'button',
+        '#value' => t('Place marker here'),
+        '#name' => 'geofield-map-marker',
+        '#attributes' => [
+          'id' => $element['#id'] . '-click-to-place-marker',
+        ],
+      ];
+      $element['#attributes']['class'] = ['geofield-map-marker'];
+    }
+
+    if (!empty($element['#geolocation']) && $element['#geolocation'] == TRUE) {
+      $element['#attached']['library'][] = 'geofield_map/geolocation';
+      $element['map']['actions']['geolocation'] = [
+        '#type' => 'button',
+        '#value' => t('Find my location'),
+        '#name' => 'geofield-html5-geocode-button',
+        '#attributes' => ['mapid' => $mapid],
+      ];
+      $element['#attributes']['class'] = ['auto-geocode'];
+    }
+
+    static::elementProcess($element, $form_state, $complete_form);
+
+    $element['lat']['#attributes']['id'] = 'lat-' . $element['#id'];
+    $element['lon']['#attributes']['id'] = 'lon-' . $element['#id'];
+
+    $address_field_exists = FALSE;
+    // Geoaddress Field Settings (now limited to the first delta value)
+    if ($element['#delta'] == 0) {
+      if (!empty($element['#geoaddress_field']['field'])) {
+        $address_field_name = $element['#geoaddress_field']['field'];
+        $parents = array_slice($element['#array_parents'], 0, -4);
+        $parents[] = $address_field_name;
+
+        $address_field = NestedArray::getValue($complete_form, $parents, $address_field_exists);
+        if ($address_field_exists) {
+          $address_field['widget'][$element['#delta']]['value']['#description'] = (string) t('This value will be synchronized with the Geofield Map Reverse-Geocoded value.');
+          if ($element['#geoaddress_field']['hidden']) {
+            $address_field['#attributes']['class'][] = 'geofield_map_geoaddress_field_hidden';
+          }
+          if ($element['#geoaddress_field']['disabled']) {
+            $address_field['widget'][$element['#delta']]['value']['#attributes']['readonly'] = 'readonly';
+            $address_field['widget'][$element['#delta']]['value']['#description'] = (string) t('This field is readonly. It will be synchronized with the Geofield Map Reverse-Geocoded value.');
+          }
+          // Ensure the geoaddress_field has got an #id, otherwise generate it.
+          if (!isset($address_field['widget'][$element['#delta']]['value']['#id'])) {
+            $address_field['widget'][$element['#delta']]['value']['#id'] = $element['#geoaddress_field']['field'] . '-0';
+          }
+          NestedArray::setValue($complete_form, $parents, $address_field);
+        }
+      }
+    }
+
+    // Attach Geofield Map Libraries.
+    $element['#attached']['library'][] = 'baidu_map/baidu_map_js';
+    $element['#attached']['library'][] = 'baidu_map_geofield/geojson';
+    $element['#attached']['library'][] = 'baidu_map_geofield/baidu_map_geofield_widget';
+
+    // The Entity Form.
+    /* @var \Drupal\Core\Entity\ContentEntityFormInterface $entityForm */
+    $entityForm = $form_state->getBuildInfo()['callback_object'];
+    $entity_operation = method_exists($entityForm, 'getOperation') ? $entityForm->getOperation() : 'any';
+
+    // Geofield Map Element specific mapid settings.
+    $settings[$mapid] = [
+      'entity_operation' => $entity_operation,
+      'id' => $element['#id'],
+      'bmap_api_key' => $element['#bmap_api_key'] && strlen($element['#bmap_api_key']) > 0 ? $element['#bmap_api_key'] : NULL,
+      'name' => $element['#name'],
+      'mapid' => $mapid,
+      'widget' => TRUE,
+      'latid' => $element['lat']['#attributes']['id'],
+      'lngid' => $element['lon']['#attributes']['id'],
+      'lat' => floatval($element['lat']['#default_value']),
+      'lng' => floatval($element['lon']['#default_value']),
+      'searchid' => isset($element['map']['geocode']) ? $element['map']['geocode']['#attributes']['id'] : NULL,
+      'geoaddress_field' => $address_field_exists ? $element['#geoaddress_field']['field'] : NULL,
+      'geoaddress_field_id' => $address_field_exists ? $address_field['widget'][0]['value']['#id'] : NULL,
+      'map_type' => $element['#map_type'],
+      'map_dimensions' => $element['#map_dimensions'],
+      'map_style' => $element['#map_style'],
+    ];
+
+    // Geofield Map Element global settings.
+    // If the gmap_api_key is defined, set it.
+    if ($element['#bmap_api_key'] && strlen($element['#bmap_api_key']) > 0) {
+      $settings['bmap_api_key'] = $element['#bmap_api_key'];
+    }
+
+    $element['#attached']['drupalSettings'] = [
+      'baidu_map_geofield' => $settings,
+    ];
+    return $element;
+  }
+
+}
