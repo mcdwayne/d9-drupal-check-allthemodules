@@ -1,0 +1,288 @@
+<?php
+
+/**
+ * @file
+ * Module file for paybox_module.
+ */
+
+use Drupal\Core\Url;
+
+define('PAYBOX_HASH', 'SHA512');
+define('PAYBOX_PAYMENT_STATUS_FAILURE', 0);
+define('PAYBOX_PAYMENT_STATUS_SUCCESS', 1);
+
+/**
+ * Send a payment request to paybox.
+ *
+ * @param string $cents
+ *   Amount in cents.
+ * @param string $order_id
+ *   The order_id.
+ * @param string $email
+ *   The email.
+ * @param array $options
+ *   Other options.
+ * @param string $currency
+ *   Type of currency.
+ * @param string $payment_method
+ *   The payment_method.
+ */
+function paybox_pay($cents, $order_id, $email, array $options, $currency = 'euro', $payment_method = 'cb') {
+  $params = [
+    'total' => $cents,
+    'order_id' => $order_id,
+    'email' => $email,
+    'currency' => $currency,
+    'payment_method' => $payment_method,
+  ];
+
+  if (isset($options['return_url'])) {
+    $params['return_url'] = $options['return_url'];
+  }
+
+  if (isset($options['cmd'])) {
+    $params['cmd'] = $options['cmd'];
+  }
+
+  $post_fields = _paybox_build_params_array($params);
+  $host = _paybox_get_host();
+
+  $ch = curl_init();
+  curl_setopt($ch, CURLOPT_HEADER, TRUE);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, TRUE);
+  curl_setopt($ch, CURLOPT_URL, $host);
+  curl_setopt($ch, CURLOPT_POST, TRUE);
+  curl_setopt($ch, CURLOPT_POSTFIELDS, $post_fields);
+  curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/x-www-form-urlencoded']);
+
+  $response = curl_exec($ch);
+}
+
+/**
+ * Return the devise code from a string.
+ *
+ * @param string $devise
+ *   The devise.
+ *
+ * @return mixed
+ *   Currency codes.
+ */
+function _paybox_devise_code($devise) {
+  static $codes = [
+    'euro' => '978',
+    'USD' => '840',
+  ];
+
+  return $codes[$devise];
+}
+
+/**
+ * Return the payment method from a string.
+ *
+ * @param string $payment_method
+ *   A key to get paybox official payment methods denominations.
+ * @param string $type
+ *   PBX_TYPECARTE or PBX_TYPEPAIMENT, defaults to
+ *   PBX_TYPECARTE for retrocompatibility.
+ *
+ * @return string
+ *   Return payment method.
+ */
+function _paybox_payment_method($payment_method, $type = 'PBX_TYPECARTE') {
+  if ($type == 'PBX_TYPECARTE') {
+    switch ($payment_method) {
+      case 'cb':
+        return 'CB';
+
+      case 'visa':
+        return 'VISA';
+
+      case 'mastercard':
+        return 'EUROCARD_MASTERCARD';
+
+      case 'paypal':
+        return 'PAYPAL';
+    }
+  }
+  else {
+    switch ($payment_method) {
+      case 'cb':
+        return 'CARTE';
+
+      case 'visa':
+        return 'CARTE';
+
+      case 'mastercard':
+        return 'CARTE';
+
+      case 'paypal':
+        return 'PAYPAL';
+    }
+  }
+}
+
+/**
+ * Payment form.
+ */
+function paybox_redirect_form($form, $form_state, $params) {
+  $form = [];
+
+  $post_params = _paybox_build_params_array($params);
+
+  foreach ($post_params as $name => $param) {
+    $form[$name] = ['#type' => 'hidden', '#value' => $param];
+  }
+
+  $form['submit'] = [
+    '#type' => 'submit',
+    '#value' => t('Pay with Paybox'),
+  ];
+
+  $host = _paybox_get_host();
+  $form['#action'] = $host;
+
+  return $form;
+}
+
+/**
+ * Return Paybox host in depending of environment settings.
+ *
+ * @return string
+ *   Return host.
+ */
+function _paybox_get_host() {
+  if (\Drupal::config('paybox.settings')->get('paybox_activate_real_payments')) {
+    return \Drupal::config('paybox.settings')->get('paybox_production_host');
+  }
+  else {
+    return \Drupal::config('paybox.settings')->get('paybox_sandbox_host');
+  }
+}
+
+/**
+ * Return secret key in depending of environment settings.
+ *
+ * @return null
+ *   Return hash key.
+ */
+function _paybox_get_secret_key() {
+  if (\Drupal::config('paybox.settings')->get('paybox_activate_real_payments')) {
+    return \Drupal::config('paybox.settings')->get('paybox_production_hash_key');
+  }
+  else {
+    return \Drupal::config('paybox.settings')->get('paybox_sandbox_hash_key');
+  }
+}
+
+/**
+ * Build array of Paybox params.
+ *
+ * @param array $params
+ *   The params.
+ *
+ * @return array
+ *   The post params.
+ */
+function _paybox_build_params_array(array $params) {
+  global $language;
+
+  $secretKey = _paybox_get_secret_key();
+
+  $PBX_SITE = \Drupal::config('paybox.settings')->get('paybox_PBX_SITE');
+  $PBX_RANG = \Drupal::config('paybox.settings')->get('paybox_PBX_RANG');
+  $PBX_IDENTIFIANT = \Drupal::config('paybox.settings')->get('paybox_PBX_IDENTIFIANT');
+  $PBX_TOTAL = $params['total'];
+  $PBX_DEVISE = _paybox_devise_code($params['currency']);
+  $PBX_CMD = $params['cmd'];
+  $PBX_PORTEUR = $params['email'];
+  $PBX_RETOUR = "Mt:M;Ref:R;Auto:A;Erreur:E";
+  $PBX_HASH = PAYBOX_HASH;
+  $PBX_TIME = date('c');
+  $PBX_TYPEPAIEMENT = _paybox_payment_method($params['payment_method'], 'PBX_TYPEPAIEMENT');
+  $PBX_TYPECARTE = _paybox_payment_method($params['payment_method'], 'PBX_TYPECARTE');
+
+  if ($lang_auto = paybox_map_language($language->language)) {
+    $PBX_LANGUE = $lang_auto;
+  }
+  else {
+    $PBX_LANGUE = 'FRA';
+  }
+
+  $msg = "PBX_SITE=$PBX_SITE";
+  $msg .= "&PBX_RANG=$PBX_RANG";
+  $msg .= "&PBX_IDENTIFIANT=$PBX_IDENTIFIANT";
+  $msg .= "&PBX_TOTAL=$PBX_TOTAL";
+  $msg .= "&PBX_DEVISE=$PBX_DEVISE";
+  $msg .= "&PBX_CMD=$PBX_CMD";
+  $msg .= "&PBX_PORTEUR=$PBX_PORTEUR";
+  $msg .= "&PBX_RETOUR=$PBX_RETOUR";
+  $msg .= "&PBX_HASH=$PBX_HASH";
+  $msg .= "&PBX_TIME=$PBX_TIME";
+  $msg .= "&PBX_TYPEPAIEMENT=$PBX_TYPEPAIEMENT";
+  $msg .= "&PBX_TYPECARTE=$PBX_TYPECARTE";
+  $msg .= "&PBX_LANGUE=$PBX_LANGUE";
+
+  $post_params = [
+    'PBX_SITE' => $PBX_SITE,
+    'PBX_RANG' => $PBX_RANG,
+    'PBX_TOTAL' => str_pad($PBX_TOTAL, 3, '0', STR_PAD_LEFT),
+    'PBX_DEVISE' => $PBX_DEVISE,
+    'PBX_CMD' => $params['order_id'],
+    'PBX_PORTEUR' => $params['email'],
+    'PBX_TYPECARTE' => $PBX_TYPECARTE,
+    'PBX_RETOUR' => $PBX_RETOUR,
+    'PBX_IDENTIFIANT' => $PBX_IDENTIFIANT,
+    'PBX_TYPEPAIEMENT' => $PBX_TYPEPAIEMENT,
+    'PBX_HASH' => PAYBOX_HASH,
+    'PBX_TIME' => $PBX_TIME,
+    'PBX_LANGUE' => $PBX_LANGUE,
+    'PBX_REPONDRE_A' => Url::fromRoute('paybox.ipn_callback', ['absolute' => TRUE]),
+  ];
+
+  if (isset($params['return_url'])) {
+    $PBX_EFFECTUE = $params['return_url'];
+    $PBX_REFUSE = $params['return_url'];
+    $PBX_ANNULE = $params['return_url'];
+
+    $msg .= "&PBX_EFFECTUE=$PBX_EFFECTUE" . "&PBX_ANNULE=$PBX_ANNULE" . "&PBX_REFUSE=$PBX_REFUSE";
+
+    $post_params['PBX_EFFECTUE'] = $PBX_EFFECTUE;
+    $post_params['PBX_REFUSE'] = $PBX_REFUSE;
+    $post_params['PBX_ANNULE'] = $PBX_ANNULE;
+  }
+
+  $binKey = pack("H*", $secretKey);
+  $PBX_HMAC = strtoupper(hash_hmac($PBX_HASH, $msg, $binKey));
+  $params['PBX_HMAC'] = $PBX_HMAC;
+
+  \Drupal::moduleHandler()->alter('paybox_post_params', $params);
+
+  return $post_params;
+}
+
+/**
+ * Try to map the Drupal's language code to the Paybox language code.
+ *
+ * @param string $langcode
+ *   A language code (eg. 'en', 'fr', ...).
+ *
+ * @return string|false
+ *   The Paybox language code if a mapping is found, FALSE otherwise.
+ */
+function paybox_map_language($langcode) {
+  $lang_map = [
+    'fr' => 'FRA',
+    'en' => 'GBR',
+    'en-gb' => 'GBR',
+    'es' => 'ESP',
+    'it' => 'ITA',
+    'de' => 'DEU',
+    'nl' => 'NLD',
+    'sv' => 'SWE',
+    'pt' => 'PRT',
+    'pt-pt' => 'PRT',
+    'pt-br' => 'PRT',
+  ];
+
+  return isset($lang_map[$langcode]) ? $lang_map[$langcode] : FALSE;
+}
