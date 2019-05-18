@@ -1,0 +1,424 @@
+<?php
+
+/**
+ * @file
+ * Allows visitors to bookmark searches and get notifications for new results.
+ */
+
+use Drupal\Core\Database\Query\AlterableInterface;
+use Drupal\Core\Database\Query\SelectInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\EntityMalformedException;
+use Drupal\Core\Entity\EntityStorageException;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Entity\Query\QueryInterface;
+use Drupal\search_api\IndexInterface;
+use Drupal\search_api_saved_searches\Entity\SavedSearch;
+use Drupal\search_api_saved_searches\Entity\SavedSearchAccessControlHandler;
+use Drupal\search_api_saved_searches\Plugin\search_api_saved_searches\notification\Email;
+use Drupal\search_api_saved_searches\SavedSearchesException;
+use Drupal\user\UserInterface;
+
+/**
+ * Implements hook_cron().
+ */
+function search_api_saved_searches_cron() {
+  \Drupal::getContainer()
+    ->get('search_api_saved_searches.new_results_check')
+    ->checkAll();
+}
+
+/**
+ * Implements hook_query_TAG_alter() for "search_api_saved_search_access".
+ */
+function search_api_saved_searches_query_search_api_saved_search_access_alter(AlterableInterface $query) {
+  // Read the account to use from the query, if provided.
+  $account = $query->getMetaData('account') ?: \Drupal::currentUser();
+
+  $admin_permission = SavedSearchAccessControlHandler::ADMIN_PERMISSION;
+  if ($account->hasPermission($admin_permission)) {
+    return;
+  }
+
+  // Non-admins can only see their own saved searches, anonymous users can't see
+  // any saved search listing (only individual searches, using an access token).
+  $uid = $account->isAnonymous() ? -1 : $account->id();
+  if ($query instanceof QueryInterface) {
+    $query->condition('uid', $uid);
+  }
+  elseif ($query instanceof SelectInterface) {
+    $search_table = NULL;
+    foreach ($query->getTables() as $key => $table_info) {
+      if ($table_info['table'] === 'search_api_saved_search') {
+        $search_table = $key;
+        break;
+      }
+    }
+    if (!$search_table) {
+      $query->where('1 <> 1');
+      \Drupal::logger('search_api_saved_searches')
+        ->error('Could not add access checks to Saved Search query: base table not found');
+      return;
+    }
+    $query->condition("$search_table.uid", $uid);
+  }
+  else {
+    $args['@class'] = get_class($query);
+    \Drupal::logger('search_api_saved_searches')
+      ->error('Could not add access checks to Saved Search query: query is of unknown class @class', $args);
+  }
+}
+
+/**
+ * Implements hook_entity_field_storage_info().
+ */
+function search_api_saved_searches_entity_field_storage_info(EntityTypeInterface $entity_type) {
+  if ($entity_type->id() !== 'search_api_saved_search') {
+    return [];
+  }
+
+  // Add field storage definitions for all notification plugin-provided fields.
+  $fields = [];
+
+  $bundles = \Drupal::getContainer()
+    ->get('entity_type.bundle.info')
+    ->getBundleInfo('search_api_saved_search');
+  foreach (array_keys($bundles) as $bundle) {
+    // We don't use the $base_field_definitions parameter in that method, so no
+    // need to retrieve those for passing them here.
+    $fields += SavedSearch::bundleFieldDefinitions($entity_type, $bundle, []);
+  }
+
+  return $fields;
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete() for type "search_api_index".
+ *
+ * Deletes all saved searches that used this index.
+ */
+function search_api_saved_searches_search_api_index_delete(IndexInterface $index) {
+  _search_api_saved_searches_delete_searches('index_id', $index->id());
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert() for type "user".
+ *
+ * If a new user already has saved searches with the same mail address,
+ * associate them with the new user. However, only do this if the user is
+ * already active.
+ */
+function search_api_saved_searches_user_insert(UserInterface $account) {
+  _search_api_saved_searches_claim_anonymous_searches($account);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update() for type "user".
+ *
+ * If a user gets activated, associate saved searches with the same mail address
+ * with them.
+ *
+ * If a user gets deactivated, disable all related saved searches.
+ *
+ * Also, change mail address of saved searches when the user mail address
+ * changes (on behalf of the "E-mail" notification plugin).
+ */
+function search_api_saved_searches_user_update(UserInterface $account) {
+  $original = $account->original;
+  if (!($original instanceof UserInterface)) {
+    return;
+  }
+
+  // For newly activated users, transfer all saved searches with their mail
+  // address to them.
+  if ($account->isActive() && !$original->isActive()) {
+    _search_api_saved_searches_claim_anonymous_searches($account);
+  }
+
+  // If an account gets deactivated/banned, disable all associated searches.
+  if (!$account->isActive() && $original->isActive()) {
+    _search_api_saved_searches_deactivate_searches($account);
+  }
+
+  // Addition on behalf of the "E-Mail" notification plugin: If the user's mail
+  // address changed, also change the mail address of the user's saved searches
+  // from previous (original) to current address.
+  if ($account->getEmail() !== $original->getEmail()) {
+    _search_api_saved_searches_adapt_mail($account, $original);
+  }
+}
+
+/**
+ * Reacts to the creation or activation of a new user account.
+ *
+ * Associates all anonymously created saved searches with the same mail address
+ * with that user account.
+ *
+ * @param \Drupal\user\UserInterface $account
+ *   The user account in question.
+ */
+function _search_api_saved_searches_claim_anonymous_searches(UserInterface $account) {
+  if (!$account->isActive()) {
+    return;
+  }
+
+  // Special case: This will silently fail if no saved search types use the
+  // "E-mail" plugin – which is fine by us.
+  $searches = _search_api_saved_searches_load_searches(0, $account->getEmail());
+  /** @var \Drupal\search_api_saved_searches\SavedSearchInterface $search */
+  foreach ($searches as $search) {
+    $search->setOwner($account);
+    try {
+      $search->save();
+    }
+    catch (EntityStorageException $e) {
+      $args['@search_id'] = $search->id();
+      watchdog_exception('search_api_saved_searches', $e, '%type while trying to save saved search #@search_id: @message in %function (line %line of %file).', $args);
+    }
+  }
+}
+
+/**
+ * Deactivates all saved searches for a specific user account.
+ *
+ * @param \Drupal\user\UserInterface $account
+ *   The user account in question.
+ */
+function _search_api_saved_searches_deactivate_searches(UserInterface $account) {
+  $searches = _search_api_saved_searches_load_searches($account->id());
+  /** @var \Drupal\search_api_saved_searches\SavedSearchInterface $search */
+  foreach ($searches as $search) {
+    $search->set('notify_interval', -1);
+    try {
+      $search->save();
+    }
+    catch (EntityStorageException $e) {
+      $args['@search_id'] = $search->id();
+      watchdog_exception('search_api_saved_searches', $e, '%type while trying to save saved search #@search_id: @message in %function (line %line of %file).', $args);
+    }
+  }
+}
+
+/**
+ * Updates a user's saved searches to reflect a changed mail address.
+ *
+ * Only used for searches that use the "E-Mail" notification plugin.
+ *
+ * @param \Drupal\user\UserInterface $account
+ *   The user account in question.
+ * @param \Drupal\user\UserInterface $original
+ *   The old version of the user account, with the old mail address.
+ */
+function _search_api_saved_searches_adapt_mail(UserInterface $account, UserInterface $original) {
+  $searches = _search_api_saved_searches_load_searches($account->id(), $original->getEmail());
+  /** @var \Drupal\search_api_saved_searches\Entity\SavedSearch $search */
+  foreach ($searches as $search) {
+    $search->set('mail', $account->getEmail());
+    try {
+      $search->save();
+    }
+    catch (EntityStorageException $e) {
+      $args['@search_id'] = $search->id();
+      watchdog_exception('search_api_saved_searches', $e, '%type while trying to save saved search #@search_id: @message in %function (line %line of %file).', $args);
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete() for type "user".
+ *
+ * Deletes all saved searches owned by the deleted user.
+ */
+function search_api_saved_searches_user_delete(UserInterface $account) {
+  _search_api_saved_searches_delete_searches('uid', $account->id());
+}
+
+/**
+ * Loads all saved searches, optionally filtering by UID or e-mail address.
+ *
+ * @param int|null $uid
+ *   (optional) The owner UID to filter for, if any.
+ * @param string|null $mail
+ *   (optional) The e-mail address to filter for, if any.
+ *
+ * @return \Drupal\search_api_saved_searches\SavedSearchInterface[]
+ *   The requested saved searches.
+ */
+function _search_api_saved_searches_load_searches($uid = NULL, $mail = NULL) {
+  try {
+    $query = \Drupal::entityQuery('search_api_saved_search');
+    if ($mail !== NULL) {
+      $query->condition('mail', $mail);
+    }
+    if ($uid !== NULL) {
+      $query->condition('uid', $uid);
+    }
+    $ids = $query->accessCheck(FALSE)->execute();
+    if (!$ids) {
+      return [];
+    }
+    /** @var \Drupal\search_api_saved_searches\SavedSearchInterface[] $searches */
+    $searches = \Drupal::entityTypeManager()
+      ->getStorage('search_api_saved_search')
+      ->loadMultiple($ids);
+    return $searches;
+  }
+  // @todo Use multi-catch for InvalidPluginDefinitionException, QueryException
+  //   and EntityStorageException once we depend on PHP 7.1+.
+  catch (\Exception $e) {
+    watchdog_exception('search_api_saved_searches', $e);
+    return [];
+  }
+}
+
+/**
+ * Deletes saved searches based on the specified criterion.
+ *
+ * @param string $field
+ *   The saved search field to match against.
+ * @param mixed $value
+ *   The field value to look for.
+ */
+function _search_api_saved_searches_delete_searches($field, $value) {
+  $ids = \Drupal::entityQuery('search_api_saved_search')
+    ->condition($field, $value)
+    ->accessCheck(FALSE)
+    ->execute();
+  if (!$ids) {
+    return;
+  }
+  try {
+    $storage = \Drupal::entityTypeManager()
+      ->getStorage('search_api_saved_search');
+    $searches = $storage->loadMultiple($ids);
+    if ($searches) {
+      $storage->delete($searches);
+    }
+  }
+  // @todo Use multi-catch for InvalidPluginDefinitionException and
+  //   EntityStorageException once we depend on PHP 7.1+.
+  catch (\Exception $e) {
+    $args['@field'] = $field;
+    $args['@value'] = $value;
+    watchdog_exception('search_api_saved_searches', $e, '%type while trying to delete saved searches (condition: @field = @value): @message in %function (line %line of %file).', $args);
+  }
+}
+
+/**
+ * Implements hook_mail().
+ *
+ * Implemented on behalf of the "E-mail" notification plugin.
+ *
+ * @see \Drupal\search_api_saved_searches\Plugin\search_api_saved_searches\notification\Email
+ */
+function search_api_saved_searches_mail($key, &$message, $params) {
+  if (empty($params['plugin'])) {
+    return;
+  }
+  $plugin = $params['plugin'];
+  if (!($plugin instanceof Email)) {
+    return;
+  }
+
+  switch ($key) {
+    case Email::MAIL_ACTIVATE:
+      $plugin->getActivationMail($message, $params);
+      break;
+
+    case Email::MAIL_NEW_RESULTS:
+      $plugin->getNewResultsMail($message, $params);
+      break;
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_presave() for type "search_api_saved_search".
+ *
+ * Implemented on behalf of the "E-mail" notification plugin.
+ *
+ * @see \Drupal\search_api_saved_searches\Plugin\search_api_saved_searches\notification\Email
+ */
+function search_api_saved_searches_search_api_saved_search_presave(EntityInterface $search) {
+  // Don't check searches that are already disabled.
+  if (!$search->get('status')->value) {
+    return;
+  }
+
+  // Admins also generally don't have to activate saved searches they create.
+  $admin_permission = SavedSearchAccessControlHandler::ADMIN_PERMISSION;
+  if (\Drupal::currentUser()->hasPermission($admin_permission)) {
+    return;
+  }
+
+  try {
+    /** @var \Drupal\search_api_saved_searches\SavedSearchInterface $search */
+    $type = $search->getType();
+
+    // If the type doesn't use the "E-mail" notification plugin, we're done.
+    if (!$type->isValidNotificationPlugin('email')) {
+      return;
+    }
+    // Otherwise, check whether the "Activation mail" setting is even enabled.
+    $plugin = $type->getNotificationPlugin('email');
+    if (!$plugin->getConfiguration()['activate']['send']) {
+      return;
+    }
+
+    // Don't check searches that aren't new, unless the mail address changed.
+    $mail = $search->get('mail')->value;
+    if (!$search->isNew() && $mail == $search->original->get('mail')->value) {
+      return;
+    }
+
+    $owner = $search->getOwner();
+    // If we couldn't get the owner, we can't really check further, so bail.
+    if (!$owner) {
+      // To avoid having to duplicate the complicated logging logic below, just
+      // throw an exception.
+      throw new SavedSearchesException('Saved search does not specify a valid owner.');
+    }
+
+    // If the owner is a registered user and used their own e-mail address,
+    // there's no need for an activation mail.
+    if (!$owner->isAnonymous() && $owner->getEmail() === $mail) {
+      return;
+    }
+
+    // De-activate the saved search.
+    $search->set('status', FALSE);
+
+    // Unfortunately, we can't send the activation mail right away, as the saved
+    // search doesn't have an ID set yet (unless this is an update), so we can't
+    // get the activation URL. We therefore queue the mail to be sent at the end
+    // of the page request.
+    $params = [
+      'search' => $search,
+      'plugin' => $plugin,
+    ];
+    \Drupal::getContainer()->get('search_api_saved_searches.email_queue')
+      ->queueMail([
+        'search_api_saved_searches',
+        Email::MAIL_ACTIVATE,
+        $mail,
+        $owner->getPreferredLangcode(),
+        $params,
+      ]);
+
+  }
+  // @todo Use multi-catch for SavedSearchesException and
+  //   InvalidArgumentException once we depend on PHP 7.1+.
+  catch (\Exception $e) {
+    $context['%search_label'] = $search->label();
+    if (!$search->isNew()) {
+      $context['%search_label'] .= ' (#' . $search->id() . ')';
+      try {
+        $context['link'] = $search->toLink(t('View saved search'), 'edit-form')
+          ->toString();
+      }
+      catch (EntityMalformedException $e) {
+        // Ignore.
+      }
+    }
+    watchdog_exception('search_api_saved_searches', $e, '%type while preprocessing saved search %search_label before saving: @message in %function (line %line of %file).', $context);
+  }
+}
