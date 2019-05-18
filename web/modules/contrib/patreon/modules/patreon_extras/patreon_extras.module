@@ -1,0 +1,156 @@
+<?php
+
+/**
+ * @file
+ * Contains patreon_extras.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Component\Utility\Xss;
+use Drupal\Core\Render\BubbleableMetadata;
+
+/**
+ * Implements hook_help().
+ */
+function patreon_extras_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the patreon_extras module.
+    case 'help.page.patreon_extras':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Extra functionality related to Patreon.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function patreon_extras_theme() {
+  return [
+    'patreon_extras' => [
+      'render element' => 'children',
+    ],
+  ];
+}
+
+/**
+ * Implements hook_cron().
+ */
+function patreon_extras_cron() {
+  $config = \Drupal::config('patreon_extras.settings');
+  $last_run = $config->get('patreon_extras_pledge_data_last_update');
+  $now = time();
+
+  // Only update data daily.
+  if ($now - $last_run > 86400) {
+    patreon_extras_update_pledge_data();
+  }
+}
+
+/**
+ * Helper to collect data about pledges from Patreon.
+ */
+function patreon_extras_update_pledge_data() {
+  $config = \Drupal::service('config.factory')
+    ->getEditable('patreon_extras.settings');
+  $service = \Drupal::service('patreon.api');
+  $tokens = $service->getStoredTokens();
+  $service->bridge->setToken($tokens['access_token']);
+
+  if ($campaign = $service->fetchCampaign()) {
+    $cursor = NULL;
+    $count = 0;
+    $amount = 0;
+    $all_data = array();
+    $key = 0;
+    while ($id = $service->bridge->getValueByKey($campaign, 'data.' . $key . '.id')) {
+      while (TRUE) {
+        $pledges_response = $service->fetchPagePledges($id, 25, $cursor);
+
+        if ($pledges_response) {
+          if ($data = $service->bridge->getPledgeData($pledges_response, $id)) {
+            $all_data += $data['all_data'];
+            $count += $data['count'];
+            $amount += $data['amount'];
+          }
+        }
+
+        // Get the link to the next page of pledges.
+        if ($next_link = $service->bridge->getValueByKey($pledges_response, 'links.next')) {
+          $next_query_params = explode("?", $next_link)[1];
+          parse_str($next_query_params, $parsed_next_query_params);
+          $cursor = $parsed_next_query_params['page']['cursor'];
+        }
+        else {
+          break;
+        }
+      }
+      $key++;
+    }
+
+    $config->set('patreon_extras_all_pledge_data', $all_data);
+    $config->set('patreon_extras_pledge_count', $count);
+    $config->set('patreon_extras_pledge_amount', $amount);
+    $config->set('patreon_extras_pledge_data_last_update', time())
+      ->save();
+  }
+}
+
+/**
+ * Implements hook_token_info().
+ */
+function patreon_extras_token_info() {
+  $info['pledge_count'] = array(
+    'name' => t('Pledge Count'),
+    'description' => t('The number of pledges currently made.'),
+  );
+  $info['pledge_amount'] = array(
+    'name' => t('Pledge Amount'),
+    'description' => t('The current amount of pledges in $USD'),
+  );
+  return array(
+    'types' => array(
+      'patreon' => array(
+        'name' => t('Patreon'),
+        'description' => t('Tokens related to Patreon data.'),
+      ),
+    ),
+    'tokens' => array(
+      'patreon' => $info,
+    ),
+  );
+}
+
+/**
+ * Implements hook_tokens().
+ */
+function patreon_extras_tokens($type, $tokens, array $data, array $options, BubbleableMetadata $bubbleable_metadata) {
+  $replacements = array();
+  $sanitize = !empty($options['sanitize']);
+  if ($type == 'patreon') {
+    $config = \Drupal::config('patreon_extras.settings');
+    foreach ($tokens as $name => $original) {
+      switch ($name) {
+        case 'pledge_count':
+          $replacements[$original] = $config->get('patreon_extras_pledge_count');
+          break;
+
+        case 'pledge_amount':
+          $stored = $config->get('patreon_extras_pledge_amount');
+          $replacements[$original] = ($stored == 0) ? '$0.00' : '$' . $stored / 100;
+          break;
+
+      }
+    }
+
+    if ($sanitize) {
+      foreach ($replacements as $token => $value) {
+        $replacements[$token] = Xss::filter($value);
+      }
+    }
+  }
+  return $replacements;
+}
