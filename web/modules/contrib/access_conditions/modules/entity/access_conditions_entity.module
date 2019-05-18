@@ -1,0 +1,86 @@
+<?php
+
+/**
+ * @file
+ * Code for the access conditions entity module.
+ */
+
+use Drupal\access_conditions_entity\EntityOperation;
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\EntityPublishedInterface;
+use Drupal\Core\Session\AccountInterface;
+
+/**
+ * Implements hook_ENTITY_TYPE_create() for case 'field_config'.
+ */
+function access_conditions_entity_field_config_create(EntityInterface $entity) {
+  /** @var \Drupal\field\FieldConfigInterface $entity */
+  if ($entity->getFieldStorageDefinition()->getType() != 'access_model_reference') {
+    return;
+  }
+
+  // Mark this field as control access, this way we should not check all fields
+  // of the entity on every operation.
+  $entity_fields = \Drupal::state()->get('access_conditions_entity', []);
+  $entity_fields[$entity->get('entity_type') . '.' . $entity->get('bundle')][$entity->getName()] = TRUE;
+  \Drupal::state()->set('access_conditions_entity', $entity_fields);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete() for case 'field_config'.
+ */
+function access_conditions_entity_field_config_delete(EntityInterface $entity) {
+  /** @var \Drupal\field\FieldConfigInterface $entity */
+  if ($entity->getFieldStorageDefinition()->getType() != 'access_model_reference') {
+    return;
+  }
+
+  // Remove this field as control access.
+  $entity_fields = \Drupal::state()->get('access_conditions_entity', []);
+  unset($entity_fields[$entity->get('entity_type') . '.' . $entity->get('bundle')][$entity->getName()]);
+  \Drupal::state()->set('access_conditions_entity', $entity_fields);
+}
+
+/**
+ * Implements hook_entity_access().
+ */
+function access_conditions_entity_entity_access(EntityInterface $entity, string $operation, AccountInterface $account) {
+  if ($entity instanceof EntityPublishedInterface && $operation == 'view' && !$entity->isPublished()) {
+    return AccessResult::neutral();
+  }
+
+  $entity_fields = \Drupal::state()->get('access_conditions_entity', []);
+
+  $restricted = FALSE;
+  $forbidden_result = AccessResult::forbidden();
+  if (!empty($entity_fields[$entity->getEntityTypeId() . '.' . $entity->bundle()])) {
+    /** @var \Drupal\access_conditions\AccessChecker $access_checker */
+    $access_checker = \Drupal::service('access_conditions.access_checker');
+
+    foreach ($entity_fields[$entity->getEntityTypeId() . '.' . $entity->bundle()] as $field_name => $status) {
+      $values = $entity->get($field_name)->getValue();
+      /** @var \Drupal\access_conditions\Entity\AccessModelInterface[] $access_models */
+      $access_models = $entity->get($field_name)->referencedEntities();
+      if (!empty($values)) {
+        foreach ($values as $key => $value) {
+          if (isset($value['operation']) &&
+            (($value['operation'] == EntityOperation::VIEW && $operation == 'view') ||
+            ($value['operation'] == EntityOperation::UPDATE && $operation == 'update') ||
+            ($value['operation'] == EntityOperation::DELETE && $operation == 'delete'))) {
+            $restricted = TRUE;
+
+            // Determine if the operation can be done.
+            if (!empty($access_models[$key]) && $access_checker->checkAccess($access_models[$key])) {
+              return AccessResult::allowed()->addCacheableDependency($access_checker);
+            }
+            $forbidden_result->addCacheableDependency($access_checker);
+          }
+        }
+      }
+    }
+  }
+
+  // Forbidden or no opinion.
+  return $restricted ? $forbidden_result : AccessResult::neutral();
+}
