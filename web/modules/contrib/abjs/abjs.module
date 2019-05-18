@@ -1,0 +1,163 @@
+<?php
+
+/**
+ * @file
+ * Write test JavaScript.
+ */
+
+use Drupal\Core\Database\Database;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Render\Markup;
+
+/**
+ * Implements hook_help().
+ */
+function abjs_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the block module.
+    case 'help.page.abjs':
+      return '<h3>' . t('See the <a href="@documentation">Module Documentation</a> for a detailed description of the module and instructions.', ['@documentation' => 'https://www.drupal.org/node/2716391']) . '</h3>';
+  }
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function abjs_page_attachments(array &$page) {
+  if (\Drupal::service('router.admin_context')->isAdminRoute()) {
+    return;
+  }
+  // Get all active tests that have at least one experience.
+  $tests = Database::getConnection()->query("SELECT DISTINCT t.tid FROM {abjs_test} AS t LEFT JOIN {abjs_test_condition} AS tc ON t.tid = tc.tid INNER JOIN {abjs_test_experience} AS te ON t.tid = te.tid WHERE t.active=1")->fetchAll();
+
+  // At least one test with at least one condition and at least one experience.
+  // must be active for any script to be added to the page. Because of this,
+  // we don't need a similar check later for conditions and experiences
+  // individually.
+  if (empty($tests)) {
+    return;
+  }
+
+  // The following section prints out javascript objects for the active tests,
+  // conditions, and experiences.
+  $abjs_script = abjs_generate_js($tests);
+  $page['#attached']['html_head'][] = [
+    [
+      '#tag' => 'script',
+      '#value' => Markup::create($abjs_script),
+      '#weight' => -100,
+    ],
+    'abjs_script',
+  ];
+}
+
+/**
+ * Builds the javascript for all active and valid A/B tests.
+ *
+ * @param array $tests
+ *   An array of database result objects from a query on abjs_test to get all
+ *   active and valid tests.
+ *
+ * @return string
+ *   A string of javascript for running all tests.
+ *
+ *   - abTests will be an array of test objects. Each abTest object has these
+ *     properties:
+ *   -- name: The name of the test, equal to the test id. This will be used as
+ *      the name of the cookie that gets assigned this test, prefixed by
+ *      abjs_cookie_prefix from the variables table.
+ *   -- conditions: An array of condition strings with the names of the
+ *      condition functions to run. The condition strings are prefixed by con_,
+ *      followed by the primary id from the test table and primary id from the
+ *      condition table, which is used instead of the condition table so that we
+ *      don't get duplicate function definitions with the same name.
+ *   -- experiences: An array of experience objects. Each experience object has
+ *      these properties:
+ *   --- name: The name of the experience, equal to the experience id. This will
+ *       be used as the value of the cookie that gets assigned for this test.
+ *   --- fraction: The probability of this experience getting chosen. If all
+ *       experience probabilities for a single test add to less than 1, the
+ *       remainder is the probability that a user will not be in the test on
+ *       each page hit. If probabilities add to greater than 1, experiences may
+ *       have less than their stated probability of occurring.
+ *   --- script: The name of the function for this experience. The name is
+ *       prefixed by exp_, followed by the primary id from the test table and
+ *       primary id from the experience table, which is used instead of the
+ *       experience table so that we don't get duplicate function definitions
+ *       with the same name.
+ *   - abConditions will be an array of condition functions that apply to the
+ *     active tests, named the same as abTest.conditions above, and using the
+ *     condition script from the condition table.
+ *   - abExperiences will be an array of experience functions that apply to the
+ *     active tests, named the same as abTest.experiences above, and using the
+ *     experience script from the experience table.
+ */
+function abjs_generate_js(array $tests) {
+  if (empty($tests)) {
+    return '';
+  }
+
+  $tests_js = [];
+
+  for ($i = 0; $i < count($tests); $i++) {
+    // Set name of this test to the tid.
+    $tests_js[$i] = [
+      'name' => "t_{$tests[$i]->tid}",
+      'conditions' => [],
+      'experiences' => [],
+    ];
+
+    // Get all conditions associated with this test,and make functions for the
+    // scripts.
+    $conditions = Database::getConnection()->query("SELECT tc.tid, tc.cid, c.script FROM {abjs_condition} AS c INNER JOIN {abjs_test_condition} AS tc ON c.cid = tc.cid WHERE tc.tid = :tid", [':tid' => $tests[$i]->tid])->fetchAll();
+    for ($j = 0; $j < count($conditions); $j++) {
+      $tests_js[$i]['conditions'][$j] = $conditions[$j]->script;
+    }
+
+    // Get all experiences associated with this test and their fractions, make
+    // a name for the value of the test cookie, and make functions for the
+    // scripts.
+    $experiences = Database::getConnection()->query("SELECT te.tid, te.eid, e.script, te.fraction FROM {abjs_experience} AS e INNER JOIN {abjs_test_experience} AS te ON e.eid = te.eid WHERE te.tid = :tid", [':tid' => $tests[$i]->tid])->fetchAll();
+    for ($j = 0; $j < count($experiences); $j++) {
+      $tests_js[$i]['experiences'][$j] = [
+        'name' => "e_{$experiences[$j]->eid}",
+        'fraction' => $experiences[$j]->fraction,
+        'script' => $experiences[$j]->script,
+      ];
+    }
+  }
+
+  // These are the only php variables referenced in the script below.
+  $cookie_prefix_var = \Drupal::config('abjs.settings')->get('cookie.prefix');
+  $cookie_lifetime_var = \Drupal::config('abjs.settings')->get('cookie.lifetime');
+  $cookie_domain_var = \Drupal::config('abjs.settings')->get('cookie.domain');
+  $cookie_secure_var = \Drupal::config('abjs.settings')->get('cookie.secure');
+  $cookie_prefix = !empty($cookie_prefix_var) ? $cookie_prefix_var : 'abjs_';
+  $cookie_lifetime = !empty($cookie_lifetime_var) ? $cookie_lifetime_var : '30';
+  $cookie_lifetime = floatval($cookie_lifetime);
+  $cookie_domain = !empty($cookie_domain_var) ? '; domain=' . $cookie_domain_var : '';
+  $cookie_secure = !empty($cookie_secure_var) ? '; secure' : '';
+
+  $js_vars = [
+    'tests' => $tests_js,
+    'cookiePrefix' => $cookie_prefix,
+    'cookieDomain' => $cookie_domain,
+    'cookieLifetime' => $cookie_lifetime,
+    'cookieSecure' => $cookie_secure,
+  ];
+  $json = json_encode($js_vars);
+
+  // abjs-common.js is the core functionality of the A/B testing javascript
+  // framework. Visitors that pass the assigned condition scripts for each test
+  // will be randomly placed and cookied into an experience for that test,
+  // based on assigned probabilities for each experience. Each experience has
+  // an associated script that is run for that experience, and all applicable
+  // experience scripts are executed for each visitor on every page load, in
+  // the order in which the tests are defined. The user will have one cookie
+  // for each active test.
+  $common_js = file_get_contents(drupal_get_path('module', 'abjs') . '/js/abjs-common.js');
+
+  $abjs_script = "'use strict'; (function() {var abjs = $json;\n$common_js})();";
+
+  return $abjs_script;
+}
