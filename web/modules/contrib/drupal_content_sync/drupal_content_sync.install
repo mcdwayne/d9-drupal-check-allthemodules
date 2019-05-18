@@ -1,0 +1,156 @@
+<?php
+
+/**
+ * @file
+ * Install file for drupal_content_sync.
+ */
+
+use Drupal\user\Entity\User;
+use Drupal\Core\Config\FileStorage;
+use Drupal\Core\Field\BaseFieldDefinition;
+
+/**
+ * Implements hook_install().
+ *
+ * Creates the Drupal Content Sync user and provides
+ * him with needed permissions.
+ */
+function drupal_content_sync_install() {
+  $config_path    = drupal_get_path('module', 'drupal_content_sync') . '/config/install';
+  $source         = new FileStorage($config_path);
+  $config_storage = \Drupal::service('config.storage');
+
+  $configsNames = [
+    'key.key.drupal_content_sync',
+    'encrypt.profile.drupal_content_sync',
+  ];
+
+  foreach ($configsNames as $name) {
+    $config_storage->write($name, $source->read($name));
+  }
+
+  $username = 'Drupal Content Sync';
+  \Drupal::moduleHandler()->alter('drupal_content_sync_username', $username);
+  $data = [
+    'userName' => $username,
+    'userPass' => user_password(),
+  ];
+
+  $user = User::create();
+  $user->setUsername($data['userName']);
+  $user->setPassword($data['userPass']);
+  $user->enforceIsNew();
+  $user->activate();
+  $user->addRole('drupal_content_sync');
+  $user->save();
+
+  // Store UID in key value table.
+  \Drupal::service('keyvalue.database')->get('drupal_content_sync_user')->set('uid', intval($user->id()));
+
+  $data     = drupal_content_sync_encrypt_values($data);
+  $userData = \Drupal::service('user.data');
+
+  $userData->set('drupal_content_sync', $user->id(), 'sync_data', $data);
+}
+
+/**
+ * Implements hook_update_N();.
+ *
+ * Delete unused rest interface configuration.
+ */
+function drupal_content_sync_update_8003(&$sandbox) {
+  Drupal::configFactory()->getEditable('rest.resource.drupal_content_sync_preview_resource')->delete();
+}
+
+/**
+ * Implements hook_update_N();.
+ *
+ * Add the new REST interface for manual import.
+ */
+function drupal_content_sync_update_8002(&$sandbox) {
+  $config_path    = drupal_get_path('module', 'drupal_content_sync') . '/config/install';
+  $source         = new FileStorage($config_path);
+  $config_storage = \Drupal::service('config.storage');
+
+  $configsNames = [
+    'rest.resource.drupal_content_sync_import_entity',
+  ];
+
+  foreach ($configsNames as $name) {
+    $config_storage->write($name, $source->read($name));
+  }
+
+  return 'Installed manual entity import functionality.';
+}
+
+/**
+ * Implements hook_update_N();.
+ *
+ * Update field type for dcs_meta_info entity. Fields: last_export, last_import.
+ */
+function drupal_content_sync_update_8001(&$sandbox) {
+  $entity_type_manager = \Drupal::entityTypeManager();
+  $bundle_of = 'dcs_meta_info';
+
+  $storage = $entity_type_manager->getStorage($bundle_of);
+  $bundle_definition = $entity_type_manager->getDefinition($bundle_of);
+  $id_key = $bundle_definition->getKey('id');
+  $table_name = $storage->getDataTable() ?: $storage->getBaseTable();
+  $database = \Drupal::database();
+  $definition_manager = \Drupal::entityDefinitionUpdateManager();
+
+  // Store the existing values for last_export.
+  $last_export_values = $database->select($table_name)
+    ->fields($table_name, [$id_key, 'last_export'])
+    ->execute()
+    ->fetchAllKeyed();
+
+  // Store the existing values for last_import.
+  $last_import_values = $database->select($table_name)
+    ->fields($table_name, [$id_key, 'last_import'])
+    ->execute()
+    ->fetchAllKeyed();
+
+  // Clear out the values.
+  $database->update($table_name)
+    ->fields([
+      'last_export' => NULL,
+      'last_import' => NULL,
+    ])
+    ->execute();
+
+  // Uninstall the old fields.
+  $field_storage_definition_last_export = $definition_manager->getFieldStorageDefinition('last_export', $bundle_of);
+  $definition_manager->uninstallFieldStorageDefinition($field_storage_definition_last_export);
+  $field_storage_definition_last_import = $definition_manager->getFieldStorageDefinition('last_import', $bundle_of);
+  $definition_manager->uninstallFieldStorageDefinition($field_storage_definition_last_import);
+
+  // Prepare new fields.
+  $new_last_export = BaseFieldDefinition::create('timestamp')
+    ->setLabel(t('Last exported'))
+    ->setDescription(t('The last time the entity got exported.'))
+    ->setRequired(FALSE);
+
+  $new_last_import = BaseFieldDefinition::create('timestamp')
+    ->setLabel(t('Last import'))
+    ->setDescription(t('The last time the entity got imported.'))
+    ->setRequired(FALSE);
+
+  // Create new fields.
+  $definition_manager->installFieldStorageDefinition('last_export', $bundle_of, $bundle_of, $new_last_export);
+  $definition_manager->installFieldStorageDefinition('last_import', $bundle_of, $bundle_of, $new_last_import);
+
+  // Restore the values.
+  foreach ($last_export_values as $id => $value) {
+    $database->update($table_name)
+      ->fields(['last_export' => $value])
+      ->condition($id_key, $id)
+      ->execute();
+  }
+  foreach ($last_import_values as $id => $value) {
+    $database->update($table_name)
+      ->fields(['last_import' => $value])
+      ->condition($id_key, $id)
+      ->execute();
+  }
+}
