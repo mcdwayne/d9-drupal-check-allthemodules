@@ -1,0 +1,179 @@
+<?php
+
+/**
+ * @file
+ * Module file for Grnhse Module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\grnhse\Entity\Job;
+use Drupal\Core\Datetime\DrupalDateTime;
+use Greenhouse\GreenhouseToolsPhp\GreenhouseService;
+
+/**
+ * Implements hook_help().
+ *
+ * Help text to be displayed in the region designated for help text.
+ *
+ * @see https://www.drupal.org/documentation/help-text-standards
+ *
+ * @see hook_help()
+ */
+function grnhse_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.grnhse':
+      return t("Use the Greenhoue module to provide access to Greenhouse job board API content and other Greenhouse services.");
+  }
+}
+
+
+/**
+ * Implements hook_cron().
+ *
+ * Refresh local course data from Greenhouse API.
+ *
+ * Currently fetches jobs by department and denormalizes department.
+ *
+ */
+function grnhse_cron() {
+  // We access our configuration.
+  $config = \Drupal::configFactory()->getEditable('grnhse.settings');
+
+  if (!empty($config->get('api_key')) && !empty($config->get('board_token'))) {
+
+    // Get sync interval from config
+    $interval = $config->get('sync_interval');
+
+    if ($interval != 0) {
+
+      // We usually don't want to act every time cron runs (which could be every
+      // minute) so keep a time for the next run in the site state.
+      $next_execution = \Drupal::state()->get('grnhse.next_sync');
+      $next_execution = !empty($next_execution) ? $next_execution : 0;
+      $request_time = \Drupal::time()->getRequestTime();
+      if ($request_time >= $next_execution) {      
+
+        $greenhouseService = new GreenhouseService([
+          'apiKey' => $config->get('api_key'), 
+          'boardToken' => $config->get('board_token')
+        ]);
+
+        $jobApiService = $greenhouseService->getJobApiService();
+
+        $data = $jobApiService->getDepartments();
+
+        $data = json_decode($data);
+
+        if (!empty($data)) {
+
+          $current = [];
+          $current_ids = [];
+
+          // Denormalize departments into jobs
+          // presumes 1:many dept:job
+          foreach ($data->departments as $dept) {
+            if (isset($dept->jobs) && count($dept->jobs) > 0) {
+              foreach ($dept->jobs as $job) {
+                $job->department = $dept->name;
+                $id = strval($job->id); // too large for 32 bit integers, convert to str
+                $current[$id] = $job;
+                $current_ids[] = $id;
+              }
+            }
+          }
+
+          $existing = Job::loadMultiple();
+
+          // update existing
+          foreach ($existing as $id => $job) {
+            $ext_id = $job->get('ext_id')->value;
+
+            // purge expired local jobs
+            if (!in_array($ext_id, $current_ids)){
+              $job->delete();
+            }
+            // update existing if match
+            else {
+              $cur = $current[$ext_id];
+              
+              if ($job->get('name')->value != $cur->title) {
+                $job->set('name', $cur->title);
+              }
+              if ($job->get('absolute_url')->value != $cur->absolute_url) {
+                $job->set('absolute_url', $cur->absolute_url);
+              }
+              if ($job->get('internal_job_id')->value != $cur->internal_job_id) {
+                $job->set('internal_job_id', $cur->internal_job_id);
+              }
+              if ($job->get('department')->value != $cur->department) {
+                $job->set('department', $cur->department);
+              }
+              if ($job->get('location')->value != $cur->location->name) {
+                $job->set('location', $cur->location->name);
+              }
+              $cur->updated_at = grnhse_convert_to_drupal_utc_date($cur->updated_at);
+              if ($course->get('updated_at')->value != $cur->updated_at) {
+                $course->set('updated_at', $cur->updated_at);
+              }
+              $job->save();
+
+              grnhse_purge_from_array($ext_id, $current_ids);
+            }
+          }
+
+          // create new
+          foreach ($current_ids as $ext_id) {
+            $cur = $current[$ext_id];
+
+            $job = Job::create([
+              'ext_id' => $ext_id,
+              'internal_job_id' => $cur->internal_job_id,
+              'name' => $cur->title,
+              'location' => $cur->location->name,
+              'absolute_url' => $cur->absolute_url,
+              'updated_at' => grnhse_convert_to_drupal_utc_date($cur->updated_at),
+              'department' => $cur->department
+            ]);
+            $job->save();
+          }
+        }
+
+        // Set the next execution time.
+        \Drupal::state()->set('grnhse.next_sync', $request_time + $interval);
+      }
+    }
+  }
+}
+
+/**
+ * Removes an arbitrary element from an array by value.
+ *
+ * @param mixed $val
+ *   The value to purge.
+ * @param array $arr
+ *   The array to search, passed by reference.
+ *
+ */
+function grnhse_purge_from_array($val, &$arr) {
+  if (($key = array_search($val, $arr)) !== FALSE) {
+    unset($arr[$key]);
+  }
+}
+
+/**
+ * Converts a date string to Drupal DateTime for storage.
+ *
+ * @param string $datestring
+ *   The string containign a date representation.
+ *
+ * @return DrupalDateTime
+ *   The DateTime representation of the date string or NULL.
+ */
+function grnhse_convert_to_drupal_utc_date($datestring) {
+  $date = new DrupalDateTime($datestring, 'UTC');
+  if ($date instanceOf DrupalDateTime && !$date->hasErrors()) {
+    return $date->format(DATETIME_DATETIME_STORAGE_FORMAT);
+  }
+
+  return null;
+}
