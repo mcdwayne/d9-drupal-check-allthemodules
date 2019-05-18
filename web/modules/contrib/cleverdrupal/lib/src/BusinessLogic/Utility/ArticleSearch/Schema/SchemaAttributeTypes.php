@@ -1,0 +1,32 @@
+<?php
+
+namespace CleverReach\BusinessLogic\Utility\ArticleSearch\Schema;
+
+/**
+ * Class SchemaAttributeTypes
+ * Enumeration representing valid schema attribute types for article search.
+ *
+ * @package CleverReach\BusinessLogic\Utility\ArticleSearch
+ */
+abstract class SchemaAttributeTypes {
+  const AUTHOR = 'author';
+
+  const URL = 'url';
+
+  const TEXT = 'text';
+
+  const NUMBER = 'number';
+
+  const IMAGE = 'image';
+
+  const DATE = 'date';
+
+  const HTML = 'html';
+
+  const OBJECT = 'object';
+
+  const COLLECTION = 'collection';
+
+  const ENUM = 'enumeration';
+
+}
