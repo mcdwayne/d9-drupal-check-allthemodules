@@ -1,0 +1,92 @@
+<?php
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ */
+function groupmedia_media_type_insert(\Drupal\media\MediaTypeInterface $mediaType) {
+  \Drupal::service('plugin.manager.group_content_enabler')->clearCachedDefinitions();
+}
+
+/**
+ * Implements hook_media_access().
+ *
+ * When trying to view, update or delete a media item it suffices to have the right to
+ * do so in only one group the media belongs to. If you wish to prevent any such
+ * action on your own terms, implement hook_media_access() in your module.
+ */
+function groupmedia_media_access(\Drupal\media\MediaInterface $media, $op, \Drupal\Core\Session\AccountInterface $account) {
+  // We do not care about create access as we have our own wizard for that. Any
+  // operation aside from 'view', 'update' and 'delete' is also unsupported.
+  if (!in_array($op, ['view', 'update', 'delete'])) {
+    return \Drupal\Core\Access\AccessResult::neutral();
+  }
+
+  // Some modules, including the code in \Drupal\media_entity\MediaForm::access() may
+  // check for 'view', 'update' or 'delete' access on new nodes, even though
+  // that makes little sense. We need to account for it to avoid crashes because
+  // we would otherwise query the DB with a non-existent node ID.
+  if ($media->isNew()) {
+    return \Drupal\Core\Access\AccessResult::neutral();
+  }
+
+  $plugin_id = 'group_media:' . $media->bundle();
+
+  // Only act if there are group content types for this node type.
+  $group_content_types = \Drupal\group\Entity\GroupContentType::loadByContentPluginId($plugin_id);
+  if (empty($group_content_types)) {
+    return \Drupal\Core\Access\AccessResult::neutral();
+  }
+
+  // Load all the group content for this node.
+  $group_contents = \Drupal::entityTypeManager()
+    ->getStorage('group_content')
+    ->loadByProperties([
+      'type' => array_keys($group_content_types),
+      'entity_id' => $media->id(),
+    ]);
+
+  // If the media does not belong to any group, we have nothing to say.
+  if (empty($group_contents)) {
+    return \Drupal\Core\Access\AccessResult::neutral();
+  }
+
+  /** @var \Drupal\group\Entity\GroupInterface[] $groups */
+  $groups = [];
+  foreach ($group_contents as $group_content) {
+    /** @var \Drupal\group\Entity\GroupContentInterface $group_content */
+    $group = $group_content->getGroup();
+    $groups[$group->id()] = $group;
+  }
+
+  // From this point on you need group to allow you to perform the requested
+  // operation. If you are not granted access for a node belonging to a group,
+  // you should be denied access instead.
+  switch ($op) {
+    case 'view':
+      foreach ($groups as $group) {
+        if ($media->isPublished()) {
+          if ($group->hasPermission("view $plugin_id entity", $account)) {
+            return \Drupal\Core\Access\AccessResult::allowed();
+          }
+        }
+        elseif ($group->hasPermission("view unpublished $plugin_id entity", $account)) {
+          return \Drupal\Core\Access\AccessResult::allowed();
+        }
+      }
+      break;
+
+    case 'update':
+    case 'delete':
+      foreach ($groups as $group) {
+        if ($group->hasPermission("$op any $plugin_id entity", $account)) {
+          return \Drupal\Core\Access\AccessResult::allowed();
+        }
+        elseif ($account->id() == $media->getOwnerId() && $group->hasPermission("$op own $plugin_id entity", $account)) {
+          return \Drupal\Core\Access\AccessResult::allowed();
+        }
+      }
+      break;
+  }
+
+  return \Drupal\Core\Access\AccessResult::forbidden();
+}
