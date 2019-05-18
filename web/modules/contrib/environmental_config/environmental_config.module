@@ -1,0 +1,163 @@
+<?php
+
+/**
+ * @file
+ * Contains environmental_config.module.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+
+/**
+ * Implements hook_help().
+ */
+function environmental_config_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the environmental_config module.
+    case 'help.page.environmental_config':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Overrides the configuration to be sync based on the server environment') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function environmental_config_form_config_admin_import_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $folderManager = \Drupal::service('environmental_config.tmpfoldermanager');
+  $date_formatter = \Drupal::service('date.formatter');
+
+  // Getting the last ran time and the environment
+  // name if detected.
+  $last_ran = $folderManager->getLastTmpFolderBuildTime();
+  $env = $folderManager->getEnvironment();
+
+  // Retrieving the environment config folder.
+  $envFolder = $folderManager->getEnvironmentConfigDir();
+
+  // If an environment has been detected show a message
+  // with the environment name and display a button
+  // to rebuild the environmental_config temp folder.
+  if ($env) {
+    drupal_set_message(t('Environmental Config has detected the environment <b>%env</b>', ['%env' => $folderManager->getEnvironment()]));
+    // Add a button to refresh the temp folder immediately.
+    $form['environmental_buttons'] = [
+      '#type' => 'actions',
+      '#weight'   => 100,
+    ];
+    $form['environmental_buttons']['refresh_tmp_folder'] = [
+      '#type'   => 'submit',
+      '#value'  => t('Rebuild environmental configuration folder'),
+      '#submit' => ['_environmental_config_form_config_admin_import_form_rebuild_tmp_config'],
+    ];
+  }
+  else {
+    drupal_set_message(t('Environmental Config has detected no environment variable.'), 'warning');
+  }
+
+  // If there are files that apply a change in the current
+  // detected environment, display a short list of them
+  // and add the rest in the watchdog.
+  if (count($folderManager->getEnvironmentalFilesList()['added'])) {
+    $time_ago = $date_formatter->formatInterval(REQUEST_TIME - $last_ran);
+
+    // Getting the filename only.
+    $alteredConfig = [];
+    foreach ($folderManager->getEnvironmentalFilesList()['added'] as $file) {
+      // Getting the configuration name only without any path or extension.
+      $current = str_replace($envFolder, '', $file);
+      $alteredConfig[] = rtrim(ltrim($current, '/'), '.yml');
+    }
+
+    // Altering the file list to add the environment name as suffix.
+    if (isset($form['']['update']['list'])) {
+      foreach ($form['']['update']['list']['#rows'] as &$row) {
+        if (in_array($row['name'], $alteredConfig)) {
+          $row['name'] = '(' . $folderManager->getEnvironment() . ') ' . $row['name'];
+        }
+      }
+      unset($row);
+    }
+
+    // Loop into any language config to find overridden files.
+    $langKey = 'language.';
+    foreach ($form as $key => $value) {
+      // If the current key starts with 'language.'.
+      if (isset($value['update']) && (0 === strpos($key, $langKey))) {
+        $langPath = str_replace('.', '/', $key) . '/';
+        foreach ($form[$key]['update']['list']['#rows'] as &$langRow) {
+          $configFile = $langPath . $langRow['name'];
+          if (in_array($configFile, $alteredConfig)) {
+            $langRow['name'] = '(' . $folderManager->getEnvironment() . ') ' . $langRow['name'];
+          }
+        }
+        unset($langRow);
+      }
+    }
+
+    // Counting the files changed in the current environment.
+    $totFilesInEnvironment = count($folderManager->getEnvironmentalFilesList()['added']);
+    $extraLogInfo = NULL;
+    if ($totFilesInEnvironment > 5) {
+      $extraLogInfo = 'Refer to the log messages for the full list of the ' . $totFilesInEnvironment . ' files overridden.';
+    }
+    drupal_set_message(t('environmental_config is overriding this configuration import with the environment "<b>%name</b>" using a temp configuration built <b>%time_ago</b> ago.<br>%extraLogInfo<pre>%files</pre>',
+                         [
+                           '%extraLogInfo' => $extraLogInfo,
+                           '%time_ago' => $time_ago,
+                           '%name'     => $folderManager->getEnvironment(),
+                           '%files'    => print_r(array_splice($folderManager->getEnvironmentalFilesList()['added'], 0, 5), TRUE),
+                           '%count'    => $totFilesInEnvironment,
+                         ]));
+    \Drupal::service('logger.channel.environmental_config')
+      ->info(t('environmental_config is overriding this configuration import with the environment "<b>%name</b>" using a temp configuration built <b>%time_ago</b> ago. <pre>%files</pre>',
+                    [
+                      '%time_ago' => $time_ago,
+                      '%name'     => $folderManager->getEnvironment(),
+                      '%files'    => print_r($folderManager->getEnvironmentalFilesList()['added'], TRUE),
+                    ]));
+  }
+  else {
+    drupal_set_message(t('Environmental Config is not applying any override on this configuration import.'), 'warning');
+  }
+
+  // If no files are changing with the current env
+  // show a message confirming this.
+  if (count($folderManager->getEnvironmentalFilesList()['not_added'])) {
+    drupal_set_message(t('These files will not be added in the environment override "<b>%name</b>": <pre>%files</pre>',
+                         [
+                           '%files' => print_r($folderManager->getEnvironmentalFilesList()['not_added'], TRUE),
+                           '%name'  => $folderManager->getEnvironment(),
+                         ]),
+                       'warning');
+  }
+}
+
+/**
+ * Implements hook_cache_flush().
+ */
+function environmental_config_cache_flush() {
+  // Rebuild the tmp folder on cache clear.
+  $folderManager = \Drupal::service('environmental_config.tmpfoldermanager');
+  $folderManager->rebuildTmpFolder();
+}
+
+/**
+ * Custom submit handler for config_admin_import_form form.
+ *
+ * Custom submit handler to rebuild the temporary configuration
+ * folder of environmental_config.
+ *
+ * @param array $form
+ *   The form array.
+ * @param \Drupal\Core\Form\FormStateInterface $form_submit
+ *   The form_submit object.
+ */
+function _environmental_config_form_config_admin_import_form_rebuild_tmp_config(array $form, FormStateInterface $form_submit) {
+  $folderManager = \Drupal::service('environmental_config.tmpfoldermanager');
+  $folderManager->rebuildTmpFolder();
+}
