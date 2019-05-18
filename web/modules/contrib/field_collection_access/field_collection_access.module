@@ -1,0 +1,141 @@
+<?php
+
+/**
+ * @file
+ * Module implementing access control for field collections.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\field_collection\Entity\FieldCollectionItem;
+
+/**
+ * Implements hook_help().
+ */
+function field_collection_access_help($route_name, RouteMatchInterface $route_match) {
+  // Remind site administrators about the {node_access} table being flagged
+  // for rebuild. We don't need to issue the message on the confirm form, or
+  // while the rebuild is being processed.
+  if ($route_name != 'field_collection_access.access_rebuild' && $route_name != 'system.batch_page.normal' && $route_name != 'help.main'
+    && \Drupal::currentUser()->hasPermission('access administration pages') && field_collection_access_needs_rebuild()) {
+    if ($route_name == 'system.status') {
+      $message = t('The content access permissions need to be rebuilt.');
+    }
+    else {
+      $message = t('The content access permissions need to be rebuilt. <a href=":node_access_rebuild">Rebuild permissions</a>.', [':node_access_rebuild' => \Drupal::url('field_collection_access.access_rebuild')]);
+    }
+    drupal_set_message($message, 'error');
+  }
+}
+
+/**
+ * Implements hook_entity_type_build().
+ */
+function field_collection_access_entity_type_build(array &$entity_types) {
+  // Override entity storage class.
+  $entity_types["field_collection_item"]->setStorageClass('\Drupal\field_collection_access\FieldCollectionItemStorage');
+  // Override Access Storage class so that we can added field_collection_access
+  // hooks.
+  $entity_types["field_collection_item"]->setAccessClass('\Drupal\field_collection_access\FieldCollectionItemAccessControlHandler');
+  // Override entity view builder so that we can alter the rendered contents.
+  $entity_types["field_collection_item"]->setViewBuilderClass('\Drupal\field_collection_access\FieldCollectionItemViewBuilder');
+}
+
+/**
+ * Implements hook_field_widget_info_alter().
+ */
+function field_collection_access_field_widget_info_alter(array &$info) {
+  // Override Widget class to allow for content replacement.
+  $info["field_collection_embed"]["class"] = '\Drupal\field_collection_access\FieldCollectionEmbedWidget';
+}
+
+/**
+ * Implements callback_batch_operation().
+ *
+ * Performs batch operation for Field Collection Access Rebuild.
+ *
+ * This is a multistep operation: we go through all field collections by packs
+ * of 20. The batch processing engine interrupts processing and sends progress
+ * feedback after 1 second execution time.
+ *
+ * @param array $context
+ *   An array of contextual key/value information for rebuild batch process.
+ *
+ * @see FieldCollectionItemAccessStorage::reloadRecords()
+ */
+function _field_collection_access_rebuild_batch_operation(array &$context) {
+  $fci_storage = \Drupal::entityManager()->getStorage('field_collection_item');
+  // @var \Drupal\field_collection_access\FieldCollectionItemAccessStorage $grantStorage.
+  $grantStorage = \Drupal::service('field_collection_access.grant_storage');
+  if (empty($context['sandbox'])) {
+    $grantStorage->deleteRecords();
+    $grantStorage->saveDefaultGrant();
+    // Initiate multistep processing.
+    $context['sandbox']['progress'] = 0;
+    $context['sandbox']['current_fci'] = 0;
+    $context['sandbox']['max'] = \Drupal::entityQuery('field_collection_item')->count()->execute();
+  }
+
+  // Process the next 20 nodes.
+  $limit = 20;
+  $ids = \Drupal::entityQuery('field_collection_item')
+    ->condition('item_id', $context['sandbox']['current_fci'], '>')
+    ->sort('item_id', 'ASC')
+    ->range(0, $limit)
+    ->execute();
+  $fci_storage->resetCache($ids);
+  $items = FieldCollectionItem::loadMultiple($ids);
+  foreach ($items as $id => $fci) {
+    // To preserve database integrity, only write grants if the node
+    // loads successfully.
+    if (!empty($fci)) {
+      $grants = $grantStorage->getRecordsFor($fci);
+      $grantStorage->saveRecords($fci, $grants);
+    }
+    $context['sandbox']['progress']++;
+    $context['sandbox']['current_node'] = $id;
+  }
+
+  // Multistep processing : report progress.
+  if ($context['sandbox']['progress'] != $context['sandbox']['max']) {
+    $context['finished'] = $context['sandbox']['progress'] / $context['sandbox']['max'];
+  }
+}
+
+/**
+ * Implements callback_batch_finished().
+ *
+ * Performs post-processing for Field Collection Access Rebuild.
+ *
+ * @param bool $success
+ *   A boolean indicating whether the re-build process has completed.
+ * @param array $results
+ *   An array of results information.
+ * @param array $operations
+ *   An array of function calls (not used in this function).
+ */
+function _field_collection_access_rebuild_batch_finished($success, array $results, array $operations) {
+  if ($success) {
+    drupal_set_message(t('The field collection access permissions have been rebuilt.'));
+    field_collection_access_needs_rebuild(FALSE);
+  }
+  else {
+    drupal_set_message(t('The field collection access permissions have not been properly rebuilt.'), 'error');
+  }
+}
+
+/**
+ * Function field_collection_access_needs_rebuild()
+ *
+ * Sets state to require rebuild and display message to admins.
+ */
+function field_collection_access_needs_rebuild($rebuild = NULL) {
+  if (!isset($rebuild)) {
+    return \Drupal::state()->get('field_collection_access.field_collection_access_needs_rebuild') ?: FALSE;
+  }
+  elseif ($rebuild) {
+    \Drupal::state()->set('field_collection_access.field_collection_access_needs_rebuild', TRUE);
+  }
+  else {
+    \Drupal::state()->delete('field_collection_access.field_collection_access_needs_rebuild');
+  }
+}
