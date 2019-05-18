@@ -1,0 +1,247 @@
+<?php
+
+/**
+ * @file
+ * Contains main popup_onload hooks and functions.
+ */
+
+define('POPUP_ONLOAD_DEFAULT_COOKIE_NAME', 'popup_onload_time');
+
+// This value is specified in seconds.
+define('POPUP_ONLOAD_DEFAULT_COOKIE_LIFETIME', 1209600);
+
+define('POPUP_ONLOAD_DEFAULT_COOKIE_PATH', '/');
+
+define('POPUP_ONLOAD_DEFAULT_DELAY', 5000);
+
+define('POPUP_ONLOAD_DEFAULT_SORT_METHOD', 'popup_onload_sort_method_random');
+
+define('POPUP_ONLOAD_VAR_SORT_METHOD', 'popup_onload_sort_method');
+
+define('POPUP_ONLOAD_VAR_COOKIE_NAME', 'popup_onload_cookie_name');
+
+define('POPUP_ONLOAD_VAR_COOKIE_LIFETIME', 'popup_onload_cookie_lifetime');
+
+define('POPUP_ONLOAD_VAR_DISPLAY_DELAY', 'popup_onload_display_delay');
+
+define('POPUP_ONLOAD_VAR_USE_RULES', 'popup_onload_use_rules');
+
+define('POPUP_ONLOAD_VAR_INCLUDE_PATHS', 'popup_onload_include_paths');
+
+define('POPUP_ONLOAD_IS_POPUP_ADDED', 'popup_onload_is_popup_added');
+
+use Drupal\popup_onload\Form\PopupOnLoadSettingsForm;
+use Drupal\popup_onload\Entity\PopupOnLoad;
+use \Symfony\Component\HttpFoundation\Response;
+use \Symfony\Component\HttpFoundation\Cookie;
+use Drupal\Component\Utility\Unicode;
+use Drupal\Core\TypedData\Plugin\DataType\Timestamp;
+
+/**
+ * A stub to fetch all popup_onload entities.
+ */
+function popup_onload_get_popups_all() {
+  $popups = PopupOnLoad::loadMultiple();
+
+  return $popups;
+}
+
+/**
+ * Load the current popup using current choose method.
+ *
+ * @return object
+ *   Fully loaded popup_onload entity, or NULL if no popups have been chosen.
+ */
+function popup_onload_choose_popup() {
+  $popup_onload = NULL;
+
+  $cur_method = PopupOnLoadSettingsForm::popupOnLoadGetDefaults(POPUP_ONLOAD_VAR_SORT_METHOD, POPUP_ONLOAD_DEFAULT_SORT_METHOD);
+  $methods = popup_onload_sort_methods();
+
+  if (isset($methods[$cur_method]) && !empty($methods[$cur_method])) {
+    if (function_exists($cur_method)) {
+      $popup_onload = $cur_method();
+    }
+  }
+
+  return $popup_onload;
+}
+
+/**
+ * Implements hook_popup_onload_check_display_conditions().
+ *
+ * @see popup_onload_check_display_conditions()
+ */
+function popup_onload_popup_onload_check_display_conditions($popup_onload) {
+  return !popup_onload_check_time_cookie();
+}
+
+/**
+ * Determine whether the popup is allowed to display.
+ *
+ * @param object $popup_onload
+ *   Fully populated popup_onload entity object.
+ *
+ * @return bool
+ *   If at least one hook returns FALSE, the popup is denied.
+ */
+function popup_onload_check_display_conditions($popup_onload) {
+  $conditions = \Drupal::moduleHandler()->invokeAll('popup_onload_check_display_conditions', [$popup_onload]);
+  return !in_array(FALSE, $conditions);
+}
+
+/**
+ * Checks whether the current path is included in popup settings.
+ */
+function popup_onload_check_path() {
+  $pages = PopupOnLoadSettingsForm::popupOnLoadGetDefaults(POPUP_ONLOAD_VAR_INCLUDE_PATHS, '');
+  if (!empty($pages)) {
+    $pages = Unicode::strtolower($pages);
+    // Further processing came from the blocks module.
+    // Convert the Drupal path to lowercase.
+    $current_path = \Drupal::service('path.current')->getPath();
+    $path = Unicode::strtolower(\Drupal::service('path.alias_manager')->getAliasByPath($current_path));
+    // Compare the lowercase internal and lowercase path alias (if any).
+    $page_match = \Drupal::service('path.matcher')->matchPath($path, $pages);
+    if ($path != $current_path) {
+      $page_match = $page_match || \Drupal::service('path.matcher')->matchPath($current_path, $pages);
+    }
+  }
+  else {
+    $active_theme = \Drupal::theme()->getActiveTheme()->getName();
+    $admin_theme = \Drupal::config('system.theme')->get('admin');
+    $page_match = (bool) ($active_theme != $admin_theme);
+  }
+
+  return $page_match;
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function popup_onload_page_attachments(array &$page) {
+  // Attach popup onload library.
+  $page['#attached']['library'][] = 'popup_onload/popup-onload';
+}
+
+/**
+ * Callback of the popup sorting method.
+ *
+ * @return object
+ *   Fully loaded popup_onload entity.
+ *
+ * @see hook_popup_onload_sort_methods()
+ */
+function popup_onload_sort_method_random() {
+  $popups = popup_onload_get_popups_all();
+  return (!empty($popups)) ? $popups[array_rand($popups)] : NULL;
+}
+
+/**
+ * Implements hook_popup_onload_sort_methods().
+ *
+ * @see popup_onload_sort_method_random()
+ */
+function popup_onload_popup_onload_sort_methods() {
+  return array(
+    POPUP_ONLOAD_DEFAULT_SORT_METHOD => t('Random (default)'),
+  );
+}
+
+/**
+ * Returns an array of sort methods, declared in all enabled modules.
+ */
+function popup_onload_sort_methods() {
+  return \Drupal::moduleHandler()->invokeAll('popup_onload_sort_methods');
+}
+
+/**
+ * Generate Javascript parameters for popup.
+ *
+ * @param object $popup_onload
+ *   Fully populated popup_onload entity.
+ *
+ * @return array
+ *   Popup javascript settings
+ */
+function popup_onload_prepare_popup($popup_onload) {
+  $popup_markup = \Drupal::entityTypeManager()->getViewBuilder('popup_onload')->view($popup_onload);
+  $renderer = \Drupal::service('renderer');
+  $popup_settings = array(
+    'html' => $renderer->renderRoot($popup_markup)->__toString(),
+    'delay' => PopupOnLoadSettingsForm::popupOnLoadGetDefaults(POPUP_ONLOAD_VAR_DISPLAY_DELAY, POPUP_ONLOAD_DEFAULT_DELAY),
+    'popup_id' => $popup_onload->id(),
+    'dialogClass' => 'popup-onload-dialog',
+    'title' => $popup_onload->get('name')->value,
+    'close' => '',
+    'cookie_name' => PopupOnLoadSettingsForm::popupOnLoadGetDefaults(POPUP_ONLOAD_VAR_COOKIE_NAME, POPUP_ONLOAD_DEFAULT_COOKIE_NAME),
+    'expire_seconds' => PopupOnLoadSettingsForm::popupOnLoadGetDefaults(POPUP_ONLOAD_VAR_COOKIE_LIFETIME, POPUP_ONLOAD_DEFAULT_COOKIE_LIFETIME),
+  );
+
+  if ($popup_onload->get('width')->value) {
+    $popup_settings['width'] = $popup_onload->get('width')->value;
+  }
+  if ($popup_onload->get('height')->height) {
+    $popup_settings['height'] = $popup_onload->get('height')->height;
+  }
+
+  // Let other modules alter popup settings.
+  \Drupal::moduleHandler()->alter('popup_onload_js_settings', $popup_settings, $popup_onload);
+
+  return $popup_settings;
+}
+
+/**
+ * Check if popup_onload cookie is set.
+ */
+function popup_onload_check_time_cookie() {
+  $cookie_name = PopupOnLoadSettingsForm::popupOnLoadGetDefaults(POPUP_ONLOAD_VAR_COOKIE_NAME, POPUP_ONLOAD_DEFAULT_COOKIE_NAME);
+  return isset($_COOKIE[$cookie_name]);
+}
+
+/**
+ * Save popup display time into the cookie.
+ */
+function popup_onload_save_time_cookie() {
+  $cookie_name = PopupOnLoadSettingsForm::popupOnLoadGetDefaults(POPUP_ONLOAD_VAR_COOKIE_NAME, POPUP_ONLOAD_DEFAULT_COOKIE_NAME);
+  $expire_seconds = PopupOnLoadSettingsForm::popupOnLoadGetDefaults(POPUP_ONLOAD_VAR_COOKIE_LIFETIME, POPUP_ONLOAD_DEFAULT_COOKIE_LIFETIME);
+  $cur_time = time();
+  $response = new Response();
+  $cookie = new Cookie($cookie_name, $cur_time, $cur_time + $expire_seconds, '/');
+  $response->headers->setCookie($cookie);
+  $response->sendHeaders();
+}
+
+/**
+ * Implements hook_theme().
+ */
+function popup_onload_theme() {
+  $theme = [];
+  $theme['popup_onload'] = [
+    'render element' => 'elements',
+    'file' => 'popup_onload.page.inc',
+    'template' => 'popup_onload',
+  ];
+  $theme['popup_onload_content_add_list'] = [
+    'render element' => 'content',
+    'variables' => ['content' => NULL],
+    'file' => 'popup_onload.page.inc',
+  ];
+  return $theme;
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK().
+ */
+function popup_onload_theme_suggestions_popup_onload(array $variables) {
+  $suggestions = [];
+  $entity = $variables['elements']['#popup_onload'];
+  $sanitized_view_mode = strtr($variables['elements']['#view_mode'], '.', '_');
+
+  $suggestions[] = 'popup_onload__' . $sanitized_view_mode;
+  $suggestions[] = 'popup_onload__' . $entity->bundle();
+  $suggestions[] = 'popup_onload__' . $entity->bundle() . '__' . $sanitized_view_mode;
+  $suggestions[] = 'popup_onload__' . $entity->id();
+  $suggestions[] = 'popup_onload__' . $entity->id() . '__' . $sanitized_view_mode;
+  return $suggestions;
+}
