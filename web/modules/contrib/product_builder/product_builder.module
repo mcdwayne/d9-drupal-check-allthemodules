@@ -1,0 +1,409 @@
+<?php
+
+/**
+ * @file
+ * Contains product_builder.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Component\Utility\NestedArray;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Render\Element;
+use Drupal\product_builder\Event\ProductBuilderAddToCart;
+
+/**
+ * Implements hook_help().
+ */
+function product_builder_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the product_builder module.
+    case 'help.page.product_builder':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Product Builder') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function product_builder_theme() {
+  $theme = [];
+  $theme['product_builder'] = [
+    'render element' => 'elements',
+    'file' => 'product_builder.page.inc',
+    'template' => 'product_builder',
+  ];
+  $theme['product_builder_content_add_list'] = [
+    'render element' => 'content',
+    'variables' => ['content' => NULL],
+    'file' => 'product_builder.page.inc',
+  ];
+  return $theme;
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK().
+ */
+function product_builder_theme_suggestions_product_builder(array $variables) {
+  $suggestions = [];
+  $entity = $variables['elements']['#product_builder'];
+  $sanitized_view_mode = strtr($variables['elements']['#view_mode'], '.', '_');
+
+  $suggestions[] = 'product_builder__' . $sanitized_view_mode;
+  $suggestions[] = 'product_builder__' . $entity->bundle();
+  $suggestions[] = 'product_builder__' . $entity->bundle() . '__' . $sanitized_view_mode;
+  $suggestions[] = 'product_builder__' . $entity->id();
+  $suggestions[] = 'product_builder__' . $entity->id() . '__' . $sanitized_view_mode;
+  return $suggestions;
+}
+
+/**
+ * Implements hook_entity_type_build().
+ */
+function product_builder_entity_type_build(array &$entity_types) {
+  $entity_types['commerce_order_item']->setFormClass('add_to_cart_product_builder', '\Drupal\product_builder\Form\AddToCartProductBuilderForm');
+}
+
+/**
+ * Implements hook_entity_base_field_info_alter().
+ */
+function product_builder_entity_base_field_info_alter(&$fields, \Drupal\Core\Entity\EntityTypeInterface $entity_type) {
+  if ($entity_type->id() == 'commerce_order_item') {
+    $fields['product_builder_id'] = BaseFieldDefinition::create('entity_reference')
+      ->setLabel(t('Product Builder entity'))
+      ->setDescription(t('The product builder entity.'))
+      ->setSetting('target_type', 'product_builder')
+      ->setSetting('handler', 'default')
+      ->setTargetEntityTypeId('commerce_order_item')
+      ->setName('product_builder_id')
+      ->setDefaultValue(NULL);
+  }
+}
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function product_builder_entity_extra_field_info() {
+  $extra = [];
+
+  $builder_types = \Drupal::entityTypeManager()->getStorage('product_builder_type')->loadMultiple();
+  foreach ($builder_types as $type) {
+    $extra['product_builder'][$type->id()]['form']['product_quantity'] = [
+      'label' => t('Product quantity'),
+      'description' => t('Rendered Product Quantity'),
+      'weight' => 50,
+      'visible' => FALSE,
+    ];
+    $extra['product_builder'][$type->id()]['form']['product_price'] = [
+      'label' => t('Product Price'),
+      'description' => t('Rendered Product Price'),
+      'weight' => 50,
+    ];
+    $extra['product_builder'][$type->id()]['form']['purchased_entity'] = [
+      'label' => t('Product'),
+      'description' => t('Rendered Product'),
+      'weight' => 50,
+    ];
+    // Using this extra field, we can manage the 'actions' container position.
+    // Now it can be placed inside of the field_group, which is important in some cases.
+    $extra['product_builder'][$type->id()]['form']['actions'] = [
+      'label' => t('Actions'),
+      'description' => t('Form actions container'),
+      'weight' => 50,
+    ];
+  }
+
+  return $extra;
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function product_builder_form_alter(array &$form, FormStateInterface &$form_state, $form_id) {
+  $form_builder = $form_state->getBuildInfo();
+  if (isset($form_builder['base_form_id']) && ($form_builder['base_form_id'] == 'product_builder_form')) {
+
+    $form_storage = $form_state->getStorage();
+
+    $builder = $form_state->getFormObject()->buildEntity($form, $form_state);
+    if (!$variation_id = product_builder_get_builder_commerce_item($builder->id())) {
+      $variation_id = \Drupal::request()->query->get('variation_id');
+      if (!isset($variation_id) && isset($form_storage['product'])) {
+        $variation_id = $form_storage['product']->getVariationIds()[0];
+      }
+    }
+    //Add Attributes form to product builder form
+    //See Class EntityFormDisplay method buildForm
+    if ($variation_id && ($product_component = $form_storage['form_display']->getComponent('purchased_entity')) && $variation = \Drupal::entityTypeManager()->getStorage('commerce_product_variation')->load($variation_id)) {
+
+      $configuration = [
+        'type' => 'commerce_product_variation_attributes',
+        'weight' => 0,
+        'settings' => [],
+        'third_party_settings' => [],
+        'region' => 'content',
+      ];
+
+      $field_name = 'purchased_entity';
+      $field_manager = \Drupal::service('entity_field.manager');
+      $widget_manager = \Drupal::service('plugin.manager.field.widget');
+      $entity_type_manager = \Drupal::service('entity_type.manager');
+
+      $definitions = $field_manager->getFieldDefinitions('commerce_order_item', 'default');
+      $field_definition = $definitions[$field_name];
+
+      $widget = $widget_manager->getInstance([
+        'field_definition' => $field_definition,
+        'form_mode' => 'add_to_cart',
+        // No need to prepare, defaults have been merged in setComponent().
+        'prepare' => FALSE,
+        'configuration' => $configuration
+      ]);
+
+      $order_item_storage = $entity_type_manager->getStorage('commerce_order_item');
+      $product = $variation->getProduct();
+
+      //Set default variation id
+      //See ProductVariationStorage class loadFromContext method
+      $request_stack = \Drupal::service('request_stack');
+      $current_request = $request_stack->getCurrentRequest();
+      $current_request->query->set('v', $variation_id);
+
+      //@todo If there is not complete match commerce use default variation
+      //@todo This bug exists in default product form.
+      //See ProductVariationAttributesWidget class selectVariationFromUserInput method.
+      //This code get variation with max match count and set triggered attribute as base.
+      $triggering_element = $form_state->getTriggeringElement();
+      if (isset($triggering_element['#attributes']['data-variation-attribute'])) {
+        $parents = [$field_name, 0];
+        $user_input = $form_state->getUserInput();
+        $attribute_user_input = (array) NestedArray::getValue($user_input, $parents);
+        $attribute = $triggering_element['#attributes']['data-variation-attribute'];
+        $current_variation = product_builder_select_variation_from_user_input($product, $attribute_user_input, $attribute);
+
+        foreach ($attribute_user_input['attributes'] as $attribute_name => $value) {
+          $attribute_user_input['attributes'][$attribute_name] = $current_variation->getAttributeValueId($attribute_name);
+        }
+        NestedArray::setValue($user_input, $parents, $attribute_user_input);
+        $form_state->setUserInput($user_input);
+      }
+
+      $form_state->setFormState(['product' => $product]);
+
+      $order_item = $order_item_storage->createFromPurchasableEntity($variation);;
+
+      //Create product variation widget
+      $items = $order_item->get($field_name);
+      $items->filterEmptyItems();
+      $form[$field_name] = $widget->form($items, $form, $form_state);
+      $form[$field_name]['#access'] = $items->access('edit');
+      $form[$field_name]['#weight'] = $product_component['weight'];
+      $form[$field_name]['#process'][] = ['Drupal\Core\Render\Element\RenderElement', 'processGroup'];
+      $form[$field_name]['#pre_render'][] = ['Drupal\Core\Render\Element\RenderElement', 'preRenderGroup'];
+      //Add data attribute for variation attributes fields.
+      if (isset($form[$field_name]['widget'][0]['attributes']) && is_array($form[$field_name]['widget'][0]['attributes'])) {
+        foreach (Element::children($form[$field_name]['widget'][0]['attributes']) as $key) {
+          $form[$field_name]['widget'][0]['attributes'][$key]['#attributes']['data-variation-attribute'] = $key;
+        }
+      }
+
+      // Associate the cache tags for the field definition & field storage
+      // definition.
+      //@todo use commented code
+//    $field_definition = $this->getFieldDefinition($configuration);
+//    $this->renderer->addCacheableDependency($form[$configuration], $field_definition);
+//    $this->renderer->addCacheableDependency($form[$configuration], $field_definition->getFieldStorageDefinition());
+
+      //Calculated price according to rules
+      //@todo rework to resolver
+      $order_type_id = 'default';
+      if ($form_state->get('selected_variation')) {
+        $variation_id = $form_state->get('selected_variation');
+      }
+      $form_state->set('selected_variation', $variation_id);
+      $selected_variation = $entity_type_manager->getStorage('commerce_product_variation')->load($variation_id);
+
+      $order_item = $entity_type_manager->getStorage('commerce_order_item')->create([
+        'type' => $order_type_id,
+        'purchased_entity' => (string) $selected_variation->id(),
+        'quantity' => 1,
+        'unit_price' => $selected_variation->getPrice(),
+        'product_builder_id' => $builder,
+      ]);
+
+      // Set the order item twice on the event: as the main subject but also in the
+      // list of arguments.
+      $event = new ProductBuilderAddToCart($order_item, $form_state, ['order_item' => $order_item]);
+      $event_dispatcher = \Drupal::service('event_dispatcher');
+      $event_dispatcher->dispatch(ProductBuilderAddToCart::EVENT_NAME, $event);
+
+      if ($product_price_component = $form_storage['form_display']->getComponent('product_price')) {
+        $price = $order_item->getTotalPrice();
+        if (!$price) {
+          $price = $order_item->getUnitPrice();
+        }
+        $currency = $entity_type_manager->getStorage('commerce_currency')->load($price->getCurrencyCode());
+        $form['product_price'] = [
+          '#theme' => 'commerce_price_plain',
+          '#number' => $price->getNumber(),
+          '#currency' => $currency,
+          '#prefix' => '<div id="product-builder-price">',
+          '#suffix' => '</div>',
+          '#weight' => $product_price_component['weight'],
+          '#process' => [
+            ['Drupal\Core\Render\Element\RenderElement', 'processGroup']
+          ],
+          '#pre_render' => [
+            ['Drupal\Core\Render\Element\RenderElement', 'preRenderGroup']
+          ],
+        ];
+      }
+
+      if ($product_quantity_component = $form_storage['form_display']->getComponent('product_quantity')) {
+        $form['product_quantity'] = [
+          '#title' => t('Quantity'),
+          '#type' => 'number',
+          '#min' => 1,
+          '#size' => 4,
+          '#step' => 1,
+          '#weight' => $product_quantity_component['weight'],
+          '#default_value' => 1,
+        ];
+      }
+
+      // Add custom submit to product builder add form.
+      $form['actions']['submit']['#submit'][] = 'product_builder_commerce_add_to_cart';
+      if ($actions_component = $form_storage['form_display']->getComponent('actions')) {
+        $form['actions']['#weight'] = $actions_component['weight'];
+        $form['actions']['#process'][] = ['Drupal\Core\Render\Element\RenderElement', 'processGroup'];
+        $form['actions']['#pre_render'][] = ['Drupal\Core\Render\Element\RenderElement', 'preRenderGroup'];
+      }
+    }
+  }
+}
+
+/**
+ * Add commerce order item to cart after create new builder entity.
+ * class ProductVariationAttributesWidget method selectVariationFromUserInput
+ */
+function product_builder_commerce_add_to_cart(array $form, FormStateInterface $form_state) {
+  $product = $form_state->get('product');
+  $selected_variation = \Drupal::entityTypeManager()->getStorage('commerce_product_variation')->load($form_state->get('selected_variation'));
+
+  //@todo probably there is better way
+  //Get store
+  $stores = $product->getStores();
+  $store = array_shift($stores);
+
+  //@todo rework to resolver
+  $order_type_id = 'default';
+  //$orderTypeResolver = \Drupal::service($id);
+  //$order_type_id = $orderTypeResolver->resolve($order_item);
+
+  $cart_provider = \Drupal::service('commerce_cart.cart_provider');
+  $cart = $cart_provider->getCart($order_type_id, $store);
+  if (!$cart) {
+    $cart = $cart_provider->createCart($order_type_id, $store);
+  }
+
+  $build_info = $form_state->getBuildInfo();
+  $builder = $build_info['callback_object']->getEntity();
+
+  $order_item = \Drupal::entityTypeManager()->getStorage('commerce_order_item')->create(array(
+    'type' => $order_type_id,
+    'purchased_entity' => (string) $selected_variation->id(),
+    'quantity' => 1,
+    'unit_price' => $selected_variation->getPrice(),
+    'product_builder_id' => $builder,
+  ));
+
+  //Add new order item to cart
+  $cart_manager = \Drupal::service('commerce_cart.cart_manager');
+  $cart_manager->addOrderItem($cart, $order_item, FALSE);
+
+  //Reload order item, because order item object doesn't have all actual values after calling addOrderItem method.
+  //And this order item is saved below.
+  //Add rule event for recalculating order item price.
+  $order_item = \Drupal::entityTypeManager()->getStorage('commerce_order_item')->load($order_item->id());
+  $event = new ProductBuilderAddToCart($order_item, $form_state, ['order_item' => $order_item]);
+  $event_dispatcher = \Drupal::service('event_dispatcher');
+  $event_dispatcher->dispatch(ProductBuilderAddToCart::EVENT_NAME, $event);
+
+  //Disable price overriding for this order item
+  //Probably, there is sense to move line below into rule action class
+  $order_item->set('overridden_unit_price', 1);
+  $order_item->save();
+
+  //Recalculate order total price and save it
+  //It needs because order item unit price was recalculated
+  $cart->recalculateTotalPrice();
+  $cart->save();
+
+  drupal_set_message(t('Product added to the cart.'));
+  $form_state->setRedirect('commerce_cart.page');
+}
+
+/**
+ * Redirect to product builder add form.
+ */
+function product_builder_add_to_cart_builder_form_redirect($form, FormStateInterface $form_state) {
+
+  $storage = $form_state->getStorage();
+  $builder_bundle = $storage['builder_bundle'];
+  $values = $form_state->getValues();
+  $variation_id = $values['purchased_entity'][0]['variation'];
+
+  $form_state->setRedirect('entity.product_builder.add_form', ['product_builder_type' => $builder_bundle], ['query' => ['variation_id' => $variation_id]]);
+  return;
+}
+
+/**
+ * Get selected variation use default attribute as base and get max count match variation.
+ * See ProductVariationAttributesWidget class selectVariationFromUserInput method.
+ */
+function product_builder_select_variation_from_user_input($product, &$user_input, $attribute) {
+  $variations = \Drupal::entityTypeManager()->getStorage('commerce_product_variation')->loadEnabled($product);
+
+  $current_variation = reset($variations);
+  if (!empty($user_input['attributes'])) {
+    $previous = 0;
+    foreach ($variations as $variation) {
+      if ($variation->getAttributeValueId($attribute) != $user_input['attributes'][$attribute]) {
+        continue;
+      }
+      $match = 0;
+      foreach ($user_input['attributes'] as $field_name => $value) {
+        if ($variation->getAttributeValueId($field_name) == $value) {
+          $match++;
+        }
+      }
+      if ($match > $previous) {
+        $current_variation = $variation;
+        $previous = $match;
+      }
+    }
+  }
+
+  return $current_variation;
+}
+
+/**
+ * Get variation id for product builder entity.
+ *
+ * @param $id
+ *   Product builder entity id.
+ *
+ * @return mixed
+ */
+function product_builder_get_builder_commerce_item($id) {
+  $q = \Drupal::database()->select('commerce_order_item', 'coi');
+  $q->addField('coi', 'purchased_entity');
+  $q->condition('coi.product_builder_id', $id);
+
+  return $q->execute()->fetchField();
+}
