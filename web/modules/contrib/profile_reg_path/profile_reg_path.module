@@ -1,0 +1,238 @@
+<?php
+
+/**
+ * @file
+ * Provides functionality for handling course.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\profile\Entity\Profile;
+use Drupal\profile\Entity\ProfileType;
+use Drupal\Core\Entity\Entity\EntityFormDisplay;
+use Drupal\profile_reg_path\Controller\ProfileRegPathController;
+
+/**
+ * Implements hook_form_alter
+ */
+function profile_reg_path_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+
+  // Adding Field to profile type add form.
+  if ($form_id == 'profile_type_add_form' || $form_id == 'profile_type_edit_form') {
+    $profile_type = '';
+    if ($form_id == 'profile_type_edit_form') {
+      $profiletype = \Drupal::routeMatch()->getParameter('profile_type');
+      $settings = $profiletype->getThirdPartySettings('profile_reg_path');
+      $profile_type = $profiletype->label();
+    }
+
+    // Getting base url of site.
+    $base_url = \Drupal::request()->getBasePath();
+
+    $form['data']['registration']['#title'] = t('Show on all user account registration forms.');
+    $form['data']['registration']['#description'] = t('If selected, fields for this profile type will be added to the core user registration page and the administrative add user page.');
+
+
+    $form['regpath'] = [
+      '#type' => 'fieldset',
+      '#title' => t('Unique registration path'),
+    ];
+
+    $form['regpath']['status'] = [
+      '#type' => 'checkbox',
+      '#title' => t('Enable unique registration path'),
+      '#default_value' => isset($settings['profile_reg_status']) ? $settings['profile_reg_status'] : 0,
+      '#description' => t("If checked, a unique registration page utilizing this profile type's fields will be available at the specified URL."),
+    ];
+
+    $form['regpath']['settings'] = [
+      '#type' => 'fieldset',
+      '#title' => t('Settings'),
+      '#states' => [
+        'invisible' => [
+          'input[name="status"]' => ['checked' => FALSE],
+        ],
+      ],
+    ];
+
+    $form['regpath']['settings']['tab_text'] = [
+      '#type' => 'textfield',
+      '#title' => t('Tab Text'),
+      '#default_value' => isset($settings['profile_reg_tab_text']) ? $settings['profile_reg_tab_text'] : 'Register as ' . $profile_type,
+      '#description' => t('Enter the menu title text for the registration tab.'),
+      '#states' => [
+        'visible' => [
+          'input[name="path_type"]' => ['value' => 'tabs'],
+        ],
+      ],
+    ];
+
+    // @todo add unlimited cardinality to the path field OR change to textarea and loop through each line.
+    $form['regpath']['settings']['path'] = [
+      '#type' => 'textfield',
+      '#title' => t('URL path'),
+      '#field_prefix' => $base_url . '/register/',
+      '#default_value' => isset($settings['profile_reg_path']) ? $settings['profile_reg_path'] : 0,
+      '#description' => t('Please enter the base URL for this registration path.
+        <ul>
+          <li>You may use the "user" base path to attach this profile to the default user registration form.</li>
+          <li>Do not include any slashes.</li>
+        </ul>'
+      ),
+      '#size' => 20,
+      '#states' => [
+        'invisible' => [
+          'input[name="path_type"]' => ['value' => 'tabs'],
+        ],
+      ],
+    ];
+
+    $form['#entity_builders'][] = 'profile_reg_path_path_builder';
+  }
+}
+
+/**
+ * Implements hook_form_[form_id]_alter();
+ * Alter User register form and add profile fields in user register form.
+ *
+ * @param array $form
+ * @param FormStateInterface $form_state
+ * @param string $form_id
+ */
+function profile_reg_path_form_user_register_form_alter(array &$form, FormStateInterface $form_state) {
+
+  $attached_profile_form = FALSE;
+
+  // If routepath is profile reg path.
+  if (\Drupal::routeMatch()
+      ->getRouteName() == 'profile_reg_path.profile_registration_page') {
+
+    // Getting route parameter.
+    $type = \Drupal::routeMatch()->getParameter('type');
+
+    if ($profile_type = ProfileRegPathController::getProfileTypeByPath($type)) {
+
+      /**
+       * We have copied following code from profile module.
+       * We will improve following code in later stage.
+       */
+      $property = ['profiles', $profile_type->get('id')];
+      $profile = $form_state->get($property);
+      if (empty($profile)) {
+        $profile = Profile::create([
+          'type' => $profile_type->id(),
+          'langcode' => $profile_type->language() ? $profile_type->language() : \Drupal::languageManager()
+            ->getDefaultLanguage()
+            ->getId(),
+        ]);
+
+        // Attach profile entity form.
+        $form_state->set($property, $profile);
+      }
+      $form_state->set('form_display_' . $profile_type->id(), EntityFormDisplay::collectRenderDisplay($profile, 'default'));
+      $form['entity_' . $profile_type->id()] = [
+        '#type' => 'details',
+        '#title' => $profile_type->label(),
+        '#tree' => TRUE,
+        '#parents' => ['entity_' . $profile_type->id()],
+        '#open' => TRUE,
+      ];
+
+      // @see https://www.drupal.org/node/2871480.
+      if (\Drupal::moduleHandler()->moduleExists('field_group')) {
+        $context = [
+          'entity_type' => $profile->getEntityTypeId(),
+          'bundle' => $profile->bundle(),
+          'entity' => $profile,
+          'context' => 'form',
+          'display_context' => 'form',
+          'mode' => 'default',
+        ];
+
+        field_group_attach_groups($form['entity_' . $profile_type->id()], $context);
+        $form['entity_' . $profile_type->id()]['#pre_render'][] = 'field_group_form_pre_render';
+      }
+
+      $form_state
+        ->get('form_display_' . $profile_type->id())
+        ->buildForm($profile, $form['entity_' . $profile_type->id()], $form_state);
+
+      $attached_profile_form = TRUE;
+    }
+  }
+
+  // Assign Form submit and validate.
+  if ($attached_profile_form) {
+    $form['actions']['submit']['#validate'][] = 'profile_form_user_register_form_validate';
+    $form['actions']['submit']['#submit'][] = 'profile_reg_path_form_user_register_form_submit';
+  }
+}
+
+/**
+ * Extra form submission handler for the user registration form.
+ */
+function profile_reg_path_form_user_register_form_submit(array &$form, FormStateInterface $form_state) {
+  /** @var \Drupal\Core\Session\AccountInterface $account */
+  $account = $form_state->getFormObject()->getEntity();
+  $profiles = $form_state->get('profiles');
+
+  $roles = array();
+
+  if (!empty($profiles)) {
+    foreach ($profiles as $bundle => $entity) {
+
+      //Getting role from user profile
+      $roles = \Drupal\profile\Entity\ProfileType::load($bundle)->get('roles');
+
+      $entity->setOwnerId($account->id());
+      $entity->setActive(TRUE);
+      $entity->save();
+    }
+  }
+
+  //assigning role to user
+  if (!empty($roles)) {
+    foreach ($roles as $role) {
+      if (is_string($role)) {
+        $account->addRole($role);
+      }
+    }
+    $account->save();
+  }
+}
+
+/**
+ * Getting list of profile registration path.
+ */
+function profile_reg_path_list() {
+
+  //Getting all profile type
+  $profile_type = \Drupal::entityQuery('profile_type')->execute();
+  $profile_path = [];
+
+  //iterating through profile type entity
+  foreach ($profile_type as $type) {
+    $profile_path[] = \Drupal\profile\Entity\ProfileType::load($type);
+  }
+
+  return $profile_path;
+}
+
+/**
+ * Added Extra parameter to profile type.
+ *
+ * @param type $entity_type
+ * @param Drupal\profile\Entity\ProfileType $profile
+ * @param type $form
+ * @param FormStateInterface $form_state
+ *
+ * @return type
+ */
+function profile_reg_path_path_builder($entity_type, Drupal\profile\Entity\ProfileType $profiletype, &$form, \Drupal\Core\Form\FormStateInterface $form_state) {
+  if ($form_state->getValue('path')) {
+    $profiletype->setThirdPartySetting('profile_reg_path', 'profile_reg_path', $form_state->getValue('path'));
+    $profiletype->setThirdPartySetting('profile_reg_path', 'profile_reg_status', $form_state->getValue('status'));
+    $profiletype->setThirdPartySetting('profile_reg_path', 'profile_reg_tab_text', $form_state->getValue('tab_text'));
+    return;
+  }
+  $profiletype->unsetThirdPartySetting('profile_reg_path', 'profile_reg_path');
+}
