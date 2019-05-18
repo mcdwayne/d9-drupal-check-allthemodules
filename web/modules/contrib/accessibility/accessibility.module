@@ -1,0 +1,407 @@
+<?php
+
+use Drupal\Core\Entity\DatabaseStorageController;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\Field\FieldDefinitionInterface;
+use Drupal\node\Entity\Node;
+use Drupal\Core\StringTranslation\Translator\FileTranslation;
+use Drupal\Core\Language\Language;
+use Drupal\taxonomy\Entity\Term;
+use Drupal\taxonomy\Entity\Vocabulary;
+use Drupal\taxonomy\VocabularyInterface;
+use Symfony\Component\HttpFoundation\JsonResponse;
+
+const ACCESSIBILITY_TEST_SEVERE     = 'severe';
+const ACCESSIBILITY_TEST_MODERATE   = 'moderate';
+const ACCESSIBILITY_TEST_SUGGESTION = 'suggestion';
+const ACCESSIBILITY_QUAIL_VERSION   = '2.0.3';
+
+/**
+ * Implements hook_help().
+ */
+function accessibility_help($path, $arg) {
+  switch($path) {
+    case 'admin/config/accessibility':
+      return '<p>' . t('The accessibility module enables tests for content, themes, and modules. You can <a target="_blank" href="https://drupal.org/node/2056945">read more defailed documentation on Drupal.org</a>.') .'</p>';
+    case 'admin/config/accessibility/tests':
+      return '<p>'. t('This is a list of your existing accessibility tests. To create new accessibiilty tests, <a href="!link">visit the Import Tests</a> page. <a href="https://drupal.org/node/2056945#tests" target="_blank">Learn more about accessibility tests</a>.', array('!link' => url('admin/config/accessibility/tests/import'))) .'</p>';
+    case 'admin/config/accessibility/tests/import':
+      return '<p>'. t('Accessibility tests check for a single error in your site. You can import tests by selecting them, or click a guideline below to enable all tests associated with that guideline.') .'</p>';
+    case 'admin/help#accessibility':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('The Accessibility module allows you to check content, themes, or modules against pre-defined accessibility tests. For example, enabling a test looking for images missing an "alt" attribute would help give content authors feedback on how to ensure people using assistive technologies (i.e. blind users using a screen reader) can use the site. You can add and edit tests under the <a href="!link">Accessibility administration page</a>. For more infromation, see the online handbook entry for the <a href="https://drupal.org/node/2056945">Accessibility module</a>.', array('!link' => url('admin/config/accessibility'))) .'</p>';
+      $output .= '<h3>' . t('Uses') . '</h3>';
+      $output .= '<dl>';
+      $output .= '<dt>' . t('Giving feedback to content authors') . '</dt>';
+      $output .= '<dd>' . t('To help content authors create accessible content, enable the Content Accessibility module. This will place a toggle on every page for users with the "Check content for accessibility" permission when viewing fields that have had testing enabled.') . '</dd>';
+      $output .= '<dt>' . t('Checking content in WYSIWYG editors') . '</dt>';
+      $output .= '<dd>' . t('Enabling the Accessibility WYSIWYG module, in combination with either the WYSIWYG or CKEditor modules, will place a checkbox in the toolbar of any TinyMCE or CKEditor (version 3 or 4) for users to check content against your enabled accessibility tests.') . '</dd>';
+      $output .= '<dt>' . t('Report on accessibility errors') . '</dt>';
+      $output .= '<dd>' . t('The Accessibility Reporting module checks content for accessibility errors in a user\'s browser and posts back to the site any errors. This data is stored in your drupal site, and is available as additional fields for the Views module. While this module installs a default view, you can clone that view to start buidlding your own accessibility reports.') . '</dd>';
+      $output .= '<dt>' . t('Checking themes for accessibility') . '</dt>';
+      $output .= '<dd>' . t('Enabling the Theme Accessibility module will give users with the "Access accessibility theming" permission a toggle to turn testing on for the entire page, not just parts of the page that are just content like the Content Accessibility module. This can lead to more false-positives, but helps users when building custom themes to ensure they are as accessible as possible. This module should not be enabled for production websites, as it alters the normal way a page is rendered.') . '</dd>';
+      $output .= '</dl>';
+      return $output;
+  }
+}
+
+/**
+ * Helper function to load the QUAIL library.
+ */
+function accessibility_load() {
+  $is_loaded = drupal_static(__FUNCTION__);
+  if ($is_loaded) {
+    return;
+  }
+  $is_loaded = TRUE;
+  $library_path = libraries_get_path('quail');
+  $module_path = drupal_get_path('module', 'accessibility');
+  drupal_add_js($library_path . '/src/quail.js');
+  drupal_add_js($module_path . '/js/accessibility.js');
+  drupal_add_css($module_path . '/css/accessibility.css');
+  drupal_add_js(array('accessibility' => array('icon_path' => drupal_get_path('module', 'accessibility') .'/css/img/', 'quail_path' => $library_path . '/src/resources')), 'setting');
+  module_invoke_all('accessibility_load');
+}
+
+
+/**
+ * Implements hook_entity_bundle_info().
+ */
+function accessibility_entity_bundle_info() {
+  $bundles['accessibility_test']['accessibility_test']['label'] = t('Accessibility test');
+  return $bundles;
+}
+
+/**
+ * Entity URI callback.
+ */
+function accessibility_uri($test) {
+  return array(
+    'path' => 'accessibility-test/' . $test->id(),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function accessibility_menu() {
+  $items['admin/config/accessibility'] = array(
+    'title' => 'Accessibility',
+    'route_name' => 'accessibility.admin_index',
+    'description' => 'Configures how page content and themes are checked for accessibility.',
+    'position' => 'right',
+    'weight' => -20,
+  );
+
+  $items['admin/config/accessibility/tests'] = array(
+    'title' => 'Accessibility tests',
+    'description' => 'View existing and create new accessibility tests.',
+    'route_name' => 'accessibility.admin_existing'
+  );
+
+  $items['admin/config/accessibility/tests/tests'] = array(
+    'title' => 'Accessibility Tests',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'description' => 'View existing and create new accessibility tests.',
+    'route_name' => 'accessibility.admin_existing'
+  );
+
+  $items['admin/config/accessibility/tests/import'] = array(
+    'title' => 'Import tests',
+    'description' => 'Import and create new accessibility tests.',
+    'type' => MENU_LOCAL_TASK,
+    'route_name' => 'accessibility.admin_import'
+  );
+
+  $items['accessibility-test/%accessibility_test/json'] = array(
+    'route_name' => 'accessibility_test.json',
+    'type' => MENU_CALLBACK
+  );
+
+  $items['accessibility-test/%accessibility_test'] = array(
+    'route_name' => 'accessibility_test.view',
+  );
+  
+  $items['accessibility-test/%accessibility_test/view'] = array(
+    'title' => 'View',
+    'route_name' => 'accessibility_test.view',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => -10
+  );
+  
+  $items['accessibility-test/%accessibility_test/edit'] = array(
+    'title' => 'Edit',
+    'type' => MENU_LOCAL_TASK,
+    'route_name' => 'accessibility_test.edit',
+  );
+  
+  $items['accessibility-test/%accessibility_test/delete'] = array(
+    'page callback' => 'drupal_get_form',
+    'route_name' => 'accessibility_test.delete',
+  );
+  
+   $items['accessibility-test/add'] = array(
+    'title' => 'Add accessibility test',
+    'page callback' => 'accessibility_test_add',
+    'access arguments' => array('administer accessibility tests'),
+    'file' => 'accessibility.pages.inc',
+  );
+
+  $items['js/accessibility/tests.json'] = array(
+    'title' => 'Accessibility tests',
+    'page callback' => 'accessibility_tests_json',
+    'access arguments' => array('view accessibility tests'),
+    'file' => 'accessibility.pages.inc',
+    'type' => MENU_CALLBACK
+  );
+  
+  return $items;
+}
+
+/**
+ * Implements hook_menu_local_tasks().
+ */
+function accessibility_menu_local_tasks(&$data, $router_item) {
+  if (isset($data['tabs'][0]['admin/config/accessibility/tests'])) {
+    $item = menu_get_item('accessibility-test/add');
+    if ($item['access']) {
+      $data['actions'][] = array(
+        '#theme' => 'menu_local_action',
+        '#link' => $item,
+      );
+    }
+  }
+}
+
+
+/**
+ * Saves an accessibility test entity.
+ */
+function accessibility_test_save(&$test) {
+  return entity_get_controller('accessibility_test')->save($test);
+}
+
+/**
+ * Implements hook_permission().
+ */
+function accessibility_permission() {
+    return array(
+    'administer accessibility tests' =>  array(
+      'title' => t('Administer accessibility tests'),
+      'restrict access' => TRUE,
+    ),
+    'view accessibility tests' =>  array(
+      'title' => t('View accessibility tests'),
+    )
+  );
+}
+
+/**
+ * Deletes an accessibility test.
+ */
+function accessibility_test_delete($test) {
+  accessibility_test_delete_multiple(array($test->test_id));
+}
+
+function accessibility_test_load($test_id) {
+  return entity_load('accessibility_test', $test_id);
+}
+
+function accessibility_test_access($op, $test) {
+  $access_controller = &drupal_static(__FUNCTION__);
+  if(!$access_controller) {
+    $access_controller = Drupal::entityManager()->getAccessController('accessibility_test');
+  }
+  return $access_controller->checkAccess($test, 'delete');
+}
+
+/**
+ * Delete multiple accessibility tests.
+ */
+function accessibility_test_delete_multiple(array $test_ids) {
+  $tests = accessibility_test_load_multiple($test_ids);
+  foreach ($tests as $test) {
+    module_invoke_all('accessibility_test_delete', $test);
+    field_attach_delete('accessibility_test', $test);
+    db_delete('accessibility_test')
+      ->condition('test_id', $test->test_id)
+      ->execute();
+  }
+}
+
+/**
+ * Returns the title of the accessibility test entity page.
+ */
+function accessibility_test_page_title($test) {
+  return $test->name;
+}
+
+/**
+ * View callback for accessibility test entities.
+ */
+function accessibility_test_page_view(EntityInterface $test, $view_mode = 'full') {
+  $values = $test->getValue();
+  drupal_set_title($values['name'][0]['value']);
+    
+  return entity_view($test, $view_mode);
+}
+
+/**
+ * JSON render callback for accessibility test entities.
+ */
+function accessibility_test_page_view_json($test, $view_mode = 'full') {
+  $test_view = entity_view($test);
+  $values = $test->getValue();
+  $json = array('content' => drupal_render($test_view),
+                'title'   => $values['name'][0]['value']
+                );
+  return new JsonResponse($json);
+}
+
+/**
+ * Implements hook_field_extra_fields().
+ */
+function accessibility_field_extra_fields() {
+  $return = array();
+  $extras = array(
+      'quail_name' => array(
+        'label' => t('Machine Name'),
+        'weight' => 0
+      ),
+      'severity' => array(
+        'label' => t('Severity level'),
+        'weight' => 0
+      ),
+      'status' => array(
+        'label' => t('Status'),
+        'weight' => 0
+      )
+    );
+  $return['accessibility_test']['accessibility_test'] = array(
+    'form' => $extras,
+    'display' => $extras,
+  );
+
+  return $return;
+}
+
+/**
+ * Implements hook_accessibility_tests().
+ */
+function accessibility_accessibility_tests($get_translation = FALSE) {
+  $suffix = ($get_translation) ? 'translated' : '';
+  if ($cache = cache()->get('accessibility_quail_tests_' . $suffix)) {
+    return $cache->data;
+  }
+  $library_path = libraries_get_path('quail');
+  $tests = (array)json_decode(file_get_contents($library_path . '/src/resources/tests.json'));
+  $test_translation = array('0'  => ACCESSIBILITY_TEST_SUGGESTION,
+                            '.5' => ACCESSIBILITY_TEST_MODERATE,
+                            '1'  => ACCESSIBILITY_TEST_SEVERE);
+  foreach ($tests as &$test) {
+    $test = (array)$test;
+    if (isset($test['testability'])) {
+      $test['severity'] = $test_translation[$test['testability']];
+    }
+  }
+  if ($get_translation) {
+    foreach ($tests as $testname => &$test) {
+      $translation = module_invoke_all('accessibility_get_test_translation', $testname);
+      $test['title'] = $translation['title'];
+      $test['description'] = $translation['body'];
+    }
+  }
+  cache()->set('accessibility_quail_tests_' . $suffix, $tests);
+  return $tests;
+}
+
+/**
+ * Implements hook_accessibility_get_test_translation().
+ */
+function accessibility_accessibility_get_test_translation($test) {
+  $directory = drupal_get_path('module', 'accessibility') . '/po/';
+  $translation = &drupal_static('accessiblity_test_translation', array());
+  $language = language_default();
+  if (!count($translation)) {
+    $file = new stdClass();
+    $file->uri = $directory . $language->id . '.po';
+    $poFileTranslation = new FileTranslation($directory);
+    $translation = $poFileTranslation->filesToArray($language->language, array($file));
+
+  }
+  return isset($translation[$test][$test]) ? $translation[$test][$test] : array('title' => $test, 'body' => '');
+}
+
+/**
+ * Implements hook_accessibility_guidelines().
+ */
+function accessibility_accessibility_guidelines($tests = FALSE) {
+  $guidelines = array('508' =>      array('title' => 'Section 508'),
+                      'wcag1a' =>   array('title' => 'WCAG 1.0 A'),
+                      'wcag1aa' =>  array('title' => 'WCAG 1.0 AA'),
+                      'wcag1aaa' => array('title' => 'WCAG 1.0 AAA'),
+                      'wcag2a' =>   array('title' => 'WCAG 2.0 A'),
+                      'wcag2aa' =>  array('title' => 'WCAG 2.0 AA'),
+                      'wcag2aaa' => array('title' => 'WCAG 2.0 AAA'),
+                      );
+  if(!$tests) {
+    return $guidelines;
+  }
+  if($cache = cache()->get('accessibility_guidelines')) {
+    return $cache->data;
+  }
+  $library_path = libraries_get_path('quail');
+  foreach($guidelines as $key => &$guideline) {
+    $guideline['tests'] = json_decode(file_get_contents($library_path .'/src/resources/guidelines/'. $key .'.json'));
+  }
+  cache()->set('accessibility_guidelines', $guidelines);
+  return $guidelines;
+}
+
+/**
+ *  Helper function to return all active accessibiliy test entities.
+ */
+function accessibility_get_active_tests($load = TRUE) {
+  $tests = db_select('accessibility_test', 't')
+                      ->fields('t', array('test_id'))
+                      ->condition('status', 1)
+                      ->execute()
+                      ->fetchAllKeyed(0, 0);
+  if ($load) {
+    foreach ($tests as &$test) {
+      $test = entity_load('accessibility_test', $test);
+    }
+  }
+  return $tests;
+                      
+}
+
+/**
+ * Implements hook_theme().
+ */
+function accessibility_theme() {
+  return array(
+    'accessibility_test' => array(
+      'render element' => 'elements',
+      'template' => 'accessibility_test',
+    ),
+  );
+}
+
+/**
+ * Preprocess accessibility test
+ */
+function template_preprocess_accessibility_test(&$variables) {
+  $variables['view_mode'] = $variables['elements']['#view_mode'];
+  $test = $variables['elements']['#accessibility_test'];
+  
+  $variables['content'] = array();
+  foreach (element_children($variables['elements']) as $key) {
+    $variables['content'][$key] = $variables['elements'][$key];
+  }
+  field_attach_preprocess($test, $variables['content'], $variables);
+
+  // Gather test classes.
+  $variables['attributes']['class'][] = 'accessibility-test';
+}
