@@ -1,0 +1,461 @@
+<?php
+
+/**
+ * @file
+ * Contains node_layout_builder.module.
+ */
+
+use Drupal\Core\Cache\RefinableCacheableDependencyInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Render\Markup;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Url;
+use Drupal\node\Entity\Node;
+use Drupal\node_layout_builder\Helpers\NodeLayoutBuilderHelper;
+use Drupal\node_layout_builder\Helpers\NodeLayoutFileHelper;
+use Drupal\node_layout_builder\NodeLayoutBuilderEditor;
+use Drupal\node_layout_builder\Services\NodeLayoutBuilderManager;
+
+/**
+ * Implements hook_help().
+ */
+function node_layout_builder_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the node_layout_builder module.
+    case 'help.page.node_layout_builder':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Builder Layout for node') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function node_layout_builder_theme() {
+  return [
+    'node_layout_builder_ui' => [
+      'variables' => [
+        'btns_import_export' => NULL,
+        'btn_add_section' => NULL,
+        'btn_save_data' => NULL,
+        'nid' => NULL,
+        'data' => NULL,
+        'btn_save_layout' => NULL,
+        'editable' => NULL,
+      ],
+    ],
+    'node_layout_builder_element' => [
+      'variables' => [
+        'btns_actions' => NULL,
+        'nid' => NULL,
+        'type' => NULL,
+        'id_element' => NULL,
+        'parent' => NULL,
+        'settings' => NULL,
+        'content_element' => NULL,
+        'attr' => NULL,
+        'styles' => NULL,
+        'editable' => NULL,
+        'class' => NULL,
+      ],
+    ],
+    'element_settings_form' => [
+      'render element' => 'form',
+    ],
+    'select_category_element' => [
+      'variables' => [
+        'links' => NULL,
+      ],
+    ],
+    'embed_video_youtube' => [
+      'variables' => [
+        'options' => [],
+      ],
+    ],
+    'audio_player' => [
+      'variables' => [
+        'url' => NULL,
+        'style' => NULL,
+      ],
+    ],
+    'btn_element' => [
+      'variables' => [
+        'type' => NULL,
+        'title' => NULL,
+        'link' => NULL,
+        'is_block_btn' => NULL,
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function node_layout_builder_form_node_type_edit_form_alter(&$form, FormStateInterface $form_state) {
+  $node_type = $form_state->getBuildInfo()['callback_object']->getEntity();
+  $config = \Drupal::config('node_layout_builder.content_type.' . $node_type->id());
+  $enabled = $config->get('enabled');
+
+  $form['node_layout_builder'] = [
+    '#type' => 'details',
+    '#title' => 'Node Layout Builder',
+    '#group' => 'additional_settings',
+  ];
+  $form['node_layout_builder']['enabled'] = [
+    '#type' => 'checkbox',
+    '#title' => 'Enable node layout builder',
+    '#default_value' => $enabled,
+    '#description' => t('Allow users to builder layout of this content type'),
+  ];
+  $form['actions']['submit']['#submit'][] = '_node_layout_builder_entity_type_form_submit';
+}
+
+/**
+ * Custom submit handler for form node type.
+ */
+function _node_layout_builder_entity_type_form_submit($form, FormStateInterface $form_state) {
+  $values = $form_state->getValues();
+  $node_type = $form_state->getBuildInfo()['callback_object']
+    ->getEntity();
+  $config = \Drupal::service('config.factory')
+    ->getEditable('node_layout_builder.content_type.' . $node_type->id());
+
+  if (isset($values['enabled'])) {
+    $config->set('enabled', $values['enabled']);
+    $config->save();
+  }
+}
+
+/**
+ * Implements hook_menu_local_tasks_alter().
+ */
+function node_layout_builder_menu_local_tasks_alter(&$data, $route_name, RefinableCacheableDependencyInterface &$cacheability) {
+  $cacheability->addCacheTags(['node_layout_builder:tabs']);
+  $cache = [
+    'contexts' => [
+      'user.permissions',
+      'route',
+      'url.query_args:layout-builder',
+    ],
+  ];
+
+  if ($route_name == 'entity.node.canonical') {
+    $nlb_manager = \Drupal::service('node_layout_builder.manager');
+    $node = $nlb_manager->getCurrentNode();
+    $entity_id = $node->id();
+
+    if ($nlb_manager->isBuilderEnabled()) {
+      $data['tabs'][0]['node.layout_builder'] = [
+        '#theme' => 'menu_local_task',
+        '#link' => [
+          'title' => t('Node Layout Builder'),
+          'url' => Url::fromRoute('entity.node.canonical', ['node' => $entity_id], ['query' => ['layout-builder' => '1']]),
+        ],
+        '#cache' => $cache,
+        '#active' => FALSE,
+      ];
+      $query = \Drupal::request()->query->all();
+      if (isset($query['layout-builder'])) {
+        $data['tabs'][0]['node.layout_builder']['#link'] = [
+          'title' => t('Exit Node Layout Builder'),
+          'url' => Url::fromRoute('entity.node.canonical', ['node' => $entity_id], ['absolute' => TRUE]),
+        ];
+        $data['tabs'][0]['node.layout_builder']['#active'] = TRUE;
+        $data['tabs'][0]['entity.node.canonical']['#active'] = FALSE;
+      }
+    }
+  }
+
+}
+
+/**
+ * Implements hook_entity_view_alter().
+ */
+function node_layout_builder_entity_view_alter(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display) {
+  $entity_type = $entity->getEntityType()
+    ->id();
+
+  if ($entity_type == 'node') {
+
+    // Get current node.
+    $nid = $build['#node']->id();
+
+    if (NodeLayoutBuilderManager::nodeLayoutBuilderIsEnabled($entity->getType())) {
+      $query = \Drupal::request()->query->all();
+      $mode_view = $display->getOriginalMode();
+
+      if ($mode_view == 'full') {
+
+        // Hide all fields.
+        $fields = NodeLayoutBuilderHelper::getFieldsEntity($build, $display);
+        if (isset($query['layout-builder'])) {
+
+          // Passe data to drupalSettings javascript object.
+          $data = NodeLayoutBuilderManager::loadDataElement($nid);
+          $build['#attached']['drupalSettings']['node_layout_builder'] = [
+            'nid' => $nid,
+            'data' => $data,
+          ];
+
+          NodeLayoutBuilderHelper::hideFields($build, $fields);
+          $nlbe = \Drupal::service('node_layout_builder.editor');
+          $nlbe->buildView($build);
+        }
+        else {
+          $data = NodeLayoutBuilderManager::loadEntityDataElementById($nid);
+          if (count($data) > 0) {
+            NodeLayoutBuilderHelper::hideFields($build, $fields);
+          }
+
+          $build[] = [
+            '#theme' => 'node_layout_builder_ui',
+            '#nid' => $nid,
+            '#attached' => [
+              'library' => [
+                'node_layout_builder/node-layout-builder-view',
+              ],
+            ],
+          ];
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ */
+function template_preprocess_node_layout_builder_ui(&$variables) {
+  if (\Drupal::moduleHandler()->moduleExists('bootstrap_library')) {
+    $variables['#attached']['library'][] = 'bootstrap_library/bootstrap';
+  }
+
+  $nid = $variables['nid'];
+
+  $query = \Drupal::request()->query->all();
+  if (isset($query['layout-builder'])) {
+    $editable = 1;
+    $data = NodeLayoutBuilderManager::loadDataElement($nid);
+  }
+  else {
+    $editable = 0;
+    $data = NodeLayoutBuilderManager::loadEntityDataElementById($nid);
+  }
+
+  $nlbe = \Drupal::service('node_layout_builder.editor');
+  $output = $nlbe->recursive($nid, $data, $editable);
+
+  // Link to add template.
+  $link_add_template = [
+    '#type' => 'link',
+    '#title' => Markup::create('choose a template'),
+    '#url' => Url::fromRoute(
+      'node_layout_builder.template.list',
+      [
+        'nid' => $nid,
+      ]
+    ),
+    '#attributes' => [
+      'class' => [
+        'use-ajax',
+        'btn',
+        'btn-info',
+      ],
+      'data-dialog-type' => 'modal',
+      'data-dialog-options' => NodeLayoutBuilderEditor::modalDialogOptions(),
+      'title' => t('choose a template'),
+    ],
+    '#attached' => [
+      'library' => 'core/drupal.dialog.ajax',
+    ],
+  ];
+  $variables['link_add_template'] = $link_add_template;
+
+  $variables['data'] = $output;
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ */
+function template_preprocess_node_layout_builder_element(&$variables) {
+  $type = $variables['type'];
+  $values = $variables['settings'];
+
+  switch ($type) {
+    case 'section':
+      break;
+
+    case 'column':
+      break;
+
+    case 'text':
+      $variables['content_element'] = isset($values['text']['value']) ? check_markup($values['text']['value'], $values['text']['format']) : '';
+      break;
+
+    case 'image':
+      // From URL.
+      if ($values['image_data']['from'] == 2) {
+        $link_img = $values['image_data']['link'];
+        if ($values['image_data']['responsive'] == 1) {
+          $width = '100%';
+        }
+
+        $image = '<img src="' . $link_img . '" width="' . $width . '" />';
+        $variables['content_element'] = $image;
+      }
+      // From disk.
+      // example https://gist.github.com/r-daneelolivaw/0edce8fe04de9fd40b1e.
+      if (isset($values['image_data']['image'][0])) {
+        $fid = $values['image_data']['image'][0];
+        $file = NodeLayoutFileHelper::loadFileByFid($fid);
+        if ($file) {
+          $uri = $file->getFileUri();
+
+          // The image.factory service will check if our image is valid.
+          $image = \Drupal::service('image.factory')->get($file->getFileUri());
+          if ($image->isValid()) {
+            $width = $image->getWidth();
+            $height = $image->getHeight();
+          }
+          else {
+            $width = $height = NULL;
+          }
+
+          if (!empty($values['image_data']['height'])) {
+            $height = $values['image_data']['height'];
+          }
+
+          // Switch theme image by style image value.
+          if (!empty($values['image_data']['style'])) {
+            $theme_img = 'image_style';
+          }
+          else {
+            $theme_img = 'image';
+          }
+
+          if ($values['image_data']['responsive'] == 1) {
+            $width = '100%';
+          }
+
+          $image_theme = [
+            '#theme' => $theme_img,
+            '#style_name' => isset($values['image_data']['style']) ? $values['image_data']['style'] : NULL,
+            '#uri' => $uri,
+            '#width' => $width,
+            '#height' => $height,
+            '#title' => $values['image_data']['title'] ?? '',
+            '#alt' => $values['image_data']['alt'] ?? '',
+          ];
+
+          // Add the file entity to the cache dependencies.
+          // This will clear our cache when this entity updates.
+          $renderer = \Drupal::service('renderer');
+          $renderer->addCacheableDependency($image_theme, $file);
+
+          $variables['content_element'] = render($image_theme);
+        }
+      }
+      break;
+
+    case 'video':
+      $url = $values['video_youtube']['url'];
+      $options = [
+        'width' => $values['video_youtube']['width'],
+        'height' => $values['video_youtube']['height'],
+        'autoplay' => $values['video_youtube']['autoplay'],
+        'responsive' => $values['video_youtube']['responsive'],
+      ];
+      $video = NodeLayoutBuilderHelper::embedVideoYoutube($url, $options);
+      $variables['content_element'] = render($video);
+      break;
+
+    case 'audio':
+      $url = $values['audio']['url'];
+      if ($values['audio']['responsive'] == 1) {
+        $style = 'width:100%';
+      }
+      else {
+        $width = $values['audio']['width'];
+        $style = 'width:' . $width . 'px';
+      }
+
+      $audio_player = [
+        '#theme' => 'audio_player',
+        '#url' => $url,
+        '#style' => $style,
+      ];
+
+      $variables['content_element'] = render($audio_player);
+      break;
+
+    case 'block':
+      if (isset($values['block_id'])) {
+        $variables['content_element'] = NodeLayoutBuilderHelper::loadBlockById($values['block_id']);
+      }
+      break;
+
+    case 'node':
+      $nid = !empty($values['node']) ? $values['node'] : NULL;
+      $view_mode = !empty($values['view_mode']) ? $values['view_mode'] : 'teaser';
+      $node_output = NodeLayoutBuilderHelper::loadNodeView($nid, $view_mode);
+      $variables['content_element'] = render($node_output);
+      break;
+
+    case 'field':
+      $nid = $variables['nid'];
+      $node = Node::load($nid);
+      $field_name = $values['entity_field'];
+      $field_view = $node->$field_name
+        ->view($values['view_mode']);
+      $variables['content_element'] = render($field_view);
+      break;
+
+    case 'btn':
+      $type = $values['button']['type'];
+      $title = $values['button']['title'];
+      $link = $values['button']['link'];
+      $is_block_btn = $values['button']['is_block_btn'];
+      $button = [
+        '#theme' => 'btn_element',
+        '#type' => $type,
+        '#title' => $title,
+        '#link' => $link,
+        '#is_block_btn' => $is_block_btn,
+      ];
+      $variables['content_element'] = $button;
+      break;
+
+    case 'map':
+
+      $options = [
+        'zoom' => $values['map_gps_zoom'],
+        'lat' => $values['map_gps_latitude'],
+        'lon' => $values['map_gps_longitude'],
+      ];
+
+      $map = [
+        '#type' => 'html_tag',
+        '#tag' => 'div',
+        '#attributes' => [
+          'id' => 'nlb-map-view-' . $variables['id_element'],
+          'class' => ['nlb-map-view'],
+          'data-options' => json_encode($options),
+        ],
+        '#attached' => [
+          'library' => [
+            'node_layout_builder/nlb-leaflet-view',
+          ],
+        ],
+      ];
+
+      $variables['content_element'] = render($map);
+      break;
+  }
+}
