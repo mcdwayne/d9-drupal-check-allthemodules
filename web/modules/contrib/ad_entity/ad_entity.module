@@ -1,0 +1,513 @@
+<?php
+
+/**
+ * @file
+ * Advertising Entity module file.
+ */
+
+use Drupal\Core\Block\BlockPluginInterface;
+use Drupal\Core\Cache\Cache;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\FieldableEntityInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Field\FieldItemListInterface;
+use Drupal\Core\Template\Attribute;
+use Drupal\Component\Serialization\Json;
+use Drupal\ad_entity\Plugin\AdContextManager;
+use Drupal\ad_entity\Render\Markup;
+
+/**
+ * Implements hook_theme().
+ */
+function ad_entity_theme($existing, $type, $theme, $path) {
+  return [
+    'ad_display' => [
+      'variables' => ['ad_display' => NULL, 'variants' => []],
+    ],
+    'ad_display_iframe' => [
+      'variables' => ['ad_display' => NULL, 'width' => 0, 'height' => 0],
+      'file' => 'ad_entity.theme.inc',
+    ],
+    'ad_entity' => [
+      'variables' => ['ad_entity' => NULL, 'variant' => '["any"]'],
+      'file' => 'ad_entity.theme.inc',
+    ],
+    'ad_entity_context' => [
+      'variables' => [
+        'item' => NULL,
+        'definition' => [],
+        'plugin' => NULL,
+      ],
+      'file' => 'ad_entity.theme.inc',
+    ],
+  ];
+}
+
+/**
+ * Implements hook_library_info_build().
+ */
+function ad_entity_library_info_build() {
+  $libraries = [];
+
+  // Add the viewready.js library, in case view handlers exist,
+  // which support execution before document is ready.
+  $dependencies = [];
+  /** @var \Drupal\ad_entity\Plugin\AdViewManager $view_manager */
+  $view_manager = \Drupal::service('ad_entity.view_manager');
+  /** @var \Drupal\ad_entity\AdEntityUsage $usage */
+  $usage = \Drupal::service('ad_entity.usage');
+  $used_view_plugins = $usage->getCurrentlyUsedAdViewPlugins();
+  foreach ($view_manager->getDefinitions() as $id => $definition) {
+    if (!empty($used_view_plugins[$id]) && !empty($definition['library']) && isset($definition['requiresDomready']) && ($definition['requiresDomready'] === FALSE)) {
+      $dependencies[] = $definition['library'];
+    }
+  }
+  if (!empty($dependencies)) {
+    // Make sure the view JS implementation is included.
+    $dependencies[] = 'ad_entity/view';
+
+    $use_context_js = TRUE;
+    if ($config = \Drupal::config('ad_entity.settings')) {
+      // Check whether frontend appliance has been forced to be turned off.
+      $use_context_js = !((bool) $config->get('tweaks.force_backend_appliance'));
+    }
+    // Add context handlers, if available.
+    if ($use_context_js) {
+      /** @var \Drupal\ad_entity\Plugin\AdContextManager $context_manager */
+      $context_manager = \Drupal::service('ad_entity.context_manager');
+      foreach ($context_manager->getDefinitions() as $definition) {
+        if (!empty($definition['library'])) {
+          $dependencies[] = $definition['library'];
+        }
+      }
+    }
+
+    $libraries['viewready'] = [
+      'dependencies' => $dependencies,
+      'js' => ['js/viewready.js' => []],
+    ];
+  }
+
+  return $libraries;
+}
+
+/**
+ * Implements hook_library_info_alter().
+ */
+function ad_entity_library_info_alter(&$libraries, $extension) {
+  if (!('ad_entity' === $extension)) {
+    return;
+  }
+  $module_handler = \Drupal::moduleHandler();
+  if (!empty($libraries['view'])) {
+    if ($module_handler->moduleExists('theme_breakpoints_js')) {
+      $libraries['view']['dependencies'][] = 'theme_breakpoints_js/breakpointsLoader';
+    }
+  }
+  if ($config = \Drupal::config('ad_entity.settings')) {
+    $personalization = $config->get('personalization');
+    if (empty($personalization['enabled'])) {
+      // In case personalization is not enabled at all,
+      // there's no need to include consent.js.
+      unset($libraries['base']['js']['js/consent.js']);
+    }
+  }
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function ad_entity_page_attachments(array &$attachments) {
+  // Attach JS settings to HTML head.
+  // The settings are required to be in HTML head,
+  // because some ad integrations must run initializations
+  // inside HTML head already. We cannot foresee if or when
+  // Advertising entities are to be displayed, either directly
+  // on the page or via attaching behaviors like AJAX. Thus,
+  // we need to always put these settings into the head.
+  _ad_entity_attach_js_settings_head($attachments);
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK().
+ */
+function ad_entity_theme_suggestions_ad_display($variables) {
+  $suggestions = [];
+  if (!empty($variables['ad_display'])) {
+    $suggestions[] = 'ad_display__' . $variables['ad_display']->id();
+  }
+  return $suggestions;
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK().
+ */
+function ad_entity_theme_suggestions_ad_entity($variables) {
+  $suggestions = [];
+  if (!empty($variables['ad_entity'])) {
+    $suggestions[] = 'ad_entity__' . $variables['ad_entity']->id();
+  }
+  return $suggestions;
+}
+
+/**
+ * Implements hook_entity_prepare_view().
+ */
+function ad_entity_entity_prepare_view($entity_type_id, array $entities, array $displays, $view_mode) {
+  $type = $entity_type_id;
+  $to_reset = &drupal_static(__FUNCTION__, [$type => []]);
+  $entities_for_reset = [];
+  /** @var \Drupal\Core\Entity\EntityInterface $entity */
+  foreach ($entities as $entity) {
+    $bundle = $entity->bundle();
+    // Check whether the entity being shown defines its own context data.
+    // If so, reset the context data for this entity.
+    if (!isset($to_reset[$type][$bundle][$view_mode])) {
+      $to_reset[$type][$bundle][$view_mode] = FALSE;
+      if ($entity instanceof FieldableEntityInterface) {
+        /** @var \Drupal\Core\Field\FieldDefinitionInterface $definition */
+        foreach ($entity->getFieldDefinitions() as $definition) {
+          if ($definition->getType() == 'ad_entity_context') {
+            $field_name = $definition->getName();
+            $display = $displays[$bundle];
+            if ($display->getComponent($field_name)) {
+              $to_reset[$type][$bundle][$view_mode] = TRUE;
+              break;
+            }
+          }
+        }
+      }
+    }
+    if (!empty($to_reset[$type][$bundle][$view_mode])) {
+      $entities_for_reset[$entity->id()] = $entity;
+    }
+  }
+  if (!empty($entities_for_reset)) {
+    /** @var \Drupal\ad_entity\Plugin\AdContextManager $context_manager */
+    $context_manager = \Drupal::service('ad_entity.context_manager');
+    // Due to the build process, multiple resets at once are not possible.
+    $entity = end($entities_for_reset);
+    if (count($entities_for_reset) === 1) {
+      $context_manager->resetContextDataForEntity($entity);
+    }
+    else {
+      // In case of multiple entities to view, a fallback needs to be provided.
+      // This fallback can only include the information by the route entity.
+      // @todo Find a proper way for list items defining their own context data.
+      // @see https://www.drupal.org/project/ad_entity/issues/2947877
+      $route_match = NULL;
+      try {
+        $route_match = \Drupal::routeMatch();
+      }
+      catch (\Exception $e) {
+      }
+      if (!empty($route_match)) {
+        $context_manager->resetContextDataForRoute($route_match);
+      }
+    }
+    // Mark this entity so that the previous context data can be restored.
+    $entity->__ad_entity_needs_previous_context = TRUE;
+  }
+}
+
+/**
+ * Implements hook_entity_view().
+ */
+function ad_entity_entity_view(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display, $view_mode) {
+  if (!empty($entity->__ad_entity_needs_previous_context)) {
+    // Context data needs to be reset to the previous state.
+    $build['#post_render'][] = '_ad_entity_reset_to_previous_context_data';
+    unset($entity->__ad_entity_needs_previous_context);
+  }
+}
+
+/**
+ * Implements hook_block_build_BASE_BLOCK_ID_alter() for ad_display blocks.
+ */
+function ad_entity_block_build_ad_display_alter(array &$build, BlockPluginInterface $block) {
+  // @see AdEntityViewBuilder::view() why no cache keys are being used.
+  unset($build['#cache']['keys']);
+}
+
+/**
+ * Implements hook_ad_context_include().
+ */
+function ad_entity_ad_context_include(FieldItemListInterface $items, array $settings) {
+  // When enabled, include "bundle: label" for targeting.
+  if (!empty($settings['targeting']['bundle_label'])) {
+    $bundle = $items->getEntity()->bundle();
+    $label = $items->getEntity()->label();
+    $item_value['context'] = [
+      'context_plugin_id' => 'targeting',
+      'apply_on' => [],
+      'context_settings' => [
+        'targeting' => ['targeting' => [$bundle => $label]],
+      ],
+    ];
+    $items->appendItem($item_value);
+  }
+}
+
+/**
+ * Implements hook_ad_context_data_reset().
+ */
+function ad_entity_ad_context_data_reset(AdContextManager $context_manager, EntityInterface $entity) {
+  $type = $entity->getEntityTypeId();
+  $id = $entity->id();
+  $cached_reset_data = &drupal_static(__FUNCTION__, []);
+  if (isset($cached_reset_data[$type][$id])) {
+    $reset = $cached_reset_data[$type][$id];
+    $context_manager->setInvolvedEntities($reset['involved']);
+    $context_manager->setContextData($reset['context']);
+  }
+  else {
+    $reset = ['involved' => [], 'context' => []];
+    if ($config = \Drupal::config('ad_entity.settings')) {
+      // When given, include site wide context data.
+      $site_wide_context = $config->get('site_wide_context');
+      if (!empty($site_wide_context)) {
+        foreach ($site_wide_context as $data) {
+          $context_manager->addContextData($data['plugin_id'], $data['settings'], $data['apply_on']);
+        }
+      }
+
+      $behavior = $config->get('behavior_on_context_reset');
+      // When enabled, include elementary entity information for targeting.
+      if (!empty($behavior['include_entity_info'])) {
+        $info = [
+          'entitytype' => $type . '/' . $entity->bundle(),
+          'entitylabel' => $entity->label(),
+          'entityuuid' => $entity->uuid(),
+        ];
+        $context_manager
+          ->addContextData('targeting', ['targeting' => $info]);
+        $context_manager->addInvolvedEntity($entity);
+      }
+      // When enabled, collect context data from the context fields being
+      // enabled in the default view mode of this entity.
+      if (!empty($behavior['collect_default_data'])) {
+        if ($entity instanceof FieldableEntityInterface) {
+          $context_manager->collectContextDataFrom($entity);
+        }
+      }
+    }
+    $reset['involved'] = $context_manager->getInvolvedEntities();
+    $reset['context'] = $context_manager->getContextData();
+    $cached_reset_data[$type][$id] = $reset;
+  }
+}
+
+/**
+ * Post render callback to reset the collected context data to a previous state.
+ *
+ * @param string $markup
+ *   The markup result of the rendering.
+ *
+ * @return string
+ *   The markup result.
+ */
+function _ad_entity_reset_to_previous_context_data($markup) {
+  /** @var \Drupal\ad_entity\Plugin\AdContextManager $context_manager */
+  $context_manager = \Drupal::service('ad_entity.context_manager');
+  $context_manager->resetToPreviousContextData();
+  return $markup;
+}
+
+/**
+ * Returns the information of ad integration modules.
+ *
+ * @return array
+ *   The module information, keyed my module name.
+ */
+function _ad_entity_get_module_info() {
+  $module_info = [];
+  $module_handler = \Drupal::moduleHandler();
+  $hook = 'ad_entity_module_info';
+  foreach ($module_handler->getImplementations($hook) as $module) {
+    $module_info[$module] = $module_handler->invoke($module, $hook);
+  }
+  return $module_info;
+}
+
+/**
+ * Get the JS settings regards viewing Advertising entities.
+ *
+ * @return array
+ *   The JS settings array.
+ */
+function _ad_entity_get_js_settings() {
+  $settings = &drupal_static(__FUNCTION__, []);
+  if (!empty($settings)) {
+    return $settings;
+  }
+  $cid = 'ad_entity.js_settings';
+  $cache_tags = ['config:ad_entity.settings'];
+  $cache = \Drupal::cache('default');
+  if ($cached = $cache->get($cid)) {
+    $settings += $cached->data;
+    if (!empty($settings)) {
+      return $settings;
+    }
+  }
+  $settings['responsive'] = FALSE;
+  $settings['inline'] = FALSE;
+  if ($config = \Drupal::config('ad_entity.settings')) {
+    $settings['responsive'] = $config->get('enable_responsive_behavior') ? TRUE : FALSE;
+    $settings['inline'] = $config->get('tweaks.use_inline_js') ? TRUE : FALSE;
+
+    // Include consent awareness settings regards personalization.
+    $personalization = $config->get('personalization');
+    $settings['p13n'] = !empty($personalization['enabled']);
+    if ($settings['p13n'] && !empty($personalization['consent_awareness'])) {
+      $consent_awareness = $personalization['consent_awareness'];
+      $method = !empty($consent_awareness['method']) ? $consent_awareness['method'] : 'opt_in';
+      if ('oil' === $method) {
+        // Use personalized ads when opt-in cookie is set via OIL.js.
+        $settings['consent'] = [
+          'method' => 'opt_in',
+          'cookie' => [
+            'name' => 'oil_data',
+            'operator' => 'e',
+            'value' => '',
+          ],
+        ];
+      }
+      elseif (('eu_cookie_compliance' === $method)
+        && (\Drupal::moduleHandler()->moduleExists('eu_cookie_compliance'))
+        && ($eu_cc_config = \Drupal::config('eu_cookie_compliance.settings'))) {
+
+        // Adapt the configured method and cookie
+        // from the eu_cookie_compliance module.
+        $supported_methods = ['opt_in', 'opt_out'];
+        $settings['consent'] = [
+          'method' => in_array($eu_cc_config->get('method'), $supported_methods) ? $eu_cc_config->get('method') : 'opt_in',
+          'cookie' => [
+            'name' => !empty($eu_cc_config->get('cookie_name')) ? $eu_cc_config->get('cookie_name') : 'cookie-agreed',
+            'operator' => '==',
+            'value' => ['1', '2'],
+          ],
+        ];
+        if ('opt_out' === $settings['consent']['method']) {
+          $settings['consent']['cookie']['value'] = ['0'];
+        }
+      }
+      else {
+        $settings['consent'] = ['method' => $method];
+        if ('disabled' !== $method) {
+          $settings['consent'] += [
+            'cookie' => [
+              'name' => !empty($consent_awareness['cookie']['name']) ? $consent_awareness['cookie']['name'] : 'cookie-agreed',
+              'operator' => !empty($consent_awareness['cookie']['operator']) ? $consent_awareness['cookie']['operator'] : '==',
+              'value' => !empty($consent_awareness['cookie']['value']) ? json_decode($consent_awareness['cookie']['value'], TRUE) : '',
+            ],
+          ];
+        }
+      }
+    }
+  }
+  \Drupal::moduleHandler()->alter('ad_entity_js_settings', $settings, $cache_tags);
+  $cache->set($cid, $settings, Cache::PERMANENT, $cache_tags);
+  return $settings;
+}
+
+/**
+ * Get a render array for the ad_entity JS settings tag.
+ *
+ * @return array
+ *   The render array for the ad_entity JS settings tag.
+ */
+function _ad_entity_js_settings_tag() {
+  $settings = _ad_entity_get_js_settings();
+  $attributes = [
+    'id' => 'ad-entity-settings',
+    'type' => 'application/json',
+  ];
+  return [
+    '#type' => 'html_tag',
+    '#tag' => 'script',
+    '#value' => Markup::create(Json::encode($settings)),
+    '#attributes' => new Attribute($attributes),
+  ];
+}
+
+/**
+ * Attaches JS settings for ad_entity into the HTML head once.
+ *
+ * This module needs these settings as soon as possible,
+ * thus they are being attached into the HTML head.
+ * We are not using drupalSettings here, as this would mean
+ * all drupalSettings libraries would be placed into the
+ * HTML head then. This is usually not desired, thus we
+ * make this exceptional attaching at this place.
+ *
+ * @param array &$variables
+ *   The preprocess variables.
+ */
+function _ad_entity_attach_js_settings_head(array &$variables) {
+  $attached = &drupal_static(__FUNCTION__, FALSE);
+  if ($attached) {
+    // The settings already have been attached before.
+    return;
+  }
+  $attached = TRUE;
+
+  $variables['#attached']['html_head'][] = [
+    _ad_entity_js_settings_tag() + [
+      '#weight' => -80,
+    ],
+    'ad_entity_settings',
+  ];
+}
+
+/**
+ * Returns a render array for embedding the ad_entity/base library inline.
+ *
+ * This might be useful for elements like iFrames, which
+ * need to include the base functionality for ad_entity Javascript.
+ *
+ * @return array
+ *   The render array for inline JS regards the ad_entity/base library.
+ */
+function _ad_entity_js_base_inline() {
+  /** @var \Drupal\Core\Asset\LibraryDiscoveryInterface $library_discovery */
+  $library_discovery = \Drupal::service('library.discovery');
+  $script = '';
+  if ($base_library = $library_discovery->getLibraryByName('ad_entity', 'base')) {
+    if (!empty($base_library['js'])) {
+      foreach ($base_library['js'] as $js_file) {
+        if (!empty($js_file['data']) && file_exists($js_file['data'])) {
+          $script .= file_get_contents($js_file['data']) . "\n";
+        }
+      }
+    }
+  }
+  $script = '<script type="text/javascript">' . str_replace("'", '"', $script) . '</script>';
+  return [
+    'settings' => _ad_entity_js_settings_tag(),
+    'script' => ['#markup' => Markup::create($script)],
+  ];
+}
+
+/**
+ * Attaches a preload tag for the external googletag library.
+ *
+ * @param array &$attachments
+ *   The page attachments array.
+ */
+function _ad_entity_attach_gpt_preload(array &$attachments) {
+  $attached = &drupal_static(__FUNCTION__, FALSE);
+  if (!$attached) {
+    $attached = TRUE;
+    $attachments['#attached']['html_head'][] = [
+      [
+        '#attributes' => [
+          'rel' => 'preload',
+          'as' => 'script',
+          'href' => '//www.googletagservices.com/tag/js/gpt.js',
+        ],
+        '#tag' => 'link',
+      ],
+      'preload_gpt',
+    ];
+  }
+}

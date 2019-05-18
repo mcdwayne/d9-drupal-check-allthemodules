@@ -1,0 +1,250 @@
+<?php
+
+/**
+ * @file
+ * Advertising Entity install file.
+ */
+
+use Drupal\ad_entity\Plugin\ad_entity\AdContext\TargetingContext;
+use Drupal\ad_entity\TargetingCollection;
+
+/**
+ * Enable new settings for the behavior on context data reset.
+ */
+function ad_entity_update_8001() {
+  if ($config = \Drupal::configFactory()->getEditable('ad_entity.settings')) {
+    $behavior_reset = [
+      'include_entity_info' => TRUE,
+      'collect_default_data' => TRUE,
+    ];
+    $config->set('behavior_on_context_reset', $behavior_reset);
+    $config->save();
+  }
+}
+
+/**
+ * Re-organizing block settings. Synchronize your config after this update.
+ */
+function ad_entity_update_8002(&$sandbox) {
+  $storage = \Drupal::entityTypeManager()->getStorage('block');
+  if (!isset($sandbox['total'])) {
+    $sandbox['total'] = $storage->getQuery()->count()->execute();
+    $sandbox['current'] = 0;
+    if (empty($sandbox['total'])) {
+      $sandbox['#finished'] = 1;
+      return;
+    }
+  }
+
+  $query = $storage->getQuery();
+  $query->range($sandbox['current'], 20);
+  $block_ids = $query->execute();
+  if (!empty($block_ids)) {
+    /** @var \Drupal\block\Entity\Block $block */
+    foreach ($storage->loadMultiple($block_ids) as $block) {
+      if (($block->get('plugin') == 'ad_entity_block') && ($settings = $block->get('settings'))) {
+        if (($theme_name = $block->get('theme')) && !empty($settings['variants'])) {
+          $theme_variants = $settings['variants'];
+          unset($settings['variants']);
+          $settings['variants'][$theme_name] = $theme_variants;
+        }
+        $settings['fallback']['use_base_theme'] = FALSE;
+        $settings['fallback']['use_settings_from'] = '';
+        $block->set('settings', $settings);
+        $storage->save($block);
+      }
+      $sandbox['current']++;
+    }
+  }
+
+  $sandbox['#finished'] = ($sandbox['current'] / $sandbox['total']);
+}
+
+/**
+ * Convert AdBlocks to AdDisplay configs. Export your config after this update.
+ */
+function ad_entity_update_8003(&$sandbox) {
+  drupal_flush_all_caches();
+
+  // Let the role give adequate permissions regards Display configurations.
+  $role_storage = \Drupal::entityTypeManager()->getStorage('user_role');
+  $ad_entity_permissions = [
+    'view ad_entity' => 'view ad_display',
+    'administer ad_entity' => 'administer ad_display',
+    'create ad_entity' => 'create ad_display',
+    'delete ad_entity' => 'delete ad_display',
+    'update ad_entity' => 'update ad_display',
+    'access ad_entity overview' => 'access ad_display overview',
+  ];
+  /** @var \Drupal\user\RoleInterface $role */
+  foreach ($role_storage->loadMultiple() as $role) {
+    $permissions = $role->get('permissions');
+    foreach ($permissions as $permission) {
+      if (!empty($ad_entity_permissions[$permission])) {
+        $role->grantPermission($ad_entity_permissions[$permission]);
+      }
+    }
+    $role_storage->save($role);
+  }
+
+  $block_storage = \Drupal::entityTypeManager()->getStorage('block');
+  $ad_display_storage = \Drupal::entityTypeManager()->getStorage('ad_display');
+  if (!isset($sandbox['total'])) {
+    $sandbox['total'] = $block_storage->getQuery()->count()->execute();
+    $sandbox['current'] = 0;
+    if (empty($sandbox['total'])) {
+      $sandbox['#finished'] = 1;
+      return;
+    }
+  }
+
+  $query = $block_storage->getQuery();
+  $query->range($sandbox['current'], 20);
+  $block_ids = $query->execute();
+  if (!empty($block_ids)) {
+    /** @var \Drupal\block\Entity\Block $block */
+    foreach ($block_storage->loadMultiple($block_ids) as $block) {
+      if ($block->get('plugin') == 'ad_entity_block') {
+        $settings = $block->get('settings');
+        $id = $block->get('id');
+        $id = str_replace('advertisingblock_', '', $id);
+        $id = str_replace('block', 'display', $id);
+
+        $label = $settings['label'];
+        // Create a display config for the given block config.
+        /** @var \Drupal\ad_entity\Entity\AdDisplayInterface $ad_display */
+        $ad_display = $ad_display_storage->create(['id' => $id, 'label' => $label]);
+        $display_dependencies = $block->get('dependencies');
+        unset($display_dependencies['theme']);
+        unset($display_dependencies['module']);
+        $display_dependencies['module'][] = 'ad_entity';
+        $ad_display->set('dependencies', $display_dependencies);
+        $ad_display->set('status', $block->get('status'));
+        $ad_display->set('langcode', $block->get('langcode'));
+        $ad_display->set('variants', $settings['variants']);
+        $ad_display->set('fallback', $settings['fallback']);
+        $ad_display_storage->save($ad_display);
+
+        $block->set('plugin', 'ad_display:' . $id);
+        $dependencies = $block->get('dependencies');
+        $dependencies['config'] = ['ad_entity.display.' . $id];
+        $block->set('dependencies', $dependencies);
+
+        unset($settings['variants']);
+        unset($settings['fallback']);
+        $settings['id'] = 'ad_display:' . $id;
+        $settings['provider'] = 'ad_entity';
+        $block->set('settings', $settings);
+
+        $block_storage->save($block);
+
+        // For whatever reason, the entity needs to be updated again
+        // to ensure the dependency is being correctly set.
+        \Drupal::service('plugin.cache_clearer')->clearCachedDefinitions();
+        $block = $block_storage->loadUnchanged($block->id());
+        $block_storage->save($block);
+      }
+      $sandbox['current']++;
+    }
+  }
+
+  $sandbox['#finished'] = ($sandbox['current'] / $sandbox['total']);
+}
+
+/**
+ * Convert default targeting to context. Export your config after this update.
+ */
+function ad_entity_update_8004(&$sandbox) {
+  $ad_storage = \Drupal::entityTypeManager()->getStorage('ad_entity');
+  if (!isset($sandbox['total'])) {
+    $sandbox['total'] = $ad_storage->getQuery()->count()->execute();
+    $sandbox['current'] = 0;
+    if (empty($sandbox['total'])) {
+      $sandbox['#finished'] = 1;
+      return;
+    }
+  }
+  $query = $ad_storage->getQuery();
+  $query->range($sandbox['current'], 20);
+  $ids = $query->execute();
+  /** @var \Drupal\ad_entity\Entity\AdEntityInterface $ad_entity */
+  foreach ($ad_storage->loadMultiple($ids) as $ad_entity) {
+    $sandbox['current']++;
+
+    foreach ($ad_entity->getThirdPartyProviders() as $provider) {
+      $settings = $ad_entity->getThirdPartySettings($provider);
+      if (!empty($settings['targeting'])) {
+        $targeting = new TargetingCollection($settings['targeting']);
+        if ($targeting->isEmpty()) {
+          $settings['targeting'] = NULL;
+        }
+        else {
+          $context = ['targeting' => $targeting->toArray()];
+          $settings['targeting'] = TargetingContext::getJsonEncode($context);
+        }
+        $ad_entity->setThirdPartySetting($provider, 'targeting', $settings['targeting']);
+        $ad_storage->save($ad_entity);
+      }
+    }
+  }
+  $sandbox['#finished'] = ($sandbox['current'] / $sandbox['total']);
+}
+
+/**
+ * Add site wide context property to global settings.
+ */
+function ad_entity_update_8005() {
+  if ($config = \Drupal::configFactory()->getEditable('ad_entity.settings')) {
+    $context_settings = $config->get('site_wide_context');
+    if (empty($context_settings)) {
+      $config->set('site_wide_context', []);
+      $config->save();
+    }
+  }
+}
+
+/**
+ * Convert targeting JSON to arrays. Export your config after this update.
+ */
+function ad_entity_update_8006(&$sandbox) {
+  $ad_storage = \Drupal::entityTypeManager()->getStorage('ad_entity');
+  if (!isset($sandbox['total'])) {
+    drupal_flush_all_caches();
+    $sandbox['total'] = $ad_storage->getQuery()->count()->execute();
+    $sandbox['current'] = 0;
+    if (empty($sandbox['total'])) {
+      $sandbox['#finished'] = 1;
+      return;
+    }
+  }
+  $query = $ad_storage->getQuery();
+  $query->range($sandbox['current'], 20);
+  $ids = $query->execute();
+  /** @var \Drupal\ad_entity\Entity\AdEntityInterface $ad_entity */
+  foreach ($ad_storage->loadMultiple($ids) as $ad_entity) {
+    $sandbox['current']++;
+
+    foreach ($ad_entity->getThirdPartyProviders() as $provider) {
+      $settings = $ad_entity->getThirdPartySettings($provider);
+      if (!empty($settings['targeting'])) {
+        if (is_string($settings['targeting'])) {
+          $settings['targeting'] = TargetingContext::getJsonDecode($settings['targeting']);
+        }
+        if (!isset($settings['targeting']['targeting'])) {
+          $settings['targeting']['targeting'] = $settings['targeting'];
+        }
+        $targeting = new TargetingCollection($settings['targeting']['targeting']);
+        if ($targeting->isEmpty()) {
+          $settings['targeting'] = NULL;
+        }
+        else {
+          $context = ['targeting' => $targeting->toArray()];
+          $settings['targeting'] = $context;
+        }
+        $ad_entity->setThirdPartySetting($provider, 'targeting', $settings['targeting']);
+        $ad_storage->save($ad_entity);
+      }
+    }
+  }
+  $sandbox['#finished'] = ($sandbox['current'] / $sandbox['total']);
+}
