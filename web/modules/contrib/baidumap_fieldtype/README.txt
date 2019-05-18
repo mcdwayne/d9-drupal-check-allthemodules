@@ -1,0 +1,1 @@
+"Baidu Map Field Type" 
