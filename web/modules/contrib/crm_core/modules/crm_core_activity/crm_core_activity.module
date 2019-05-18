@@ -1,0 +1,81 @@
+<?php
+
+/**
+ * @file
+ * Provides an entity for recording a contact's activities.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+
+/**
+ * Implements hook_entity_predelete() for CRM Core Contact entities.
+ */
+function crm_core_activity_entity_predelete(EntityInterface $entity) {
+  switch ($entity->getEntityTypeId()) {
+    case 'crm_core_individual':
+      crm_core_activity_pre_delete_checker($entity);
+      break;
+
+    case 'crm_core_organization':
+      crm_core_activity_pre_delete_checker($entity);
+      break;
+  }
+}
+
+/**
+ * Looks for activities to be removed.
+ *
+ * Separate function for running for both Individual and Organization.
+ * If current entity to be deleted was only participant in Activity, that
+ * activity will be removed.
+ *
+ * @param Drupal\Core\Entity\EntityInterface $entity
+ *   The entity ID to be looked for from participants.
+ *
+ * @throws \Drupal\Component\Plugin\Exception\InvalidPluginDefinitionException
+ * @throws \Drupal\Core\Entity\EntityStorageException
+ */
+function crm_core_activity_pre_delete_checker(EntityInterface $entity) {
+  $activities_to_remove = [];
+  $entity_id = $entity->id();
+  $entity_type = $entity->getEntityTypeId();
+  $activity_storage = \Drupal::entityTypeManager()->getStorage('crm_core_activity');
+
+  $query = \Drupal::entityQuery('crm_core_activity');
+  $activity_ids = $query
+    ->condition('activity_participants.target_id', $entity_id)
+    ->condition('activity_participants.target_type', $entity_type)
+    ->execute();
+  if (empty($activity_ids)) {
+    // No related Activities.
+    return;
+  }
+  // Load fully populated Activity objects to analyze/update.
+  $crm_core_activities = $activity_storage->loadMultiple($activity_ids);
+
+  foreach ($crm_core_activities as $crm_core_activity) {
+    /** @var \Drupal\crm_core_activity\Entity\Activity $crm_core_activity */
+    $participants = $crm_core_activity->get('activity_participants')->getValue();
+    // Remove Individual from participants array.
+    $participants = array_diff(array_column($participants, 'target_id'), [$entity_id]);
+    if (empty($participants)) {
+      // Last main participant was deleted, so we should kill entire activity.
+      $activities_to_remove[] = $crm_core_activity->id();
+    }
+    else {
+      // Save Activity with renewed list.
+      $crm_core_activity->set('activity_participants', $participants);
+      $crm_core_activity->save();
+    }
+  }
+
+  if (!empty($activities_to_remove)) {
+    $activities = $activity_storage->loadMultiple($activities_to_remove);
+    \Drupal::logger('crm_core_activity')->info('Deleted @count activities due to deleting @type id=%individual_id.', [
+      '@count' => count($activities_to_remove),
+      '@type' => $entity_type,
+      '%individual_id' => $entity_id,
+    ]);
+    $activity_storage->delete($activities);
+  }
+}
