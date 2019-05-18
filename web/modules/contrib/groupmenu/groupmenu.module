@@ -1,0 +1,324 @@
+<?php
+
+/**
+ * @file
+ * Gives the ability to create and manage menus for groups.
+ */
+
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\gnode\Plugin\GroupContentEnabler\GroupNode;
+use Drupal\group\Entity\Group;
+use Drupal\group\Entity\GroupContent;
+use Drupal\group\Entity\GroupContentInterface;
+use Drupal\group\Entity\GroupContentType;
+use Drupal\group\Entity\Form\GroupContentTypeForm;
+use Drupal\menu_link_content\Form\MenuLinkContentForm;
+use Drupal\menu_ui\Form\MenuLinkEditForm;
+use Drupal\system\MenuInterface;
+
+/**
+ * Implements hook_entity_create_access().
+ *
+ * When trying to create a menu it suffices to have the right to
+ * do so in only one group the menu belongs to.
+ */
+function groupmenu_entity_create_access(AccountInterface $account, array $context, $entity_bundle) {
+  $plugin_id = 'group_menu:menu';
+  $group_content_types = GroupContentType::loadByContentPluginId($plugin_id);
+  if (isset($group_content_types[$entity_bundle])) {
+    if ($context['group']->hasPermission("create $plugin_id entity", $account)) {
+      return AccessResult::allowed();
+    }
+  }
+  return AccessResult::neutral();
+}
+
+/**
+ * Implements hook_entity_access().
+ *
+ * When trying to view, update or delete a menu it suffices to have the right to
+ * do so in only one group the menu belongs to.
+ */
+function groupmenu_entity_access(EntityInterface $entity, $op, AccountInterface $account) {
+  if (!($entity instanceof MenuInterface)) {
+    return AccessResult::neutral();
+  }
+  return \Drupal::service('groupmenu.menu')->menuAccess($op, $entity, $account);
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function groupmenu_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'form_alter') {
+    // Make sure our hook_node_form_alter runs after the form alter of the
+    // menu_ui module.
+    $group = $implementations['groupmenu'];
+    unset($implementations['groupmenu']);
+    $implementations['groupmenu'] = $group;
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function groupmenu_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $form_object = $form_state->getFormObject();
+
+  // Filter menu options to group menus.
+  if ($form_object instanceof MenuLinkEditForm || $form_object instanceof MenuLinkContentForm) {
+    $account = \Drupal::currentUser();
+    if (!$account->hasPermission('administer menu')) {
+      groupmenu_filter_parent_options($form['menu_parent']['#options']);
+    }
+  }
+
+  // Add setting to group node plugins to allow group menus.
+  if ($form_object instanceof GroupContentTypeForm) {
+    /** @var \Drupal\group\Entity\GroupContentType $group_content_type */
+    $group_content_type = $form_object->getEntity();
+    if ($group_content_type->getContentPlugin() instanceof GroupNode) {
+      $configuration = $group_content_type->get('plugin_config');
+      $form['node_form_group_menu'] = [
+        '#type' => 'checkbox',
+        '#title' => t("Add group menus to node form"),
+        '#default_value' => isset($configuration['node_form_group_menu']) ? $configuration['node_form_group_menu'] : FALSE,
+      ];
+    }
+  }
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function groupmenu_form_node_form_alter(&$form, FormStateInterface $form_state) {
+  $account = \Drupal::currentUser();
+  $node = $form_state->getFormObject()->getEntity();
+  $groups = [];
+  // If a node is being edited at /node/%/edit, look for groups that it is a
+  // part of. If not, try to use the group ID from the URL.
+  if ($node->id()) {
+    $group_content_array = GroupContent::loadByEntity($node);
+    foreach ($group_content_array as $group_content) {
+      $group_ids[] = $group_content->gid->target_id;
+    }
+    if (!empty($group_ids)) {
+      $groups = Group::loadMultiple($group_ids);
+    }
+  }
+  elseif (isset($form_state->getStorage()['group'])) {
+    $groups[] = $form_state->getStorage()['group'];
+  }
+
+  if (!empty($groups) || !$account->hasPermission('administer menu')) {
+    $menu_options = &$form['menu']['link']['menu_parent']['#options'];
+    if ($menu_options) {
+      $filtered_menu_options = groupmenu_filter_parent_options($menu_options, $groups);
+      if ($filtered_menu_options) {
+        // If we have access to menu options, this means we have permission to
+        // edit the group menu. When the menu options were added by Group menu,
+        // access needs to be restored again as the Menu module removed it.
+        $form['menu']['#access'] = TRUE;
+      }
+      else {
+        // If there are no menu options available, remove the menu settings tab.
+        $form['menu']['#access'] = FALSE;
+      }
+    }
+  }
+}
+
+/**
+ * Deletes not allowed menu items from select element for current user.
+ *
+ * @param array &$options
+ *   Form options to filter.
+ * @param \Drupal\group\Entity\GroupInterface[] $groups
+ *   Optionally filter menus by group.
+ *
+ * @return bool
+ *   FALSE if there is no allowed menu items,
+ *   TRUE if we have some allowed menu items.
+ */
+function groupmenu_filter_parent_options(array &$options, array $groups = []) {
+  $allowed_menus = [];
+  $groupmenu_service = \Drupal::service('groupmenu.menu');
+  if (!empty($groups)) {
+    foreach ($groups as $group) {
+      $allowed_menus = array_merge($allowed_menus, $groupmenu_service->loadUserGroupMenusByGroup('edit', $group->id()));
+    }
+  }
+  else {
+    $allowed_menus = $groupmenu_service->loadUserGroupMenus('edit');
+  }
+
+  if (count($allowed_menus) && is_array($options)) {
+    $option_keys = array_keys($options);
+    foreach ($option_keys as $option_key) {
+      list($menu, $item) = explode(':', $option_key);
+      if (!isset($allowed_menus[$menu])) {
+        unset($options[$option_key]);
+      }
+    }
+    return count($options);
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_entity_type_alter().
+ */
+function groupmenu_entity_type_alter(array &$entity_types) {
+  // Use a different list builder to exclude group menus.
+  $config = \Drupal::config('groupmenu.settings');
+  if ($config->get('groupmenu_hide_list')) {
+    $entity_types['menu']->setHandlerClass('list_builder', 'Drupal\groupmenu\GroupMenuListBuilder');
+  }
+}
+
+/**
+ * Implements hook_preprocess_menu().
+ *
+ * Hides group menu's from admin menu.
+ */
+function groupmenu_preprocess_menu(&$variables) {
+  if (empty($variables['items'])) {
+    return;
+  }
+  // Ensure that menu_name exists.
+  if (!isset($variables['menu_name'])) {
+    // In rare cases (for unknown reasons) menu_name may not be set.
+    // As fallback, we can fetch it from the first menu item.
+    $variables['menu_name'] = NULL;
+    $first_link = reset($variables['items']);
+    if (isset($first_link['original_link'])) {
+      $variables['menu_name'] = $first_link['original_link']->getMenuName();
+    }
+  }
+  if ($variables['menu_name'] == 'admin') {
+    // Get group types that enabled group menu's.
+    $plugin_id = 'group_menu:menu';
+    $group_content_types = \Drupal::entityTypeManager()->getStorage('group_content_type')
+      ->loadByProperties([
+        'content_plugin' => $plugin_id,
+      ]);
+    if (empty($group_content_types)) {
+      return;
+    }
+    _groupmenu_filter_admin_links($variables['items'], $group_content_types);
+  }
+}
+
+/**
+ * Helper function to hide group menu's from admin menu.
+ *
+ * @param array $items
+ *   The menu items to check for group menu's.
+ * @param array $group_content_types
+ *   The group content types that have group menu content enabled.
+ */
+function _groupmenu_filter_admin_links(array &$items, array $group_content_types) {
+  foreach ($items as $route => &$item) {
+    if (!empty($item['url'])) {
+      /** @var \Drupal\Core\Url $url */
+      $url = $item['url'];
+      if (!$url->isRouted()) {
+        continue;
+      }
+      $route_name = $url->getRouteName();
+      $route_params = $url->getRouteParameters();
+      if ($route_name === 'entity.menu.edit_form') {
+        $menu_name = $route_params['menu'];
+
+        // Check if this is a group menu.
+        $group_contents = \Drupal::entityTypeManager()->getStorage('group_content')
+          ->loadByProperties([
+            'type' => array_keys($group_content_types),
+            'entity_id' => $menu_name,
+          ]);
+        if (!empty($group_contents)) {
+          unset($items[$route]);
+        }
+        else {
+          if (!empty($items[$route]['below'])) {
+            // Recursively call this function for the child items.
+            _groupmenu_filter_admin_links($items[$route]['below'], $group_content_types);
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ */
+function groupmenu_group_content_insert(EntityInterface $entity) {
+  groupmenu_group_content_update($entity);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update().
+ */
+function groupmenu_group_content_update(EntityInterface $entity) {
+  if ($entity->getContentPlugin()->getPluginId() === 'group_menu:menu') {
+    \Drupal::service('cache.groupmenu')->invalidateAll();
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ */
+function groupmenu_group_insert(EntityInterface $entity) {
+  if (!$entity->getGroupType()->hasContentPlugin('group_menu:menu')) {
+    return;
+  }
+
+  $group_type_configuration = $entity->getGroupType()->getContentPlugin('group_menu:menu')->getConfiguration();
+  $auto_create_group_menu = $group_type_configuration['auto_create_group_menu'] ?? FALSE;
+  if (!$auto_create_group_menu) {
+    return;
+  }
+
+  $group_menu = \Drupal::entityTypeManager()->getStorage('menu')->create([
+    'id' => 'group-' . $entity->id() . '-menu',
+    'label' => $entity->label() . ' menu',
+    'description' => 'Menu for ' . $entity->label(),
+  ]);
+  $group_menu->save();
+
+  // Add menu link for group if enabled.
+  $auto_create_home_link = $group_type_configuration['auto_create_home_link'] ?? FALSE;
+  if ($auto_create_home_link) {
+    \Drupal::entityTypeManager()->getStorage('menu_link_content')->create([
+      'title' => $group_type_configuration['auto_create_home_link_title'] ?? t('Home'),
+      'link' => ['uri' => 'internal:/group/' . $entity->id()],
+      'menu_name' => $group_menu->id(),
+      'expanded' => TRUE,
+    ])->save();
+  }
+
+  $entity->addContent($group_menu, 'group_menu:menu');
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ */
+function groupmenu_group_content_delete(EntityInterface $entity) {
+  if ($entity->getContentPlugin()->getPluginId() === 'group_menu:menu') {
+    \Drupal::service('cache.groupmenu')->invalidateAll();
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ */
+function groupmenu_group_delete(EntityInterface $entity) {
+  $autocreated_menu = \Drupal::entityTypeManager()->getStorage('menu')->load('group-' . $entity->id() . '-menu');
+  if ($autocreated_menu) {
+    $autocreated_menu->delete();
+  }
+}
