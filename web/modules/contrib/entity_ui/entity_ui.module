@@ -1,0 +1,99 @@
+<?php
+
+/**
+ * @file
+ * Provides an admin UI for building tabs on content entities.
+ */
+
+/**
+ * Implements hook_entity_type_build().
+ */
+function entity_ui_entity_type_build(array &$entity_types) {
+  $target_entity_types = \Drupal::service('entity_ui.target_entity_types')->filterTargetEntityTypes($entity_types);
+  foreach ($target_entity_types as $entity_type_id => $entity_type) {
+    // Add our route provider for the tabs we add to entities.
+    // @todo Core forgot to add a direct way to manipulate route_provider, so
+    // we have to do it the sloppy way for now.
+    $providers = $entity_type->getRouteProviderClasses() ?: [];
+    if (empty($providers['entity_ui'])) {
+      $providers['entity_ui'] = Drupal\entity_ui\Routing\TabRouteProvider::class;
+      $entity_type->setHandlerClass('route_provider', $providers);
+    }
+
+    // Add our admin UI handler.
+    // Which handler class we add depends on what sort of admin UI the entity
+    // type has.
+    // @see \Drupal\entity_ui\EntityHandler\EntityUIAdminInterface
+    // TODO: consider moving this logic to static methods on the actual handler
+    // classes.
+
+    // Don't set a handler if the entity type has one set already. This allows
+    // entity type modules to define their own handlers if their UIs require it.
+    if ($entity_type->hasHandlerClass('entity_ui_admin')) {
+      continue;
+    }
+
+    // Case 1: The entity type has a bundle entity type, and there is a link
+    // template for the collection of bundle entities.
+    if ($bundle_entity_type_id = $entity_type->getBundleEntityType()) {
+      $bundle_entity_type = $entity_types[$bundle_entity_type_id];
+      if ($bundle_collection_link_template = $bundle_entity_type->getLinkTemplate('collection')) {
+        // We ideally should check that there is a route actually defined for
+        // the link template, as if the entity's module has forgotten to do this
+        // our handler can't do anything, but this causes problems in tests and
+        // if we are enabled at the same time as entity type modules.
+        // See https://www.drupal.org/node/2896669.
+        $entity_type->setHandlerClass('entity_ui_admin', \Drupal\entity_ui\EntityHandler\BundleEntityCollection::class);
+
+        // Done with this entity type.
+        continue;
+      }
+      else {
+        // If there is no link template for the collection of bundle entities,
+        // we don't know what to do.
+        continue;
+      }
+    }
+
+    // If there is no bundle entity, but there is a field UI base route, then
+    // there are these two cases, but we cannot distinguish between them at this
+    // point:
+    //  - PlainBundlesEntityUIAdmin: an entity type that allows multiple
+    //    bundles, but where these are not defined by a config entity.
+    //  - BasicFieldUI: an entity type that only has a single bundle.
+    // This is because we would either need to check the path of the field admin
+    // UI route for a '{bundle}' path component, and we cannot load routes
+    // during entity type build, or get the number of bundles from the
+    // entity_type.bundle.info service, and we can't call that during entity
+    // type build.
+    // Instead, we use a proxy handler, which will instantiate the real handlers
+    // during the router rebuild.
+    $field_ui_base_route_name = $entity_type->get('field_ui_base_route');
+
+    if ($field_ui_base_route_name) {
+      $entity_type->setHandlerClass('entity_ui_admin', \Drupal\entity_ui\EntityHandler\FieldUIWithoutBundleEntityProxy::class);
+
+      // Done with this entity type.
+      continue;
+    }
+
+    // Other cases are not yet handled.
+  }
+}
+
+/**
+ * Implements hook_local_tasks_alter().
+ */
+function entity_ui_local_tasks_alter(&$local_tasks) {
+  // Allow Entity UI admin handlers to alter local tasks for an entity type's
+  // admin UI.
+  $entity_type_manager = \Drupal::service('entity_type.manager');
+  $entity_types = $entity_type_manager->getDefinitions();
+  foreach ($entity_types as $entity_type_id => $entity_type) {
+    if ($entity_type_manager->hasHandler($entity_type_id, 'entity_ui_admin')) {
+      $entity_ui_admin_handler = $entity_type_manager->getHandler($entity_type_id, 'entity_ui_admin');
+
+      $entity_ui_admin_handler->localTasksAlter($local_tasks);
+    }
+  }
+}
