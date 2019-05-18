@@ -1,0 +1,352 @@
+<?php
+
+/**
+ * @file
+ * SPID authentication module for Drupal.
+ *
+ * This authentication module is based on the SimpleSAMLphp module
+ * that is based on shibboleth authentication module,
+ * with changes to adopt to use internal spid classes.
+ *
+ */
+
+use Drupal\Core\Url;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Link;
+use Drupal\Core\Database\Database;
+use Drupal\Core\Database\Connection;
+use Drupal\Core\Database\Query\Condition;
+
+/**
+ * Implements hook_help().
+ */
+function microspid_help($route_name) {
+  switch ($route_name) {
+    case 'microspid.admin_settings':
+    case 'help.page.microspid':
+      $output = t('MicroSPiD configuration handler');
+
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_locale_translation_projects_alter()
+ */
+function microspid_locale_translation_projects_alter(&$projects) {
+  $modpath = drupal_get_path('module', 'microspid');
+  $translation = $modpath . '/translations/it.po';
+  if (!isset($projects['microspid'])) {
+    return;
+  }
+  $projects['microspid']['info'] = 
+    [
+      'interface translation server pattern' => $translation,
+    ];
+  
+}
+ 
+/**
+ * Implements hook_user_logout().
+ */
+function microspid_user_logout($account) {
+
+  $logout_url = \Drupal::config('microspid.settings')->get('logout_goto_url');
+  $simplesaml = \Drupal::service('microspid.manager');
+
+  if ($logout_url) {
+    $simplesaml->logout($logout_url);
+  }
+  else {
+    $simplesaml->logout();
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Alters the user register form to include a checkbox signifying the user
+ * should be SimpleSAML enabled. Removes password fields if the IdP
+ * is the sole place for password management.
+ *
+ * @see AccountForm::form()
+ * @see microspid_user_form_submit()
+ */
+function microspid_form_user_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  microspid_user_form_includes($form);
+  $authmap = \Drupal::service('externalauth.authmap');
+
+  // If the user has a microspid authmap record, then don't require
+  // them to know their Drupal password. This will allow them to change their
+  // e-mail address, and set a Drupal password if they want to
+  // (and are allowed).
+  $account = $form_state->getFormObject()->getEntity();
+  $saml_enabled = $authmap->get($account->id(), 'microspid');
+
+  if ($saml_enabled) {
+    $form['microspid_user_enable']['#default_value'] = TRUE;
+    $form['account']['current_pass']['#access'] = FALSE;
+
+    // If the user is a microspid user and is NOT allowed to set their
+    // Drupal password, remove the fields from the form.
+    $config = \Drupal::config('microspid.settings');
+    if (!$config->get('allow.set_drupal_pwd')) {
+      $form['account']['pass']['#access'] = FALSE;
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Alters the user register form to include a checkbox signifying the user
+ * should be SimpleSAML enabled.
+ *
+ * @see AccountForm::form()
+ * @see microspid_user_form_submit()
+ */
+function microspid_form_user_register_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  microspid_user_form_includes($form);
+  $form['microspid_user_enable']['#default_value'] = TRUE;
+}
+
+/**
+ * Helper function to include the SimpleSAML checkbox on user forms.
+ *
+ * @param array $form
+ *   The user account form.
+ *
+ * @see microspid_form_user_form_alter()
+ * @see microspid_form_user_register_form_alter()
+ * @see microspid_user_form_submit()
+ */
+function microspid_user_form_includes(&$form) {
+  $form['microspid_user_enable'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Enable this user to leverage SPID authentication'),
+    '#access' => \Drupal::currentUser()->hasPermission('change saml authentication setting'),
+    '#description' => t("WARNING: if unchecked, this will become a local Drupal user, which might be denied access based on the MicroSPiD settings for authenticating local Drupal accounts.<br />Don't use this setting for access control, which should be configured in your IdP instead.<br />NOTE: if the configuration option 'Automatically enable SAML authentication for existing users upon successful login' is activated, this Drupal account can become linked with SAML (again) when the user succesfully authenticates to the IdP."),
+  ];
+
+  // We store the authname as the initial email. If we're using SimpleSAML we
+  // need to enforce an email address.
+  $form['account']['mail']['#required'] = TRUE;
+
+  $form['actions']['submit']['#submit'][] = 'microspid_user_form_submit';
+}
+
+/**
+ * Implements hook_cron
+ * minimum interval 2 days.
+ */
+function microspid_cron() {
+  $interval = 48 * 60 * 60;
+  $next_execution = \Drupal::state()
+    ->get('microspid.next_execution');
+  $next_execution = !empty($next_execution) ? $next_execution : 0;
+  if (REQUEST_TIME >= $next_execution) {
+    \Drupal::logger('microspid')
+      ->notice('db maintenance');
+    Database::getConnection()->delete('microspid_tracking')
+      ->condition('Timestamp', REQUEST_TIME - (60 * 20), '<')
+      ->isNull('Response')
+      ->execute();
+    Database::getConnection()->delete('microspid_tracking')
+      ->condition('Timestamp', REQUEST_TIME - (2 * 365 * 24 * 60 * 60), '<')
+      ->execute();
+    \Drupal::state()
+      ->set('microspid.next_execution', REQUEST_TIME + $interval);
+  }
+}
+
+
+/**
+ * 
+ * Generate the button source code according to AGID specs,
+ * using AGID vendor folder.
+ * @PASW aggiornato con nuovi provider
+ * 
+ * @return 
+ *   A string containing the source code that generate the Login Button 
+ */
+function _microspid_spidbutton() {
+	global $base_url;
+	
+  $path = $base_url . '/' . drupal_get_path('module', "microspid");
+
+  $spid_ico_circle_svg = $path . '/vendor/agid/img/spid-ico-circle-bb.svg';
+  $spid_ico_circle_png = $path . '/vendor/agid/img/spid-ico-circle-bb.png';
+
+  $spid_idp_infocert_svg = $path . '/vendor/agid/img/spid-idp-infocertid.svg';
+  $spid_idp_infocert_png = $path . '/vendor/agid/img/spid-idp-infocertid.png';
+
+  $spid_idp_timid_svg = $path . '/vendor/agid/img/spid-idp-timid.svg';
+  $spid_idp_timid_png = $path . '/vendor/agid/img/spid-idp-timid.png';
+
+  $spid_idp_posteid_svg = $path . '/vendor/agid/img/spid-idp-posteid.svg';
+  $spid_idp_posteid_png = $path . '/vendor/agid/img/spid-idp-posteid.png';
+
+  $spid_idp_sielteid_svg = $path . '/vendor/agid/img/spid-idp-sielteid.svg';
+  $spid_idp_sielteid_png = $path . '/vendor/agid/img/spid-idp-sielteid.png';
+
+  $spid_idp_arubaid_svg = $path . '/vendor/agid/img/spid-idp-arubaid.svg';
+  $spid_idp_arubaid_png = $path . '/vendor/agid/img/spid-idp-arubaid.png';
+
+  $spid_idp_namirialid_svg = $path . '/vendor/agid/img/spid-idp-namirialid.svg';
+  $spid_idp_namirialid_png = $path . '/vendor/agid/img/spid-idp-namirialid.png';
+
+  $spid_idp_registerid_svg = $path . '/vendor/agid/img/spid-idp-spiditalia.svg';
+  $spid_idp_registerid_png = $path . '/vendor/agid/img/spid-idp-spiditalia.png';
+
+  $spid_idp_intesaid_svg = $path . '/vendor/agid/img/spid-idp-intesaid.svg';
+  $spid_idp_intesaid_png = $path . '/vendor/agid/img/spid-idp-intesaid.png';
+
+  $spid_idp_lepidaid_svg = $path . '/vendor/agid/img/spid-idp-lepidaid.svg';
+  $spid_idp_lepidaid_png = $path . '/vendor/agid/img/spid-idp-lepidaid.png';
+
+  $spid_idp_testid_svg = $path . '/vendor/agid/img/spid-idp-testidt.svg';
+  $spid_idp_testid_png = $path . '/vendor/agid/img/spid-idp-testid.png';
+
+  $spid_idp_testonlineid_svg = $path . '/vendor/agid/img/spid-ico-circle-bb.svg';
+  $spid_idp_testonlineid_png = $path . '/vendor/agid/img/spid-ico-circle-bb.png';
+
+  $spid_idp_demo_svg = $path . '/vendor/agid/img/idp-logo-demo.svg';
+  $spid_idp_demo_png = $path . '/vendor/agid/img/idp-logo-demo.png';
+
+  $spid_idp_testid_svg = $path . '/vendor/agid/img/spid-idp-testidt.svg';
+  $spid_idp_testid_png = $path . '/vendor/agid/img/spid-idp-testid.png';
+
+  $spid_idp_testonlineid_svg = $path . '/vendor/agid/img/spid-ico-circle-bb.svg';
+  $spid_idp_testonlineid_png = $path . '/vendor/agid/img/spid-ico-circle-bb.png';
+
+  $infocert_id = 'https://identity.infocert.it';
+  $poste_id = 'https://posteid.poste.it';
+  $tim_id = 'https://login.id.tim.it/affwebservices/public/saml2sso';
+  $sielte_id = 'https://identity.sieltecloud.it';
+  $aruba_id = 'https://loginspid.aruba.it';
+	$namirial_id = 'https://idp.namirialtsp.com/idp';
+	$register_id = 'https://spid.register.it';
+  $intesa_id = 'https://spid.intesa.it';
+  $lepida_id = 'https://id.lepida.it/idp/shibboleth';
+  $agid_id = 'https://validator.spid.gov.it';
+  $agid_display = \Drupal::config('microspid.settings')->get('show_agid_link')? 'display:block' : 'display:none';
+
+  $formaction = $base_url . '/saml_login';
+
+  if (\Drupal::config('microspid.settings')->get('test_mode') != TRUE) {
+    $spid_bottone = <<<BOTTONE
+    <form name="spid_idp_access" action="$formaction" method="post">
+      <a href="#" class="italia-it-button italia-it-button-size-s button-spid" spid-idp-button="#spid-idp-button-small-post" aria-haspopup="true" aria-expanded="false">
+          <span class="italia-it-button-icon"><img src="$spid_ico_circle_svg" onerror="this.src='$spid_ico_circle_png'; this.onerror=null;" alt="" /></span>
+          <span class="italia-it-button-text">Entra con SPID</span>
+      </a>
+      <div id="spid-idp-button-small-post" class="spid-idp-button spid-idp-button-tip spid-idp-button-relative">
+        <ul id="spid-idp-list-small-root-post" class="spid-idp-button-menu" aria-labelledby="spid-idp">
+          <li class="spid-idp-button-link">
+              <button class="idp-button-idp-logo" name="infocert_id" type="submit" value="$infocert_id"><span class="spid-sr-only">Infocert ID</span><img class="spid-idp-button-logo" src="$spid_idp_infocert_svg" onerror="this.src='$spid_idp_infocert_png'; this.onerror=null;" alt="Infocert ID" /></button>
+          </li>
+          <li class="spid-idp-button-link">
+              <button class="idp-button-idp-logo" name="poste_id" type="submit" value="$poste_id"><span class="spid-sr-only">Poste ID</span><img class="spid-idp-button-logo" src="$spid_idp_posteid_svg" onerror="this.src='$spid_idp_posteid_png'; this.onerror=null;" alt="Poste ID" /></button>
+          </li>
+          <li class="spid-idp-button-link">
+              <button class="idp-button-idp-logo" name="tim_id" type="submit" value="$tim_id"><span class="spid-sr-only">Tim ID</span><img class="spid-idp-button-logo" src="$spid_idp_timid_png" onerror="this.src='$spid_idp_timid_svg'; this.onerror=null;" alt="Tim ID" /></button>
+          </li>
+          <li class="spid-idp-button-link">
+              <button class="idp-button-idp-logo" name="sielte_id" type="submit" value="$sielte_id"><span class="spid-sr-only">Sielte ID</span><img class="spid-idp-button-logo" src="$spid_idp_sielteid_png" onerror="this.src='$spid_idp_sielteid_svg'; this.onerror=null;" alt="Sielte ID" /></button>
+          </li>
+          <li class="spid-idp-button-link">
+              <button class="idp-button-idp-logo" name="aruba_id" type="submit" value="$aruba_id"><span class="spid-sr-only">Aruba ID</span><img class="spid-idp-button-logo" src="$spid_idp_arubaid_png" onerror="this.src='$spid_idp_arubaid_svg'; this.onerror=null;" alt="Aruba ID" /></button>
+          </li>
+          <li class="spid-idp-button-link">
+              <button class="idp-button-idp-logo" name="namirial_id" type="submit" value="$namirial_id"><span class="spid-sr-only">Namirial ID</span><img class="spid-idp-button-logo" src="$spid_idp_namirialid_png" onerror="this.src='$spid_idp_namirialid_svg'; this.onerror=null;" alt="Namirial ID" /></button>
+          </li>
+          <li class="spid-idp-button-link">
+              <button class="idp-button-idp-logo" name="register_id" type="submit" value="$register_id"><span class="spid-sr-only">SpidItalia ID</span><img class="spid-idp-button-logo" src="$spid_idp_registerid_png" onerror="this.src='$spid_idp_registerid_svg'; this.onerror=null;" alt="SpidItalia ID" /></button>
+          </li>
+          <li class="spid-idp-button-link">
+              <button class="idp-button-idp-logo" name="intesa_id" type="submit" value="$intesa_id"><span class="spid-sr-only">Intesa ID</span><img class="spid-idp-button-logo" src="$spid_idp_intesaid_png" onerror="this.src='$spid_idp_intesaid_svg'; this.onerror=null;" alt="Intesa ID" /></button>
+          </li>
+          <li class="spid-idp-button-link">
+              <button class="idp-button-idp-logo" name="lepida_id" type="submit" value="$lepida_id"><span class="spid-sr-only">Lepida ID</span><img class="spid-idp-button-logo" src="$spid_idp_lepidaid_png" onerror="this.src='$spid_idp_lepidaid_svg'; this.onerror=null;" alt="Lepida ID" /></button>
+          </li>
+          <li class="spid-idp-button-link" style="$agid_display">
+              <button class="idp-button-idp-logo" name="agid_id" type="submit" value="$agid_id"><span class="spid-sr-only">AGID Test</span><img class="spid-idp-button-logo" src="$spid_idp_testid_png" onerror="this.src='$spid_idp_testid_svg'; this.onerror=null;" alt="AGID Test ID" /></button>
+          </li>
+          <li class="spid-idp-support-link">
+              <a href="http://www.spid.gov.it">Maggiori info</a>
+          </li>
+          <li class="spid-idp-support-link">
+              <a href="http://www.spid.gov.it/#registrati">Non hai SPID?</a>
+          </li>
+          <li class="spid-idp-support-link">
+              <a href="https://www.spid.gov.it/serve-aiuto">Serve aiuto?</a>
+          </li>
+        </ul>
+      </div>
+    </form>
+BOTTONE;
+  } else {
+    $spid_bottone = <<<BOTTONE
+    <form name="spid_idp_access" action="$formaction" method="post">
+      <a href="#" class="italia-it-button italia-it-button-size-s button-spid" spid-idp-button="#spid-idp-button-small-post" aria-haspopup="true" aria-expanded="false">
+          <span class="italia-it-button-icon"><img src="$spid_ico_circle_svg" onerror="this.src='$spid_ico_circle_png'; this.onerror=null;" alt="" /></span>
+          <span class="italia-it-button-text">Entra con SPID</span>
+      </a>
+      <div id="spid-idp-button-small-post" class="spid-idp-button spid-idp-button-tip spid-idp-button-relative">
+        <ul id="spid-idp-list-small-root-post" class="spid-idp-button-menu" aria-labelledby="spid-idp">
+          <li class="spid-idp-button-link">
+              <button class="idp-button-idp-logo" name="test_id" type="submit" value="spid-testenv-identityserver"><span class="spid-sr-only">Test ID</span><img class="spid-idp-button-logo" src="$spid_idp_testid_png" onerror="this.src='$spid_idp_testid_svg'; this.onerror=null;" alt="Test ID" /></button>
+          </li>
+          <li class="spid-idp-button-link">
+              <button class="idp-button-idp-logo" name="demo_id" type="submit" value="http://localhost:8088"><span class="spid-sr-only">DemoIDP</span><img class="spid-idp-button-logo" src="$spid_idp_demo_png" onerror="this.src='$spid_idp_demo_svg'; this.onerror=null;" alt="DemoIDP" /></button>
+          </li>
+          <li class="spid-idp-button-link">
+              <button class="idp-button-idp-logo" name="testonline_id" type="submit" value="https://idp.spid.gov.it"><span class="spid-sr-only">TestOnLine ID</span><img class="spid-idp-button-logo" src="$spid_idp_testonlineid_png" onerror="this.src='$spid_idp_testonlineid_svg'; this.onerror=null;" alt="TestOnLine ID" /></button>
+          </li>
+          <li class="spid-idp-support-link">
+              <a href="http://www.spid.gov.it">Maggiori info</a>
+          </li>
+          <li class="spid-idp-support-link">
+              <a href="http://www.spid.gov.it/#registrati">Non hai SPID?</a>
+          </li>
+          <li class="spid-idp-support-link">
+              <a href="https://www.spid.gov.it/serve-aiuto">Serve aiuto?</a>
+          </li>
+        </ul>
+      </div>
+    </form>
+BOTTONE;
+    
+  }
+
+    return $spid_bottone;
+}
+
+/**
+ * Form submission handler for user_form.
+ *
+ * @see microspid_form_user_register_form_alter()
+ * @see microspid_form_user_form_alter()
+ */
+function microspid_user_form_submit($form, FormStateInterface $form_state) {
+  $authmap = \Drupal::service('externalauth.authmap');
+  $externalauth = \Drupal::service('externalauth.externalauth');
+
+  // Add an authmap entry for this account, so it can leverage SAML
+  // authentication.
+  if ($form_state->getValue('microspid_user_enable')) {
+    $account = $form_state->getFormObject()->getEntity();
+    // Link an authmap entry to this account, if not yet existing.
+    // By default, we use the username as authname.
+    // This can be altered if needed. See microspid.api.php for
+    // details.
+    $authname = $account->getAccountName();
+    \Drupal::modulehandler()->alter('microspid_account_authname', $authname, $account);
+    $externalauth->linkExistingAccount($authname, 'microspid', $account);
+  }
+  // Remove this user from the ExternalAuth authmap table.
+  else {
+    $authmap->delete($form_state->getValue('uid'));
+  }
+}
+
