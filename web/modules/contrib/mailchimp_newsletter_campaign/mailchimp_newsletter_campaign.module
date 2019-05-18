@@ -1,0 +1,206 @@
+<?php
+
+/**
+ * @file
+ * Mailchimp newsletter campaign module.
+ */
+
+use Drupal\Core\Link;
+use Drupal\Core\Url;
+use Drupal\mailchimp_newsletter_campaign\Campaigns;
+use Drupal\Core\Form\FormStateInterface;
+
+/**
+ * Implements hook_form_alter().
+ */
+function mailchimp_newsletter_campaign_form_alter(&$form, &$form_state, $form_id) {
+
+  if ($form_id == 'node_newsletter_form' || $form_id == 'node_newsletter_edit_form') {
+
+    $mc_lists = Campaigns::mailchimpGetList();
+
+    $lists_admin_url = Url::fromUri('https://admin.mailchimp.com/lists/', ['attributes' => ['target' => '_blank']]);
+
+    $lists_empty_message = "";
+
+    if (empty($mc_lists)) {
+      $lists_empty_message = t('You do not have any lists configured in your
+      MailChimp account, (or you have not configured your API key correctly in 
+      configuration). Head over to @link and create some lists, then
+      come back here "',
+      ['@link' => Link::fromTextAndUrl(t('MailChimp'), $lists_admin_url)->toString()]);
+      $form['actions']['publish']['#attributes']['disabled'] = TRUE;
+      $form['actions']['unpublish']['#attributes']['disabled'] = TRUE;
+      $form['actions']['publish']['#attributes']['class'][] = 'save-disabled';
+      $form['actions']['unpublish']['#attributes']['class'][] = 'save-disabled';
+    }
+
+    $form['mailchimp'] = [
+      '#type' => 'details',
+      '#title' => t('Mailchimp Settings'),
+      '#group' => 'advanced',
+      '#description' => $lists_empty_message,
+    ];
+
+    if (!empty($mc_lists)) {
+
+      $lists = [];
+      foreach ($mc_lists as $mc_list) {
+        $lists[$mc_list->id] = $mc_list->name;
+      }
+
+      $current_datetime = new DateTime('now');
+      $current_date = $current_datetime->format('Y-m-d');
+
+      if ($form_id == 'node_newsletter_edit_form') {
+        $config = Drupal::config('newsletter.form');
+        $default_list = $config->get('list');
+        $default_date = $config->get('date');
+        $default_hrs = $config->get('hrs');
+        $default_mins = $config->get('mins');
+        $default_ampm = $config->get('ampm');
+      }
+      else {
+        $default_date = $current_date;
+        $default_hrs = $default_mins = $default_ampm = '';
+        $default_list = NULL;
+      }
+      $form['mailchimp']['lists'] = [
+        '#type' => 'radios',
+        '#options' => $lists,
+        '#title' => t('Lists'),
+        '#required' => TRUE,
+        '#default_value' => $default_list,
+      ];
+
+      $form['mailchimp']['schedule_date'] = [
+        '#type' => 'date',
+        '#title' => t('Schedule'),
+        '#min' => $current_date,
+        '#default_value' => $default_date,
+      ];
+      $form['mailchimp']['schedule_time'] = [
+        '#type' => 'container',
+        '#attributes' => ['class' => 'time-container'],
+        '#suffix' => '(must be in future otherwise campaign would be saved as draft)',
+      ];
+      $hrs = [
+        '01' => 1,
+        '02' => 2,
+        '03' => 3,
+        '04' => 4,
+        '05' => 5,
+        '06' => 6,
+        '07' => 7,
+        '08' => 8,
+        '09' => 9,
+        '10' => 10,
+        '11' => 11,
+        '12' => 12,
+      ];
+      $form['mailchimp']['schedule_time']['schedule_hrs'] = [
+        '#type' => 'select',
+        '#options' => $hrs,
+        '#default_value' => $default_hrs,
+      ];
+      $mins = ['00' => '00', '15' => 15, '30' => 30, '45' => 45];
+      $form['mailchimp']['schedule_time']['schedule_mins'] = [
+        '#type' => 'select',
+        '#options' => $mins,
+        '#default_value' => $default_mins,
+      ];
+      $form['mailchimp']['schedule_time']['schedule_ampm'] = [
+        '#type' => 'select',
+        '#options' => ['am' => 'am', 'pm' => 'pm'],
+        '#default_value' => $default_ampm,
+      ];
+    }
+    $form['#attached']['library'][] = 'mailchimp_newsletter_campaign/global-css';
+    array_unshift($form['actions']['publish']['#submit'], 'mailchimp_newsletter_campaign_submit');
+    array_unshift($form['actions']['unpublish']['#submit'], 'mailchimp_newsletter_campaign_submit');
+
+  }
+
+}
+
+/**
+ * The submit handler for the node form.
+ *
+ * @param array $form
+ *   An associative array containing the structure of the form.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   An associative array containing the current state of the form.
+ */
+function mailchimp_newsletter_campaign_submit(array &$form, FormStateInterface &$form_state) {
+
+  $values = $form_state->getValues();
+  $config = Drupal::configFactory()->getEditable('newsletter.form');
+  $config->set('list', $values['lists']);
+  $config->set('date', $values['schedule_date']);
+  $config->set('hrs', $values['schedule_hrs']);
+  $config->set('mins', $values['schedule_mins']);
+  $config->set('ampm', $values['schedule_ampm']);
+  $config->save();
+
+  $recipients = (object) [
+    'list_id' => $values['lists'],
+  ];
+  $current_user = \Drupal::currentUser();
+  $user_mail = $current_user->getEmail();
+  $user_display_name = $current_user->getDisplayName();
+
+  $settings = (object) [
+    'subject_line' => $values['title'][0]['value'],
+    'title' => $values['title'][0]['value'],
+    'from_name' => $user_display_name,
+    'reply_to' => $user_mail,
+  ];
+
+  $content = $values['body'][0]['value'];
+
+  $body = [
+    '#theme' => 'mailchimp',
+    '#mail_title' => $settings->title,
+    '#mail_content' => $content,
+  ];
+
+  $template = drupal_render($body);
+  $campaign_id = Campaigns::mailchimpCreateCampaign($template, $recipients, $settings);
+
+  if ($values['schedule_ampm'] == 'pm' && $values['schedule_hrs'] != 12) {
+    $values['schedule_hrs'] += 12;
+  }
+  elseif ($values['schedule_ampm'] == 'am' && $values['schedule_hrs'] == 12) {
+    $values['schedule_hrs'] -= 12;
+  }
+  $schedule_time = $values['schedule_date'] . 'T' . $values['schedule_hrs'] . ':' . $values['schedule_mins'] . ':00' . '+05:30';
+  if (!empty($campaign_id)) {
+    Campaigns::mailchimpScheduleCampaign($campaign_id, $schedule_time);
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function mailchimp_newsletter_campaign_theme() {
+
+  $theme['mailchimp'] = [
+
+    'variables' => ['mail_title' => NULL, 'mail_content' => NULL],
+  ];
+  return $theme;
+}
+
+/**
+ * Implements hook_help().
+ */
+function mailchimp_newsletter_campaign_help($path, $arg) {
+
+  switch ($path) {
+    case "help.main":
+      return t("This module lets you create scheduled campaigns dynamically on your mailchimp account using Newsletter content type.");
+
+    case "help.page.mailchimp_newsletter_campaign":
+      return t("This module lets you create scheduled campaigns dynamically on your mailchimp account using Newsletter content type.");
+  }
+}
