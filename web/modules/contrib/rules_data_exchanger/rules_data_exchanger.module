@@ -1,0 +1,285 @@
+<?php
+
+/**
+ * @file
+ * Contains rules_data_exchanger.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Form\FormStateInterface;
+
+/**
+ * Adding a rule deletion handler for removing a stored data related with this rule.
+ *
+ * Implements hook_form_FORM_ID_alter().
+ */
+function rules_data_exchanger_form_rules_reaction_rule_delete_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $form['#validate'][] = 'rules_data_exchanger_delete_stored_data_if_rule_deleted';
+}
+
+/**
+ * Delete a stored data which was stored in a rule if this rule was deleted.
+ */
+function rules_data_exchanger_delete_stored_data_if_rule_deleted($form, FormStateInterface $form_state) {
+
+  $stored_data = \Drupal::state()->get('rules_data_exchanger.stored_data');
+  if (!isset($stored_data)) {
+    return;
+  }
+
+  $rule_id = $form_state->getFormObject()->getEntity()->id;
+
+  foreach ($stored_data as $key => $data) {
+    if ($data['rule_id'] == $rule_id) {
+      unset($stored_data[$key]);
+    }
+  }
+
+  \Drupal::state()->set('rules_data_exchanger.stored_data', $stored_data);
+}
+
+/**
+ * Get a key of a stored data to be cleared using 'rules_data_exchanger_clear_stored_data' action.
+ *
+ * If user selected a name of stored data from the selector then we need to extract a key from this name.
+ * This is the key of stored data that will be cleared in 'rules_data_exchanger_clear_stored_data' action.
+ * For instance, if full name of a stored data is '@stored_data:my_variable' then variable name will be 'my_variable'.
+ * This key then provided as the context value into the 'rules_data_exchanger_clear_stored_data' action.
+ *
+ * Implements hook_form_FORM_ID_alter().
+ */
+function rules_data_exchanger_form_rules_expression_edit_alter(&$form, FormStateInterface $form_state, $form_id) {
+
+  if (!isset($form_state->getStorage()['action_id'])) {
+    return;
+  }
+
+  if ($form_state->getStorage()['action_id'] == 'rules_data_exchanger_clear_stored_data') {
+    // Register validate handler for extracting a key of a stored data that need to be cleared.
+    $form['#validate'][] = 'rules_data_exchanger_extract_name_of_selected_data';
+    // Hide the field which uses for providing of extracted key into the 'rules_data_exchanger_clear_stored_data' action.
+    $form['context']['key']['#access'] = FALSE;
+  }
+  elseif ($form_state->getStorage()['action_id'] == 'rules_data_exchanger_store_data') {
+    $form['context']['rule_id']['#access'] = FALSE;
+    // Store rule id in context variable to using in the 'rules_data_exchanger_store_data' action.
+    $rule_id = \Drupal::request()->get('rules_reaction_rule')->id;
+    $form['context']['rule_id']['setting']['#default_value'] = $rule_id;
+
+    // Register validate handler for checking that a name of a stored data consists not only with spaces or tabs.
+    $form['#validate'][] = 'rules_data_exchanger_check_that_name_contains_visible_symbols';
+  }
+}
+
+/**
+ * Extract a key of stored data that need to be cleared and then provide it as a context value into the action.
+ *
+ * The action name in which key provided as a context value is 'rules_data_exchanger_clear_stored_data'.
+ */
+function rules_data_exchanger_extract_name_of_selected_data($form, FormStateInterface $form_state) {
+
+  $full_name_of_stored_data = $form_state->getValues()['context']['data']['setting'];
+  // If user selected existing stored data from the selector that the variable name will be start with '@stored_data:'.
+  if (mb_substr($full_name_of_stored_data, 0, 13) != '@stored_data:') {
+    $form_state->setErrorByName('context][data', t('A valid name of a stored data must start with @stored_data:'));
+    return;
+  }
+
+  $key = substr_replace($full_name_of_stored_data, '', 0, 13);
+  // Prevent the situation when a user copy and paste only '@stored_data:' without a key.
+  if (trim($key) == '') {
+    $error_message = t('A valid name must contains at least one visible symbol after @stored_data:');
+    $form_state->setErrorByName('context][data', $error_message);
+    return;
+  }
+
+  $form_state->setValueForElement($form['context']['key']['setting'], $key);
+}
+
+/**
+ * Check that a name of a stored data consists not only with spaces or tabs but contains visible symbols.
+ */
+function rules_data_exchanger_check_that_name_contains_visible_symbols($form, FormStateInterface $form_state) {
+  $name = $form_state->getValues()['context']['name']['setting'];
+  if (trim($name) == '') {
+    $form_state->setErrorByName('context][name', t('A valid name must contains at least one visible symbol.'));
+  }
+}
+
+/**
+ * If user save rule (click on 'Save' button) than we delete a stored data related with actions that was deleted.
+ *
+ * That is if a user delete 'rules_data_exchanger_store_data' action that we delete a data that was stored in it.
+ *
+ * Implements hook_form_FORM_ID_alter().
+ */
+function rules_data_exchanger_form_rules_reaction_rule_edit_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+
+  $form['#validate'][] = 'rules_data_exchanger_delete_stored_data';
+}
+
+/**
+ * Delete a data which was stored in 'rules_data_exchanger_store_data' actions if this actions has ben deleted.
+ */
+function rules_data_exchanger_delete_stored_data($form, FormStateInterface $form_state) {
+
+  $stored_data = \Drupal::state()->get('rules_data_exchanger.stored_data');
+  if (!isset($stored_data)) {
+    return;
+  }
+
+  $reaction_rule = $form_state->getFormObject()->getEntity();
+
+  $component = $reaction_rule->getComponent();
+  $actions = $component->getExpression()->getActions()->getConfiguration()['actions'];
+  // Keys of stored data that are used in rules.
+  // Because actions in which this data was stored still exist.
+  $keys_which_are_used = [];
+
+  foreach ($actions as $action) {
+    if ($action['action_id'] == 'rules_data_exchanger_store_data') {
+      $keys_which_are_used[] = $action['context_values']['name'];
+    }
+  }
+
+  $rule_id = $reaction_rule->id;
+
+  foreach ($stored_data as $key => $data) {
+    if ($data['rule_id'] == $rule_id) {
+      if (!in_array($key, $keys_which_are_used)) {
+        unset($stored_data[$key]);
+      }
+    }
+  }
+
+  \Drupal::state()->set('rules_data_exchanger.stored_data', $stored_data);
+}
+
+/**
+ * Implements hook_help().
+ */
+function rules_data_exchanger_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the rules_data_exchanger module.
+    case 'help.page.rules_data_exchanger':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= t('The module enables to exchange data between Rules and rules Components.');
+      $output .= '</br>';
+      $output .= t("It's possible to store any data of a some Rule and then use them in others Rules or Components.");
+      $output .= '</br>';
+      $output .= t('This can be used, for instance, for implementation of condition expressions');
+      $output .= ' ';
+      $output .= t("like 'if..else' in a rule.");
+      $output .= '<h3>' . t('Uses') . '</h3>';
+      $output .= '<dl>';
+      $output .= '<dt><h4>' . t('Store data') . '</h4></dt>';
+      $output .= '<dd>';
+      $output .= t('To store rules data for using in components or other rules do the following:');
+      $output .= '<ol>';
+      $output .= '<li>';
+      $output .= t("Add 'Store data' action to your rule");
+      $output .= ' ';
+      $output .= t("(you will find it under 'Data' section of the actions list).");
+      $output .= '</br>';
+      $output .= '</li>';
+      $output .= '<li>';
+      $output .= t('Select data to be stored.');
+      $output .= '</br>';
+      $output .= t("To do this switch to the 'Data selection' mode (click on 'Switch to data selection' button).");
+      $output .= '</br>';
+      $output .= t('Then select data to be stored using the selector.');
+      $output .= '</br>';
+      $output .= '</li>';
+      $output .= '<li>';
+      $output .= t('Think of a name for the variable in which a data will be stored.');
+      $output .= '</br>';
+      $output .= t('For that any string of text may be used.');
+      $output .= '</br>';
+      $output .= t('For instance, if the name of stored data will be:');
+      $output .= '</br>';
+      $output .= t('my stored data');
+      $output .= '</br>';
+      $output .= t('then this data will become available in the selector under the following name:');
+      $output .= '</br>';
+      $output .= t('@stored_data:my stored data');
+      $output .= '</br>';
+      $output .= '</li>';
+      $output .= '<li>';
+      $output .= t("Type this name into the 'NAME' field and click on 'Save' button.");
+      $output .= '</br>';
+      $output .= '</br>';
+      $output .= '</li>';
+      $output .= '</ol>';
+      $output .= t('After that this data will become available in other rules or components.');
+      $output .= '</dd>';
+      $output .= '<dt><h4>' . t('Alter stored data') . '</h4></dt>';
+      $output .= '<dd>';
+      $output .= t("You can alter the value of stored data with 'Set a data value' action.");
+      $output .= '</br>';
+      $output .= t('For instance, you can select from the selector the following variable:');
+      $output .= '</br>';
+      $output .= t('@stored_data:my stored data');
+      $output .= '</br>';
+      $output .= t("and set to it a new value using 'Set a data value' action.");
+      $output .= '</br>';
+      $output .= t('After that, a new value will be available in a current rule.');
+      $output .= '</br>';
+      $output .= t('But remember that if you need that this');
+      $output .= ' ';
+      $output .= t('new value will become available in other rules you need to store it again.');
+      $output .= '</br>';
+      $output .= t("Just add 'Store data' action again and select our data:");
+      $output .= '</br>';
+      $output .= t('@stored_data:my stored data');
+      $output .= '</br>';
+      $output .= t("then type into the 'NAME' field the name of our data:");
+      $output .= '</br>';
+      $output .= t('my stored data');
+      $output .= '</br>';
+      $output .= t('After that, the new value will also be available in other rules.');
+      $output .= '</dd>';
+      $output .= '<dt><h4>' . t('Clear stored data') . '</h4></dt>';
+      $output .= '<dd>';
+      $output .= t('Keep in mind that stored data are also available for other modules.');
+      $output .= '</br>';
+      $output .= t('Therefore, if you work with a confidential data you may want to clear them after using.');
+      $output .= '</br>';
+      $output .= t("The 'Clear stored data' action exist for this purpose.");
+      $output .= '</br>';
+      $output .= t("To clear stored data do the following:");
+      $output .= '<ol>';
+      $output .= '<li>';
+      $output .= t("Add 'Clear stored data' action to your rule");
+      $output .= ' ';
+      $output .= t("(you will find it under 'Data' section of the actions list).");
+      $output .= '</li>';
+      $output .= '<li>';
+      $output .= t("Select data to be cleared.");
+      $output .= '</br>';
+      $output .= t("To do this switch to the 'Data selection' mode (click on 'Switch to data selection' button).");
+      $output .= '</br>';
+      $output .= t("Then select data to be cleared using the selector.");
+      $output .= '</br>';
+      $output .= t("For instance, if we want to clear stored data named as 'my stored data'");
+      $output .= ' ';
+      $output .= t('then we need to select the following variable:');
+      $output .= '</br>';
+      $output .= t('@stored_data:my stored data');
+      $output .= '</li>';
+      $output .= '<li>';
+      $output .= t("Click on 'Save' button.");
+      $output .= '</li>';
+      $output .= '</ol>';
+      $output .= t('Immediately upon completion of this action the stored data will be cleared.');
+      $output .= '</br>';
+      $output .= t("In other words, after completion of this action the variable '@stored_data:my stored data'");
+      $output .= ' ';
+      $output .= t('will become empty.');
+      $output .= '</dd>';
+      $output .= '</dl>';
+      return $output;
+
+    default:
+  }
+}
