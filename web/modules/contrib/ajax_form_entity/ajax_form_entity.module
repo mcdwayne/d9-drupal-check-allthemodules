@@ -1,0 +1,271 @@
+<?php
+
+/**
+ * @file
+ * Contain ajax form entity module.
+ */
+
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Url;
+
+// -----------------------  ROADMAP -----------------------
+
+// -----------------------  PRIO 1 -----------------------
+// @todo : Custom div to send content to be tested.
+// @todo : handle better the dimensions of the popin.
+// @todo : Choose view mode on creation.
+// @todo : Cancel operation button.
+// @todo : remove a specific div on creation.
+// @todo : cache (configuration of extra fields and links).
+// @todo : Delete (popin or inline).
+// @todo : composer.json / hook_help / readme.txt.
+
+// -----------------------  PRIO 2 -----------------------
+// @todo : reload a selected view on creation ?
+// @todo : issue with blocks.
+// @todo : choose form mode on edition (per display ?)
+// @todo : Entity form in blocks + popin ?
+// @todo : scrollto a div.
+// @todo : Fields with formatter & configuration or config entity instead of extra fields
+
+// -----------------------  PRIO 3 -----------------------
+// @todo : implement testing.
+// @todo : AJAX setting form (ajax button + scroll & message).
+// @todo : Do not launch on edit page when inside the backoffice.
+// @todo : Ajaxification of configuration entity forms.
+// @todo : title for content page : reload the title block (check compatibility with quick edit).
+// @todo : Autoclose when the form is outdated ?
+// @todo : Make it work with dropdown buttons.
+// @todo : preview in AJAX.
+// @todo : message to show ("please wait" : 'progess' 'message' of '#ajax').
+
+/**
+ * Alter forms to ajaxify specified forms.
+ *
+ * Implements hook_form_alter().
+ */
+function ajax_form_entity_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+
+  // Work only on entity forms.
+  $build_info = $form_state->getBuildInfo();
+  if (empty($build_info['callback_object'])) {
+    return;
+  }
+  /* @var $callback Drupal\Core\Entity\EntityForm */
+  $callback = $build_info['callback_object'];
+  if (method_exists($callback, 'getEntity')) {
+    // Get the entity.
+    $entity = $callback->getEntity();
+    $entity_type = $entity->getEntityTypeId();
+    $bundle = $entity->bundle();
+    $entity_id = $entity->id();
+
+    // Get Ajax form entity configuration.
+    $config_ajax_form_entity = \Drupal::config('ajax_form_entity.settings');
+    $confs = $config_ajax_form_entity->get('content');
+
+    if ((isset($confs[$entity_type][$bundle]['activate']) && $confs[$entity_type][$bundle]['activate'])) {
+
+      // Add form class for ajaxification. In case of add form, append "new"
+      // instead of the entity ID.
+      if ($entity_id) {
+        $ajax_id = 'ajax-form-entity-' . $entity_type . '-' . $bundle . '-' . $entity_id;
+      }
+      else {
+        $ajax_id = 'ajax-form-entity-' . $entity_type . '-' . $bundle . '-new';
+      }
+      $form['#attributes']['class'][] = $ajax_id;
+
+      // Ajaxification settings of the buttons.
+      $ajax_settings = [
+        'callback' => 'Drupal\ajax_form_entity\Form\FormAlter::ajaxFormEntityCallback',
+        'wrapper' => $ajax_id,
+        'effect' => 'fade',
+      ];
+      $form['actions']['submit']['#ajax'] = $ajax_settings;
+      $form['actions']['publish']['#ajax'] = $ajax_settings;
+      $form['actions']['unpublish']['#ajax'] = $ajax_settings;
+      // @todo : does not work with dropbuttons (needs javascript magic presumably).
+      unset($form['actions']['publish']['#dropbutton']);
+      unset($form['actions']['unpublish']['#dropbutton']);
+      // Ajaxify the buttons.
+      foreach (array_keys($form['actions']) as $action) {
+        if ($action != 'preview' && isset($form['actions'][$action]['#type']) && $form['actions'][$action]['#type'] === 'submit') {
+          $form['actions'][$action]['#submit'][] = 'Drupal\ajax_form_entity\Form\FormAlter::ajaxFormEntityFormSubmit';
+        }
+      }
+
+      // Handle case of entity edition : define the options.
+      if ($entity_id) {
+        $current_path = \Drupal::service('path.current')->getPath();
+        $path_args = explode('/', $current_path);
+
+        // Case of edit link.
+        if ($path_args[1] == 'ajax-form-entity') {
+          $view_mode = $path_args[5];
+          // Never reload the form.
+          $reload = FALSE;
+
+          // Always send content back for replacement.
+          $send_content = TRUE;
+          $selector_type = TRUE;
+        }
+
+        // Case of form inside the display of the entity.
+        else {
+          // @todo  : define display mode on creation.
+          $view_mode = 'default';
+          //$view_mode = $confs[$entity_type][$bundle]['view_mode'];
+          // Always reload the form.
+          $reload = 'reload_entity';
+          $send_content = FALSE;
+          $selector_type = FALSE;
+        }
+
+        // Selector is the class of content if popin or clas of form creation.
+        if ($confs[$entity_type][$bundle]['popin'] || $path_args[1] != 'ajax-form-entity') {
+          $content_selector = '.ajax-form-entity-view-' . $entity_type . '-' . $entity_id;
+        }
+        else {
+          $content_selector = '.' . $ajax_id;
+        }
+      }
+      // Case of creation.
+      else {
+        // @todo  : define display mode on creation.
+        $view_mode = 'default';
+        //$view_mode = $confs[$entity_type][$bundle]['view_mode'];
+
+        $reload = $confs[$entity_type][$bundle]['reload'];
+
+        $send_content = $confs[$entity_type][$bundle]['send_content'];
+        $selector_type = $confs[$entity_type][$bundle]['selector_type'];
+
+        if ($confs[$entity_type][$bundle]['selector_content']) {
+          $content_selector = $confs[$entity_type][$bundle]['selector_content'];
+        }
+        else {
+          $content_selector = '.' . $ajax_id;
+        }
+
+      }
+
+      // Add all configurations to the form to make it available everywhere.
+      $form['ajax_form_entity'] = [
+        '#type' => 'hidden',
+        '#value' => [
+          'view_mode' => $view_mode,
+          'reload' => $reload,
+          'popin' => $confs[$entity_type][$bundle]['popin'],
+          'selector_type' => $selector_type,
+          'send_content' => $send_content,
+          'content_selector' => $content_selector,
+          'form_selector' => '.' . $ajax_id,
+          'show_message' => $confs[$entity_type][$bundle]['show_message'],
+        ],
+      ];
+
+      // @todo : handle preview and deletion.
+
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function ajax_form_entity_entity_extra_field_info() {
+  // Get Ajax form entity configuration.
+  $config_ajax_form_entity = \Drupal::config('ajax_form_entity.settings');
+  $confs = $config_ajax_form_entity->get('content');
+  // Create pseudo fields.
+  $extra = [];
+  foreach ($confs as $entity_type => $bundles) {
+    foreach ($bundles as $bundle => $bundle_configuration) {
+      // AJAX edit link.
+      if ($bundle_configuration['activate'] && isset($bundle_configuration['edit_link']) && $bundle_configuration['edit_link']) {
+        $extra[$entity_type][$bundle]['display']['ajax_form_entity_edit_link'] = [
+          'label' => t('Ajax manage links'),
+          'description' => t('Provides an ajax links to manage the current entity.'),
+          'weight' => 100,
+          'visible' => TRUE,
+        ];
+      }
+      // Edit form.
+      if ($bundle_configuration['activate'] && isset($bundle_configuration['form']) && $bundle_configuration['form']) {
+        $extra[$entity_type][$bundle]['display']['ajax_form_entity_form'] = [
+          'label' => t('Edit form'),
+          'description' => t('Provides the edit form.'),
+          'weight' => 100,
+          'visible' => TRUE,
+        ];
+      }
+    }
+  }
+  return $extra;
+}
+
+/**
+ * Implements hook_entity_view().
+ */
+function ajax_form_entity_entity_view(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display, $view_mode) {
+  $entity_type = $entity->getEntityTypeId();
+  $bundle = $entity->bundle();
+  $entity_id = $entity->id();
+  $config_ajax_form_entity = \Drupal::config('ajax_form_entity.settings');
+  $confs = $config_ajax_form_entity->get('content');
+
+  // Add AJAX edit link.
+  if (isset($confs[$entity_type][$bundle]['activate']) && $confs[$entity_type][$bundle]['activate'] && $display->getComponent('ajax_form_entity_edit_link') && $entity->access('edit')) {
+
+    // Popin edit mode.
+    $popin = $confs[$entity_type][$bundle]['popin'];
+
+    // Build the AJAX link.
+    $build['ajax_form_entity_edit_link'] = [
+      '#theme' => 'links',
+      '#weight' => -10,
+      '#links' => [
+        'ajax_edit_link' => [
+          'title' => t('Edit'),
+          'url' => Url::fromRoute(
+            'ajax_form_entity.ajaxform',
+            [
+              'entity_type' => $entity_type,
+              'id' => $entity_id,
+              'popin' => $popin,
+              'view_mode' => $view_mode,
+            ]
+          ),
+          'attributes' => ['class' => ['use-ajax']],
+        ],
+      ],
+    ];
+
+    // Ajax popin mode.
+    // @todo : handle better dimensions of the dialog.
+    if ($popin) {
+      $build['ajax_form_entity_edit_link']['#links']['ajax_edit_link']['attributes']['data-dialog-type'] = 'modal';
+      $build['ajax_form_entity_edit_link']['#links']['ajax_edit_link']['attributes']['data-dialog-options'] = json_encode([
+        'width' => 1000,
+        'height' => 700,
+      ]);
+      $build['ajax_form_entity_edit_link']['#attached']['library'] = [
+        'core/drupal.ajax',
+        'core/drupal.dialog',
+      ];
+    }
+
+    // Add AJAX class for replacement.
+    $build['#attributes']['class'][] = 'ajax-form-entity-view-' . $entity_type . '-' . $entity_id;
+  }
+
+  // Edit form inside the content.
+  if (isset($confs[$entity_type][$bundle]['activate']) && $confs[$entity_type][$bundle]['activate'] && $display->getComponent('ajax_form_entity_form') && $entity->access('edit')) {
+    $build['ajax_form_entity_form'] = \Drupal::service('entity.form_builder')
+      ->getForm($entity);
+  }
+
+}
