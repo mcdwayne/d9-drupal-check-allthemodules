@@ -1,0 +1,235 @@
+<?php
+/**
+ * @file
+ * Functions for restricted area module.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Symfony\Component\HttpKernel\Exception\HttpException;
+
+define('RESTRICTED_AREA_ENTITY_TABLE_NAME', 'restricted_area_entity');
+
+/**
+ * Implements hook_entity_delete().
+ *
+ * @inheritdoc
+ */
+function restricted_area_entity_delete(EntityInterface $entity) {
+  restricted_area_delete_by_entity($entity->getType(), $entity->id());
+}
+
+/**
+ * Implements hook_entity_view().
+ *
+ * @inheritdoc
+ */
+function restricted_area_entity_view(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display, $view_mode) {
+  $type = $entity->getEntityTypeId();
+  $id = $entity->id();
+  $restriction = restricted_area_load_by_entity($type, $id);
+  if ($restriction) {
+    // Disable cache for for current node, because need to have to check access for each time.
+    restricted_area_require_login($restriction);
+  }
+}
+
+/**
+ * Require login/password for current page.
+ *
+ * @param array $restriction
+ *   Array with 'login' and 'password' elements.
+ *
+ * @return bool
+ *   TRUE if login/password is correct.
+ */
+function restricted_area_require_login(array $restriction) {
+  if (PHP_SAPI != 'cli') {
+    $hash = $restriction['password'];
+    if (!\Drupal::currentUser()->hasPermission('bypass restricted area access')) {
+      if (!empty($_SERVER['PHP_AUTH_USER']) && isset($_SERVER['PHP_AUTH_PW'])
+        && $_SERVER['PHP_AUTH_USER'] == $restriction['login']
+        && \Drupal::service('password')->check($_SERVER['PHP_AUTH_PW'], $hash)) {
+        return TRUE;
+      }
+      $build['#cache']['max-age'] = 0;
+      throw new HttpException(401, NULL, NULL, [
+        'WWW-Authenticate' => 'Basic realm="' . t('Please, enter login and password for access to this page.') . '"',
+        'Cache-Control' => 'no-cache, must-revalidate, post-check=0, pre-check=0',
+      ]);
+    }
+  }
+
+  return TRUE;
+}
+
+/**
+ * Load restricted information by entity.
+ *
+ * @param string $entity_type
+ *   Entity type for search.
+ * @param int $entity_id
+ *   Entity ID for search.
+ *
+ * @return mixed
+ *   Array with such keys:
+ *   - entity_type
+ *   - entity_id
+ *   - login
+ *   - password (hashed)
+ *   OR FALSE if nothing found.
+ */
+function restricted_area_load_by_entity($entity_type, $entity_id) {
+  return \Drupal::database()->select(RESTRICTED_AREA_ENTITY_TABLE_NAME, 'rae')
+    ->fields('rae')
+    ->condition('rae.entity_type', $entity_type)
+    ->condition('rae.entity_id', $entity_id)
+    ->execute()
+    ->fetchAssoc();
+}
+
+/**
+ * Save restricted information about entity.
+ *
+ * @param array $restricted
+ *   Array to save with such data:
+ *   - entity_type
+ *   - entity_id
+ *   - login
+ *   - password (not hashed).
+ */
+function restricted_area_save(array $restricted) {
+  // Hash password before saving it to database.
+  $password_service = \Drupal::service('password');
+  $restricted['password'] = $password_service->hash($restricted['password']);
+
+  \Drupal::database()->merge(RESTRICTED_AREA_ENTITY_TABLE_NAME)
+    ->key([
+      'entity_type' => $restricted['entity_type'],
+      'entity_id' => $restricted['entity_id'],
+    ])
+    ->fields($restricted)
+    ->execute();
+}
+
+/**
+ * Delete restricted information about entity.
+ *
+ * @param string $entity_type
+ *   Entity type for search.
+ * @param int $entity_id
+ *   Entity ID for search.
+ */
+function restricted_area_delete_by_entity($entity_type, $entity_id) {
+  \Drupal::database()->delete(RESTRICTED_AREA_ENTITY_TABLE_NAME)
+    ->condition('entity_type', $entity_type)
+    ->condition('entity_id', $entity_id)
+    ->execute();
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * @inheritdoc
+ */
+function restricted_area_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $form_state_object = $form_state->getFormObject();
+  if ($form_state_object instanceof \Drupal\Node\NodeForm) {
+    $element = [
+      '#type' => 'details',
+      '#title' => t('Restricted area'),
+      '#access' => \Drupal::currentUser()->hasPermission('administer entity restrictions'),
+      '#group' => 'advanced',
+      '#attributes' => [
+        'class' => ['entity-create-restricted-area'],
+      ],
+      '#weight' => 100,
+      'login' => [
+        '#type' => 'textfield',
+        '#title' => t('Login'),
+        '#description' => t('Login used for access to this entity.'),
+      ],
+      'password' => [
+        '#type' => 'password',
+        '#title' => t('Password'),
+        '#description' => t('The password is hashed and can not be showed as a default value.<br>If you forget it, you can only change the password, <strong>there is no way to restore it</strong>.'),
+      ],
+    ];
+    $attention = '<strong data-restricted-area>';
+    $attention .= t('Password already set, you can:<br> - enter a new password for update it;<br> - clear the "Login" field to remove restriction;<br> - leave it as is to keep the restriction.');
+    $attention .= '</strong>';
+
+    if (method_exists($form_state_object, 'getEntity')) {
+      $entity = $form_state_object->getEntity();
+      if ($entity->id() && $restriction = restricted_area_load_by_entity('node', $entity->id())) {
+        $element['login']['#default_value'] = $restriction['login'];
+        $element['attention']['#markup'] = $attention;
+      }
+    }
+    $form['restricted_area'] = $element;
+    $form['#validate'][] = 'restricted_area_node_form_validate';
+    $form['actions']['publish']['#submit'][] = 'restricted_area_node_form_submit';
+  }
+}
+
+/**
+ * Custom submit handler for entity forms.
+ *
+ * @param array $form
+ *   Form array.
+ * @param FormStateInterface $form_state
+ *   Object which contain the current state of a form.
+ */
+function restricted_area_node_form_validate(array &$form, FormStateInterface $form_state) {
+  $password = $form_state->getValue('password');
+  $login = $form_state->getValue('login');
+
+  if (empty($login) && !empty($password)) {
+    $form_state->setErrorByName('login', t('Restriction can not be created without Login.'));
+  }
+}
+
+/**
+ * Custom submit handler for entity forms.
+ *
+ * @param array $form
+ *   Form array.
+ * @param FormStateInterface $form_state
+ *   Object which contain the current state of a form.
+ */
+function restricted_area_node_form_submit(array &$form, FormStateInterface $form_state) {
+  $form_state_object = $form_state->getFormObject();
+  if ($form_state_object instanceof \Drupal\Node\NodeForm) {
+    if (method_exists($form_state_object, 'getEntity')) {
+      $node = $form_state_object->getEntity();
+      $login = $form_state->getValue('login');
+      $password = $form_state->getValue('password');
+
+      if (empty($node->id()) && !empty($login) && !empty($password)) {
+        // Create new restricted area.
+        restricted_area_save([
+          'entity_type' => $node->getEntityTypeId(),
+          'entity_id' => $node->id(),
+          'login' => $login,
+          'password' => $password,
+        ]);
+      }
+      elseif (!empty($node->id())) {
+        if (!empty($password)) {
+          // Update credentials.
+          restricted_area_save([
+            'entity_type' => 'node',
+            'entity_id' => $node->id(),
+            'login' => $login,
+            'password' => $password,
+          ]);
+        }
+        elseif (empty($login)) {
+          // Remove restriction.
+          restricted_area_delete_by_entity('node', $node->id());
+        }
+      }
+    }
+  }
+}
