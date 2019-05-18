@@ -1,0 +1,797 @@
+<?php
+
+/**
+ * @file
+ * Shopify module file.
+ */
+
+use Drupal\Core\Url;
+use Drupal\shopify\Entity\ShopifyProduct;
+use Drupal\taxonomy\Entity\Term;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\views\ViewExecutable;
+use Drupal\views\Plugin\views\cache\CachePluginBase;
+use Drupal\Core\Render\Element;
+use Drupal\views\Entity\View;
+
+/**
+ * Implements hook_theme().
+ */
+function shopify_theme($existing, $type, $theme, $path) {
+  return [
+    'shopify_product' => [
+      'render element' => 'elements',
+    ],
+    'shopify_product_variant' => [
+      'render element' => 'elements',
+    ],
+    'shopify_cart' => [
+      'template' => 'shopify_cart',
+      'variables' => ['domain' => ''],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_views_post_render().
+ */
+function shopify_views_post_render(ViewExecutable $view, &$output, CachePluginBase $cache) {
+  if ($view->id() === 'shopify_store') {
+    $output['#attached']['library'][] = 'shopify/shopify.store.css';
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Adds "edit on shopify" link to the term operations for collections.
+ */
+function shopify_form_taxonomy_overview_terms_alter(array &$form, FormStateInterface $form_state) {
+  $vocab = $form_state->get(['taxonomy', 'vocabulary']);
+
+  if ($vocab->id() == ShopifyProduct::SHOPIFY_COLLECTIONS_VID) {
+    foreach (Element::children($form['terms']) as $key) {
+      $term = $form['terms'][$key]['#term'];
+      $form['terms'][$key]['operations']['#links']['edit_on_shopify'] = [
+        'title' => t('Edit on Shopify'),
+        'url' => Url::fromUri('https://' . shopify_shop_info('domain') . '/admin/collections/' . $term->field_shopify_collection_id->value),
+        'attributes' => ['target' => '_blank'],
+      ];
+      ksort($form['terms'][$key]['operations']['#links']);
+      $form['terms'][$key]['operations']['#links'] = array_reverse($form['terms'][$key]['operations']['#links']);
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_bundle_info_alter().
+ *
+ * @todo: Doesn't work because link_templates['canonical'] override this.
+ *
+ * @see Drupal\Core\Entity\Entity::toUrl()
+ */
+function shopify_entity_bundle_info_alter(&$bundles) {
+  if (isset($bundles['taxonomy_term']['shopify_tags'])) {
+    $bundles['taxonomy_term']['shopify_tags']['uri_callback'] = 'shopify_taxonomy_tag_term_uri';
+  }
+  if (isset($bundles['taxonomy_term']['shopify_collections'])) {
+    $bundles['taxonomy_term']['shopify_collections']['uri_callback'] = 'shopify_taxonomy_collection_term_uri';
+  }
+}
+
+/**
+ * Set the route for tag terms.
+ */
+function shopify_taxonomy_tag_term_uri(Term $term) {
+  return Url::fromUri('internal:/' . shopify_store_url('page_tag', $term->id()));
+}
+
+/**
+ * Set the route for collection terms.
+ */
+function shopify_taxonomy_collection_term_uri(Term $term) {
+  return Url::fromUri('internal:/' . shopify_store_url('page_collection', $term->id()));
+}
+
+/**
+ * Data that should be passed into drupalSettings.
+ */
+function shopify_drupal_js_data() {
+  $info = shopify_shop_info();
+  return [
+    'shop' => [
+      'domain' => $info->domain,
+    ],
+  ];
+}
+
+/**
+ * Pulls the dynamic Shopify store URL from the View.
+ */
+function shopify_store_url($display = 'main', $arg = NULL) {
+  $view = View::load('shopify_store');
+  if ($view instanceof View) {
+    $path = $view->getDisplay($display)['display_options']['path'];
+    if ($arg) {
+      return strtr($path, ['%' => $arg]);
+    }
+    return $path;
+  }
+}
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function shopify_entity_extra_field_info() {
+  $extra = [];
+  $extra['shopify_product']['shopify_product']['display']['add_to_cart_form'] = [
+    'label' => t('Add to cart form'),
+    'description' => t('Display variant options, quantity field, and "Add to Cart" button.'),
+    'visible' => TRUE,
+    'weight' => 100,
+  ];
+  $extra['shopify_product']['shopify_product']['display']['dynamic_product_image'] = [
+    'label' => t('Dynamic product image'),
+    'description' => t('Displays the product image by default, or the variant image if one is selected.'),
+    'visible' => TRUE,
+    'weight' => 150,
+  ];
+  $extra['shopify_product']['shopify_product']['display']['active_variant'] = [
+    'label' => t('Active variant'),
+    'description' => t('Renders the active variant.'),
+    'visible' => TRUE,
+    'weight' => 200,
+  ];
+  return $extra;
+}
+
+/**
+ * Implements hook_cron().
+ */
+function shopify_cron() {
+  $config = \Drupal::config('shopify.sync');
+  $shopify_cron_sync_time = $config->get('cron_sync_time') ?: 0;
+  $product_last = \Drupal::state()->get('shopify.sync.products_last_sync_time') ?: 0;
+  $collection_last = \Drupal::state()->get('shopify.sync.collections_last_sync_time') ?: 0;
+
+  // Sync the products and collections if the difference between now and the
+  // last time they have been synched is greater than the cron sync time.
+  $sync_products = $config->get('cron_sync_products') && \Drupal::time()->getRequestTime() - $product_last > $shopify_cron_sync_time;
+  $sync_collections = $config->get('cron_sync_collections') && \Drupal::time()->getRequestTime() - $collection_last > $shopify_cron_sync_time;
+
+  // Sync products.
+  if ($sync_products) {
+    $synced_products = shopify_sync_products([
+      'query' => [
+        'updated_at_min' => date(DATE_ISO8601, \Drupal::state()
+          ->get('shopify.sync.products_last_sync_time')),
+        'limit' => 250,
+      ],
+    ]);
+    shopify_sync_deleted_products();
+    \Drupal::state()
+      ->set('shopify.sync.products_last_sync_time', \Drupal::time()->getRequestTime());
+    \Drupal::logger('shopify.cron')
+      ->info(t('Synced @count on cron run.', [
+        '@count' => \Drupal::translation()
+          ->formatPlural(count($synced_products), '@count product', '@count products'),
+      ]));
+  }
+
+  // Sync collections.
+  if ($sync_collections) {
+    $synced_collections = shopify_sync_collections([
+      'query' => [
+        'updated_at_min' => date(DATE_ISO8601, \Drupal::state()
+          ->get('shopify.sync.collections_last_sync_time')),
+        'limit' => 250,
+      ],
+    ]);
+    shopify_sync_deleted_collections();
+    \Drupal::state()
+      ->set('shopify.sync.collections_last_sync_time', \Drupal::time()->getRequestTime());
+    \Drupal::logger('shopify.cron')
+      ->info(t('Synced @count on cron run.', [
+        '@count' => \Drupal::translation()
+          ->formatPlural(count($synced_collections), '@count collection', '@count collections'),
+      ]));
+  }
+}
+
+/**
+ * Implements hook_toolbar().
+ */
+function shopify_toolbar() {
+  $items = [];
+  $links = shopify_renderable_links();
+  // @todo: Need caching per user setup.
+  // @todo: Need better permission checking.
+  $items['shopify'] = [
+    '#type' => 'toolbar_item',
+    'tab' => [
+      '#type' => 'link',
+      '#title' => t('Shopify'),
+      '#url' => Url::fromRoute('shopify.admin'),
+      '#attributes' => [
+        'title' => t('Shopify'),
+        'class' => ['toolbar-icon', 'toolbar-icon-shopify'],
+      ],
+    ],
+    'tray' => [
+      '#heading' => t('Shopify admin pages'),
+      'shopify_links' => [
+        '#theme' => 'item_list',
+        '#items' => $links,
+        '#attributes' => [
+          'class' => ['toolbar-menu'],
+        ],
+        '#attached' => [
+          'library' => [
+            'shopify/shopify.toolbar.css',
+          ],
+        ],
+      ],
+    ],
+    '#weight' => -5,
+  ];
+
+  return $items;
+}
+
+/**
+ * Returns an array of Shopify admin links.
+ */
+function shopify_renderable_links() {
+  // @todo: Need better permission checking.
+  $links[] = [
+    '#type' => 'link',
+    '#title' => t('Visit Store'),
+    '#url' => Url::fromUri('internal:/' . shopify_store_url()),
+  ];
+  $links[] = [
+    '#type' => 'link',
+    '#title' => t('Overview'),
+    '#url' => Url::fromRoute('shopify.admin'),
+  ];
+  $links[] = [
+    '#type' => 'link',
+    '#title' => t('Sync'),
+    '#url' => Url::fromRoute('shopify.sync'),
+  ];
+  $links[] = [
+    '#type' => 'link',
+    '#title' => t('Webhooks'),
+    '#url' => Url::fromRoute('shopify.webhooks'),
+  ];
+  $links[] = [
+    '#type' => 'link',
+    '#title' => t('View Products'),
+    '#url' => Url::fromRoute('entity.shopify_product.collection'),
+  ];
+  $links[] = [
+    '#type' => 'link',
+    '#title' => t('View Collections'),
+    '#url' => Url::fromUri('internal:/admin/structure/taxonomy/manage/shopify_collections/overview'),
+    // @todo: Make more dynamic.
+  ];
+  $links[] = [
+    '#type' => 'link',
+    '#title' => t('View Tags'),
+    '#url' => Url::fromUri('internal:/admin/structure/taxonomy/manage/shopify_tags/overview'),
+    // @todo: Make more dynamic.
+  ];
+  $links[] = [
+    '#type' => 'link',
+    '#title' => t('Product Display'),
+    '#url' => Url::fromUri('internal:/admin/structure/shopify_product/display'),
+  ];
+  $links[] = [
+    '#type' => 'link',
+    '#title' => t('Variant Display'),
+    '#url' => Url::fromUri('internal:/admin/structure/shopify_product_variant/display'),
+  ];
+  $links[] = [
+    '#type' => 'link',
+    '#title' => t('API Settings'),
+    '#url' => Url::fromRoute('shopify_api.admin'),
+  ];
+  $links[] = [
+    '#type' => 'link',
+    '#title' => t('Shopify Admin &rarr;'),
+    '#url' => Url::fromUri('https://' . shopify_shop_info('domain') . '/admin', ['attributes' => ['target' => '_blank']]),
+  ];
+  return $links;
+}
+
+/**
+ * Gets store info from Shopify.
+ *
+ * @param string $key
+ *   Optional specific key to return.
+ * @param bool $refresh
+ *   Whether store info should be refreshed from Shopify.
+ *
+ * @return string|object
+ *   Returns a specific key value or the info object.
+ */
+function shopify_shop_info($key = '', $refresh = FALSE) {
+  if ($refresh) {
+    $client = shopify_api_client();
+    $info = $client->getShopInfo();
+    \Drupal::state()->set('shopify.shop_info', $info);
+  }
+  $info = \Drupal::state()->get('shopify.shop_info', new stdClass());
+  if (!empty($key)) {
+    return $info->{$key};
+  }
+  else {
+    return $info;
+  }
+}
+
+/**
+ * Formats currency based on Shopify settings.
+ *
+ * @param float $amount
+ *   Amount that should be formatted.
+ *
+ * @return string
+ *   Amount with currency.
+ */
+function shopify_currency_format($amount) {
+  return strtr(shopify_shop_info()->money_format, ['{{amount}}' => $amount]);
+}
+
+/**
+ * Sync Shopify products to the site.
+ *
+ * @param array $opts
+ *   Array of options to pass the API call.
+ *
+ * @return ShopifyProduct[]
+ *   Returns the products that were updated/created.
+ */
+function shopify_sync_products(array $opts = []) {
+  $client = shopify_api_client();
+  $result = $client->get('products', $opts);
+  $synced_products = [];
+
+  foreach ($result->products as $product) {
+    try {
+      // Fetch alt data for product image.
+      if (!empty($product->image)) {
+        $product->image->alt = shopify_fetch_alt($client, $product->image->id);
+      }
+      // Fetch alt data for product images.
+      if (!empty($product->images)) {
+        foreach ($product->images as $img_key => $image) {
+          $product->images[$img_key]->alt = shopify_fetch_alt($client, $image->id);
+        }
+      }
+
+      $entity = ShopifyProduct::loadByProductId($product->id);
+      if ($entity instanceof ShopifyProduct) {
+        $entity->update((array) $product);
+        $entity->save();
+      }
+      else {
+        $entity = ShopifyProduct::create((array) $product);
+        $entity->save();
+      }
+      $synced_products[] = $entity;
+    }
+    catch (Exception $e) {
+      \Drupal::logger('shopify')->error('Failed to sync product id: %id', array('%id' => $product->id));
+    }
+  }
+  return $synced_products;
+}
+
+/**
+ * Fetch image alt data.
+ *
+ * @param object $client
+ *   Client object used with the initial API call.
+ * @param int $image_id
+ *   The id of the image to fetch the alt for.
+ *
+ * @return string
+ *   Alt text, or empty string.
+ */
+function shopify_fetch_alt($client, $image_id) {
+  $image_meta = $client->get('metafields', array(
+    'query' => array(
+      'metafield[owner_id]' => $image_id,
+      'metafield[owner_resource]' => 'product_image',
+    ),
+  ));
+  foreach ($image_meta->metafields as $metafield) {
+    if ($metafield->key === 'alt') {
+      return $metafield->value;
+    }
+  }
+  return '';
+}
+
+/**
+ * Deletes products on the site that don't exist on Shopify anymore.
+ *
+ * @param array $opts
+ *   Array of options to pass to the API call.
+ *
+ * @return int
+ *   The number of deleted products.
+ */
+function shopify_sync_deleted_products(array $opts = []) {
+  $client = shopify_api_client();
+  $opts += ['query' => ['fields' => 'id,variants']];
+
+  // Get all Shopify product_ids and variant_ids.
+  $products = $client->getProducts($opts);
+  $product_count = $client->getProductsCount();
+  $product_ids = $variant_ids = [];
+
+  // Build up arrays of products and variant IDs.
+  foreach ($products as $product) {
+    $product_ids[] = $product->id;
+    foreach ($product->variants as $variant) {
+      $variant_ids[] = $variant->id;
+    }
+  }
+
+  // Sanity check to make sure we've gotten all data back from Shopify.
+  if ($product_count != count($product_ids)) {
+    // Something went wrong.
+    return 0;
+  }
+
+  // Go ahead and delete all rogue products.
+  $query = \Drupal::entityQuery('shopify_product');
+  $query->condition('product_id', $product_ids, 'NOT IN');
+  $result = $query->execute();
+  if ($result) {
+    $manager = \Drupal::entityTypeManager()
+      ->getStorage('shopify_product');
+    $product_entities = $manager->loadMultiple($result);
+    $manager->delete($product_entities);
+  }
+
+  // Go ahead and delete all rogue variants.
+  $query = \Drupal::entityQuery('shopify_product_variant');
+  $query->condition('variant_id', $variant_ids, 'NOT IN');
+  $result = $query->execute();
+  if ($result) {
+    $manager = \Drupal::entityTypeManager()
+      ->getStorage('shopify_product_variant');
+    $variant_entities = $manager->loadMultiple($result);
+    $manager->delete($variant_entities);
+  }
+
+  return isset($product_entities) ? count($product_entities) : 0;
+}
+
+/**
+ * Sync Shopify collections to the site.
+ *
+ * @param array $opts
+ *   Array of options to pass the API call.
+ *
+ * @return Term[]
+ *   Returns the collections that were updated/created.
+ */
+function shopify_sync_collections(array $opts = []) {
+  $collections = shopify_api_get_collections($opts);
+  $synced_collections = [];
+  foreach ($collections as $collection) {
+    $term = shopify_collection_load($collection->id);
+    if ($term instanceof Term) {
+      $term = shopify_collection_update($collection, TRUE);
+    }
+    else {
+      // Need to create a new collection.
+      $term = shopify_collection_create($collection, TRUE);
+    }
+    $synced_collections[] = $term;
+  }
+  return $synced_collections;
+}
+
+/**
+ * Deletes collections on the site that don't exist on Shopify anymore.
+ *
+ * @param array $opts
+ *   Additional options to pass to the API call.
+ *
+ * @return int
+ *   Returns the count of collections deleted.
+ */
+function shopify_sync_deleted_collections(array $opts = []) {
+  $opts += ['query' => ['fields' => 'id']];
+  $collections = shopify_api_get_collections();
+  $collection_ids = [];
+
+  // Build up array of all existing collection_ids.
+  foreach ($collections as $col) {
+    $collection_ids[] = $col->id;
+  }
+
+  // Get collections that are not on Shopify anymore.
+  $query = \Drupal::entityQuery('taxonomy_term');
+  $query->condition('vid', 'shopify_collections');
+  $query->condition('field_shopify_collection_id', $collection_ids, 'NOT IN');
+  $result = $query->execute();
+
+  // Delete these collections.
+  if ($result) {
+    $manager = \Drupal::entityTypeManager()
+      ->getStorage('taxonomy_term');
+    $collection_entities = $manager->loadMultiple($result);
+    $manager->delete($collection_entities);
+  }
+
+  return isset($collection_entities) ? count($collection_entities) : 0;
+}
+
+/**
+ * Deletes all Shopify products.
+ */
+function shopify_product_delete_all() {
+  $ids = shopify_product_load_all_ids();
+  foreach ($ids as $id) {
+    $product = ShopifyProduct::load($id);
+    $product->delete();
+  }
+}
+
+/**
+ * Loads all Shopify product IDs.
+ *
+ * @return array
+ *   Shopify product IDs.
+ */
+function shopify_product_load_all_ids() {
+  $query = \Drupal::entityQuery('shopify_product');
+  $ids = $query->execute();
+  if ($ids) {
+    return $ids;
+  }
+  return [];
+}
+
+/**
+ * Get Shopify collections from the API.
+ *
+ * @param array $opts
+ *   Arguments to pass to the API.
+ * @param string $type
+ *   Type of collections to get, options are:
+ *   - both: Get smart and custom collections.
+ *   - smart: Get smart collections only.
+ *   - custom: Get custom collections only.
+ *
+ * @return array
+ *   Returns the API response data.
+ */
+function shopify_api_get_collections(array $opts = [], $type = 'both') {
+  $smart_collections = $custom_collections = [];
+  $client = shopify_api_client();
+  if ($type == 'both' || $type == 'smart') {
+    $smart_collections = $client->getResources('smart_collections', $opts);
+  }
+  if ($type == 'both' || $type == 'custom') {
+    $custom_collections = $client->getResources('custom_collections', $opts);
+  }
+  return array_merge($smart_collections, $custom_collections);
+}
+
+/**
+ * Loads a collection term based on the collection ID.
+ *
+ * @param int $collection_id
+ *   Shopify collection ID.
+ *
+ * @return Term
+ *   Shopify collection.
+ */
+function shopify_collection_load($collection_id) {
+  $query = \Drupal::entityQuery('taxonomy_term');
+  $query->condition('field_shopify_collection_id', $collection_id);
+  $ids = $query->execute();
+  if ($ids) {
+    $terms = Term::loadMultiple($ids);
+    return reset($terms);
+  }
+  return FALSE;
+}
+
+/**
+ * Create a new collection in the system and sync products.
+ *
+ * @param \stdClass $collection
+ *   Shopify collection.
+ * @param bool $sync_products
+ *   Whether or not to sync product information during creation.
+ *
+ * @return Term
+ *   Shopify collection.
+ */
+function shopify_collection_create(\stdClass $collection, $sync_products = FALSE) {
+  $date = strtotime($collection->published_at);
+  $term = Term::create([
+    'vid' => ShopifyProduct::SHOPIFY_COLLECTIONS_VID,
+    'name' => $collection->title,
+    'description' => [
+      'value' => $collection->body_html,
+      'format' => filter_default_format(),
+    ],
+    'field_shopify_collection_id' => $collection->id,
+    'field_shopify_collection_pub' => $date ? $date : 0,
+  ]);
+  if ($term->save() && isset($collection->image->src)) {
+    // Save the image for this term.
+    shopify_collection_save_image($term, $collection->image->src);
+  }
+  if ($sync_products) {
+    // Sync product information for this collection.
+    shopify_collection_sync_products($collection);
+  }
+  return $term;
+}
+
+/**
+ * Saves an image for a Shopify collection.
+ *
+ * @param Term $term
+ *   Taxonomy term entity.
+ * @param string $image_url
+ *   Remote image URL for the collection image.
+ */
+function shopify_collection_save_image(Term $term, $image_url) {
+  $directory = file_build_uri('shopify_images');
+  if (!file_prepare_directory($directory, FILE_CREATE_DIRECTORY)) {
+    // If our directory doesn't exist and can't be created, use the default.
+    $directory = NULL;
+  }
+  $file = system_retrieve_file($image_url, $directory, TRUE, FILE_EXISTS_REPLACE);
+  $term->field_shopify_collection_image = $file;
+  $term->save();
+}
+
+/**
+ * Sync product collect information for a given collection.
+ *
+ * @param \stdClass $collection
+ *   Shopify collection.
+ */
+function shopify_collection_sync_products(\stdClass $collection) {
+  $term = shopify_collection_load($collection->id);
+  $client = shopify_api_client();
+  $collects = $client->getResources('collects', ['query' => ['collection_id' => $collection->id]]);
+  foreach ($collects as $c) {
+    // Update this product information.
+    $product = ShopifyProduct::loadByProductId($c->product_id);
+    if (!$product) {
+      continue;
+    }
+    foreach ($product->collections as $key => $item) {
+      if ($item->target_id && ($item->target_id == $term->id())) {
+        // Product already in collection.
+        // Check if this collection is active.
+        if ($term->field_shopify_collection_pub->value == 0) {
+          // Remove this collection from the product.
+          $product->collections->removeItem($key);
+          $product->save();
+        }
+        continue 2;
+      }
+    }
+    if ($term->field_shopify_collection_pub->value != 0) {
+      $product->collections[] = $term;
+      $product->save();
+    }
+  }
+}
+
+/**
+ * Update a Shopify collection with new information.
+ *
+ * @param \stdClass $collection
+ *   Shopify collection.
+ * @param bool $sync_products
+ *   Whether or not to sync product information during update.
+ *
+ * @return Term
+ *   Shopify collection.
+ */
+function shopify_collection_update(\stdClass $collection, $sync_products = FALSE) {
+  $term = shopify_collection_load($collection->id);
+  if ($term) {
+    $term->name = $collection->title;
+    $term->description = [
+      'value' => $collection->body_html,
+      'format' => filter_default_format(),
+    ];
+    $date = strtotime($collection->published_at);
+    $term->field_shopify_collection_pub = $date ? $date : 0;
+  }
+  if ($term->save() && isset($collection->image->src)) {
+    // Save the image for this term.
+    shopify_collection_save_image($term, $collection->image->src);
+  }
+  if ($sync_products) {
+    // Sync product information for this collection.
+    shopify_collection_sync_products($collection);
+  }
+  return $term;
+}
+
+/**
+ * Delete all Shopify collections.
+ */
+function shopify_delete_all_collections() {
+  $ids = shopify_collection_load_all_ids();
+  foreach ($ids as $id) {
+    $term = Term::load($id);
+    $term->delete();
+  }
+}
+
+/**
+ * Loads all Shopify collection IDs.
+ *
+ * @return array
+ *   Shopify collections IDs.
+ */
+function shopify_collection_load_all_ids() {
+  $query = \Drupal::entityQuery('taxonomy_term');
+  $query->condition('vid', ShopifyProduct::SHOPIFY_COLLECTIONS_VID);
+  $ids = $query->execute();
+  if ($ids) {
+    return $ids;
+  }
+  return [];
+}
+
+/**
+ * Prepares variables for shopify product templates.
+ *
+ * Default template: shopify-product.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - elements: An array of elements to display in view mode.
+ *   - shopify_product: The shopify product object.
+ *   - view_mode: View mode; e.g., 'full', 'store_listing', etc.
+ */
+function template_preprocess_shopify_product(&$variables) {
+  $variables['view_mode'] = $variables['elements']['#view_mode'];
+  $variables['shopify_product'] = $variables['elements']['#shopify_product'];
+
+  // Helpful $content variable for templates.
+  $variables += ['content' => []];
+  foreach (Element::children($variables['elements']) as $key) {
+    $variables['content'][$key] = $variables['elements'][$key];
+  }
+}
+
+/**
+ * Prepares variables for shopify product variant templates.
+ *
+ * Default template: shopify-product-variant.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - elements: An array of elements to display in view mode.
+ *   - shopify_product_variant: The shopify product variant object.
+ *   - view_mode: View mode; e.g., 'full', 'store_listing', etc.
+ */
+function template_preprocess_shopify_product_variant(&$variables) {
+  $variables['view_mode'] = $variables['elements']['#view_mode'];
+  $variables['shopify_product_variant'] = $variables['elements']['#shopify_product_variant'];
+
+  // Helpful $content variable for templates.
+  $variables += array('content' => array());
+  foreach (Element::children($variables['elements']) as $key) {
+    $variables['content'][$key] = $variables['elements'][$key];
+  }
+}
