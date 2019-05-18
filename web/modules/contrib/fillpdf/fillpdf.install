@@ -1,0 +1,186 @@
+<?php
+
+/**
+ * @file
+ * Install functions for FillPDF.
+ */
+
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Core\StreamWrapper\StreamWrapperInterface;
+use Drupal\Component\Render\FormattableMarkup;
+use Drupal\Core\StringTranslation\TranslatableMarkup;
+use Drupal\fillpdf\Entity\FillPdfForm;
+use Drupal\fillpdf\Service\FillPdfAdminFormHelper;
+use Drupal\Core\Link;
+use Drupal\Core\Url;
+
+/**
+ * Add scheme field to FillPdfForm.
+ */
+function fillpdf_update_8101() {
+  $edum = \Drupal::entityDefinitionUpdateManager();
+  $scheme_field = BaseFieldDefinition::create('string')
+    ->setLabel('Storage system for generated PDFs')
+    ->setDescription(t('This setting is used as the storage/download method for generated PDFs. The use of public files is more efficient, but does not provide any access control. Changing this setting will require you to migrate associated files and data yourself and is not recommended after you have uploaded a template.'))
+    ->setDisplayOptions('form', [
+      'type' => 'radios',
+      'options' => FillPdfAdminFormHelper::schemeOptions(),
+    ]);
+  $edum->installFieldStorageDefinition('scheme', 'fillpdf_form', 'fillpdf_form', $scheme_field);
+}
+
+/**
+ * Install FillPdfFileContext storage.
+ */
+function fillpdf_update_8102() {
+  $edum = \Drupal::entityDefinitionUpdateManager();
+  $entity_manager = \Drupal::entityManager();
+  $fillpdf_file_context = $entity_manager->getDefinition('fillpdf_file_context');
+  $edum->installEntityType($fillpdf_file_context);
+}
+
+/**
+ * Use file fields instead of entity_reference fields for referring to files.
+ */
+function fillpdf_update_8103() {
+  $edum = \Drupal::entityDefinitionUpdateManager();
+  $em = \Drupal::entityManager();
+  $db = \Drupal::database();
+
+  $form_file_def = BaseFieldDefinition::create('file')
+    ->setLabel(t('The associated managed file.'))
+    ->setDescription(t('The associated managed file.'))
+    ->setName('file')
+    ->setProvider('fillpdf_form')
+    ->setTargetBundle(NULL)
+    ->setTargetEntityTypeId('fillpdf_form');
+
+  $fc_file_def = BaseFieldDefinition::create('file')
+    ->setLabel(t('The associated managed file.'))
+    ->setDescription(t('The associated managed file.'))
+    ->setName('file')
+    ->setProvider('fillpdf_file_context')
+    ->setTargetBundle(NULL)
+    ->setTargetEntityTypeId('fillpdf_file_context');
+
+  // Save existing data.
+  $form_files = $db->select('fillpdf_forms', 'ff')
+    ->fields('ff', ['fid', 'file'])
+    ->execute()
+    ->fetchAllKeyed();
+
+  $fc_files = $db->select('fillpdf_file_context', 'fc')
+    ->fields('fc', ['id', 'file'])
+    ->execute()
+    ->fetchAllKeyed();
+
+  // Remove data from the storage.
+  $db->update('fillpdf_forms')
+    ->fields(['file' => NULL])
+    ->execute();
+
+  $db->update('fillpdf_file_context')
+    ->fields(['file' => NULL])
+    ->execute();
+
+  // Now install the new field definitions.
+  $edum->updateFieldStorageDefinition($form_file_def);
+  $edum->updateFieldStorageDefinition($fc_file_def);
+
+  foreach ($form_files as $entity_id => $fillpdf_form_file) {
+    /** @var ContentEntityInterface $entity */
+    $entity = $em->getStorage('fillpdf_form')->load($entity_id);
+    $entity->file->target_id = $fillpdf_form_file;
+    $entity->save();
+  }
+
+  foreach ($fc_files as $entity_id => $ffcf) {
+    /** @var ContentEntityInterface $entity */
+    $entity = $em->getStorage('fillpdf_file_context')->load($entity_id);
+    $entity->file->target_id = $ffcf;
+    $entity->save();
+  }
+}
+
+/**
+ * Add replacements fields.
+ */
+function fillpdf_update_8104() {
+  $edum = \Drupal::entityDefinitionUpdateManager();
+  $replacements = BaseFieldDefinition::create('string_long')
+    ->setLabel(t('Replace word(s) with correct output values'))
+    ->setDescription(FillPdfAdminFormHelper::getReplacementsDescription());
+  $edum->installFieldStorageDefinition('replacements', 'fillpdf_form', 'fillpdf_form', $replacements);
+}
+
+/**
+ * Enable Serialization module.
+ */
+function fillpdf_update_8105() {
+  \Drupal::getContainer()->get('module_installer')->install(['serialization']);
+}
+
+/**
+ * Update default FillPDF Service endpoint (if it's currently the default).
+ */
+function fillpdf_update_8106() {
+  $config = \Drupal::getContainer()->get('config.factory');
+  $settings = $config->getEditable('fillpdf.settings');
+  if ($settings->get('remote_endpoint') === 'fillpdf-service.com/xmlrpc.php') {
+    $settings->set('remote_endpoint', 'fillpdf.io/xmlrpc.php');
+    $settings->save();
+  }
+
+  return t('Default FillPDF Service endpoint updated to fillpdf.io/xmlrpc.php.');
+}
+
+/**
+ * Update storage scheme configuration.
+ */
+function fillpdf_update_8107() {
+  $config = \Drupal::configFactory()->getEditable('fillpdf.settings');
+
+  // Rename the 'scheme' key to 'template_scheme'.
+  if ($config->get('template_scheme') === NULL) {
+    $config->set('template_scheme', $config->get('scheme'));
+  }
+  $config->clear('scheme');
+
+  // Initialize the new 'allowed_schemes' key with all currently available
+  // storage schemes.
+  if ($config->get('allowed_schemes') === NULL) {
+    $available_schemes = array_keys(\Drupal::service('stream_wrapper_manager')->getWrappers(StreamWrapperInterface::WRITE_VISIBLE));
+    $config->set('allowed_schemes', $available_schemes)->save();
+  }
+  $config->save();
+
+  return new FormattableMarkup('All currently available file storage schemes were added to FillPDF configuration. Please review at <a href=":url">FillPDF settings</a>.', [
+    ':url' => Url::fromRoute('fillpdf.settings')->setOption('base_url', \Drupal::request()->getBasePath())->toString(),
+  ]);
+}
+
+/**
+ * Update stored FillPDF forms to the changed storage logic.
+ */
+function fillpdf_update_8108() {
+  $fillpdf_forms = FillPdfForm::loadMultiple();
+
+  // Previously, populated PDF files were stored in the filesystem, if a
+  // 'destination_path' is set. Now it is stored, if 'scheme' is set, which
+  // previously was always the case. So for preexisting FillPdfForms without
+  // a 'destination_path', we need to unset 'scheme' to ensure nothing changes.
+  $updated_ids = [];
+  foreach ($fillpdf_forms as $id => $form) {
+    if (empty($form->getStoragePath())) {
+      $status = $form->set('scheme', NULL)->save();
+      if ($status === SAVED_UPDATED) {
+        $base_path = ['base_url' => \Drupal::request()->getBasePath()];
+        $updated_ids[] = Link::createFromRoute($id, 'entity.fillpdf_form.edit_form', ['fillpdf_form' => $id], $base_path)->toString();
+      }
+    }
+  }
+
+  return new FormattableMarkup('The following FillPDF forms were updated to the changed storage logic: %list.', [
+    '%list' => new FormattableMarkup(implode(', ', $updated_ids), []),
+  ]);
+}
