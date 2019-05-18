@@ -1,0 +1,450 @@
+<?php
+
+/**
+ * @file
+ * Private forum containers for groups.
+ */
+
+use Drupal\Core\Url;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\group\Entity\Group;
+use Symfony\Component\HttpFoundation\RedirectResponse;
+
+/**
+ * Implements hook_form_alter().
+ */
+function gforum_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+
+  // Check if this is the edit form for the Group entity.
+  if (preg_match('/^group_[a-z_]{1,}_edit_form$/', $form_id)) {
+
+    // It wouldn't make sense to allow group roles to assign containers to their
+    // group.  So we check for a Drupal core permission.
+    $user = \Drupal::currentUser();
+
+    if (!$user->hasPermission('assign forum containers to groups')) {
+
+      $field = gforum_forum_containers_field_name();
+
+      if (isset($form[$field])) {
+        unset($form[$field]);
+      }
+    }
+  }
+
+}
+
+/**
+ * Implements hook_field_widget_form_alter().
+ */
+function gforum_field_widget_form_alter(&$element, FormStateInterface $form_state, $context) {
+
+  if (isset($context['items'])) {
+
+    $def = $context['items']->getFieldDefinition();
+
+    if (method_exists($def, 'get') && 'taxonomy_forums' == $def->get('field_name')) {
+
+      // Remove options that aren't relevant to the group.
+      if ($group = \Drupal::routeMatch()->getParameter('group')) {
+
+        $field = gforum_forum_containers_field_name();
+
+        if (!$group->hasField($field)) {
+
+          $txt = t('Please be sure you have created a forum containers field in
+                   your group type.  See the install instructions in the README
+                   file that comes with the Group Forum module.');
+
+          \Drupal::logger('my_module')->warning($txt);
+          drupal_set_message($txt, 'warning');
+
+          $response = new RedirectResponse('/group/' . $group->id());
+          $response->setStatusCode(301)->send();
+        }
+        else {
+
+          $group_containers = $group->{$field}->getValue();
+
+          if (empty($group_containers)) {
+            $txt = t('No forum containers are assigned to this group. Please 
+                      assign at least one forum container to the group, and at 
+                      least one forum to the forum container. See the install 
+                      instructions in the README file that comes with the Group 
+                      Forum module.');
+            drupal_set_message($txt, 'warning');
+          }
+          else {
+
+            // Initialize an array of options.
+            $options['_none'] = $element['#options']['_none'];
+
+            $ct = count($group_containers);
+
+            // A group may have more than one container.
+            foreach ($group_containers as $container) {
+
+              // Get the terms in this container.
+              $container_tid = (int) $container['target_id'];
+              $terms = gforum_forum_terms($container_tid, NULL);
+
+              foreach ($terms as $tid => $value) {
+
+                // Remove the dash.
+                $label = ltrim($element['#options'][$tid], '-');
+
+                if (1 == $ct) {
+                  $options[$tid] = $label;
+                }
+                else {
+                  // If there are multiple containers in the widget, prefix the
+                  // option labels with the container label.
+                  $options[$tid] = $element['#options'][$container_tid] . ' - ' . $label;
+                }
+              }
+            }
+
+            if (count($options) < 2) {
+              $txt = t('The forum container(s) assigned to this group contain no
+                       forums. Please assign at least one forum to this group\'s
+                       forum container(s). See the install instructions in the README
+                       file that comes with the Group Forum module.');
+              drupal_set_message($txt, 'warning');
+            }
+          }
+
+          asort($options);
+
+          $element['#options'] = $options;
+        }
+      }
+
+    }
+  }
+
+}
+
+/**
+ * Implements hook_preprocess_block().
+ */
+function gforum_preprocess_block(&$variables) {
+
+  if ('system_main_block' == $variables['plugin_id']) {
+
+    $url = Url::fromRoute('<current>');
+    $internalpath = $url->getInternalPath();
+    $parts = explode('/', $internalpath);
+
+    // If the internal path starts with 'forum', we might want to modify the UI.
+    if ('forum' == $parts[0]) {
+
+      $account = \Drupal::currentUser();
+
+      if ($account->hasPermission('create forum content')) {
+        // The user has the 'create forum content' permission in Drupal's core
+        // permissions, but we probably don't want to show the ui.
+        $remove_ui = \Drupal::config('gforum.settings')->get('remove_core_create_ui');
+      }
+      else {
+        // If the user doesn't have permission to create forum topics in
+        // Drupal's core permissions, we probably don't want to show a "You are
+        // not allowed" message here, because the user is probably able to
+        // create group forum content.  For most use cases, if a user has read
+        // access to a forum, they probably will have ability to create topics.
+        $remove_ui = \Drupal::config('gforum.settings')->get('remove_core_create_disallowed_message');
+      }
+
+      if ($remove_ui) {
+
+        $original = $variables['content']['#markup'];
+
+        // Remove everything before the forum div.
+        $ui_removed = strstr($original, '<div class="forum"');
+        $variables['content']['#markup'] = $ui_removed ? $ui_removed : $original;
+
+        $topic_create_help = \Drupal::config('gforum.settings')->get('topic_create_help');
+
+        if ($topic_create_help && !$account->hasPermission('create forum content')) {
+
+          $targs['@topic_create_help'] = $topic_create_help;
+          $prefix = '<p class="gforum-help">' . t('@topic_create_help', $targs) . '</p>';
+          $variables['content']['#markup'] = $prefix . $variables['content']['#markup'];
+        }
+      }
+
+    }
+    // We could put this redirect in any hook that will fire once per page load.
+    elseif ('taxonomy' == $parts[0] && 'term' == $parts[1] && !isset($parts[2])) {
+
+      if (\Drupal::config('gforum.settings')->get('taxonomy_term_redirect')) {
+        if ($term = \Drupal::routeMatch()->getParameter('taxonomy_term')) {
+
+          $tid = $term->id();
+          $tree = gforum_forum_terms(0, NULL);
+
+          // Check if the term is a forum term.
+          if (isset($tree[$tid])) {
+            // It's a forum term, so redirect to the forum.
+            // For example, taxonomy/term/123 would redirect to forum/123.
+            \Drupal::service('page_cache_kill_switch')->trigger();
+            $response = new RedirectResponse('/forum/' . $tid);
+            $response->setStatusCode(301)->send();
+          }
+        }
+      }
+    }
+
+  }
+}
+
+/**
+ * Implements hook_preprocess_forums().
+ */
+function gforum_preprocess_forums(&$variables) {
+
+  // Forum landing page.
+  if (0 === $variables['tid']) {
+
+    // Get the entire tree for the Forums vocabulary.
+    $tree = gforum_forum_terms(0, NULL);
+
+    $forums = $variables['forums']['#forums'];
+
+    foreach ($forums as $key => $forum) {
+
+      $root_tid = gforum_get_root($tree, $key);
+
+      // Get any groups associated with this forum container.
+      $groups = gforum_container_groups($root_tid);
+
+      if (!empty($groups)) {
+
+        $perm = gforum_access_perm();
+
+        if (!gforum_has_perm($groups, $perm)) {
+          unset($variables['forums']['#forums'][$key]);
+        }
+      }
+    }
+  }
+  // Container page (forum listing).
+  elseif ('1' == $variables['term']->forum_container->value) {
+
+    $groups = gforum_container_groups($variables['tid']);
+
+    if (!empty($groups)) {
+
+      $perm = gforum_access_perm();
+
+      if (!gforum_has_perm($groups, $perm)) {
+
+        \Drupal::service('page_cache_kill_switch')->trigger();
+
+        $path = \Drupal::currentUser()->isAnonymous() ? '/' : '/forum';
+        $response = new RedirectResponse($path);
+        $response->setStatusCode(403)->send();
+        exit();
+      }
+    }
+  }
+  // Forum page (topic listing).
+  else {
+
+    // Get the entire tree for the Forums vocabulary.
+    $tree = gforum_forum_terms(0, NULL);
+
+    // Get the tid of this term's root container.
+    $root_tid = gforum_get_root($tree, $variables['tid']);
+
+    $groups = gforum_container_groups($root_tid);
+
+    if (!empty($groups)) {
+
+      $perm = gforum_access_perm();
+
+      if (!gforum_has_perm($groups, $perm)) {
+
+        \Drupal::service('page_cache_kill_switch')->trigger();
+
+        $path = \Drupal::currentUser()->isAnonymous() ? '/' : '/forum';
+        $response = new RedirectResponse($path);
+        $response->setStatusCode(403)->send();
+        exit();
+      }
+    }
+
+  }
+}
+
+/**
+ * Get all the groups assigned to a forum container.
+ *
+ * @param string|array $root_tid
+ *   A term Id or an array of term Ids.
+ *
+ * @return array
+ *   Loaded group entities.
+ */
+function gforum_container_groups($root_tid) {
+
+  // Make sure there is at least one Group type.
+  $group_types = \Drupal::entityTypeManager()->getDefinition('group');
+
+  if (empty($group_types)) {
+
+    $roles = \Drupal::currentUser()->getRoles();
+
+    if (in_array('administrator', $roles)) {
+      $txt = t('You must create a Group type before you can use Group Forum.');
+      drupal_set_message($txt, 'status');
+    }
+
+    return [];
+  }
+
+  $field = gforum_forum_containers_field_name();
+
+  if (!is_array($root_tid)) {
+    $root_tid = [$root_tid];
+  }
+
+  try {
+    // Get the groups associated with the forum container.
+    $query = \Drupal::service('entity.query')
+      ->get('group')
+      ->condition($field, $root_tid);
+    $gids = $query->execute();
+
+    if ($gids && $groups = Group::loadMultiple($gids)) {
+      return $groups;
+    }
+  }
+  catch (Exception $e) {
+    $roles = \Drupal::currentUser()->getRoles();
+
+    $txt = t('Please be sure you have created a forum containers field in your
+             group type.  See the install instructions in the README file
+             that comes with the Group Forum module.');
+    $txt .= "\n" . $e->getMessage();
+
+    \Drupal::logger('my_module')->warning($txt);
+
+    if (in_array('administrator', $roles)) {
+      drupal_set_message($txt, 'warning');
+    }
+  }
+
+  return [];
+}
+
+/**
+ * Get the terms in the Forums vocabulary.
+ *
+ * @param int $parent
+ *   The term ID under which to generate the tree. If 0, generate the tree for
+ *   the entire vocabulary.
+ * @param int $max_depth
+ *   The number of levels of the tree to return. Set to NULL to return all
+ *   levels.
+ * @param bool $load_entities
+ *   If TRUE, a full entity load will occur on the term objects. Otherwise they
+ *   are partial objects queried directly from the {taxonomy_term_data} table
+ *   to save execution time and memory consumption when listing large numbers of
+ *   terms. Defaults to FALSE.
+ *
+ * @return array
+ *   The term entities, keyed by term Id.
+ */
+function gforum_forum_terms($parent = 0, $max_depth = 1, $load_entities = FALSE) {
+
+  $terms = [];
+
+  $tree = \Drupal::entityTypeManager()
+    ->getStorage('taxonomy_term')
+    ->loadTree('forums', $parent, $max_depth, $load_entities);
+
+  foreach ($tree as $term) {
+    $tid = $term->tid;
+    $terms[$tid] = $term;
+  }
+  return $terms;
+}
+
+/**
+ * Given a term Id, get the root of the tree in which it's found.
+ *
+ * The $tree array should be keyed by term Ids, like the output from
+ * gforum_forum_terms().
+ *
+ * @param array $tree
+ *   A tree from gforum_forum_terms().
+ * @param string $tid
+ *   The term Id.
+ *
+ * @return int
+ *   The term Id.
+ */
+function gforum_get_root(array $tree, $tid) {
+
+  $parents = $tree[$tid]->parents;
+
+  if ('0' === $parents[0]) {
+    // It's the root.
+    return (int) $tid;
+  }
+  else {
+    return gforum_get_root($tree, $parents[0]);
+  }
+}
+
+/**
+ * Determine if a user has a permission in at least one relevant group.
+ *
+ * @param array $groups
+ *   Array of groups from gforum_container_groups().
+ * @param string $perm
+ *   The group permission for which to check.
+ *
+ * @return bool
+ *   TRUE if the user has the permission in one of the groups.
+ */
+function gforum_has_perm(array $groups, $perm = 'view group_node:forum content') {
+
+  $account = \Drupal::currentUser();
+
+  // It suffices if one of a user's groups is associated with the container.
+  foreach ($groups as $group) {
+    if ($group->hasPermission($perm, $account)) {
+      return TRUE;
+    }
+  }
+
+  return FALSE;
+}
+
+/**
+ * Determine which Group permission should control access to forums.
+ *
+ * @return string
+ *   The permission.
+ */
+function gforum_access_perm() {
+
+  $perm = \Drupal::config('gforum.settings')->get('group_forum_access_perm');
+  return is_null($perm) ? 'view group_node:forum content' : $perm;
+}
+
+/**
+ * Get the forum containers field name from the module settings.
+ *
+ * This is the taxonomy reference field we add to our group type so we can
+ * associate forum containers with groups.
+ *
+ * @return string
+ *   The field's machine name.
+ */
+function gforum_forum_containers_field_name() {
+
+  $field = \Drupal::config('gforum.settings')->get('containers_field_machine_name');
+  return is_null($field) ? 'field_forum_containers' : $field;
+}
