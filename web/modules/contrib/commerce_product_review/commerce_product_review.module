@@ -1,0 +1,168 @@
+<?php
+
+/**
+ * @file
+ * Hook implementations of the Commerce Product Review module.
+ */
+
+use Drupal\commerce_product\Entity\ProductInterface;
+use Drupal\commerce_product_review\Plugin\Field\FieldFormatter\OverallRatingEmptyTextFormatterInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Core\Link;
+use Drupal\Core\Render\Element;
+use Drupal\Core\StringTranslation\TranslatableMarkup;
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_entity_base_field_info().
+ */
+function commerce_product_review_entity_base_field_info(EntityTypeInterface $entity_type) {
+  $fields = [];
+
+  if ($entity_type->id() === 'commerce_product') {
+    $fields['overall_rating'] = BaseFieldDefinition::create('commerce_product_review_overall_rating')
+      ->setLabel(new TranslatableMarkup('Overall rating'))
+      ->setDisplayConfigurable('view', TRUE);
+  }
+
+  return $fields;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function commerce_product_review_theme() {
+  return [
+    'commerce_product_review' => [
+      'render element' => 'elements',
+    ],
+    'commerce_product_review_form' => [
+      'render element' => 'form',
+    ],
+    'commerce_product_review_empty_page' => [
+      'variables' => ['product' => NULL],
+    ],
+    'commerce_product_review_notification' => [
+      'variables' => [
+        'review' => NULL,
+        'product' => NULL,
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_theme_suggestions_commerce_product_review().
+ */
+function commerce_product_review_entity_theme_suggestions_commerce_product_review(array $variables) {
+  $original = $variables['theme_hook_original'];
+  /** @var \Drupal\commerce_product_review\Entity\ProductReviewInterface $entity */
+  $entity = $variables['elements']['#commerce_product_review'];
+  $sanitized_view_mode = strtr($variables['elements']['#view_mode'], '.', '_');
+
+  $suggestions = [];
+  $suggestions[] = $original;
+  $suggestions[] = $original . '__' . $sanitized_view_mode;
+  $suggestions[] = $original . '__' . $entity->bundle();
+  $suggestions[] = $original . '__' . $entity->bundle() . '__' . $sanitized_view_mode;
+  $suggestions[] = $original . '__' . $entity->id();
+  $suggestions[] = $original . '__' . $entity->id() . '__' . $sanitized_view_mode;
+
+  return $suggestions;
+}
+
+/**
+ * Prepares variables for commerce_product_review templates.
+ *
+ * Default template: commerce-product-review.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - elements: An associative array containing the user information and any
+ *   - attributes: HTML attributes for the containing element.
+ */
+function template_preprocess_commerce_product_review(array &$variables) {
+  /** @var \Drupal\commerce_product_review\Entity\ProductReviewInterface $entity */
+  $entity = $variables['elements']['#commerce_product_review'];
+  $variables['product_review_entity'] = $entity;
+
+  // Helpful $content variable for templates.
+  foreach (Element::children($variables['elements']) as $key) {
+    if ($key == 'title') {
+      continue;
+    }
+    $variables['content'][$key] = $variables['elements'][$key];
+  }
+
+  // Set title.
+  $variables['title'] = $entity->label();
+}
+
+/**
+ * Implements hook_mail().
+ */
+function commerce_product_review_mail($key, &$message, $params) {
+  if (isset($params['headers'])) {
+    $message['headers'] = array_merge($message['headers'], $params['headers']);
+  }
+
+  $message['from'] = $params['from'];
+  $message['subject'] = $params['subject'];
+  $message['body'][] = $params['body'];
+}
+
+/**
+ * Implements hook_entity_display_build_alter().
+ *
+ * @throws \Drupal\Component\Plugin\Exception\InvalidPluginDefinitionException
+ */
+function commerce_product_review_entity_display_build_alter(&$build, $context) {
+  $entity = $context['entity'];
+  if ($entity instanceof ProductInterface) {
+    /** @var \Drupal\Core\Entity\Display\EntityViewDisplayInterface $display */
+    $display = $context['display'];
+    if ($entity->hasField('overall_rating') && $entity->get('overall_rating')
+      ->isEmpty() && ($handler = $display->getRenderer('overall_rating')) &&
+      $handler instanceof OverallRatingEmptyTextFormatterInterface &&
+      !empty($handler->getEmptyText())
+    ) {
+      $link_to_review_form = TRUE;
+      /** @var \Drupal\commerce_product_review\ProductReviewTypeStorageInterface $product_review_type_storage */
+      $product_review_type_storage = \Drupal::entityTypeManager()
+        ->getStorage('commerce_product_review_type');
+      $review_type = $product_review_type_storage->findMatchingReviewType($entity);
+      $user_has_create_access = \Drupal::entityTypeManager()
+        ->getAccessControlHandler('commerce_product_review')
+        ->createAccess($review_type ? $review_type->id() : NULL);
+      if (\Drupal::currentUser()->isAuthenticated()) {
+        /** @var \Drupal\commerce_product_review\ProductReviewStorageInterface $review_storage */
+        $review_storage = \Drupal::entityTypeManager()
+          ->getStorage('commerce_product_review');
+        $existing_reviews = $review_storage->loadByProductAndUser($entity->id(), \Drupal::currentUser()
+          ->id());
+        if (!empty($existing_reviews)) {
+          // The user has already submitted a review, which isn't published yet.
+          // Only one review per user and product is allowed, so we won't link
+          // the empty message to the review form.
+          $link_to_review_form = FALSE;
+        }
+        elseif (!$user_has_create_access) {
+          $link_to_review_form = FALSE;
+        }
+      }
+      if ($link_to_review_form) {
+        $url = Url::fromRoute('entity.commerce_product.review_form', ['commerce_product' => $entity->id()]);
+        if (!$user_has_create_access) {
+          $url = Url::fromRoute('user.login', [], ['query' => ['destination' => $url->toString()]]);
+        }
+        $empty_markup = Link::fromTextAndUrl($handler->getEmptyText(), $url)
+          ->toRenderable();
+      }
+      else {
+        $empty_markup = ['#markup' => $handler->getEmptyText()];
+      }
+      $build['overall_rating'] = $empty_markup;
+    }
+  }
+}
