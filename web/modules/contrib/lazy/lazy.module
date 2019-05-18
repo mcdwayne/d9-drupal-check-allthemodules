@@ -1,0 +1,247 @@
+<?php
+
+/**
+ * @file
+ * Module file for Lazy-load.
+ */
+
+use Drupal\Core\Entity\Entity\EntityViewDisplay;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+
+/**
+ * Implements hook_help().
+ */
+function lazy_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.lazy':
+      $readme = file_get_contents(__DIR__ . '/README.md');
+
+      if (\Drupal::moduleHandler()->moduleExists('markdown')) {
+        // Use the Markdown filter to render the README.
+        $filter_manager = \Drupal::service('plugin.manager.filter');
+        $settings = \Drupal::configFactory()->get('markdown.settings')->getRawData();
+        $config = ['settings' => $settings];
+        $filter = $filter_manager->createInstance('markdown', $config);
+        return $filter->process($readme, 'en');
+      }
+
+      return '<pre>' . $readme . '</pre>';
+  }
+
+  return NULL;
+}
+
+/**
+ * Implements template_preprocess_field().
+ */
+function lazy_preprocess_field(&$variables) {
+  $element = $variables['element'];
+  if ($element['#field_type'] === 'image') {
+    $config = \Drupal::config('lazy.settings')->get();
+    $pages = $config['disabled_paths'];
+    $path_matches = lazy_disabled_by_path($pages);
+  if (!$path_matches) {
+    $entity         = $element['#object'];
+    $entity_type    = $entity->getEntityTypeId();
+    $bundle         = $entity->bundle();
+    $view_mode      = $element['#view_mode'];
+    $field_name      = $element['#field_name'];
+    $render_display = EntityViewDisplay::collectRenderDisplay($entity, $view_mode);
+    $field_display   = $render_display->getComponent($field_name);
+    $image_fields    = [];
+
+    if (isset($field_display['third_party_settings']['lazy']) && $field_display['third_party_settings']['lazy']['lazy_image']) {
+      foreach ($variables['items'] as $key => $item) {
+        $variables['items'][$key]['content']['#item_attributes']['data-lazy-load-fields'] = 'image';
+        $view_mode = ($view_mode === 'full') ? 'default' : $view_mode;
+        $image_fields["$entity_type--$bundle--$view_mode--$field_name"] = TRUE;
+      }
+    }
+
+    lazy_settings_update($image_fields);
+  }
+  }
+}
+
+/**
+ * Implements template_preprocess_image().
+ */
+function lazy_preprocess_image(&$variables) {
+  if (array_key_exists('data-lazy-load-fields', $variables['attributes'])) {
+    unset($variables['attributes']['data-lazy-load-fields']);
+    $config = \Drupal::config('lazy.settings')->get();
+    $variables['attributes'][$config['src']] = $variables['attributes']['src'];
+    $variables['attributes']['src'] = $config['placeholderSrc'];
+    $variables['attributes']['class'][] = $config['selector'];
+  }
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function lazy_page_attachments(array &$attachments) {
+  $config = lazy_is_enabled();
+  if ($config) {
+    $options = [
+      'errorClass' => $config['errorClass'],
+      'loadInvisible' => (bool) $config['loadInvisible'],
+      'offset' => (int) $config['offset'],
+      'saveViewportOffsetDelay' => (int) $config['saveViewportOffsetDelay'],
+      'selector' => '.' . $config['selector'],
+      'skipClass' => $config['skipClass'],
+      'src' => $config['src'],
+      'successClass' => $config['successClass'],
+      'validateDelay' => $config['validateDelay'],
+      'placeholderSrc' => $config['placeholderSrc'],
+    ];
+    $attachments['#attached']['library'][] = 'lazy/lazy';
+    $attachments['#attached']['drupalSettings']['lazy'] = $options;
+  }
+}
+
+/**
+ * Callback function to check whether lazy is enabled in any text-formats.
+ *
+ * @return mixed
+ *   Lazy configuration object if enabled, false otherwise.
+ */
+function lazy_is_enabled() {
+  $status = [];
+  $connection = \Drupal::database();
+  $query = $connection->query('SELECT c.name, c.data FROM {config} c WHERE c.name LIKE :format', [
+    ':format' => 'filter.format.%',
+  ]);
+  $filters = $query->fetchAllKeyed();
+  foreach ($filters as $key => $filter) {
+    $filter = unserialize($filter);
+    if (
+      isset($filter['status'], $filter['dependencies']['module'])
+      && $filter['status']
+      && in_array('lazy', $filter['dependencies']['module'], TRUE)
+    ) {
+      $status[$key] = TRUE;
+    }
+  }
+
+  $config = \Drupal::config('lazy.settings')->get();
+  $image_fields = $config['image_fields'];
+  if (is_array($image_fields)) {
+    foreach ($image_fields as $field_name => $bool_value) {
+      if ($bool_value) {
+        $status[$field_name] = TRUE;
+      }
+    }
+  }
+
+  $config['status'] = $status;
+
+  return count($status) ? $config : FALSE;
+}
+
+/**
+ * Implements hook_field_formatter_third_party_settings_form().
+ */
+function lazy_field_formatter_third_party_settings_form($plugin) {
+  $element = [];
+
+  if ($plugin->getPluginId() === 'image') {
+    $element['lazy_image'] = [
+      '#type' => 'checkbox',
+      '#title' => t('Enable lazy-loading'),
+      '#default_value' => $plugin
+        ->getThirdPartySetting('lazy', 'lazy_image', FALSE),
+    ];
+  }
+
+  return $element;
+}
+
+/**
+ * Implements hook_form_FORM_BASE_ID_alter().
+ */
+function lazy_form_entity_view_display_edit_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $entity_type  = $form['#entity_type'];
+  $bundle       = $form['#bundle'];
+  $image_fields = [];
+
+  if ($fields = $form_state->getValue('fields')) {
+    foreach ($fields as $field_name => $field) {
+      if (
+        ($field['type'] === 'image')
+        && isset($field['settings_edit_form']['third_party_settings']['lazy']['lazy_image'])
+      ) {
+        $route_match = \Drupal::service('current_route_match');
+        $view_mode = $route_match->getParameter('view_mode_name');
+        $image_fields["$entity_type--$bundle--$view_mode--$field_name"] = (bool) $field['settings_edit_form']['third_party_settings']['lazy']['lazy_image'];
+      }
+    }
+  }
+
+  lazy_settings_update($image_fields);
+}
+
+/**
+ * Implements hook_field_formatter_settings_summary_alter().
+ */
+function lazy_field_formatter_settings_summary_alter(&$summary, $context) {
+  if (
+    ($context['formatter']->getPluginId() === 'image')
+    && $context['formatter']->getThirdPartySetting('lazy', 'lazy_image', FALSE)
+  ) {
+    $summary[] = t('Lazy-loading enabled');
+  }
+}
+
+/**
+ * Update `lazy.settings.image_fields` value with currently enabled options.
+ *
+ * @param array $image_fields
+ *   An array of image fields set to use Lazy.
+ */
+function lazy_settings_update(array $image_fields) {
+  $current_image_fields = \Drupal::config('lazy.settings')->get('image_fields');
+  if (!is_array($current_image_fields) || empty($current_image_fields)) {
+    $current_image_fields = [];
+  }
+
+  $fields = array_merge($current_image_fields, $image_fields);
+  foreach ($fields as $field_name => $bool_value) {
+    if (!$bool_value) {
+      unset($fields[$field_name]);
+    }
+  }
+  \Drupal::service('config.factory')->getEditable('lazy.settings')
+    ->set('image_fields', $fields)
+    ->save();
+}
+
+/**
+ * Checks whether lazy-load is disabled for the current path.
+ *
+ * @param string $disabled_paths
+ *   List of paths Lazy should be disabled.
+ *
+ * @return bool
+ *   Whether Lazy is disabled for the requested path.
+ */
+function lazy_disabled_by_path($disabled_paths) {
+  if (empty($disabled_paths)) {
+    return FALSE;
+  }
+
+  // Convert path to lowercase. This allows comparison of the same path
+  // with different case. Ex: /Page, /page, /PAGE.
+  $disabled_paths = mb_strtolower($disabled_paths);
+  // Current path. Do not trim a trailing slash if that is the complete path.
+  $current_path = \Drupal::service('path.current')->getPath();
+  $current_path = $current_path === '/' ? $current_path : rtrim($current_path, '/');
+  // Path alias.
+  $path_alias = \Drupal::service('path.alias_manager')->getAliasByPath($current_path);
+  $path_alias = mb_strtolower($path_alias);
+  // If either returns TRUE, Lazy should be disabled for this path.
+  $path_matcher = \Drupal::service('path.matcher')->matchPath($current_path, $disabled_paths);
+  $path_alias_matcher = \Drupal::service('path.matcher')->matchPath($path_alias, $disabled_paths);
+
+  return ($path_alias_matcher || $path_matcher);
+}
