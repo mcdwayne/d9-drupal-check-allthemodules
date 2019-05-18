@@ -1,0 +1,510 @@
+<?php
+
+/**
+ * @file
+ * Main functions of paragraphs_sets.module.
+ */
+
+use Drupal\Component\Utility\Html;
+use Drupal\Core\Entity\Entity\EntityFormDisplay;
+use Drupal\Core\Field\FieldFilteredMarkup;
+use Drupal\Core\Field\FieldStorageDefinitionInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Template\Attribute;
+use Drupal\Core\Field\WidgetInterface;
+use Drupal\Core\Field\FieldDefinitionInterface;
+use Drupal\paragraphs\Plugin\Field\FieldWidget\ParagraphsWidget;
+use Drupal\paragraphs_sets\Entity\ParagraphsSet;
+use Drupal\paragraphs_sets\ParagraphsSets;
+
+/**
+ * Implements hook_theme().
+ */
+function paragraphs_sets_theme() {
+  return [
+    'field_multiple_value_form__paragraphs_sets' => [
+      'render element' => 'element',
+      'path' => drupal_get_path('module', 'paragraphs_sets') . '/templates',
+    ],
+    'paragraphs_sets_add_dialog' => [
+      'render element' => 'element',
+      'path' => drupal_get_path('module', 'paragraphs_sets') . '/templates',
+    ],
+  ];
+}
+
+/**
+ * Implements hook_field_widget_settings_summary_alter().
+ */
+function paragraphs_sets_field_widget_settings_summary_alter(&$summary, $context) {
+  if ($context['widget'] instanceof ParagraphsWidget) {
+    $settings = $context['widget']->getThirdPartySettings('paragraphs_sets');
+    if (isset($settings['paragraphs_sets']['use_paragraphs_sets']) && $settings['paragraphs_sets']['use_paragraphs_sets']) {
+      $summary[] = t('Show Paragraphs Sets');
+    }
+    if (isset($settings['paragraphs_sets']['sets_allowed']) && count(array_filter($settings['paragraphs_sets']['sets_allowed']))) {
+      $sets_allowed = implode(', ', array_filter($settings['paragraphs_sets']['sets_allowed']));
+      $summary[] = t('Limit sets to: @sets', ['@sets' => $sets_allowed]);
+    }
+  }
+}
+
+/**
+ * Implements hook_field_widget_third_party_settings_form().
+ */
+function paragraphs_sets_field_widget_third_party_settings_form(WidgetInterface $plugin, FieldDefinitionInterface $field_definition, $form_mode, $form, FormStateInterface $form_state) {
+  if ($plugin instanceof ParagraphsWidget) {
+    $settings = $plugin->getThirdPartySettings('paragraphs_sets');
+    $element['paragraphs_sets'] = [
+      '#type' => 'fieldgroup',
+      '#title' => t('Paragraphs Sets'),
+      '#attributes' => [
+        'class' => [
+          'fieldgroup',
+          'form-composite',
+        ],
+      ],
+    ];
+    $element['paragraphs_sets']['use_paragraphs_sets'] = [
+      '#type' => 'checkbox',
+      '#title' => t('Enable Paragraphs Sets'),
+      '#default_value' => (isset($settings['paragraphs_sets']['use_paragraphs_sets'])) ? $settings['paragraphs_sets']['use_paragraphs_sets'] : '',
+    ];
+    $paragraph_field = $field_definition->getName();
+    $field_allowed_paragraphs_types = $plugin->getAllowedTypes($field_definition);
+    $cardinality = $field_definition->getFieldStorageDefinition()->getCardinality();
+    $element['paragraphs_sets']['sets_allowed'] = [
+      '#type' => 'checkboxes',
+      '#title' => t('Limit sets to'),
+      '#description' => t('Leave unchecked to show all. Sets not shown here are not available due to field restrictions on cardinality or Paragraph types.'),
+      '#options' => ParagraphsSets::getSetsOptions(array_keys($field_allowed_paragraphs_types), $cardinality),
+      '#default_value' => (isset($settings['paragraphs_sets']['sets_allowed'])) ? $settings['paragraphs_sets']['sets_allowed'] : '',
+      '#states' => [
+        'visible' => [
+          ':input[name="fields[' . $paragraph_field . '][settings_edit_form][third_party_settings][paragraphs_sets][paragraphs_sets][use_paragraphs_sets]"]' => ['checked' => TRUE],
+        ],
+      ],
+    ];
+    return $element;
+  }
+}
+
+/**
+ * Implements hook_field_widget_multivalue_form_alter().
+ */
+function paragraphs_sets_field_widget_multivalue_form_alter(array &$elements, FormStateInterface $form_state, array $context) {
+  /** @var \Drupal\paragraphs\Plugin\Field\FieldWidget\ParagraphsWidget $widget */
+  $widget = $context['widget'];
+  if (!$widget instanceof ParagraphsWidget) {
+    return;
+  }
+
+  $widget_third_party_settings = $widget->getThirdPartySetting('paragraphs_sets', 'paragraphs_sets', []);
+  if (empty($widget_third_party_settings['use_paragraphs_sets'])) {
+    return;
+  }
+
+  $items = $context['items'];
+  $host = $context['items']->getEntity();
+  $form = $context['form'];
+
+  if (ParagraphsSets::inTranslation($form_state, $host)) {
+    // Do not alter form while translating the host entity.
+    return;
+  }
+
+  /** @var \Drupal\Core\Field\FieldDefinitionInterface $field_definition */
+  $field_definition = $items->getFieldDefinition();
+  $field_name = $field_definition->getName();
+  $field_parents = $form['#parents'];
+  $field_state = ParagraphsSets::getWidgetState($field_parents, $field_name, $form_state);
+
+  $is_multiple = $field_definition->getFieldStorageDefinition()->isMultiple();
+  $field_title = $field_definition->getLabel();
+  $description = FieldFilteredMarkup::create(\Drupal::token()->replace($field_definition->getDescription()));
+
+  $user_input = &$form_state->getUserInput();
+
+  $max = $field_state['items_count'];
+  $entity_type_manager = \Drupal::entityTypeManager();
+
+  // Get a list of all Paragraphs types allowed in this field.
+  $field_allowed_paragraphs_types = $widget->getAllowedTypes($field_definition);
+  $sets = ParagraphsSets::getSets(array_keys($field_allowed_paragraphs_types));
+
+  // Limit available sets from widget settings.
+  if (isset($widget_third_party_settings['sets_allowed']) && count(array_filter($widget_third_party_settings['sets_allowed']))) {
+    $sets = array_intersect_key($sets, array_filter($widget_third_party_settings['sets_allowed']));
+  }
+
+  $set = isset($field_state['selected_set']) ? $field_state['selected_set'] : NULL;
+
+  // Consider adding a default paragraph set for new host entities.
+  if ($max == 0 && $items->getEntity()->isNew() && empty($set)) {
+    $set = ParagraphsSets::getDefaultParagraphTypeMachineName($widget);
+  }
+
+  if ($set && isset($sets[$set])) {
+    if (isset($field_state['button_type']) && ('set_selection_button' === $field_state['button_type'])) {
+      // Clear all items.
+      $items->filter(function () {
+        return FALSE;
+      });
+      // Clear field state.
+      $field_state['paragraphs'] = [];
+      // Clear user input.
+      foreach ($user_input[$field_name] as $key => $value) {
+        if (!is_numeric($key) || empty($value['subform'])) {
+          continue;
+        }
+        unset($user_input[$field_name][$key]);
+      }
+      $field_state['items_count'] = 0;
+      foreach (Element::children($elements) as $element_key) {
+        if (is_numeric($element_key)) {
+          unset($elements[$element_key]);
+        }
+      }
+      $max = 0;
+    }
+    $target_type = $field_definition->getSetting('target_type');
+    $context = [
+      'set' => $set,
+      'field' => $field_definition,
+      'form' => $form,
+      'form_state' => $form_state,
+      'entity' => $host,
+    ];
+
+    // Get delta where the sets paragraphs should be added (when using
+    // "add in between").
+    $insert_delta = isset($user_input[$field_name]['add_more']['add_modal_form_area']['add_more_delta']) ? $user_input[$field_name]['add_more']['add_modal_form_area']['add_more_delta'] : NULL;
+
+    foreach ($sets[$set]['paragraphs'] as $key => $info) {
+      $alter_hooks = [
+        'paragraphs_set_data',
+        'paragraphs_set_' . $set . '_data',
+        'paragraphs_set_' . $set . '_' . $field_name . '_data',
+      ];
+
+      $context['key'] = $key;
+      $context['paragraphs_bundle'] = $info['type'];
+      $data = empty($info['data']) ? [] : $info['data'];
+      \Drupal::moduleHandler()->alter($alter_hooks, $data, $context);
+
+      $item_values = [
+        'type' => $info['type'],
+      ] + $data;
+
+      $max++;
+      if (isset($insert_delta)) {
+        ParagraphsSets::prepareDeltaPosition($field_state, $form_state, [$field_name], $insert_delta);
+        $insert_delta++;
+      }
+      $paragraphs_entity = $entity_type_manager->getStorage($target_type)->create($item_values);
+      $display = EntityFormDisplay::collectRenderDisplay($paragraphs_entity, $field_definition->getSetting('form_display_mode'));
+      $field_state['paragraphs'][$max - 1] = [
+        'entity' => $paragraphs_entity,
+        'display' => $display,
+        'mode' => 'edit',
+        'original_delta' => $max,
+      ];
+    }
+    $field_state['items_count'] = $max;
+    $field_state['selected_set'] = NULL;
+    ParagraphsSets::setWidgetState($field_parents, $field_name, $form_state, $field_state);
+  }
+
+  if ($max > 0) {
+    for ($delta = 0; $delta < $max; $delta++) {
+      // Add a new empty item if it doesn't exist yet at this delta.
+      if (!isset($items[$delta])) {
+        $items->appendItem();
+      }
+
+      // For multiple fields, title and description are handled by the wrapping
+      // table.
+      $element_base = [
+        '#title' => $is_multiple ? '' : $field_title,
+        '#description' => $is_multiple ? '' : $description,
+        '#paragraphs_bundle' => '',
+      ];
+      $element_base += [
+        '#field_parents' => $form['#parents'],
+        // Only the first widget should be required.
+        '#required' => $delta == 0 && $field_definition->isRequired(),
+        '#delta' => $delta,
+        '#weight' => $delta,
+      ];
+
+      $element = $widget->formElement($items, $delta, $element_base, $form, $form_state);
+
+      if ($element) {
+        // Set paragraphs bundle.
+        $widget_state = ParagraphsSets::getWidgetState($element['#field_parents'], $field_name, $form_state);
+        $element['#paragraphs_bundle'] = $widget_state['paragraphs'][$delta]['entity']->bundle();
+
+        // Allow modules to alter the field widget form element.
+        $context = [
+          'form' => $form,
+          'widget' => $widget,
+          'items' => $items,
+          'delta' => $delta,
+          'default' => (bool) $form_state->get('default_value_widget'),
+        ];
+        \Drupal::moduleHandler()->alter(['field_widget_form', 'field_widget_' . $widget->getPluginId() . '_form'], $element, $form_state, $context);
+
+        // Input field for the delta (drag-n-drop reordering).
+        if ($is_multiple) {
+          // We name the element '_weight' to avoid clashing with elements
+          // defined by widget.
+          $element['_weight'] = [
+            '#type' => 'weight',
+            '#title' => t('Weight for row @number', ['@number' => $delta + 1]),
+            '#title_display' => 'invisible',
+            // Note: this 'delta' is the FAPI #type 'weight' element's property.
+            '#delta' => $max,
+            '#default_value' => $items[$delta]->_weight ?: $delta,
+            '#weight' => 100,
+          ];
+        }
+
+        // Access for the top element is set to FALSE only when the paragraph
+        // was removed. A paragraphs that a user can not edit has access on
+        // lower level.
+        if (isset($element['#access']) && !$element['#access']) {
+          $field_state['items_count']--;
+        }
+        else {
+          $elements[$delta] = $element;
+        }
+      }
+    }
+  }
+
+  $field_state = ParagraphsSets::getWidgetState($field_parents, $field_name, $form_state);
+  $field_state['real_item_count'] = $field_state['items_count'];
+  $field_state['add_mode'] = $widget->getSetting('add_mode');
+  ParagraphsSets::setWidgetState($field_parents, $field_name, $form_state, $field_state);
+
+  if ('field_multiple_value_form' === $elements['#theme']) {
+    $elements['#theme'] = 'field_multiple_value_form__paragraphs_sets';
+  }
+  if ('modal' === $field_state['add_mode']) {
+    $elements['add_more']['#theme'] = 'paragraphs_sets_add_dialog';
+    $elements['add_more']['#widget_title'] = $widget->getSetting('title');
+    $elements['add_more']['#widget_title_plural'] = $widget->getSetting('title_plural');
+    $cardinality = $field_definition->getFieldStorageDefinition()->getCardinality();
+    $field_id_prefix = implode('-', array_merge($field_parents, [$field_name]));
+    $field_wrapper_id = Html::getId($field_id_prefix . '-add-more-wrapper');
+
+    foreach ($sets as $machine_name => $set) {
+      if (($cardinality !== FieldStorageDefinitionInterface::CARDINALITY_UNLIMITED) && (count($set['paragraphs']) > $cardinality)) {
+        // Do not add sets having more paragraphs than allowed.
+        continue;
+      }
+      $button_key = 'append_selection_button_' . $machine_name;
+      $elements['add_more'][$button_key] = ParagraphsWidget::expandButton([
+        '#type' => 'submit',
+        '#name' => $field_id_prefix . '_' . $machine_name . '_set_set',
+        '#value' => $set['label'],
+        '#attributes' => [
+          'class' => [
+            'field-add-more-submit',
+            'field-append-set-submit',
+          ],
+        ],
+        '#limit_validation_errors' => [
+          array_merge($field_parents, [
+            $field_definition->getName(), 'set_set',
+          ]),
+        ],
+        '#submit' => [['Drupal\paragraphs_sets\ParagraphsSets', 'setSetSubmit']],
+        '#ajax' => [
+          'callback' => ['Drupal\paragraphs_sets\ParagraphsSets', 'setSetAjax'],
+          'wrapper' => $field_wrapper_id,
+        ],
+        '#set_machine_name' => $machine_name,
+      ]);
+    }
+  }
+
+  $context['widget'] = $widget;
+  $elements['set_selection'] = ParagraphsSets::buildSelectSetSelection($elements, $context, $form_state, $set);
+  $elements['#attached']['library'][] = 'paragraphs_sets/drupal.paragraphs_sets.admin';
+}
+
+/**
+ * Overrides variables used in field-multiple-value-form.html.twig for sets.
+ *
+ * @see template_preprocess_field_multiple_value_form()
+ */
+function paragraphs_sets_preprocess_field_multiple_value_form__paragraphs_sets(&$variables) {
+  $element = $variables['element'];
+  $variables['multiple'] = $element['#cardinality_multiple'];
+
+  if ($variables['multiple']) {
+    $table_id = Html::getUniqueId($element['#field_name'] . '_values');
+    $order_class = $element['#field_name'] . '-delta-order';
+    $rows = [];
+
+    // Sort items according to '_weight' (needed when the form comes back after
+    // preview or failed validation).
+    $items = [];
+    $variables['button'] = [];
+    $variables['selection'] = [];
+    foreach (Element::children($element) as $key) {
+      if ($key === 'add_more') {
+        $variables['button'] = &$element[$key];
+      }
+      elseif ($key === 'set_selection') {
+        $variables['selection'] = &$element[$key];
+      }
+      elseif ($key === 'header_actions') {
+        $variables['header_actions'] = &$element[$key];
+      }
+      elseif (!empty($element[$key]['#paragraphs_bundle'])) {
+        $items[] = &$element[$key];
+      }
+    }
+    usort($items, '_field_multiple_value_form_sort_helper');
+
+    // Add the items as table rows.
+    foreach ($items as $item) {
+      $item['_weight']['#attributes']['class'] = [$order_class];
+      $item['#attributes']['data-paragraphs-bundle'] = $item['#paragraphs_bundle'];
+
+      // Remove weight form element from item render array so it can be rendered
+      // in a separate table column.
+      $delta_element = $item['_weight'];
+      unset($item['_weight']);
+
+      $cells = [
+        ['data' => '', 'class' => ['field-multiple-drag']],
+        ['data' => $item],
+        ['data' => $delta_element, 'class' => ['delta-order']],
+      ];
+      $rows[] = [
+        'data' => $cells,
+        'class' => [
+          'draggable',
+          'paragraphs-item',
+          Html::getClass("paragraphs-item--{$item['#paragraphs_bundle']}"),
+        ],
+      ];
+    }
+
+    $header_attributes = new Attribute(['class' => ['label']]);
+    if (!empty($element['#required'])) {
+      $header_attributes['class'][] = 'js-form-required';
+      $header_attributes['class'][] = 'form-required';
+    }
+    $header = [
+      [
+        'data' => [
+          '#prefix' => '<h4' . $header_attributes . '>',
+          '#markup' => $element['#title'],
+          '#suffix' => '</h4>',
+        ],
+        'colspan' => 2,
+        'class' => ['field-label'],
+      ],
+      t('Order', [], ['context' => 'Sort order']),
+    ];
+    if (!empty($variables['header_actions'])) {
+      $header[0]['data'] = [
+        'title' => $header[0]['data'],
+        'button' => $variables['header_actions'],
+      ];
+    }
+
+    $variables['table'] = [
+      '#type' => 'table',
+      '#header' => $header,
+      '#rows' => $rows,
+      '#attributes' => [
+        'id' => $table_id,
+        'class' => ['field-multiple-table'],
+      ],
+      '#tabledrag' => [
+        [
+          'action' => 'order',
+          'relationship' => 'sibling',
+          'group' => $order_class,
+        ],
+      ],
+    ];
+
+    if (!empty($element['#description'])) {
+      $description_id = $element['#attributes']['aria-describedby'];
+      $description_attributes['id'] = $description_id;
+      $variables['description']['attributes'] = new Attribute($description_attributes);
+      $variables['description']['content'] = $element['#description'];
+
+      // Add the description's id to the table aria attributes.
+      $variables['table']['#attributes']['aria-describedby'] = $element['#attributes']['aria-describedby'];
+    }
+  }
+  else {
+    $variables['elements'] = [];
+    $variables['selection'] = [];
+    foreach (Element::children($element) as $key) {
+      if ($key === 'set_selection') {
+        $variables['selection'] = &$element[$key];
+      }
+      else {
+        $variables['elements'][] = $element[$key];
+      }
+    }
+  }
+
+  // Call paragraphs_preprocess_field_multiple_value_form() to fix table header.
+  call_user_func_array('paragraphs_preprocess_field_multiple_value_form', [&$variables]);
+}
+
+/**
+ * Prepares variables for modal form add widget template.
+ *
+ * Default template: paragraphs-sets-add-dialog.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - buttons: An array of buttons to display in the modal form.
+ */
+function template_preprocess_paragraphs_sets_add_dialog(array &$variables) {
+  // Define variables for the template.
+  $variables += [
+    'buttons' => [],
+    'buttons_title' => $variables['element']['#widget_title_plural'],
+    'sets' => [],
+    'sets_title' => t('@title sets', ['@title' => $variables['element']['#widget_title']]),
+  ];
+  foreach (Element::children($variables['element']) as $key) {
+    if ($key == 'add_modal_form_area') {
+      // $add variable for the add button.
+      $variables['add'] = $variables['element'][$key];
+    }
+    elseif (strpos($key, 'append_selection_button_') === 0) {
+      // Buttons for the paragraph sets in the modal form.
+      $variables['sets'][$key] = $variables['element'][$key];
+    }
+    else {
+      // Buttons for the paragraph types in the modal form.
+      $variables['buttons'][$key] = $variables['element'][$key];
+    }
+  }
+}
+
+/**
+ * Helper function to load a paragraphs set.
+ *
+ * @param string $name
+ *   Name (ID) of paragraphs set.
+ *
+ * @return \Drupal\paragraphs_sets\Entity\ParagraphsSet
+ *   The loaded set or NULL if no set with the given name exists.
+ */
+function paragraphs_set_load($name) {
+  return ParagraphsSet::load($name);
+}
