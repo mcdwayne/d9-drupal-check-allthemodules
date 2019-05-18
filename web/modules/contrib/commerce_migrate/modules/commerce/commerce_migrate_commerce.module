@@ -1,0 +1,325 @@
+<?php
+
+/**
+ * @file
+ * Contains commerce_migrate_commerce.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\commerce_migrate_commerce\Plugin\migrate\source\commerce1\Profile;
+use Drupal\field\Plugin\migrate\source\d7\Field;
+use Drupal\field\Plugin\migrate\source\d7\FieldInstance;
+use Drupal\field\Plugin\migrate\source\d7\FieldInstancePerFormDisplay;
+use Drupal\field\Plugin\migrate\source\d7\FieldInstancePerViewMode;
+use Drupal\field\Plugin\migrate\source\d7\ViewMode;
+use Drupal\migrate\Exception\RequirementsException;
+use Drupal\migrate\Plugin\MigrationDeriverTrait;
+use Drupal\migrate_drupal\Plugin\migrate\FieldMigration;
+use Drupal\node\Plugin\migrate\source\d7\Node;
+use Drupal\taxonomy\Plugin\migrate\source\d7\Term;
+
+/**
+ * Implements hook_help().
+ */
+function commerce_migrate_commerce_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the commerce_migrate_commerce module.
+    case 'help.page.commerce_migrate_commerce':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p><strong>' . t('Drupal Commerce 1.x') . '</strong></p>';
+      $output .= '<p>' . t('The Commerce Migrate Commerce module provides migrations for attributes, billing profile, currency, language, orders, payments, product and product variation and store.
+Test coverage for migrations and a complete end to end migration.') . '</p>';
+      $output .= '<ul>';
+      $output .= '<li>' . t('Migrate field plugins for Commerce Product Reference, Commerce Price, Line Item reference and Customer Profile reference.') . '</li>';
+      $output .= '<li>' . t('Migrate source plugins for Products, Product Variations, Orders, Payments, Attributes and other entities.') . '</li>';
+      $output .= '<li>' . t('Migrate process plugin for Commerce Price.') . '</li>';
+      $output .= '</ul>';
+      $output .= '<p><strong>' . t('Commerce Migrate documentation') . '</strong></p>';
+      $output .= '<p>' . t('For more information, see the <a href=":commerce_migrate">online documentation for the Commerce Migrate module</a>.',
+          [
+            ':commerce_migrate' => 'https://www.drupal.org/docs/8/modules/commerce-migrate',
+          ]) . '</p>';
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_migration_plugins_alter().
+ */
+function commerce_migrate_commerce_migration_plugins_alter(array &$migrations) {
+  foreach ($migrations as $key => &$migration) {
+    /** @var \Drupal\migrate\Plugin\MigratePluginManager $migration_plugin_manager */
+    $migration_plugin_manager = \Drupal::service('plugin.manager.migration');
+    $migration_stub = $migration_plugin_manager->createStubMigration($migration);
+    /** @var \Drupal\migrate\Plugin\MigrateSourcePluginManager $source_plugin_manager */
+    $source_plugin_manager = \Drupal::service('plugin.manager.migrate.source');
+    $source = NULL;
+    $configuration = $migration['source'];
+    $source = $source_plugin_manager->createInstance($migration['source']['plugin'], $configuration, $migration_stub);
+    if ($source) {
+      if (is_a($source, Node::class)) {
+        // This is a node or node revision migration.
+        if (isset($migration['source']['node_type'])) {
+          // Unset migrations for nodes that are product displays.
+          $node_type = $migration['source']['node_type'];
+          $product_node_types = _commerce_migrate_commerce_get_product_node_types($migrations);
+          if (in_array($node_type, $product_node_types)) {
+            unset($migrations[$key]);
+          }
+        }
+      }
+
+      if ((is_a($migration['class'], FieldMigration::class, TRUE))) {
+        // Field storage.
+        if (is_a($source, Field::class)) {
+          $migration['source']['plugin'] = 'commerce1_field';
+          $migration['process']['entity_type'] = _commerce_migrate_commerce_get_entity_type('commerce1_entity_type');
+          $migration['migration_dependencies']['required'][] = 'commerce1_product_type';
+          $migration['migration_dependencies']['required'][] = 'commerce1_product_variation_type';
+          $migration['process']['field_name'] = ['plugin' => 'commerce1_field_name'];
+          $migration['process']['settings/target_type'] = ['plugin' => 'commerce1_attribute_target_type'];
+        }
+
+        // Field instance.
+        if (get_class($source) === FieldInstance::class) {
+          $migration['process']['entity_type'] = _commerce_migrate_commerce_get_entity_type('commerce1_entity_type');
+          $migration['process']['entity_type'][0]['map']['commerce_customer_profile'] = 'skip';
+          $migration['process']['field_name'] = _commerce_migrate_commerce_get_field_name();
+          // Add process to set the target_bundles setting for attributes.  This
+          // must be after the process for the settings field.
+          $attributes_process['settings/handler_settings'] =
+            [
+              'plugin' => 'commerce1_attribute_handler_setting',
+            ];
+          $migration['process'] += $attributes_process;
+          $migration['migration_dependencies']['required'][] = 'commerce1_product_type';
+          $migration['migration_dependencies']['required'][] = 'commerce1_product_variation_type';
+        }
+
+        // Field instance widget settings.
+        if (is_a($source, FieldInstancePerFormDisplay::class)) {
+          $migration['process']['entity_type'] = _commerce_migrate_commerce_get_entity_type('commerce1_entity_type');
+          $migration['process']['entity_type'][0]['map']['commerce_customer_profile'] = 'skip';
+          $migration['process']['field_name'] = _commerce_migrate_commerce_get_field_name();
+          $migration['process']['workaround'] = [
+            [
+              'plugin' => 'static_map',
+              'source' => '@options/type',
+              'bypass' => 'true',
+              'map' => [
+                'commerce_price_full' => 'skip',
+                'commerce_price_simple' => 'skip',
+                'inline_entity_form' => 'skip',
+              ],
+            ],
+            [
+              'plugin' => 'skip_on_value',
+              'value' => 'skip',
+              'method' => 'row',
+            ],
+          ];
+        }
+
+        // Field formatter.
+        if (is_a($source, FieldInstancePerViewMode::class)) {
+          $migration['process']['entity_type'] = _commerce_migrate_commerce_get_entity_type('commerce1_entity_type');
+          $migration['process']['entity_type'][0]['map']['commerce_customer_profile'] = 'skip';
+          $migration['process']['field_name'] = _commerce_migrate_commerce_get_field_name();
+          $migration['process']['workaround'] = [
+            [
+              'plugin' => 'static_map',
+              'source' => '@options/type',
+              'bypass' => 'true',
+              'map' => [
+                'taxonomy_term_reference_plain' => 'skip',
+                'image_delta' => 'skip',
+                'cloud_zoom' => 'skip',
+                'commerce_price_formatted_amount' => 'skip',
+                'commerce_price_prefix_suffix' => 'skip',
+                'field_extractor' => 'skip',
+                'commerce_cart_add_to_cart_form' => 'skip',
+                'commerce_fancy_attributes_color' => 'skip',
+                'title_linked' => 'skip',
+                // Skipping this to avoid a fatal error that has something to do
+                // with dependencies.
+                'entity_reference_label' => 'skip',
+              ],
+            ],
+            [
+              'plugin' => 'skip_on_value',
+              'value' => 'skip',
+              'method' => 'row',
+            ],
+          ];
+        }
+      }
+
+      // View mode.
+      if (is_a($source, ViewMode::class)) {
+        $migration['source']['plugin'] = 'commerce1_view_mode';
+        // Add map for the destination entity type.
+        // Use the source entity type here because the source plugin,
+        // 'commerce1_view_mode', will add rows for the product displays.
+        $migration['process']['targetEntityType'] = _commerce_migrate_commerce_get_entity_type('entity_type');
+        $migration['process']['targetEntityType'][0]['map']['commerce_customer_profile'] = 'skip';
+      }
+
+      // Taxonomy Terms.
+      if (is_a($source, Term::class)) {
+        $attributes = _commerce_migrate_commerce_get_attributes();
+        if (in_array($migration['source']['bundle'], $attributes)) {
+          // This is a product attribute.
+          $migration['process']['attribute'] = '@vid';
+          $migration['destination']['plugin'] = 'entity:commerce_product_attribute_value';
+        }
+      }
+
+      // The field migration uses the source field name as the destination name
+      // but for profiles the destination name is 'address'.
+      if (is_a($source, Profile::class)) {
+        if (isset($migration['process']['commerce_customer_address'])) {
+          $migration['process']['address'] = $migration['process']['commerce_customer_address'];
+          unset($migration['process']['commerce_customer_address']);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Return the static map process plugin for determining the entity type.
+ *
+ * @param string $source
+ *   The source field name.
+ *
+ * @return array
+ *   A process plugin array.
+ */
+function _commerce_migrate_commerce_get_entity_type($source) {
+  return ([
+    [
+      'plugin' => 'static_map',
+      'source' => $source,
+      'bypass' => 'true',
+      'map' => [
+        // The entity product_display does not exist. It is set in the
+        // MigratePrepareRow event to mark the row as a product display.
+        'product_display' => 'commerce_product',
+        'commerce_product' => 'commerce_product_variation',
+        'commerce_customer_profile' => 'profile',
+        // Inline conditions are conditions added to the entity add/edit
+        // form and those conditions are later mapped to rules
+        // conditions when the rule is generated.
+        // https://www.drupal.org/project/inline_conditions.
+        'inline_conditions' => 'skip',
+        // @TODO: Skip these entities until there is a migration for discounts.
+        // https://www.drupal.org/node/2905242
+        'commerce_discount' => 'skip',
+        'commerce_discount_offer' => 'skip',
+        // @TODO: Skip line item and order until there is a migration for
+        // line items. https://www.drupal.org/node/2905245
+        'commerce_line_item' => 'skip',
+        'commerce_order' => 'skip',
+        // @TODO: Skip these entities until there is a migration for message.
+        // https://www.drupal.org/node/2905244
+        'message' => 'skip',
+        'message_type' => 'skip',
+      ],
+    ],
+    [
+      'plugin' => 'skip_on_value',
+      'value' => 'skip',
+      'method' => 'row',
+    ],
+  ]);
+}
+
+/**
+ * Get the node types that are products.
+ *
+ * @param array $migrations
+ *   An array of all migrations.
+ *
+ * @return array
+ *   An array of node types that are product types.
+ */
+function _commerce_migrate_commerce_get_product_node_types(array $migrations) {
+  // Get the product types.
+  /** @var \Drupal\migrate\Plugin\migrate\source\SqlBase $source_plugin */
+  $source_plugin = \Drupal::service('plugin.manager.migration')
+    ->createStubMigration($migrations['commerce1_store'])
+    ->getSourcePlugin();
+  $product_node_types = [];
+  $connection = NULL;
+  try {
+    $connection = $source_plugin->getDatabase();
+  }
+  catch (RequirementsException $e) {
+    // It is possible the commerce_migrate is enabled to use the supplied
+    // plugins, but the migrations are not configured. In this case, the
+    // exported configurations are not available to swap out the default
+    // sql source key of 'migrate'.
+  }
+  if ($connection) {
+    if ($connection->schema()->tableExists('node_type')) {
+      $query = $connection->select('commerce_product_type', 'pt')
+        ->fields('pt', ['type']);
+      $product_node_types = $query->execute()->fetchCol();
+    }
+  }
+  return $product_node_types;
+}
+
+/**
+ * Return the process pipeline for determining the field name.
+ *
+ * @return array
+ *   A process plugin array.
+ */
+function _commerce_migrate_commerce_get_field_name() {
+  return ([
+    [
+      'plugin' => 'migration_lookup',
+      'migration' => 'd7_field',
+      'source' => 'field_name',
+    ],
+    [
+      'plugin' => 'extract',
+      'index' => [1],
+    ],
+    [
+      'plugin' => 'skip_on_empty',
+      'method' => 'row',
+    ],
+  ]);
+}
+
+/**
+ * Get the fields that are commerce product attributes.
+ *
+ * Commerce 1 product attributes use taxonomy term reference fields with select
+ * options.
+ *
+ * @see https://drupalcommerce.org/user-guide/product-attributes-variations
+ *
+ * @return array
+ *   An array of taxonomy vocabularies that are product attributes..
+ */
+function _commerce_migrate_commerce_get_attributes() {
+  $source_plugin = MigrationDeriverTrait::getSourcePlugin('d7_field_instance');
+  $attributes = [];
+  foreach ($source_plugin as $row) {
+    if (($row->getSourceProperty('entity_type') == 'commerce_product') &&
+      ($row->getSourceProperty('type') == 'taxonomy_term_reference') &&
+      ($row->getSourceProperty('widget')['type'] == 'options_select')) {
+      // Get all bundles for this field.
+      $field_definition = $row->getSourceProperty('field_definition');
+      $data = unserialize($field_definition['data']);
+      foreach ($data['settings']['allowed_values'] as $allowed_value) {
+        $attributes[] = $allowed_value['vocabulary'];
+      }
+    }
+  }
+  return array_unique($attributes);
+}
