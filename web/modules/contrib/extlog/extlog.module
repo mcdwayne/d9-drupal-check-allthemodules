@@ -1,0 +1,257 @@
+<?php
+
+/**
+ * @file
+ * System monitoring and logging for administrators.
+ *
+ * The External Logging module monitors your site and sends the selected
+ * events containing usage and performance data, errors, warnings, and similar
+ * operational information.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\StringTranslation\TranslatableMarkup;
+use Drupal\views\ViewEntityInterface;
+use Drupal\views\ViewExecutable;
+ use Drupal\Component\Utility\UrlHelper;
+
+/**
+ * Implements hook_help().
+ */
+function extlog_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.extlog':
+        $output = '';
+        $output .= '<h3>' . t('Monitoring your site') . '</h3>';
+        $output .= '<p>' . t('The External Logging module allows you to configure which events should be logged to an external server. An event can contain usage data, performance data, errors, warnings and operational information.') . '</p>';
+        $output .= '<h3>' . t('Environment detection') . '</h3>';
+        $output .= '<p>' . t('This module detects current environment (LOCAL, DEV, TEST or LIVE) based on Acquia Cloud environment variable {AH_SITE_ENVIRONMENT}.') . '</p>';
+        $output .= '<h3>' . t('Severity') . '</h3>';
+        $output .= '<ul>';
+        $output .= '<li><B>' . t('Emergency') . ':</B> ' . t('System is unusable');
+        $output .= '<li><B>' . t('Alert') . ':</B> ' . t('Action must be taken immediately');
+        $output .= '<li><B>' . t('Critical') . ':</B> ' . t('Critical conditions');
+        $output .= '<li><B>' . t('Error') . ':</B> ' . t('Error conditions');
+        $output .= '<li><B>' . t('Warning') . ':</B> ' . t('Warning conditions');
+        $output .= '<li><B>' . t('Notice') . ':</B> ' . t('Normal but significant conditions');
+        $output .= '<li><B>' . t('Info') . ':</B> ' . t('Informational messages');
+        $output .= '<li><B>' . t('Debug') . ':</B> ' . t('Debug-level messages');
+        $output .= '</ul>';
+      return $output;
+      break;
+  }
+}
+
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function extlog_form_system_logging_settings_alter(&$form, FormStateInterface $form_state) {
+  $config = \Drupal::configFactory()->getEditable('extlog.settings');
+  $env = isset($_ENV['AH_SITE_ENVIRONMENT']) ? $_ENV['AH_SITE_ENVIRONMENT'] : 'local';
+  $form['extlog'] = [
+      '#type' => 'details',
+      '#title' => t('External Logger Service Authorization'),
+      '#open' => TRUE,
+  ];
+  $form['extlog']['extlog_active'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Active'),
+      '#description' => t('If active, this module will send log information to the active logger server.'),
+      '#default_value' => $config->get('active'),
+  );
+  $form['extlog']['extlog_env'] = array(
+      '#type' => 'table',
+      '#responsive' => FALSE,
+      '#header' => [
+          t('Environment'),
+          t('Server address'),
+          t('Header name'),
+          t('Header value'),
+      ],
+  );
+  $form['extlog']['extlog_env'][0]['srv_env'] = [
+      '#type' => 'item',
+      '#title' => '',
+  ];
+  $form['extlog']['extlog_env'][0]['srv_address'] = [
+      '#type' => 'item',
+      '#title' => t('The URL of the web service.'),
+  ];
+  $form['extlog']['extlog_env'][0]['srv_header'] = [
+      '#type' => 'item',
+      '#title' => t('The header key to send of the web service.'),
+  ];
+  $form['extlog']['extlog_env'][0]['srv_value'] = [
+      '#type' => 'item',
+      '#title' => t('The header value to send of the web service.'),
+  ];
+  $serverEnvironments = extlog_environments_list();
+  foreach ($serverEnvironments as $key => $value) {
+    $form['extlog']['extlog_env'][$value] = [
+        '#attributes' => array(
+            'class' => ($value === $env ? 'color-warning' : ''),
+        ),
+    ];
+    $form['extlog']['extlog_env'][$value]['srv_env'] = [
+        '#type' => 'label',
+        '#title' => $value . ($value === $env ? ' [' . t('Current') . ']' : ''),
+        '#attributes' => array(
+            'class' => $value . ($value === $env ? 'selected' : ''),
+        ),
+    ];
+    $form['extlog']['extlog_env'][$value]['srv_address'] = [
+        '#type' => 'url',
+        '#size' => 40,
+        '#attributes' => array(
+            'placeholder' => t('http://... or https://...'),
+        ),
+        '#default_value' => $config->get('env.' . $value . '.srv_address'),
+    ];
+    $form['extlog']['extlog_env'][$value]['srv_header'] = [
+        '#type' => 'textfield',
+        '#size' => 30,
+        '#default_value' => $config->get('env.' . $value . '.srv_header'),
+    ];
+    $form['extlog']['extlog_env'][$value]['srv_value'] = [
+        '#type' => 'textfield',
+        '#size' => 20,
+        '#default_value' => $config->get('env.' . $value . '.srv_value'),
+    ];
+  }
+  $form['extlog']['extlog_n_rules'] = [
+      '#type' => 'number',
+      '#min' => extlog_rules_min(),
+      '#max' => extlog_rules_max(),
+      '#step' => 1,
+      '#title' => t('Number of rules'),
+      '#default_value' => max($config->get('n_rules'), 1),
+      '#description' => t("The number of rules to process. You can change accordingly between %min and %max.", ['%min' => extlog_rules_min(), '%max' => extlog_rules_max()]),
+  ];
+  $severities = extlog_severities_list();
+
+  $form['logging_configuration'] = [
+      '#type' => 'details',
+      '#title' => t('External Logger Rules'),
+      '#open' => FALSE,
+      '#description' =>
+      t('Fill with desired logging rules, using the Drupal Event, Message Regex (Optional) and Severities. Multiple combinations for same event can be used.')
+      . '<BR/>',
+  ];
+
+  $form['logging_configuration']['extlog_conf'] = array(
+      '#type' => 'table',
+      '#header' => [
+          '#',
+          t('Event'),
+          t('Message regex'),
+          [
+              'data' => t('Severity'),
+              'colspan' => 8,
+          ],
+      ],
+  );
+
+  for ($i = 0; $i < max($config->get('n_rules'), 1); $i++) {
+    $form['logging_configuration']['extlog_conf'][$i]['id_' . $i] = array(
+        '#type' => 'label',
+        '#title' => $i + 1,
+    );
+
+    $form['logging_configuration']['extlog_conf'][$i]['event'] = array(
+        '#type' => 'textfield',
+        '#size' => 20,
+        '#attributes' => array(
+            'placeholder' => t('event'),
+        ),
+        '#default_value' => $config->get('conf.' . $i . '.event'),
+    );
+
+    $form['logging_configuration']['extlog_conf'][$i]['regex'] = array(
+        '#type' => 'textfield',
+        '#size' => 30,
+        '#attributes' => array(
+            'placeholder' => t('regex'),
+        ),
+        '#default_value' => $config->get('conf.' . $i . '.regex'),
+    );
+    foreach ($severities as $key => $value) {
+      $form['logging_configuration']['extlog_conf'][$i][$key] = array(
+          '#type' => 'checkbox',
+          '#title' => $value,
+          '#default_value' => $config->get('conf.' . $i . '.' . $key),
+      );
+    }
+  }
+
+  $form['logging_configuration']['help'] = [
+      '#type' => 'item',
+      '#description' => t('Please visit the <a href=":help">help page</a> if you have any questions', [':help' => \Drupal::url('help.page', array('name' => 'extlog'))]),
+  ];
+
+  $form['#submit'][] = 'extlog_logging_settings_submit';
+}
+
+
+/**
+ * Form submission handler for system_logging_settings().
+ *
+ * @see extlog_form_system_logging_settings_alter()
+ */
+function extlog_logging_settings_submit($form, FormStateInterface $form_state) {
+  \Drupal::configFactory()->getEditable('extlog.settings')
+    ->set('active', $form_state->getValue('extlog_active'))
+    ->set('n_rules', $form_state->getValue('extlog_n_rules'))
+    ->set('env', $form_state->getValue('extlog_env'))
+    ->set('conf', $form_state->getValue('extlog_conf'))
+    ->save();
+}
+
+/**
+ * Lists all possible log severities.
+ *
+ * @return array
+ *   An array of log severities.
+ */
+function extlog_severities_list() {
+    return [
+        'emergency' => t('Emergency'),
+        'alert' => t('Alert'),
+        'critical' => t('Critical'),
+        'error' => t('Error'),
+        'warning' => t('Warning'),
+        'notice' => t('Notice'),
+        'info' => t('Info'),
+        'debug' => t('Debug'),
+    ];
+}
+
+
+/**
+ * Indicates the max available rules.
+ *
+ * @return integer
+ *   The max available rules.
+ */
+function extlog_rules_max() {
+  return 20;
+}
+/**
+ * Indicates the min available rules.
+ *
+ * @return integer
+ *   The min available rules.
+ */
+function extlog_rules_min() {
+  return 1;
+}
+/**
+ * Lists all possible environments.
+ *
+ * @return array
+ *   An array of environments
+ */
+function extlog_environments_list() {
+  return ['local', 'dev', 'test', 'prod'];
+}
