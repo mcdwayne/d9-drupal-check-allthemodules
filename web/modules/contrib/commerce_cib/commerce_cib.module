@@ -1,0 +1,163 @@
+<?php
+
+use Drupal\commerce_cib\Event\CibEvents;
+use Drupal\commerce_cib\Event\Timeout;
+use Drupal\commerce_cib\Plugin\Commerce\PaymentGateway\Cib;
+use Drupal\commerce_payment\Entity\Payment;
+use Drupal\commerce_payment\Entity\PaymentInterface;
+
+/**
+ * @file
+ * Commerce Payment method for CIB bank.
+ */
+
+/**
+ * Implements hook_mail().
+ */
+function commerce_cib_mail($key, &$message, $params) {
+  switch ($key) {
+    case 'order_placed':
+    case 'timeout':
+      $message['from'] = \Drupal::config('system.site')->get('mail');
+      $message['subject'] = $params['subject'];
+      $message['body'][] = $params['body'];
+      break;
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function commerce_cib_cron() {
+  commerce_cib_handle_timeouts();
+}
+
+/**
+ * Handling timeouted transactions.
+ *
+ * Called by cron.
+ */
+function commerce_cib_handle_timeouts() {
+  $timeout_time = \Drupal::time()->getCurrentTime() - Cib::TIMEOUT;
+  $entity_type_manager = \Drupal::entityTypeManager();
+  // Get unfinished transactions.
+  $timeouted_payment_ids = $entity_type_manager->getStorage('commerce_payment')->getQuery()
+    ->accessCheck(FALSE)
+    ->condition('type', 'payment_cib')
+    ->condition('payment_cib_start', $timeout_time, '<')
+    ->condition('payment_cib_end', 0)
+    ->sort('payment_id')
+    ->execute();
+  if (!empty($timeouted_payment_ids)) {
+    foreach ($timeouted_payment_ids as $payment_id) {
+      $payment = Payment::load($payment_id);
+      // Get transaction error codes and history.
+      _commerce_cib_transaction_investigate($payment);
+      $event = new Timeout($payment);
+      \Drupal::service('event_dispatcher')->dispatch(CibEvents::TIMEOUT, $event);
+    }
+  }
+}
+
+/**
+ * Investigate a broken transaction.
+ *
+ * Send a MSGT 33 (transaction status query) and if it succeeds
+ * send a MSGT 37 (transaction history query).
+ *
+ * If we don't get a valid response, we close the transaction anyway by setting
+ * the finishing timestamp.
+ *
+ * @param \Drupal\commerce_payment\Entity\PaymentInterface $payment
+ *   The payment.
+ */
+function _commerce_cib_transaction_investigate(PaymentInterface $payment) {
+  // Send MSGT 33 to find out what happened to the transaction.
+  $gateway = $payment->getPaymentGateway();
+  /** @var \Drupal\Core\Logger\LoggerChannel $logger */
+  $logger = \Drupal::service('commerce_cib.logger');
+  /** @var \Drupal\commerce_cib\Plugin\Commerce\PaymentGateway\Cib $gateway_plugin */
+  $gateway_plugin = $gateway->getPlugin();
+  $gateway_config = $gateway->getPluginConfiguration();
+  /** @var \Drupal\commerce_cib\EncryptionInterface $encryption */
+  $encryption = \Drupal::service('commerce_cib.encryption');
+  $client = \Drupal::httpClient();
+  $pid = $gateway_config['pid'];
+  $trid = $payment->getRemoteId();
+  $amo = $payment->getAmount()->getNumber();
+
+  $query33 = [
+    'MSGT' => 33,
+    'PID' => $pid,
+    'TRID' => $trid,
+    'AMO' => $amo,
+  ];
+  $url = $gateway_plugin->createUrl($query33);
+  $response = $client->get($url);
+  $status_code = $response->getStatusCode();
+  $vars = [
+    '@orderid' => $payment->getOrderId(),
+    '@msgt' => 33,
+    '@trid' => $trid,
+    '@amo' => $amo,
+    '@pid' => $pid,
+    '@code' => $status_code,
+  ];
+
+  $logger->notice(t('Request to CIB sent for order @orderid with MSGT @msgt, TRID @trid, AMO @amo and PID @pid. The response had a @code status code.', $vars));
+
+  if ($status_code == 200) {
+    $des = $gateway_plugin->getMode() === 'live' ? $gateway_config['des-live'] : $gateway_config['des-test'];
+    $encryption->setKeyfile($des);
+    $cleartext2 = $encryption->decrypt($response->getBody());
+    parse_str($cleartext2, $query);
+    if (($query['TRID'] == $trid) && ($query['MSGT'] == 31)) {
+      $payment->payment_cib_msg = $query['MSGT'];
+      $payment->setRemoteState($query['RC']);
+      // Text messages are sent in latin2 by IIS.
+      $payment->payment_cib_rt = iconv('ISO-8859-2//TRANSLIT', 'UTF-8', $query['RT']);
+      $payment->payment_cib_anum = $query['ANUM'];
+      $vars['@msgt'] = 31;
+      $vars['@trid'] = $query['TRID'];
+      $vars['@rc'] = $query['RC'];
+      $vars['@rt'] = $payment->payment_cib_rt->value;
+      $logger->notice(t('Response from CIB sent for order @orderid. MSGT @msgt, TRID @trid, RC @rc, RT @rt.', $vars));
+
+      $query37 = [
+        'MSGT' => 37,
+        'PID' => $pid,
+        'TRID' => $trid,
+        'AMO' => $amo,
+      ];
+      $url = $gateway_plugin->createUrl($query37);
+      $response = $client->get($url);
+      $status_code = $response->getStatusCode();
+      $vars = [
+        '@orderid' => $payment->getOrderId(),
+        '@msgt' => 37,
+        '@trid' => $trid,
+        '@amo' => $amo,
+        '@pid' => $pid,
+        '@code' => $status_code,
+      ];
+      $logger->notice(t('Request to CIB sent for order @orderid with MSGT @msgt, TRID @trid, AMO @amo and PID @pid. The answer returned a code @code.', $vars));
+
+      if ($status_code == 200) {
+        $cleartext2 = $encryption->decrypt($response->getBody(), $des);
+        parse_str($cleartext2, $query);
+        if (($query['TRID'] == $trid) && ($query['MSGT'] == 38)) {
+          $payment->payment_cib_history = $query['HISTORY'];
+        }
+        $vars['@cleartext'] = $cleartext2;
+        $vars['@msgt'] = $query['MSGT'];
+        $logger->notice(t('Response from CIB sent for order @orderid, MSGT @msgt, TRID @trid. The response is: @cleartext.', $vars));
+      }
+    }
+    else {
+      $payment->payment_cib_rc = '';
+    }
+  }
+  $payment->payment_cib_end = \Drupal::time()->getCurrentTime();
+  $payment->setState('voided');
+  $payment->save();
+}
