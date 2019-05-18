@@ -1,0 +1,1 @@
+The Snippets module allows you to store and display code snippets on Drupal sites.
