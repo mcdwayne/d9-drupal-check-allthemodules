@@ -1,0 +1,522 @@
+<?php
+
+/**
+ * Hook implementations for External Links Extra.
+ */
+
+use Drupal\Component\Utility\UrlHelper;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Url;
+
+// The default space is intentional so there is a space when CSS is off.
+define('EXTLINK_EXTRA_508_TEXT', ' [external link]');
+
+/**
+ * Implements hook_config_schema_info_alter().
+ */
+function extlink_extra_config_schema_info_alter(&$definitions) {
+  // Make sure we can store formatted text for the alert.
+  $definitions['extlink.settings']['mapping']['extlink_alert_text']['type'] = 'text_format';
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function extlink_extra_page_attachments(array &$attachments) {
+  // Get configuration.
+  $config = \Drupal::config('extlink_extra.settings');
+
+  // Attach JavaScript scripts.
+  $attachments['#attached']['library'][] = 'extlink_extra/extlink_extra';
+
+  // If we are using Colorbox we will add colorbox=1 to the query string of the
+  // alert page. This causes a premature exit which saves execution time and does
+  // not render the rest of the page.
+  $alert_type = $config->get('extlink_alert_type') ?: 'confirm';
+  $query = [];
+  if ($alert_type == 'colorbox') {
+    $query = ['colorbox' => 1];
+  }
+
+  // Get URL params if they exist.
+  $url_params = [];
+  $request = \Drupal::request();
+  $external_url = $request->request->get('external_url');
+  if ($external_url && UrlHelper::isValid($external_url, TRUE)) {
+    $url_params['external_url'] = UrlHelper::stripDangerousProtocols($external_url);
+  }
+  $back_url = $request->request->get('back_url');
+  if ($back_url && UrlHelper::isValid($back_url, TRUE)) {
+    $url_params['back_url'] = UrlHelper::stripDangerousProtocols($back_url);
+  }
+
+  // Attach JavaScript settings.
+  $alert_url = Url::fromRoute('extlink_extra.leaving')
+    ->setOption('query', $query)
+    ->setAbsolute();
+  $attachments['#attached']['drupalSettings']['extlink_extra'] = [
+      'extlink_alert_type' => $alert_type,
+      'extlink_modal_width' => $config->get('extlink_modal_width') ?: 0,
+      'extlink_alert_timer' => $config->get('extlink_alert_timer') ?: 0,
+      'extlink_alert_url' => $alert_url->toString(),
+      'extlink_cache_fix' => $config->get('extlink_cache_fix') ?: 0,
+      'extlink_exclude_warning' => $config->get('extlink_exclude_warning') ?: '',
+      'extlink_508_fix' => $config->get('extlink_508_fix') ?: 0,
+      'extlink_508_text' => $config->get('extlink_508_text') ?: EXTLINK_EXTRA_508_TEXT,
+      'extlink_url_override' => $config->get('extlink_url_override') ?: 0,
+      'extlink_url_params' => $url_params,
+    ];
+
+  // Add an extra CSS file if our 508 fix option is on.
+  $extlink_508_fix = $config->get('extlink_508_fix') ?: 0;
+  if ($extlink_508_fix) {
+    $attachments['#attached']['library'][] = 'extlink_extra/extlink_508';
+  }
+
+  // Add colorbox library if applicable.
+  $moduleHandler = \Drupal::service('module_handler');
+  if($alert_type == 'colorbox' && $moduleHandler->moduleExists('colorbox')) {
+    $attachments['#attached']['library'][] = 'colorbox/colorbox';
+  }
+
+  // Add ajax and dialog libraries if applicable.
+  if ($alert_type == 'modal') {
+    $attachments['#attached']['library'][] = 'core/drupal.dialog.ajax';
+  }
+}
+
+/**
+ * Implementation of hook_theme()
+ */
+function extlink_extra_theme() {
+  return [
+    'extlink_extra_leaving' => [
+      'variables' => [],
+      'template' => 'extlink-extra-leaving',
+    ],
+  ];
+}
+
+/**
+ * Implements hook_preprocess_HOOK for extlink_extra_leaving.
+ *
+ * Adds variables for the template.
+ */
+function extlink_extra_preprocess_extlink_extra_leaving(&$variables) {
+  // Get configuration.
+  $config = \Drupal::config('extlink_extra.settings');
+
+  // Prepare token replacement values.
+  $cache_fix = $config->get('extlink_cache_fix') ?: 0;
+  $request = \Drupal::request();
+
+  $external_url = $request->query->get('external_url');
+  // UrlHelper::isValid() considers spaces in URLs invalid if they are not
+  // encoded so we make sure to encode them before checking validity.
+  if ($external_url) {
+    $external_url = _extlink_extra_encode_url_parts($external_url);
+  }
+  if (!$external_url || !UrlHelper::isValid($external_url, TRUE)) {
+    $external_url = $cache_fix ? 'external-url-placeholder' : $_COOKIE['external_url'];
+  }
+  $variables['external_url'] = Url::fromUri($external_url)->setAbsolute()->toString();
+
+  $back_url = $request->query->get('back_url');
+  // UrlHelper::isValid() considers spaces in URLs invalid if they are not
+  // encoded so we make sure to encode them before checking validity.
+  if ($back_url) {
+    $back_url = _extlink_extra_encode_url_parts($back_url);
+  }
+  if (!$back_url || !UrlHelper::isValid($back_url, TRUE)) {
+    $back_url = $cache_fix ? 'back-url-placeholder' : $_COOKIE['back_url'];
+  }
+  $variables['back_url'] = Url::fromUri($back_url)->setAbsolute()->toString();
+
+  $extlink_token_data = [
+    'extlink' => [
+      'external_url' => $variables['external_url'],
+      'back_url' => $variables['back_url'],
+    ],
+  ];
+
+  // Fetch the alert text and replace tokens.
+  $token = \Drupal::token();
+  $eat_default = [
+    'value' => 'This link will take you to an external web site. We are not responsible for their content.',
+    'format' => filter_default_format(),
+  ];
+  $alert_text = $config->get('extlink_alert_text') ?: $eat_default;
+  $variables['alert_text'] = check_markup($token->replace($alert_text['value'], $extlink_token_data), $alert_text['format']);
+
+  // Fetch the timer markup.
+  $variables['timer'] = extlink_extra_timer_markup();
+
+  // Fetch the site name.
+  $config = \Drupal::config('system.site');
+  $variables['site_name'] = $config->get('name') ?: '';
+}
+
+/**
+ * Encodes all parts of an URL.
+ *
+ * @param string $url
+ *   The URL that needs to be encoded.
+ *
+ * @return string
+ *   The encoded URL.
+ */
+function _extlink_extra_encode_url_parts($url) {
+  // Parse the URL so that we can encode all parts.
+  $parts = UrlHelper::parse($url);
+  // Unfortunately UrlHelper::parse() considers the scheme and the host to be
+  // part of the path so we need to split them ourselves.
+  $parts = parse_url($parts['path']) + $parts;
+
+  // Encode the URL parts to make sure Drupal considers to URL to be valid when
+  // there are spaces in the path. We don't want to encode slashes in the path
+  // so we split the path before encoding all parts.
+  $parts['path'] = explode('/', $parts['path']);
+  array_walk_recursive($parts, '_extlink_extra_encode_url_part');
+  $parts['path'] = implode('/', $parts['path']);
+
+  // Return a full URL constructed from the parts.
+  return _extlink_extra_http_build_url($parts);
+}
+
+/**
+ * Encodes a singles part of an URL.
+ *
+ * @param string $part
+ *   The part of the URL that needs to be encoded.
+ * @param int|string $key
+ *   The key of the part in a parts array.
+ */
+function _extlink_extra_encode_url_part(&$part, $key) {
+  $part = urlencode($part);
+}
+
+/**
+ * Builds a full URL from the separate parts.
+ *
+ * @param array $parts
+ *   The array of URL parts.
+ *
+ * @return string
+ *   The full URL as constructed from the parts.
+ */
+function _extlink_extra_http_build_url($parts) {
+  // Unfortunately http_build_url() isn't always available but we will use it
+  // when available.
+  if (function_exists('http_build_url')) {
+    $url = http_build_url($parts);
+  }
+  else {
+    // Base URL starting with URI scheme.
+    $url = $parts['scheme'] . '://' . $parts['host'];
+
+    // Add the path if available.
+    if (!empty($parts['path'])) {
+      $url .= $parts['path'];
+    }
+
+    // Add the query string if available.
+    if (!empty($parts['query'])) {
+      $url .= '?' . UrlHelper::buildQuery($parts['query']);
+    }
+
+    // Add the fragment if available.
+    if (!empty($parts['fragment'])) {
+      $url .= '#' . $parts['fragment'];
+    }
+  }
+
+  return $url;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for extlink_admin_settings.
+ */
+function extlink_extra_form_extlink_admin_settings_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // Get configuration.
+  $config = \Drupal::config('extlink_extra.settings');
+
+  // Add a select field for the type of alert.
+  $form['extlink_alert_type'] = [
+    '#type' => 'select',
+    '#title' => t('External link click reaction'),
+    '#default_value' => $config->get('extlink_alert_type') ?: 'confirm',
+    '#description' => t('Choose the way you would like external links to be handled.'),
+    '#options' => [
+      'confirm' => t('A standard javascript confirm form will popup with the alert text'),
+      'page' => t('The user will be taken to an intermediate warning page which will display the alert text'),
+    ],
+  ];
+  // Add an extra option when the Colorbox module is enabled.
+  $moduleHandler = \Drupal::service('module_handler');
+  if($moduleHandler->moduleExists('colorbox')) {
+    $form['extlink_alert_type']['#options']['colorbox'] = t('A jQuery colorbox will be used for the alert (allows for HTML inside)');
+    $form['extlink_alert_type']['#default_value'] = $config->get('extlink_alert_type') ?: 'colorbox';
+  }
+
+  // Add a textfield for the modal width.
+  $form['extlink_modal_width'] = [
+    '#type' => 'textfield',
+    '#title' => t('Modal width'),
+    '#description' => t('The width of the modal. The height will be determined by the contents of the modal. Use 0 to let Drupal determine the width too.'),
+    '#default_value' => $config->get('extlink_modal_width') ?: 0,
+    '#states' => [
+      'visible' => [
+        ':input[name=extlink_alert_type]' => [
+          ['value' => 'modal'],
+        ],
+      ],
+    ],
+  ];
+
+  // Add a collapsible wrapper.
+  $form['extlink_alert_text_fieldset'] = [
+    '#type' => 'details',
+    '#title' => t('Warning Text'),
+    '#open' => TRUE,
+    '#states' => [
+      'invisible' => [
+        ':input[name=extlink_alert_type]' => [
+          'value' => '',
+        ],
+      ],
+    ],
+  ];
+
+  // Add a textfield for the page title.
+  $form['extlink_alert_text_fieldset']['extlink_page_title'] = [
+    '#type' => 'textfield',
+    '#title' => t('Warning Page Title'),
+    '#description' => t('If you are using an intermediate page to display the leaving alert, you can specify it\'s the page title here.  You may also use the tokens indicated below.'),
+    '#default_value' => $config->get('extlink_page_title') ?: NULL,
+    '#states' => [
+      'visible' => [
+        ':input[name=extlink_alert_type]' => [
+          ['value' => 'modal'],
+          ['value' => 'page'],
+        ],
+      ],
+    ],
+  ];
+
+  // Convert the field for the text to a formatted text field with token support.
+  $eat_default = ['value' => extlink_extra_alert_default(), 'format' => filter_default_format()];
+  $alert_text = $config->get('extlink_alert_text') ?: $eat_default;
+  $form['extlink_alert_text']['#type'] = 'text_format';
+  $form['extlink_alert_text']['#default_value'] = $alert_text['value'];
+  $form['extlink_alert_text']['#format'] = $alert_text['format'];
+
+  $form['extlink_alert_text_fieldset']['token_tree'] = [
+    '#theme' => 'token_tree_link',
+    '#global_types' => TRUE,
+    '#click_insert' => TRUE,
+    '#weight' => 20,
+    '#token_types' => ['extlink'],
+  ];
+
+  // Move the original alert text textfield into the wrapper.
+  $form['extlink_alert_text_fieldset']['extlink_alert_text'] = $form['extlink_alert_text'];
+  unset($form['extlink_alert_text']);
+
+  // Remove the 'Display pop-up warnings' checkbox that extlink.module provides.
+  $form['extlink_alert']['#access'] = FALSE;
+
+  // Add a select field for the type of alert.
+  $form['extlink_alert_type'] = [
+    '#type' => 'select',
+    '#title' => t('External link click reaction'),
+    '#default_value' => $config->get('extlink_alert_type') ?: 'modal',
+    '#description' => t('Choose the way you would like external links to be handled.'),
+    '#options' => [
+      'modal' => t('Drupal 8 core Modal Dialog (jQuery UI Dialog)'),
+      'confirm' => t('A standard javascript confirm form will popup with the alert text'),
+      'page' => t('The user will be taken to an intermediate warning page which will display the alert text'),
+    ],
+  ];
+  // Add an extra option when the Colorbox module is enabled.
+  $moduleHandler = \Drupal::service('module_handler');
+  if($moduleHandler->moduleExists('colorbox')) {
+    $form['extlink_alert_type']['#options']['colorbox'] = t('A jQuery colorbox will be used for the alert (allows for HTML inside)');
+  }
+
+  // Add a number field for setting the interval for the redirect timer.
+  $form['extlink_alert_timer'] = [
+    '#type' => 'number',
+    '#title' => t('Use automatic redirect timer'),
+    '#default_value' => $config->get('extlink_alert_timer') ?: 0,
+    '#description' => t('If you would like the colorbox popup (if enabled) to automatically redirect the user after clicking clicking an external link, choose the number of seconds on the timer before it will happen.  Enter 0 for no automatic redirection.  Using this feature will not allow the link to open in a new window.'),
+  ];
+
+  // Handle caching.
+  $form['extlink_cache_fix'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Enable aggressive caching compatibility'),
+    '#description' => t('If you\'re running an aggressive caching system like varnish or memcached, you may find that the \'now-leaving\' page or colorbox popup gets cached
+       and shows the same redirect tokens for all users.  Enabling this option will cause the module to overcome this by using client side (javascript) code to dynamically
+       replace the values when the page is loaded.  <br/>
+       <span class="error">Note</span> that this depends on your links being wrapped in the default classes: extlink-extra-back-action and extlink-extra-go-action.
+       See extlink-extra-leaving.html.example.twig for an example.'),
+    '#default_value' => $config->get('extlink_cache_fix') ?: 0,
+  ];
+
+  // Handle accessibility.
+  $form['extlink_508'] = [
+    '#type' => 'details',
+    '#title' => t('Section 508 Accessibility'),
+    '#open' => FALSE,
+  ];
+  $form['extlink_508']['extlink_508_fix'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Section 508 improvement for link indicators'),
+    '#description' => t('Improves usability for screen readers by adding offscreen text to the span tags created by the External Link module.'),
+    '#default_value' => $config->get('extlink_508_fix') ?: 0,
+  ];
+  $form['extlink_508']['extlink_508_text'] = [
+    '#type' => 'textfield',
+    '#title' => t('Section 508 text'),
+    '#description' => t('Screenreader text used when 508 fix is applied'),
+    '#default_value' => $config->get('extlink_508_text') ?: EXTLINK_EXTRA_508_TEXT,
+    '#states' => [
+      'invisible' => [
+        ':input[name=extlink_508_fix]' => ['checked' => FALSE],
+      ],
+    ],
+  ];
+
+  // Override options.
+  $form['extlink_url_override'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Allow query string parameters to set destination and back links'),
+    '#description' => t('If you have advertisements and require a bumper for leaving the site, some advertisers use url parameters to set the destination.
+     Select this checkbox to allow url parameters to set the destination and back links. Links must be prepended with http://.<br/> 
+     Eg. example.com/now-leaving?external_url=http://newurl.com&back_url=http://example.com/old-path.'),
+    '#default_value' => $config->get('extlink_url_override') ?: 0,
+  ];
+
+  // Add exclude option for alerts.
+  $form['patterns']['#weight'] = 1;
+  $form['patterns']['extlink_exclude_warning'] = array(
+    '#title' => t('Don\'t warn for links matching the pattern'),
+    '#description' => t('Enter a regular expression for external links that you wish <strong>not</strong> to display a warning when clicked'),
+    '#type' => 'textfield',
+    '#default_value' => $config->get('extlink_exclude_warning') ?: '',
+  );
+
+  // Add a custom submit handler to save the settings in config.
+  $form['#submit'][] = 'extlink_extra_admin_settings_submit';
+}
+
+/**
+ * Additional submit handler for the extlink_admin_settings form.
+ */
+function extlink_extra_admin_settings_submit(&$form, FormStateInterface $form_state) {
+  // Fetch the submitted values.
+  $values = $form_state->getValues();
+
+  // Store the values related to this module in config.
+  \Drupal::configFactory()->getEditable('extlink_extra.settings')
+    ->set('extlink_page_title', $values['extlink_page_title'])
+    ->set('extlink_alert_text', $values['extlink_alert_text'])
+    ->set('extlink_alert_type', $values['extlink_alert_type'])
+    ->set('extlink_modal_width', $values['extlink_modal_width'])
+    ->set('extlink_alert_timer', $values['extlink_alert_timer'])
+    ->set('extlink_cache_fix', $values['extlink_cache_fix'])
+    ->set('extlink_508_fix', $values['extlink_508_fix'])
+    ->set('extlink_508_text', $values['extlink_508_text'])
+    ->set('extlink_url_override', $values['extlink_url_override'])
+    ->set('extlink_exclude_warning', $values['extlink_exclude_warning'])
+    ->save();
+}
+
+/**
+ * Returns the default value for the extlink_alert_text setting.
+ *
+ * @return string
+ */
+function extlink_extra_alert_default() {
+  $output = '<h2>You are leaving the  [site:name] website</h2>
+    <p>You are being directed to a third-party website:</p>
+    <p><strong>[extlink:external-url]</strong></p>
+    <p>This link is provided for your convenience. Please note that this third-party website is not controlled by [site:name] or subject to our privacy policy.</p>
+    <p>Thank you for visiting our site. We hope your visit was informative and enjoyable.</p>
+    
+    <div class="extlink-extra-actions">
+        <div class="extlink-extra-back-action"><a title="Cancel" href="[extlink:back-url]">Cancel</a></div>
+        <div class="extlink-extra-go-action"><a class="ext-override" title="Go to link" href="[extlink:external-url]">Go to link</a></div>
+    </div>
+    <br/><br/>
+    [extlink:timer]';
+
+  return $output;
+}
+
+/**
+ * Implements hook_token_info().
+ */
+function extlink_extra_token_info() {
+  $types = [
+    'name' => t('External Links'), 
+    'description' => t('Tokens related to the External Links module.'),
+    'needs-data' => 'extlink',
+  ];
+
+  $extlinks['external-url'] = [
+    'name' => t('External URL'),
+    'description' => t('The URL of the external site that the user has just clicked.'),
+  ];
+
+  $extlinks['back-url'] = [
+    'name' => t('Back URL'),
+    'description' => t('The URL of the page the user was on when they clicked the external link.'),
+  ];
+  
+  $extlinks['timer'] = [
+    'name' => t('Timer'),
+    'description' => t('Use this token to position the automatic redirect timer (if you are using it).'),
+  ];
+
+  return [
+    'types' => ['extlink' => $types],
+    'tokens' => ['extlink' => $extlinks],
+  ];
+}
+
+/**
+ * Implements hook_tokens().
+ */
+function extlink_extra_tokens($type, $tokens, array $data = [], array $options = []) {
+  if($type == 'extlink') {
+    $replacements = [];
+
+    foreach ($tokens as $name => $original) {
+      switch ($name) {
+        case 'external-url':
+          $replacements[$original] = urldecode($data['extlink']['external_url']);
+          break;
+        case 'back-url':
+          $replacements[$original] = urldecode($data['extlink']['back_url']);
+          break;
+        case 'timer':
+          /** @var \Drupal\Core\Render\RendererInterface $renderer */
+          $renderer = \Drupal::service('renderer');
+          $timer_markup = extlink_extra_timer_markup();
+          $replacements[$original] = $renderer->render($timer_markup);
+          break;
+      }
+    }
+
+    return $replacements;
+  }
+}
+
+// Returns the markup that the automatic timer uses to attach itself to.
+function extlink_extra_timer_markup() {
+  return [
+      '#type' => 'inline_template',
+      '#template' => '<div class="automatic-redirect-countdown"></div>',
+    ];
+}
