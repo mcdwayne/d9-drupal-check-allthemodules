@@ -1,0 +1,470 @@
+<?php
+
+/**
+ * @file
+ * Contains entity_reference_layout.module.
+ */
+
+use Drupal\Core\Render\Element;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\entity_reference_layout\Event\ErlMergeAttributesEvent;
+use Drupal\Component\Utility\NestedArray;
+
+/**
+ * Implements hook_help().
+ */
+function entity_reference_layout_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the entity_reference_layout module.
+    case 'help.page.entity_reference_layout':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Entity reference field with layouts') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_entity_view_alter().
+ */
+function entity_reference_layout_entity_view_alter(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display) {
+  if (!empty($build['#erl_layout']) && !empty($build['regions']) && \Drupal::service('module_handler')->moduleExists('layout_discovery')) {
+    /* @var \Drupal\Core\Layout\LayoutPluginManager @$layout_plugin_manager */
+    $layout_plugin_manager = \Drupal::service('plugin.manager.core.layout');
+    if (!$layout_plugin_manager->getDefinition($build['#erl_layout'], FALSE)) {
+      $messenger = \Drupal::messenger();
+      $messenger->addMessage(t('Layout `%layout_id` is unknown.', ['%layout_id' => $build['#layout']]), 'warning');
+      return;
+    }
+
+    // Provide any configuration to the layout plugin if necessary.
+    /* @var \Drupal\Core\Layout\LayoutInterface $layout_instance */
+    $layout_instance = $layout_plugin_manager->createInstance($build['#erl_layout'], $build['#erl_layout_config']);
+
+    // This builds the render array.
+    $build['_entity_reference_layout'] = [
+      '#weight' => 1000,
+      'content' => $layout_instance->build($build['regions']),
+    ];
+    if (!empty($build['#erl_layout_options'])) {
+      $layout_plugin_attributes = !empty($build['_entity_reference_layout']['content']['#attributes']) ? $build['_entity_reference_layout']['content']['#attributes'] : [];
+      $attributes = entity_reference_layout_merge_attributes($layout_plugin_attributes, $build['#erl_layout_options']);
+      $build['_entity_reference_layout']['content']['#attributes'] = $attributes;
+    }
+
+    unset($build['regions']);
+  }
+}
+
+/**
+ * Prepares variables for `field.html.twig`.
+ */
+function entity_reference_layout_preprocess_field(&$variables) {
+
+  $element = $variables['element'];
+  if ($element['#formatter'] == 'entity_reference_layout') {
+    /* @var \Drupal\entity_reference_layout\EntityReferenceLayoutRevisionsFieldItemList $item_list */
+    $item_list = $element['#items'];
+    $handler_settings = $item_list->getSetting('handler_settings');
+    $layout_bundles = $handler_settings['layout_bundles'];
+    $variables['items'] = _entity_reference_layout_nest_items($element, $variables['items'], $layout_bundles);
+  }
+}
+
+/**
+ * Helper function to nest references entities into regions within a layout.
+ *
+ * @param array $element
+ *   The field item containing referenced entities.
+ * @param array $items
+ *   Array of referenced entities.
+ * @param array $layout_bundles
+ *   Array of bundles (typically paragraph bundles)
+ *   that can be associated with layouts.
+ */
+function _entity_reference_layout_nest_items(array $element, array $items, array $layout_bundles) {
+
+  $nested_items = [];
+  foreach ($items as $delta => $item) {
+    /* @var \Drupal\Core\Entity\EntityInterface $entity */
+    $entity = $element['#items'][$delta]->entity;
+    $config = $element['#items'][$delta]->config;
+    $options = $element['#items'][$delta]->options;
+
+    $region = !empty($element['#items'][$delta]->region) ? $element['#items'][$delta]->region : '';
+    $layout = !empty($element['#items'][$delta]->layout) ? $element['#items'][$delta]->layout : '';
+
+    if (isset($entity) && in_array($entity->bundle(), $layout_bundles)) {
+      $item['content']['#erl_layout'] = $layout;
+      $item['content']['#erl_layout_config'] = !empty($config) ? $config : [];
+      $item['content']['#erl_layout_options'] = $options;
+      $section_id = $entity->id();
+    }
+
+    // Add items with region or layout value into the rendering list.
+    // Disabled items won't have any of them, so they won't be included,
+    // and rendered.
+    if (!empty($region)) {
+      if (empty($nested_items[$section_id]['content']['regions'][$region])) {
+        $nested_items[$section_id]['content']['regions'][$region] = [];
+      }
+      $nested_items[$section_id]['content']['regions'][$region][] = $item['content'];
+    }
+    elseif (!empty($layout)) {
+      $nested_items[$entity->id()] = $item;
+    }
+  }
+  return $nested_items;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function entity_reference_layout_theme() {
+  return [
+    'entity_reference_layout_widget' => [
+      'render element' => 'form',
+      'function' => 'theme_entity_reference_layout_widget',
+    ],
+    'entity_reference_layout_ief' => [
+      'render element' => 'form',
+      'function' => 'theme_entity_reference_layout_ief',
+    ],
+    'entity_reference_layout_radio' => [
+      'render element' => 'element',
+      'function' => 'theme_entity_reference_layout_radio',
+    ],
+  ];
+}
+
+/**
+ * Implements hook_entity_reference_layout_radio().
+ *
+ * Custom theme hook for adding layout icons
+ * and wrapper HTML to layout select radios.
+ */
+function theme_entity_reference_layout_radio($element) {
+  /* @var \Drupal\Core\Layout\LayoutPluginManager $layout_plugin_manager */
+  $layout_plugin_manager = \Drupal::service('plugin.manager.core.layout');
+  $renderer = \Drupal::service('renderer');
+  $layout_name = $element['element']['#return_value'];
+  try {
+    /* @var \Drupal\Core\Layout\LayoutDefinition $definition */
+    $definition = $layout_plugin_manager->getDefinition($layout_name);
+    $icon = $definition->getIcon(40, 60, 1, 0);
+    $rendered_icon = $renderer->render($icon);
+
+    $layout_item = [
+      '#type' => 'container',
+      '#prefix' => '<div class="layout-radio-item">',
+      '#suffix' => '</div>',
+      'icon' => [
+        '#prefix' => '<div class="layout-icon-wrapper">',
+        '#suffix' => '</div>',
+        '#markup' => $rendered_icon,
+      ],
+      'radio' => [
+        '#type' => 'container',
+        '#attributes' => [
+          // 'class' => ['visually-hidden'],.
+        ],
+        'item' => ['#markup' => $element['element']['#children']],
+      ],
+    ];
+
+    return \Drupal::service('renderer')->render($layout_item);
+  }
+  catch (\Exception $e) {
+    watchdog_exception('entity_reference_layout', $e);
+  }
+
+}
+
+/**
+ * Wraps $element in HTML used for rendering modal.
+ */
+function _entity_reference_layout_modal_wrappers(array $element) {
+  $modal_wrapper = [
+    '#prefix' => '<div id="erl-modal">',
+    '#suffix' => '</div>',
+  ];
+  $element += $modal_wrapper;
+  return $element;
+}
+
+/**
+ * Implements hook_alter_form().
+ *
+ * Adds HTML wrappers for modal when appropriate.
+ */
+function entity_reference_layout_alter_form(&$element, &$form_state) {
+  $element['#attributes']['class'][] = 'erl-entity-form';
+  $element = _entity_reference_layout_modal_wrappers($element);
+  return $element;
+}
+
+/**
+ * Implements hook_entity_reference_layout_ief().
+ *
+ * Adds structure and classes to inline entity form.
+ */
+function theme_entity_reference_layout_ief($variables) {
+  $form = $variables['form'];
+  $renderer = \Drupal::service('renderer');
+  $container = [
+    '#type' => 'container',
+    '#attributes' => [
+      'class' => [
+        'erl-form-body',
+        'scrollable',
+      ],
+    ],
+  ];
+  foreach (Element::children($form['inline_entity_form']) as $key) {
+    if ($key != 'actions') {
+      $container[$key] = $form['inline_entity_form'][$key];
+      unset($form['inline_entity_form'][$key]);
+    }
+  }
+  $form['inline_entity_form']['#attributes']['class'][] = 'erl-form-container';
+  $form['inline_entity_form']['erl_form_body'] = $container;
+  return $renderer->render($form);
+}
+
+/**
+ * Merges $layout_options into an $attributes array.
+ *
+ * Returned attributes are passed to a rendered layout,
+ * typically with custom classes to be applied although can
+ * include other data useful to rendering.
+ *
+ * Leverages even dispatcher pattern so other modules
+ * can add data to attributes.
+ */
+function entity_reference_layout_merge_attributes(array $attributes, array $layout_options) {
+  if (!empty($layout_options)) {
+    if (!empty($layout_options['options']['container_classes'])) {
+      $attributes['class'][] = $layout_options['options']['container_classes'];
+    }
+    if (!empty($layout_options['options']['bg_color'])) {
+      $attributes['style'] = ['background-color: ' . $layout_options['options']['bg_color']];
+    }
+  }
+
+  $event = new ErlMergeAttributesEvent($attributes, $layout_options);
+  $event_dispatcher = \Drupal::service('event_dispatcher');
+  $event_dispatcher->dispatch(ErlMergeAttributesEvent::EVENT_NAME, $event);
+
+  return $attributes;
+}
+
+/**
+ * Themes entity reference with layout field widget, using Layouts API.
+ *
+ * @param array $variables
+ *   Contains the form element data from $element['entities'].
+ */
+function theme_entity_reference_layout_widget(array $variables) {
+
+  $renderer = \Drupal::service('renderer');
+  $form = $variables['form'];
+  $build = [
+    'content' => [
+      // Add a dependable wrapper to use for drag/drop.
+      '#prefix' => '<div class="erl-field-item--layout-container">',
+      '#suffix' => '</div>',
+    ],
+  ];
+
+  // Add more structure to help styling.
+  foreach (Element::children($form) as $key) {
+    // If there is a form, wrap it for modal.
+    if (isset($form[$key]['form'])) {
+      $form[$key]['form'] = _entity_reference_layout_modal_wrappers($form[$key]['form']);
+    }
+    // Add container element for form items.
+    $copy = ['#type' => 'container', '#attributes' => ['class' => ['erl-field-item']]];
+    foreach (Element::children($form[$key]) as $item_key) {
+      $copy[$item_key] = $form[$key][$item_key];
+      unset($form[$key][$item_key]);
+    }
+    $form[$key]['item'] = $copy;
+    if (!empty($form[$key]['#layout'])) {
+      $form[$key]['#prefix'] = '<div class="erl-field-item--layout">';
+      $form[$key]['#suffix'] = '</div>';
+    }
+
+    // Add button classes.
+    if (!empty($form[$key]['item']['actions']['ief_entity_edit'])) {
+      $form[$key]['item']['actions']['ief_entity_edit']['#attributes']['class'][] = 'form-submit-edit';
+    }
+    if (!empty($form[$key]['item']['actions']['ief_entity_remove'])) {
+      $form[$key]['item']['actions']['ief_entity_remove']['#attributes']['class'][] = 'form-submit-remove';
+    }
+
+    // Add container element for actions.
+    if (!empty($form[$key]['item']['actions'])) {
+      $form[$key]['item']['actions'] = [
+        '#type' => 'container',
+        'actions' => $form[$key]['item']['actions'],
+        '#weight' => '-1000',
+        '#attributes' => [
+          'class' => ['container-inline', 'actions'],
+        ],
+      ];
+    }
+  }
+
+  // Organize items into nested layouts.
+  $layout_delta = -1;
+
+  // Create a container for items not associated with a layout.
+  // This happens when a user changes from one layout to another,
+  // and the newly selected layout has different regions from
+  // the original one.
+  $disabled = [
+    '#prefix' => '<a id ="disabled"></a>',
+    '#type' => 'container',
+    '#attributes' => [
+      'class' => [
+        'erl-layout-disabled',
+      ],
+    ],
+    'title' => [
+      '#type' => 'html_tag',
+      '#tag' => 'h4',
+      '#value' => t('Disabled items'),
+    ],
+    'container' => [
+      '#type' => 'container',
+      '#attributes' => [
+        'class' => [
+          'erl-layout',
+          'erl-layout-section',
+        ],
+      ],
+      'description' => [
+        '#type' => 'html_tag',
+        '#tag' => 'div',
+        '#attributes' => [
+          'class' => [
+            'erl-layout-disabled-description ',
+          ],
+        ],
+        '#value' => t('Drop items here that you want to keep disabled / hidden, without removing them permanently.'),
+      ],
+      'items' => [],
+    ],
+  ];
+
+  foreach (Element::children($form) as $key) {
+
+    // Layout properties:
+    $layout_element = [];
+    if (isset($form[$key]['item']['layout_properties'])) {
+      $layout_element = $form[$key]['item']['layout_properties'];
+    }
+    $layout = isset($layout_element['layout']['#value']) ? $layout_element['layout']['#value'] : '';
+    $region = isset($layout_element['region']['#value']) ? $layout_element['region']['#value'] : '';
+    $parent = isset($layout_element['parent']['#value']) ? $layout_element['parent']['#value'] : -1;
+
+    // Process layout paragraphs.
+    if (!empty($layout)) {
+      $layout_delta = $key;
+      $form[$key]['regions'] = [];
+      // $form[$key]['#prefix'] = 'key: ' . $key;.
+      /* @var \Drupal\Core\Layout\LayoutPluginManager @$layout_plugin_manager */
+      $layout_plugin_manager = \Drupal::service('plugin.manager.core.layout');
+      /* @var \Drupal\Core\Layout\LayoutInterface $layout_instance */
+      $layout_instance = $layout_plugin_manager->createInstance($layout);
+      foreach ($layout_instance->getPluginDefinition()->getRegionNames() as $region_name) {
+        $form[$key]['regions'][$region_name] = [
+          '#attributes' => [
+            'class' => [
+              'erl-layout-section',
+              'erl-layout-delta--' . $key,
+              'erl-layout-section--' . $region_name,
+            ],
+          ],
+        ];
+      }
+    }
+
+    // Process paragraphs that go inside regions or that are "disabled".
+    else {
+      if (isset($parent) && $parent >= 0) {
+        $layout_key = $parent;
+      }
+      else {
+        $layout_key = $layout_delta;
+      }
+      if (isset($form[$layout_key]) && isset($form[$layout_key]['regions'][$region])) {
+        $form[$layout_key]['regions'][$region]['content'][] = $form[$key];
+      }
+      else {
+        if ($region) {
+          \Drupal::messenger()->addMessage(t('One ore more items were <a href="#disabled">disabled.</a>'), 'warning');
+        }
+        $disabled['container']['items'][] = $form[$key];
+      }
+      $form[$key]['#skip'] = TRUE;
+    }
+  }
+
+  // Build the render array.
+  foreach (Element::children($form) as $key) {
+    $layout_plugin_manager = \Drupal::service('plugin.manager.core.layout');
+    $form_item = $form[$key];
+
+    if (isset($form_item['#skip'])) {
+      continue;
+    }
+
+    $item = $form_item;
+    if (isset($form_item['#layout'])) {
+      $layout_instance = $layout_plugin_manager->createInstance($form_item['#layout'], $form_item['#layout_config']);
+      // This builds the render array.
+      // Add layout attributes:
+      $attributes = entity_reference_layout_merge_attributes(['class' => ['erl-layout']], $form_item['#layout_options']);
+      if (!empty($form_item['regions'])) {
+        $layout_build = NestedArray::mergeDeep(['#attributes' => $attributes], $layout_instance->build($form_item['regions']));
+        $item['regions'] = [
+          'content' => $layout_build,
+          '#weight' => 100,
+          '#attributes' => [
+            'class' => ['erl-layout'],
+          ],
+        ];
+      }
+    }
+    if (empty($form[$key]['#skip'])
+      && isset($form[$key]['item']['layout_properties']['parent']['#value'])
+      && $form[$key]['item']['layout_properties']['parent']['#value'] > -1) {
+      $parent = $form[$key]['item']['layout_properties']['parent']['#value'];
+      $item['#weight'] = $parent + .5;
+    }
+    $build['content'][] = $item;
+  }
+  // Add "disabled" container to build (anyway) with eventual items into it.
+  $build['disabled'] = $disabled;
+
+  $build['#attached']['drupalSettings']['erlLayoutFields'][$form['#id']] = $form['#id'];
+  $build['#attached']['library'][] = 'entity_reference_layout/entity_reference_layout';
+  return $renderer->render($build);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for 'field_ui_field_storage_add_form'.
+ */
+function entity_reference_layout_form_field_ui_field_storage_add_form_alter(array &$form) {
+  if (isset($form['add']['new_storage_type']['#options'][(string) t('Reference revisions')]['field_ui:entity_reference_layout_revisioned:paragraph'])) {
+    // @todo Figure out why this option breaks the field config form
+    // and reintroduce it if possible.
+    // See https://www.drupal.org/project/entity_reference_layout/issues/3041126
+    unset($form['add']['new_storage_type']['#options'][(string) t('Reference revisions')]['field_ui:entity_reference_layout_revisioned:paragraph']);
+  }
+}
