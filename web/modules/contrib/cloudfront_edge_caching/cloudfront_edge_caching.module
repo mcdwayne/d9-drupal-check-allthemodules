@@ -1,0 +1,190 @@
+<?php
+
+/**
+ * @file
+ * This module enables integration with Amazon Cloudfront functionality.
+ *
+ * Administrators can add the credentials in order to clear cache when
+ * content and users are updated, also it's possible invalidate specific's URL.
+ */
+
+use Aws\Exception\AwsException;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Aws\CloudFront\CloudFrontClient;
+use Drupal\Core\Entity\EntityInterface;
+
+/**
+ * Implements hook_help().
+ */
+function cloudfront_edge_caching_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.cloudfront_edge_caching':
+      $output = '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Cloudfront Edge Caching module allow to clear cache pages when the content is modified, also allow to invalidate specific URL through an interface.') . '</p>';
+      $output .= '<p>' . t('Cloudfront Edge Caching is a trademark of Emergya S.L..') . '</p>';
+      return ['#markup' => $output];
+  }
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function cloudfront_edge_caching_entity_update(EntityInterface $entity) {
+
+  // Get settings.
+  $config = \Drupal::config('cec.settings');
+
+  $enable_auto_clear_cache_content = $config->get('cec_auto_cache_clear_content');
+  $enable_auto_clear_cache_users = $config->get('cec_auto_cache_clear_users');
+
+  if ($enable_auto_clear_cache_content['cec_auto_cache'] || $enable_auto_clear_cache_users['cec_auto_cache']) {
+    // Only clear URL in nodes.
+    $entity_type = $entity->getEntityTypeId();
+
+    if ($enable_auto_clear_cache_content['cec_auto_cache'] && $entity_type == 'node') {
+      $path_url = \Drupal::service('path.alias_manager')->getAliasByPath('/node/' . $entity->id());
+
+      // Test connection.
+      $test_connection_cec = cloudfront_edge_caching_test_connection($config->get('cec_region'), $config->get('cec_key'), $config->get('cec_secret'));
+      if ($test_connection_cec == TRUE) {
+        // Invalidate URL.
+        cloudfront_edge_caching_invalidate_url([$path_url]);
+      }
+    }
+    elseif ($enable_auto_clear_cache_users['cec_auto_cache'] && $entity_type == 'user') {
+      $path_url = \Drupal::service('path.alias_manager')->getAliasByPath('/user/' . $entity->id());
+
+      // Test connection.
+      $test_connection_cec = cloudfront_edge_caching_test_connection($config->get('cec_region'), $config->get('cec_key'), $config->get('cec_secret'));
+      if ($test_connection_cec == TRUE) {
+        // Invalidate URL.
+        cloudfront_edge_caching_invalidate_url([$path_url]);
+      }
+    }
+  }
+}
+
+/**
+ * Test connection with Amazon AWS.
+ *
+ * Data may be stored as either plain text or as serialized data. cache_get.
+ *
+ * @param string $cec_region
+ *   Regions configured in the administer form.
+ * @param string $cec_key
+ *   Regions configured in the administer form.
+ * @param string $cec_secret
+ *   Regions configured in the administer form.
+ *
+ * @return mixed
+ *   The value result.
+ */
+function cloudfront_edge_caching_test_connection($cec_region, $cec_key, $cec_secret) {
+
+  // Return values.
+  $return[0] = FALSE;
+  $return[1] = 'status';
+  $return[2] = 'message';
+
+  if (!empty($cec_region) && !empty($cec_key) && !empty($cec_secret)) {
+    // Load AWS SDK.
+    $cloudFront = new CloudFrontClient([
+      'version' => 'latest',
+      'region' => $cec_region,
+      'credentials' => [
+        'key' => $cec_key,
+        'secret' => $cec_secret,
+      ],
+    ]);
+
+    // Try a connection test.
+    try {
+      $cloudFront->listDistributions();
+    }
+
+    catch (AwsException $e) {
+      $catch = TRUE;
+      $return[1] = $e->getStatusCode();
+      $return[2] = $e->getMessage();
+    }
+
+    if (empty($catch)) {
+      $return[0] = TRUE;
+    }
+  }
+  else {
+    $return[2] = 'Parameters not received correctly';
+  }
+
+  return $return;
+}
+
+/**
+ * Invalidate specific URL.
+ *
+ * @param string $paths
+ *   Array with paths to invalidate.
+ *
+ * @return mixed
+ *   The value result.
+ */
+function cloudfront_edge_caching_invalidate_url($paths) {
+
+  // Return values.
+  $return[0] = FALSE;
+  $return[1] = 'message';
+
+  // Get the AWS Credentials.
+  $config = \Drupal::config('cec.settings');
+
+  // Quantity.
+  $total_paths = count($paths);
+
+  // Load AWS SDK.
+  $cloudFront = new CloudFrontClient([
+    'version'     => 'latest',
+    'region'      => $config->get('cec_region'),
+    'credentials' => [
+      'key'    => $config->get('cec_key'),
+      'secret' => $config->get('cec_secret'),
+    ],
+  ]);
+
+  // Invalidate URL.
+  try {
+    $cloudFront->createInvalidation([
+      'DistributionId' => $config->get('cec_distribution_id'),
+      'InvalidationBatch' => [
+        'CallerReference' => random_int(1, 999999999999999999),
+        'Paths' => [
+          'Items' => $paths,
+          'Quantity' => $total_paths,
+        ],
+      ],
+    ]);
+  }
+
+  catch (AwsException $e) {
+    $catch = TRUE;
+    $return[1] = $e->getMessage();
+
+    // Logs an error.
+    \Drupal::logger('cloudfront_edge_caching')->error($e->getMessage());
+  }
+
+  if (empty($catch)) {
+    $return[0] = TRUE;
+
+    // Logs a message.
+    if ($total_paths == 1) {
+      \Drupal::logger('cloudfront_edge_caching')->notice('The URL ' . $paths[0] . ' is in progress.');
+    }
+    else {
+      foreach ($paths as $value) {
+        \Drupal::logger('cloudfront_edge_caching')->notice('The URL ' . $value . ' is in progress.');
+      }
+    }
+  }
+
+  return $return;
+}
