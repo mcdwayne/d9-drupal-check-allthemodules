@@ -1,0 +1,163 @@
+<?php
+
+/**
+ * @file
+ * Contains micro_site.install.
+ */
+
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_requirements().
+ */
+function micro_site_requirements($phase) {
+  if ($phase == 'install') {
+    \Drupal::messenger()->addWarning(t('You must <a href="@url">configure</a> the base url for the micro sites hosts otherwise the module will not works properly.', ['@url' => Url::fromUri('internal:/admin/config/system/sites')->toString()]));
+  }
+
+  if ($phase == 'runtime') {
+    $requirements = [];
+    $base_url = \Drupal::config('micro_site.settings')->get('base_url');
+    $base_url_configured = !empty($base_url) && $base_url != 'micro.site';
+
+    $requirements['micro_site_base_url'] = [
+      'title' => t('Micro site base URL'),
+      'value' => $base_url_configured ? t('Configured') : t('Not configured'),
+      'description' => $base_url_configured ? t('The base url for the micro sites host is configured on @base_url', ['@base_url' => $base_url]) : t('You must <a href="@url">configure</a> the base url for the micro sites hosts otherwise the module will not works properly.', ['@url' => Url::fromUri('internal:/admin/config/system/sites')->toString()]),
+      'severity' => $base_url_configured ? REQUIREMENT_OK : REQUIREMENT_ERROR,
+    ];
+
+    return $requirements;
+  }
+
+}
+
+/**
+ * Implements hook_install().
+ *
+ * Install the default site users fields on sites.
+ */
+function micro_site_install() {
+  _micro_site_install_user_fields();
+}
+
+/**
+ * Install the site user fields.
+ */
+function micro_site_update_8101() {
+  _micro_site_install_user_fields();
+}
+
+/**
+ * Install the site user fields.
+ */
+function micro_site_update_8102() {
+  _micro_site_install_user_fields();
+}
+
+/**
+ * Reconfigure all the blocks to handle the micro site context provider
+ * renamed from entity:site to site.
+ */
+function micro_site_update_8103() {
+  $blockStorage = \Drupal::entityTypeManager()->getStorage('block');
+  $blocks = $blockStorage->loadMultiple();
+  /** @var \Drupal\block\BlockInterface $block */
+  foreach ($blocks as $block) {
+    $changed = FALSE;
+    $visibility = $block->getVisibility();
+    foreach ($visibility as $instance_id => $condition) {
+      if (isset($condition['context_mapping']['site'])) {
+        if ($condition['context_mapping']['site'] == '@micro_site.current_site_context:entity:site') {
+          $visibility[$instance_id]['context_mapping']['site'] = '@micro_site.current_site_context:site';
+          $block->setVisibilityConfig($instance_id, $visibility[$instance_id]);
+          $changed = TRUE;
+        }
+
+      }
+      if (isset($condition['context_mapping']['entity:site'])) {
+        unset($visibility[$instance_id]['context_mapping']['entity:site']);
+        $visibility[$instance_id]['context_mapping']['site'] = '@micro_site.current_site_context:site';
+        $block->setVisibilityConfig($instance_id, $visibility[$instance_id]);
+        $changed = TRUE;
+      }
+    }
+    if ($changed) {
+      $block->save();
+    }
+  }
+}
+
+/**
+ * Increase micro site entities name field max length.
+ */
+function micro_site_update_8104() {
+  $entity_type_id = 'site';
+  $field_name = 'name';
+  $field_length = 128;
+
+  // Ignore entity manager caches.
+  /** @var \Drupal\Core\Entity\EntityManager $entity_manager */
+  $entity_manager = \Drupal::service('entity.manager');
+  $entity_manager->useCaches(FALSE);
+
+  /** @var \Drupal\Core\Entity\EntityLastInstalledSchemaRepositoryInterface $schema_repository */
+  $schema_repository = \Drupal::service('entity.last_installed_schema.repository');
+  /** @var \Drupal\Core\Entity\EntityFieldManager $entity_field_manager */
+  $entity_field_manager = \Drupal::service('entity_field.manager');
+  $base_field_definitions = $entity_field_manager->getBaseFieldDefinitions($entity_type_id);
+
+  // Updates the field storage definition
+  $schema_repository->setLastInstalledFieldStorageDefinition($base_field_definitions[$field_name]);
+  $field_storage_definitions = $schema_repository->getLastInstalledFieldStorageDefinitions($entity_type_id);
+  $field_storage_definitions[$field_name]['schema'] = $field_storage_definitions[$field_name]->getSchema();
+  $field_storage_definitions[$field_name]['schema']['columns']['value']['length'] = 128;
+  $schema_repository->setLastInstalledFieldStorageDefinitions($entity_type_id, $field_storage_definitions);
+  $is_revisionable = $field_storage_definitions[$field_name]->isRevisionable();
+
+  // Updates the storage schema.
+  $key_value = \Drupal::keyValue('entity.storage_schema.sql');
+  $key_name = $entity_type_id . '.field_schema_data.' . $field_name;
+  $storage_schema = $key_value->get($key_name);
+  $storage_schema[$entity_type_id . '_field_data']['fields'][$field_name]['length'] = $field_length;
+  if ($is_revisionable) {
+    $storage_schema[$entity_type_id . '_field_revision']['fields'][$field_name]['length'] = $field_length;
+  }
+  $key_value->set($key_name, $storage_schema);
+
+  // Updates the base database field.
+  $db_schema = \Drupal\Core\Database\Database::getConnection()->schema();
+  $db_schema->changeField($entity_type_id . '_field_data', $field_name, $field_name, [
+    'type' => 'varchar',
+    'length' => $field_length,
+    'not null' => !empty($storage_schema[$entity_type_id]['fields'][$field_name]['not null']),
+    'default' => '',
+  ]);
+
+  // Updates the revision database field.
+  if ($is_revisionable) {
+    $db_schema->changeField($entity_type_id . '_field_revision', $field_name, $field_name, [
+      'type' => 'varchar',
+      'length' => $field_length,
+      'not null' => !empty($storage_schema[$entity_type_id]['fields'][$field_name]['not null']),
+      'default' => '',
+    ]);
+  }
+
+  drupal_flush_all_caches();
+}
+
+/**
+ * Install the site user fields.
+ */
+function _micro_site_install_user_fields() {
+  $list = [];
+  $site_types = \Drupal::entityTypeManager()->getStorage('site_type')->loadMultiple();
+  foreach ($site_types as $type => $info) {
+    $list[$type] = 'site';
+  }
+
+  foreach ($list as $bundle => $entity_type) {
+    micro_site_assign_fields($entity_type, $bundle);
+  }
+}
