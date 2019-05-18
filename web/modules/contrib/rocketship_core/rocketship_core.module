@@ -1,0 +1,572 @@
+<?php
+
+/**
+ * @file
+ * Main module file.
+ */
+
+use Drupal\Core\Entity\TranslatableInterface;
+use Drupal\Core\Entity\ContentEntityFormInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\redirect\Entity\Redirect;
+use Drupal\menu_link_content\MenuLinkContentInterface;
+use Drupal\Core\Render\BubbleableMetadata;
+use Drupal\block\Entity\Block;
+use Drupal\Component\Utility\Random;
+use Drupal\user\Entity\Role;
+use Symfony\Component\Yaml\Yaml;
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_token_info().
+ */
+function rocketship_core_token_info() {
+  // Add a token for the alias of the parent menu link.
+  $info['tokens']['menu-link']['parent-alias'] = [
+    'name' => t('Menu parent: alias'),
+    'description' => t('URL alias of the menu parent.'),
+  ];
+  $info['tokens']['current-page']['paged-url'] = [
+    'name' => t('Paged URL'),
+    'description' => t('The URL of the current page including the page query parameter.'),
+    'type' => 'url',
+  ];
+  return $info;
+}
+
+/**
+ * Implements hook_tokens().
+ */
+function rocketship_core_tokens($type, $tokens, array $data, array $options, BubbleableMetadata $bubbleable_metadata) {
+  $replacements = [];
+  $language_manager = \Drupal::languageManager();
+  $url_options = ['absolute' => TRUE];
+  if (isset($options['langcode'])) {
+    $url_options['language'] = $language_manager->getLanguage($options['langcode']);
+  }
+
+  if ($type == 'menu-link' && !empty($data['menu-link'])) {
+    $link = $data['menu-link'];
+    $menu_link_manager = \Drupal::service('plugin.manager.menu.link');
+
+    if ($link instanceof MenuLinkContentInterface) {
+      $link = $menu_link_manager->createInstance($link->getPluginId());
+    }
+    foreach ($tokens as $name => $original) {
+      switch ($name) {
+        case 'parent-alias':
+          if ($link->getParent() && $parent = $menu_link_manager->createInstance($link->getParent())) {
+            $alias_manager = \Drupal::service('path.alias_manager');
+            $url = $parent->getUrlObject();
+            if (!$url->isExternal()) {
+              $path = '/' . $url->getInternalPath();
+              $replacements[$original] = $alias_manager->getAliasByPath($path);
+            }
+          }
+          break;
+      }
+    }
+  }
+
+  // Current page tokens.
+  if ($type == 'current-page') {
+    $request = \Drupal::request();
+    foreach ($tokens as $name => $original) {
+      switch ($name) {
+        // Returns the current page url + the page query parameter if present.
+        case 'paged-url':
+          $page = $request->query->get('page', NULL);
+          if ($page) {
+            $url_options['query']['page'] = $page;
+          }
+          $bubbleable_metadata->addCacheContexts(['url']);
+          try {
+            $url = Url::createFromRequest($request)->setOptions($url_options);
+          }
+          catch (\Exception $e) {
+            // Url::createFromRequest() can fail, e.g. on 404 pages.
+            // Fall back and try again with Url::fromUserInput().
+            try {
+              $url = Url::fromUserInput($request->getPathInfo(), $url_options);
+            }
+            catch (\Exception $e) {
+              // Instantiation would fail again on malformed urls.
+            }
+          }
+          if (isset($url)) {
+            $replacements[$original] = $url->toString();
+          }
+          break;
+      }
+    }
+  }
+
+  return $replacements;
+}
+
+/**
+ * Implements hook_path_update().
+ */
+function rocketship_core_path_update($path) {
+  if ($path['original']['alias'] != $path['alias']) {
+    // Look for any aliases with the original alias as a part of it.
+    $q = Drupal::database()->select('url_alias', 'u');
+    $q->fields('u', ['pid', 'source', 'alias', 'langcode']);
+    $q->condition('u.alias', $path['original']['alias'] . '%', 'LIKE');
+    $q->condition('u.source', $path['source'], '<>');
+    $results = $q->execute();
+
+    while ($alias_to_update = $results->fetchObject()) {
+      // Build an save the new alias.
+      $new_alias = str_replace($path['original']['alias'], $path['alias'], $alias_to_update->alias);
+      $q = Drupal::database()->update('url_alias');
+      $q->fields(['alias' => $new_alias]);
+      $q->condition('pid', $alias_to_update->pid);
+      $q->execute();
+
+      // Trigger the redirect_path_update() functionality.
+      if (!\Drupal::config('redirect.settings')->get('auto_redirect')) {
+        return;
+      }
+
+      // Delete all redirects having the same source as this alias.
+      redirect_delete_by_path($new_alias, $alias_to_update->langcode, FALSE);
+      if ($alias_to_update->alias != $new_alias) {
+        if (!redirect_repository()->findMatchingRedirect($alias_to_update->alias, [], $alias_to_update->langcode)) {
+          $redirect = Redirect::create();
+          $redirect->setSource($alias_to_update->alias);
+          $redirect->setRedirect($alias_to_update->source);
+          $redirect->setLanguage($alias_to_update->langcode);
+          $redirect->setStatusCode(\Drupal::config('redirect.settings')
+            ->get('default_status_code'));
+          $redirect->save();
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_BASE_FORM_ID_alter().
+ *
+ * If the field_header_paragraph is present, and that node is set as the
+ * frontpage, hide the header paragraph field.
+ */
+function rocketship_core_form_node_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  if (isset($form['field_header_paragraph'])) {
+    /** @var \Drupal\Core\Entity\EntityForm $form_object */
+    $form_object = $form_state->getFormObject();
+    /** @var \Drupal\node\NodeInterface $node */
+    $node = $form_object->getEntity();
+    if ($node->isNew()) {
+      return;
+    }
+    $front = \Drupal::configFactory()->get('system.site')->get('page.front');
+    if ("/node/{$node->id()}" == $front) {
+      // Hide the paragraph header field
+      // $form['field_header_paragraph']['#access'] = FALSE;
+      // Unset it, #access => FALSE triggers ImageWidget::validateRequiredFields
+      // for some godforsaken reason.
+      unset($form['field_header_paragraph']);
+    }
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * We're not using the language selector, instead we're just making it clear
+ * to the user in what language they're working in.
+ */
+function rocketship_core_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // Only on admin pages and for logged in users.
+  if (!\Drupal::service('router.admin_context')->isAdminRoute()
+    || !\Drupal::currentUser()->isAuthenticated()) {
+    return;
+  }
+
+  $object = $form_state->getFormObject();
+  if ($object instanceof ContentEntityFormInterface) {
+    $entity = $object->getEntity();
+    if ($entity) {
+      $language = $entity->language()->getName();
+
+      $text = t('Creating @entity_type in @language', [
+        '@language' => $language,
+        '@entity_type' => $entity->getEntityType()->getLabel(),
+      ]);
+      if (!$entity->isNew()) {
+        $text = t('Editing @language translation', ['@language' => $language]);
+      }
+      if ($entity instanceof TranslatableInterface) {
+        if ($entity->isNewTranslation() && !$entity->isNew()) {
+          $text = t('Adding @language translation', ['@language' => $language]);
+        }
+      }
+
+      $form['rocketship_core_language_info'] = [
+        '#weight' => -9999,
+        '#markup' => "<h4>$text</h4>",
+      ];
+    }
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function rocketship_core_theme() {
+  $return = [
+    'idt_widget' => [
+      'render element' => 'element',
+      'file' => 'rocketship_core.field.inc',
+    ],
+    'label_value_list_item' => [
+      'variables' => ['label' => NULL, 'value' => NULL, 'promoted' => FALSE],
+    ],
+    'title_description_list_item' => [
+      'variables' => [
+        'title' => NULL,
+        'description' => NULL,
+        'wrapper' => NULL,
+      ],
+    ],
+  ];
+
+  return $return;
+}
+
+/**
+ * Implements hook_theme_registry_alter().
+ */
+function rocketship_core_theme_registry_alter(&$theme_registry) {
+  $layouts = \Drupal::service('plugin.manager.core.layout')->getDefinitions();
+
+  $layout_theme_hooks = [];
+  /** @var \Drupal\Core\Layout\LayoutDefinition $info */
+  foreach ($layouts as $info) {
+    if ($info->getCategory() == 'Rocketship Layouts - Display Suite') {
+      $layout_theme_hooks[$info->getThemeHook()] = 'layout';
+    }
+
+    if ($info->getCategory() == 'Rocketship Layouts - Panels') {
+      $layout_theme_hooks[$info->getThemeHook()] = 'layout';
+    }
+  }
+
+  // Only add preprocess functions if entity exposes theme function, and this
+  // layout is using the Display Suite layout class.
+  foreach ($theme_registry as $theme_hook => $info) {
+    if (array_key_exists($theme_hook, $layout_theme_hooks) || (!empty($info['base hook']) && array_key_exists($info['base hook'], $layout_theme_hooks))) {
+
+      // @todo Remove once https://www.drupal.org/node/2861840 is resolved.
+      if (!in_array('template_preprocess_layout', $theme_registry[$theme_hook]['preprocess functions'])) {
+        $theme_registry[$theme_hook]['preprocess functions'][] = 'template_preprocess_layout';
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------------
+  // Workaround to get theme suggestions working for templates using the
+  // the Display Suite class. It's borderline insane, but gets the job done.
+  //
+  // Note that this currently only works for Twig, but I assume, there isn't
+  // any other engine out there yet for Drupal 8.
+  //
+  // Code based on drupal_find_theme_templates().
+  //
+  // @see
+  // - https://www.drupal.org/node/2862683 (core queue)
+  // - https://www.drupal.org/node/2802429 (DS queue)
+  // (and maybe others)
+  // ------------------------------------------------------------------------.
+  // Merge layout and field hooks.
+  $all_ds_theme_hooks = $layout_theme_hooks;
+
+  $engine = \Drupal::theme()->getActiveTheme()->getEngine();
+  if ($engine == 'twig') {
+
+    $extension = '.html.twig';
+    $theme_path = \Drupal::theme()->getActiveTheme()->getPath();
+
+    // Escape the periods in the extension.
+    $regex = '/' . str_replace('.', '\.', $extension) . '$/';
+    // Get a listing of all template files in the path to search.
+    $files = file_scan_directory($theme_path, $regex, ['key' => 'filename']);
+    $patterns = array_keys($files);
+    $implementations = [];
+
+    foreach ($all_ds_theme_hooks as $hook => $base_hook) {
+
+      // Ignored if not registered (which would be weird).
+      if (!isset($theme_registry[$hook])) {
+        continue;
+      }
+
+      $pattern = isset($info['pattern']) ? $info['pattern'] : ($hook . '__');
+      if (!empty($pattern)) {
+        // Transform _ in pattern to - to match file naming scheme
+        // for the purposes of searching.
+        $pattern = strtr($pattern, '_', '-');
+
+        $matches = preg_grep('/^' . $pattern . '/', $patterns);
+        if ($matches) {
+          foreach ($matches as $match) {
+            $file = $match;
+            // Remove the extension from the filename.
+            $file = str_replace($extension, '', $file);
+            // Put the underscores back in for the hook name and register this
+            // pattern.
+            $info = $theme_registry[$hook];
+            $arg_name = isset($info['variables']) ? 'variables' : 'render element';
+            $new_hook = strtr($file, '-', '_');
+            $implementations[$new_hook] = [
+              'template' => $file,
+              'path' => dirname($files[$match]->uri),
+              $arg_name => $info[$arg_name],
+              'base hook' => $base_hook,
+              'type' => 'theme_engine',
+              'theme path' => $theme_path,
+            ];
+            if (isset($theme_registry[$hook]['preprocess functions'])) {
+              $implementations[$new_hook]['preprocess functions'] = $theme_registry[$hook]['preprocess functions'];
+            }
+          }
+        }
+      }
+    }
+
+    if (!empty($implementations)) {
+      $theme_registry += $implementations;
+    }
+  }
+
+  // ------------------------------------------------------------------------
+  // End of workaround, hopefully we can kill this one day.
+  // ------------------------------------------------------------------------.
+}
+
+/**
+ * Class Rocketship.
+ *
+ * @package Drupal\rocketship_core
+ */
+class Rocketship {
+
+  /**
+   * Update roles for a modules for Rocketship.
+   *
+   * If a module has permissions folder with .yml files
+   * named ROLE.yml with a permissions key and then a list
+   * of permissions, this function will update those roles
+   * with those permissions.
+   *
+   * @param string $module
+   *   Module name.
+   *
+   * @throws \Drupal\Core\Entity\EntityStorageException
+   */
+  public static function updateRolePermissionsForModule($module) {
+
+    $path = \Drupal::service('module_handler')
+        ->getModule($module)
+        ->getPath() . '/permissions';
+
+    /** @var \Drupal\user\RoleInterface[] $roles */
+    $roles = Role::loadMultiple();
+
+    foreach ($roles as $role) {
+      $file_path = $path . '/' . $role->id() . '.yml';
+      if (is_file($file_path)) {
+        $file_contents = file_get_contents($file_path);
+        $file = (array) Yaml::parse($file_contents);
+
+        foreach ($file['permissions'] as $permission) {
+          $role->grantPermission($permission);
+        }
+        $role->save();
+      }
+    }
+  }
+
+  /**
+   * Get module installer service.
+   *
+   * @return \Drupal\Core\Extension\ModuleInstallerInterface
+   *   Service.
+   */
+  public static function getModuleInstaller() {
+    return \Drupal::service('module_installer');
+  }
+
+  /**
+   * Get UUID Generator service.
+   *
+   * @return \Drupal\Component\Uuid\UuidInterface
+   *   Service.
+   */
+  public static function getUuidGenerator() {
+    return \Drupal::service('uuid');
+  }
+
+  /**
+   * Helper function to place blocks in a region.
+   *
+   * @param string $plugin_id
+   *   Block plugin ID.
+   * @param array $settings
+   *   Block settings.
+   *
+   * @return bool|\Drupal\block\BlockInterface
+   *   FALSE on failure or the Block that was just placed.
+   */
+  public static function placeBlock($plugin_id, array $settings = []) {
+    // Set theme fallback.
+    $theme = isset($settings['theme']) ? $settings['theme'] : \Drupal::configFactory()
+      ->get('system.theme')
+      ->get('default');
+
+    // Generate ID.
+    $id = $theme . '_' . str_replace([':', '-'], '_', $plugin_id);
+    if (strlen($id) > 64) {
+      // Fallback if max length exceeded.
+      $id = (new Random())->name(8);
+    }
+
+    // Make sure region is valid.
+    $regions = system_region_list($theme);
+    $region = isset($settings['region']) ? $settings['region'] : system_default_region($theme);
+    if (!isset($regions[$region])) {
+      $region = system_default_region($theme);
+    }
+
+    // Fill in defaults.
+    $settings += [
+      'plugin' => $plugin_id,
+      'region' => $region,
+      'id' => $id,
+      'theme' => $theme,
+      'label' => '',
+      'visibility' => [],
+      'weight' => 0,
+    ];
+    $values = [];
+
+    $keys = [
+      'region',
+      'id',
+      'theme',
+      'plugin',
+      'weight',
+      'visibility',
+    ];
+    foreach ($keys as $key) {
+      $values[$key] = $settings[$key];
+      // Remove extra values that do not belong in the settings array.
+      unset($settings[$key]);
+    }
+    foreach ($values['visibility'] as $id => $visibility) {
+      $values['visibility'][$id]['id'] = $id;
+    }
+    $values['settings'] = $settings;
+    $block = Block::create($values);
+    try {
+      $block->save();
+
+      return $block;
+    }
+    catch (\Exception $e) {
+      \Drupal::logger('Rocketship')->error($e->getMessage());
+
+      return FALSE;
+    }
+  }
+
+  /**
+   * Render a block.
+   *
+   * @param string $plugin_id
+   *   Plugin ID.
+   * @param array $config
+   *   Config array.
+   *
+   * @return array
+   *   Renderable array.
+   *
+   * @see https://drupal.stackexchange.com/questions/171686/how-can-i-programmatically-display-a-block
+   */
+  public static function renderPluginBlock($plugin_id, array $config = []) {
+    $block_manager = \Drupal::service('plugin.manager.block');
+    $plugin_block = $block_manager->createInstance($plugin_id, $config);
+    // Some blocks might implement access check.
+    $access_result = $plugin_block->access(\Drupal::currentUser());
+    // Return empty render array if user doesn't have access.
+    // $access_result can be boolean or an AccessResult class.
+    if (is_object($access_result) && $access_result->isForbidden() || is_bool($access_result) && !$access_result) {
+      // You might need to add some cache tags/contexts.
+      return [];
+    }
+    $render = $plugin_block->build();
+    // In some cases, you need to add the cache tags/context depending on
+    // the block implemention. As it's possible to add the cache tags and
+    // contexts in the render method and in ::getCacheTags and
+    // ::getCacheContexts methods.
+    return $render;
+  }
+
+  /**
+   * Hides the breadcrumb and title block on detail pages for the given CT.
+   *
+   * @param string $theme
+   *   Theme name.
+   * @param string $contentType
+   *   Content type name.
+   *
+   * @throws \Drupal\Core\Entity\EntityStorageException
+   */
+  public static function hideBreadcrumbAndTitleBlockOnContentType($theme, $contentType) {
+
+    $blocks = [
+      "{$theme}_breadcrumbs",
+      "{$theme}_page_title",
+    ];
+
+    foreach ($blocks as $config_name) {
+      /** @var \Drupal\block\BlockInterface $block */
+      $block = Block::load($config_name);
+      if ($block) {
+        $visibility = $block->getVisibility();
+        $visibility['entity_bundle:node']['bundles'][$contentType] = $contentType;
+        $visibility['entity_bundle:node']['negate'] = TRUE;
+        $visibility['entity_bundle:node']['context_mapping']['node'] = '@node.node_route_context:node';
+        $block->setVisibilityConfig('entity_bundle:node', $visibility['entity_bundle:node']);
+        $block->save();
+      }
+    }
+  }
+
+  /**
+   * @deprecated
+   *
+   * Ensure content types have the translation tables.
+   *
+   * Creating CTs with config imports doesn't trigger translation table updates.
+   *
+   * @param string $entityType
+   *   Entity type name.
+   * @param string $bundle
+   *   Bundle name.
+   *
+   * @see https://www.drupal.org/project/drupal/issues/2599228
+   *
+   * @todo: rework applyUpdates, because it's going away in 8.7
+   * This entire thing shouldn't be needed once 8.8 hits.
+   *
+   * The patch to fix translations has hit early, it's in 8.7 so this
+   * method is no longer required. Marking as deprecated.
+   */
+  public static function fixTranslationConfigImportIssues($entityType, $bundle) {
+
+  }
+
+}
