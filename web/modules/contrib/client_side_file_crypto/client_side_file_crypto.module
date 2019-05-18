@@ -1,0 +1,264 @@
+<?php
+
+/**
+ * @file
+ * Contains client_side_file_crypto.module.
+ */
+
+use Drupal\Core\Form\FormState;
+use Drupal\user\Entity\User;
+use Drupal\Core\Url;
+use Drupal\Core\Routing\RouteMatchInterface;
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function client_side_file_crypto_form_user_login_form_alter(&$form, FormState $form_state) {
+  $form['#submit'][] = 'client_side_file_crypto_user_login_submit';
+}
+
+/**
+ * Implements hook_user_login().
+ */
+function client_side_file_crypto_user_login($account) {
+  drupal_flush_all_caches();
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function client_side_file_crypto_page_attachments(&$page) {
+  global $base_url;
+  $route_match = \Drupal::routeMatch();
+  $user = \Drupal::currentUser();
+  $node = $route_match->getParameter('node');
+  $nid = ($node) ? $node->id() : -1;
+  $routeName = $route_match->getRouteName();
+  $blockedRoutes = [
+    'client_side_file_crypto.newKeys',
+    'client_side_file_crypto.postLogin',
+  ];
+  if (!User::load($user->id())->get('pub_key')->value && $user->id() != 0 && in_array($routeName, $blockedRoutes)) {
+    // user_logout();
+  }
+  $page['#attached']['library'][] = 'client_side_file_crypto/csfcUpdatePendingKeys';
+  $page['#attached']['drupalSettings']['client_side_file_crypto']['uid'] = $user->id();
+  $page['#attached']['drupalSettings']['client_side_file_crypto']['nodeid'] = $nid;
+  $page['#attached']['drupalSettings']['client_side_file_crypto']['baseURL'] = $base_url;
+  $page['#attached']['drupalSettings']['client_side_file_crypto']['routeName'] = $routeName;
+  if(!file_exists('libraries/client_side_file_crypto/jsencrypt.js')){
+    drupal_set_message(t('jsencrypt.js library not in place, please follow instructions on the module page <a href="https://www.drupal.org/project/client_side_file_crypto/">here.</a>'),'error');
+  }
+  if(!file_exists('libraries/client_side_file_crypto/cryptojs.js')){
+    drupal_set_message(t('cryptojs.js library not in place, please follow instructions on the module page <a href="https://www.drupal.org/project/client_side_file_crypto/">here.</a>'),'error');
+  }
+  
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Attaches post submission method to node form.
+ */
+function client_side_file_crypto_form_node_form_alter(&$form, FormState $form_state, $form_id) {
+  $form['#attached'] = [
+    'library' => [
+      'client_side_file_crypto/csfcEncrypt',
+    ],
+  ];
+  $form['cryptoFields'] = [
+    '#type' => 'file',
+    '#title' => t('Encrypted file'),
+    '#id' => 'cryptoFields',
+    '#weight' => 15,
+    '#description' => t('Attach your file with sensitive data here.'),
+  ];
+  $form['fileID'] = [
+    '#type' => 'hidden',
+    '#id' => 'fileID',
+    '#title' => t('Encrypted file ID'),
+    '#weight' => 14,
+  ];
+
+  $current_user = \Drupal::currentUser();
+  $roles = $current_user->getRoles();
+  $roleOptions = [];
+  foreach ($roles as $key => $value) {
+    $roleOptions[$value] = $value;
+  }
+  $form['roleSelect'] = [
+    '#type' => 'select',
+    '#id' => 'roleSelect',
+    '#title' => t('Encrypt for role'),
+    '#default_value' => $roles[0],
+    '#options' => $roleOptions,
+    '#weight' => 13,
+    '#description' => t('Select role to encrypt for.'),
+  ];
+
+  foreach (array_keys($form['actions']) as $action) {
+    if ($action != 'preview' && isset($form['actions'][$action]['#type']) && $form['actions'][$action]['#type'] === 'submit') {
+      $form['actions'][$action]['#submit'][] = 'client_side_file_crypto_form_submit';
+    }
+  }
+}
+
+/**
+ * Form submission handler for node_form_submit().
+ *
+ * Encrypted file upload link for new node.
+ */
+function client_side_file_crypto_form_submit(array $form, FormState $form_state) {
+  $query = \Drupal::database()->update('client_side_file_crypto_files');
+  $query->fields([
+    'nodeID' => $form_state->getValue('nid'),
+  ]);
+  $query->condition('fileIndex', $form_state->getValue('fileID'));
+  $query->execute();
+
+}
+
+/**
+ * Node preprocess hook, adds the decryption library to the nodes.
+ */
+function client_side_file_crypto_preprocess_node(&$variables) {
+  $node = $variables['node'];
+  $variables['#attached']['library'][] = 'client_side_file_crypto/csfcDecrypt';
+}
+
+/**
+ * Form submission handler for user_login_form().
+ *
+ * Conditional redirect post login handler.
+ */
+function client_side_file_crypto_user_login_submit(&$form, FormState $form_state) {
+  $uid = \Drupal::currentUser()->id();
+  $user = User::load($uid);
+  $pubKeyAvailable = $user->get('pub_key')->value;
+  if ($pubKeyAvailable == NULL || $pubKeyAvailable == "") {
+    $url = Url::fromRoute('client_side_file_crypto.newKeys');
+    $request = \Drupal::service('request_stack')->getCurrentRequest();
+    if (!$request->request->has('destination')) {
+      $form_state->setRedirectUrl($url);
+    }
+    else {
+      $request->query->set('destination', $request->request->get('destination'));
+    }
+  }
+
+}
+
+/**
+ * Implements hook_user_insert().
+ */
+function client_side_file_crypto_user_insert($account) {
+  $user = \Drupal::entityManager()->getStorage('user')->load($account->id());
+  $values = [];
+  $roles = $user->getRoles();
+  foreach ($roles as $role) {
+    $values[] = [
+      'accessKey' => '100',
+      'roleName' => $role,
+      'userID' => $account->id(),
+      'needsKey' => 1,
+    ];
+  }
+  $query = db_insert('client_side_file_crypto_Keys')->fields([
+    'accessKey',
+    'roleName',
+    'userID',
+  ]
+  );
+  foreach ($values as $record) {
+    $query->values($record);
+  }
+  $query->execute();
+}
+
+/**
+ * Implements hook_user_update().
+ */
+function client_side_file_crypto_user_update($account) {
+  $user = \Drupal::entityManager()->getStorage('user')->load($account->id());
+  $values = [];
+  $rolesUpdated = $user->getRoles();
+  $rolesExisting = [];
+  $query = db_select('client_side_file_crypto_Keys');
+  $query->condition('userID', $account->id());
+  $query->addField('client_side_file_crypto_Keys', 'roleName');
+  $db_result = $query->execute();
+  if ($db_result) {
+    foreach ($db_result as $record) {
+      $rolesExisting[] = $record->roleName;
+    }
+  }
+
+  // Stores all rolenames that have keys for the edited user and the user has
+  // been removed from that role.
+  $rolesToRemove = array_diff($rolesExisting, $rolesUpdated);
+  if (count($rolesToRemove)) {
+    db_delete('client_side_file_crypto_Keys')
+      ->condition('roleName', $rolesToRemove, 'in')
+      ->condition('userID', $account->id(), '=')
+      ->execute();
+  }
+
+  // Stores all rolenames that dont have keys for the edited user and the user
+  // has been just added to that role.
+  $rolesToAdd = array_diff($rolesUpdated, $rolesExisting);
+
+  $values = [];
+  foreach ($rolesToAdd as $role) {
+    $values[] = [
+      'accessKey' => '100',
+      'roleName' => $role,
+      'userID' => $account->id(),
+      'needsKey' => 1,
+    ];
+  }
+  $query = db_insert('client_side_file_crypto_Keys')->fields([
+    'accessKey',
+    'roleName',
+    'userID',
+  ]
+  );
+  foreach ($values as $record) {
+    $query->values($record);
+  }
+  if (count($values)) {
+    $query->execute();
+  }
+}
+
+/**
+ * Implements hook_help().
+ */
+function client_side_file_crypto_help($route_name, RouteMatchInterface $route_match) {
+
+  switch ($route_name) {
+    // Main module help for the client_side_file_crypto module.
+    case 'help.page.client_side_file_crypto':
+      $output = '';
+      $output .= '<h2>' . t('Client-side File encryption for implementing a zero-knowledge system') . '</h2>';
+      $output .= '<h4>' . t('Google Summer of Code Project for Drupal') . '</h4>';
+      $output .= '<h4>' . t('Student: Tameesh Biswas (@tameeshb)') . '</h4>';
+      $output .= '<h4>' . t('Mentor: Colan Schwartz (@colan)') . '</h4>';
+      $output .= '<h4>' . t('Objective') . '</h4>';
+      $output .= '<p>' . t('This project will involve building a complete module for Drupal 8 site to make it a zero-knowledge system using client-side encryption so that the users can rely on the site when uploading sensitive files, including images on confidential posts, not having to worry about data being stolen in case the server gets compromised.') . '</p>';
+      $output .= '<p>' . t('Client side crypto for files for a zero knowledge system') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function client_side_file_crypto_theme() {
+  return [
+    'client_side_file_crypto' => [
+      'render element' => 'children',
+    ],
+  ];
+}
