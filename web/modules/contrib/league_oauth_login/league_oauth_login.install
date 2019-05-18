@@ -1,0 +1,92 @@
+<?php
+
+/**
+ * @file
+ * Install things for this module.
+ */
+
+use Drupal\league_oauth_login\Controller\LoginController;
+use League\OAuth2\Client\Token\AccessToken;
+
+/**
+ * Migrate all users to use externalauth.
+ */
+function league_oauth_login_update_8001() {
+  // First make sure externalauth is enabled.
+  /** @var \Drupal\Core\Extension\ModuleInstaller $installer */
+  $installer = \Drupal::service('module_installer');
+  $installer->install(['externalauth']);
+  /** @var \Drupal\user\UserStorageInterface $user_storage */
+  $user_storage = \Drupal::entityTypeManager()->getStorage('user');
+  /** @var \Drupal\externalauth\ExternalAuth $externalauth */
+  $externalauth = \Drupal::service('externalauth.externalauth');
+  $uids = $user_storage->getQuery()
+    ->execute();
+  /** @var \Drupal\league_oauth_login\LeagueOauthLoginPluginManager $login_manager */
+  $login_manager = \Drupal::service('plugin.manager.league_oauth_login');
+  $providers = $login_manager->getDefinitions();
+  /** @var \Drupal\user\UserDataInterface $user_data */
+  $user_data = \Drupal::service('user.data');
+  foreach ($uids as $uid) {
+    // See if they have something stored for any provider.
+    foreach ($providers as $id => $provider) {
+      $plugin = $login_manager->createInstance($id);
+      $key = LoginController::createUserDataKey($plugin);
+      if ($data = $user_data->get('league_oauth_login', $uid, $key)) {
+        /** @var \Drupal\user\Entity\User $user */
+        $user = $user_storage->load($uid);
+        $externalauth->linkExistingAccount($user->getEmail(), $key, $user);
+      }
+    }
+  }
+}
+
+/**
+ * Migrate all users to use resource ids instead of email as authname.
+ */
+function league_oauth_login_update_8002() {
+  /** @var \Drupal\user\UserStorageInterface $user_storage */
+  $user_storage = \Drupal::entityTypeManager()->getStorage('user');
+  $uids = $user_storage->getQuery()
+    ->sort('uid', 'ASC')
+    ->execute();
+  /** @var \Drupal\league_oauth_login\LeagueOauthLoginPluginManager $login_manager */
+  $login_manager = \Drupal::service('plugin.manager.league_oauth_login');
+  $providers = $login_manager->getDefinitions();
+  /** @var \Drupal\user\UserDataInterface $user_data */
+  $user_data = \Drupal::service('user.data');
+  /** @var \Drupal\externalauth\ExternalAuth $externalauth */
+  $externalauth = \Drupal::service('externalauth.externalauth');
+  $database = \Drupal::database();
+  foreach ($uids as $uid) {
+    // See if they have something stored for any provider.
+    foreach ($providers as $id => $provider) {
+      try {
+        /** @var \Drupal\league_oauth_login\LeagueOauthLoginInterface $plugin */
+        $plugin = $login_manager->createInstance($id);
+        $key = LoginController::createUserDataKey($plugin);
+        if ($data = $user_data->get('league_oauth_login', $uid, $key)) {
+          /** @var \Drupal\user\Entity\User $user */
+          if (!$user = $user_storage->load($uid)) {
+            continue;
+          }
+          $access_token = new AccessToken(['access_token' => $data]);
+          $resource_owner = $plugin->getProvider()->getResourceOwner($access_token);
+          $new_authname = LoginController::getAuthName($resource_owner->getId(), $plugin);
+          $database->delete('authmap')
+            ->condition('uid', $uid)
+            ->condition('provider', $key)
+            ->execute();
+          $externalauth->linkExistingAccount($new_authname, $key, $user);
+        }
+      }
+      catch (Exception $e) {
+        \Drupal::logger('league_oauth_login')->error('Caught exception trying to update user @uid with plugin @plugin. Message was @msg', [
+          '@uid' => $uid,
+          '@plugin' => $plugin->getPluginId(),
+          '@msg' => $e->getMessage(),
+        ]);
+      }
+    }
+  }
+}
