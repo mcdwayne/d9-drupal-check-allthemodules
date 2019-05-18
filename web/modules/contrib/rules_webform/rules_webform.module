@@ -1,0 +1,439 @@
+<?php
+
+/**
+ * @file
+ * Contains rules_webform.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\rules_webform\Event\WebformSubmitEvent;
+use Drupal\rules_webform\Event\UpdatingSubmissionEvent;
+use Drupal\rules_webform\Event\DeletingSubmissionEvent;
+use Drupal\rules_webform\Event\ViewingSubmissionEvent;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\webform\Entity\Webform;
+use Drupal\rules\Context\ContextConfig;
+use Drupal\webform\Entity\WebformSubmission;
+
+/**
+ * Add the element for a 'Webform id' selection to the rule adding form.
+ *
+ * Implements hook_form_FORM_ID_alter().
+ */
+function rules_webform_form_rules_reaction_rule_add_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+
+  $form['webform_id'] = [
+    '#type' => 'select',
+    '#title' => t('Webform'),
+    '#empty_option' => t('- Select -'),
+  ];
+  $form['#attached']['library'][] = 'rules_webform/rules_webform.select_webform_id';
+
+  $query = \Drupal::service('entity.query')->get('webform');
+  $webform_ids = $query->execute();
+  $webforms = Webform::loadMultiple($webform_ids);
+  foreach ($webforms as $webform) {
+    $form['webform_id']['#options'][$webform->get('id')] = $webform->get('title');
+  }
+
+  // Remove default Webform submission events from the list.
+  unset($form['events']['0']['event_name']['#options']['Webform submission']);
+
+  $form['#validate'] = ['rules_webform_check_if_webform_submit_event_selected'];
+}
+
+/**
+ * Check if Webform events selected.
+ *
+ * And if so then adding the 'webform_fields' properties definitions to the context variable
+ * and adding 'webform_name' condition.
+ */
+function rules_webform_check_if_webform_submit_event_selected($form, FormStateInterface $form_state) {
+  $event_name = $form_state->getValue('events')[0]['event_name'];
+  // Events supported by the module.
+  $webform_events = [
+    'webform_submit',
+    'updating_submission',
+    'deleting_submission',
+    'viewing_submission',
+  ];
+
+  if (in_array($event_name, $webform_events)) {
+
+    rules_webform_store_webform_id($form, $form_state);
+    rules_webform_add_condition($form, $form_state);
+    rules_webform_save_rule($form, $form_state);
+  }
+}
+
+/**
+ * Add the 'webform_fields' properties definitions to the context variable.
+ */
+function rules_webform_store_webform_id($form, FormStateInterface $form_state) {
+  $webform_id = $form_state->getValue('webform_id');
+
+  if (isset($webform_id)) {
+    $reaction_rule = $form_state->getFormObject()->getEntity();
+    // Store webform id, it will be then using in the following hook:
+    // 'rules_webform_form_rules_reaction_rule_edit_form_alter()'.
+    // For storing we use state instead of setThirdPartySetting().
+    // It enables reinstall the module and continue to using rules that use this module.
+    $rule_id = $reaction_rule->id;
+    \Drupal::state()->set('rules_webform.webform_id.' . $rule_id, $webform_id);
+    \Drupal::state()->get('rules_webform.webform_id.' . $rule_id);
+  }
+}
+
+/**
+ * Add rule condition 'webform_name' based on selected webform id.
+ */
+function rules_webform_add_condition($form, FormStateInterface $form_state) {
+  $selected_webform_id = $form_state->getValue('webform_id');
+  $values = [];
+  $values['context_values'] = ['selected_webform_id' => $selected_webform_id];
+  // Submitted webform ID will be extracted from webform_info context variable.
+  // And then will be using for compare selected and submitted webform in 'webform_name' condition.
+  $values['context_mapping']['submitted_webform_info'] = 'webform_info';
+  $values['provides_mapping'] = [];
+  $values['condition_id'] = 'webform_name';
+  $values['negate'] = 0;
+
+  $config = ContextConfig::create($values);
+
+  $entity = $form_state->getFormObject()->getEntity();
+  $component = $entity->getComponent();
+  $component->getExpression()->addCondition('webform_name', $config);
+  $entity->updateFromComponent($component);
+}
+
+/**
+ * Save changes in the Rule after storing webform_id and adding the condition.
+ */
+function rules_webform_save_rule($form, FormStateInterface $form_state) {
+  $form_state->getFormObject()->getEntity()->save();
+}
+
+/**
+ * Add to the condition title a webform title that user can see which webform has been selected.
+ *
+ * Also hiding our condition ('webform has name'), that user don't distracted on it.
+ *
+ * Implements hook_form_FORM_ID_alter().
+ */
+function rules_webform_form_rules_reaction_rule_edit_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $reaction_rule = $form_state->getFormObject()->getEntity();
+  $event_name = $reaction_rule->getEventNames()[0];
+  // Events supported by the module.
+  $webform_events = [
+    'webform_submit',
+    'updating_submission',
+    'deleting_submission',
+    'viewing_submission',
+  ];
+
+  if (!in_array($event_name, $webform_events)) {
+    return;
+  }
+
+  $rule_id = $reaction_rule->id;
+  $webform_id = \Drupal::state()->get('rules_webform.webform_id.' . $rule_id);
+  $webform = Webform::load($webform_id);
+  // Add to the condition title a webform title that user can see which webform has been selected.
+  if (isset($form['conditions']['table']['#rows'][0]['element'])) {
+    // Hiding our condition ('webform has name'), that user don't distracted on it.
+    $form['conditions']['table']['#rows'][0]['element'] = t('None');
+    $form['conditions']['table']['#rows'][0]['operations']['data']['#access'] = FALSE;
+  }
+  // Add webform title to the event title that user can see which a webform has been selected.
+  $webform_title = $webform->get('title');
+  $form['event'][0]['#title'] = t('Event:');
+
+  switch ($event_name) {
+    case 'webform_submit':
+      $form['event'][0]['#markup'] = t('Webform "@title" submit', ['@title' => $webform_title]);
+      break;
+
+    case 'updating_submission':
+      $form['event'][0]['#markup'] = t('Updating a submission of the "@title" webform', ['@title' => $webform_title]);
+      break;
+
+    case 'deleting_submission':
+      $form['event'][0]['#markup'] = t('Deleting a submission of the "@title" webform', ['@title' => $webform_title]);
+      break;
+
+    case 'viewing_submission':
+      $form['event'][0]['#markup'] = t('Viewing a submission of the "@title" webform', ['@title' => $webform_title]);
+  }
+
+  // Removing 'Edit' button for 'Delete webform submission' action because there is nothing to edit.
+  if (isset($form['action_table']['table']['#rows'])) {
+    foreach ($form['action_table']['table']['#rows'] as &$row) {
+      if ($row['element']->render() == 'Action: Delete webform submission') {
+        unset($row['operations']['data']['#links']['edit']);
+        break;
+      }
+    }
+    unset($row);
+  }
+}
+
+/**
+ * Add the 'webform_fields' properties definitions to the context variable.
+ *
+ * The information are then using in 'WebformFieldsDataDefinition' class.
+ * And it's needed for autocomplete of properties of 'webform_fields' context variable.
+ * Also removing default 'Webform submission' action from the Action selection list.
+ * And also removing condition 'webform name from the condition list, because it set programmatically by default.
+ * The module doesn't work with Rules components (actions and variables are not available).
+ * Therefore if this hook was called when a user edit a Rule component then hide related actions and condition.
+ *
+ * Implements hook_form_FORM_ID_alter().
+ */
+function rules_webform_form_rules_expression_edit_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $reaction_rule = \Drupal::request()->get('rules_reaction_rule');
+  // If this hook was called when a user edit a Rule component then hide related actions and condition.
+  // The module doesn't work with Rules components (actions and variables are not available).
+  if (is_null($reaction_rule)) {
+    // Removing our actions 'Delete webform submission' and 'Set webform field value' from the action list.
+    unset($form['action_id']['#options']['A Webform']);
+    // Removing our condition 'webform name from the condition list.
+    unset($form['condition_id']['#options']['A Webform']);
+    return;
+  }
+
+  $event_name = $reaction_rule->getEventNames()[0];
+  // Events supported by the module.
+  $webform_events = [
+    'webform_submit',
+    'updating_submission',
+    'deleting_submission',
+    'viewing_submission',
+  ];
+
+  if (!in_array($event_name, $webform_events)) {
+    // Removing our actions because they are unuseful for other events.
+    unset($form['action_id']['#options']['A Webform']);
+    return;
+  }
+
+  // Removing default 'Webform submission' action from the Action selection list.
+  unset($form['action_id']['#options']['Webform submission']);
+  // Removing our condition 'webform name from the condition list, because it set programmatically by default.
+  unset($form['condition_id']['#options']['A Webform']);
+  // Get the information about a webform fields.
+  $rule_id = $reaction_rule->id;
+  $webform_id = \Drupal::state()->get('rules_webform.webform_id.' . $rule_id);
+  $webform = Webform::load($webform_id);
+  $elements = $webform->getElementsInitializedAndFlattened();
+  $fields_definitions = [];
+  rules_webform_extract_composite_elements($elements, $fields_definitions);
+  // Store webform fields information for using in 'WebformFieldsDataDefinition' class.
+  \Drupal::state()->set('rules_webform.fields_definitions', $fields_definitions);
+
+  // If this is the form of 'set_webform_field_value' action then store event name.
+  if (isset($form_state->getStorage()['action_id'])) {
+    if ($form_state->getStorage()['action_id'] == 'set_webform_field_value') {
+      // Store 'event_name' for using in "set_webform_field_value" action.
+      $form['context']['event_name']['setting']['#default_value'] = $event_name;
+      $form['context']['event_name']['#access'] = FALSE;
+    }
+  }
+
+  // If this is add 'Action' form then ulter it.
+  if (isset($form['action_id'])) {
+    // If event is 'Deleting a submission' then remove 'Deleting a submission' and 'Set webform field value' actions.
+    if ($event_name == 'deleting_submission') {
+      unset($form['action_id']['#options']['A Webform']);
+    }
+    // Add validate handler to add and setup 'delete_webform_submission' action if user will select it.
+    $form['continue']['#validate'] = ['rules_webform_form_rules_expression_edit_validate'];
+  }
+}
+
+/**
+ * Adding submit handler for adding rule actions.
+ *
+ * Adding submit handler for adding 'delete_webform_submission' action if user will select it.
+ */
+function rules_webform_form_rules_expression_edit_validate($form, FormStateInterface $form_state) {
+  if ($form_state->getValue('action_id') == 'delete_webform_submission') {
+    $form_state->setSubmitHandlers(['rules_webform_add_action_delete_webform_submission']);
+  }
+  else {
+    $form_state->setSubmitHandlers(['Drupal\rules\Form\Expression\ActionForm::submitFirstStep']);
+  }
+}
+
+/**
+ * Adding 'Delete webform submission' action if a user selected it.
+ */
+function rules_webform_add_action_delete_webform_submission($form, FormStateInterface $form_state) {
+  $values = [];
+  $values['context_mapping']['webform_info'] = 'webform_info';
+  $values['provides_mapping'] = [];
+  $values['action_id'] = 'delete_webform_submission';
+  $values['negate'] = 0;
+
+  $config = ContextConfig::create($values);
+
+  $reaction_rule = \Drupal::request()->get('rules_reaction_rule');
+  $component = $reaction_rule->getComponent();
+  // Check if this action was already added then don't add it again.
+  $actions = $component->getExpression()->getActions()->getConfiguration()['actions'];
+  foreach ($actions as $action) {
+    if ($action['action_id'] == 'delete_webform_submission') {
+      $form_state->setRedirect('entity.rules_reaction_rule.edit_form', ['rules_reaction_rule' => $reaction_rule->id]);
+      return;
+    }
+  }
+
+  $component->getExpression()->addAction('delete_webform_submission', $config);
+  $reaction_rule->updateFromComponent($component);
+  $reaction_rule->save();
+
+  $form_state->setRedirect('entity.rules_reaction_rule.edit_form', ['rules_reaction_rule' => $reaction_rule->id]);
+}
+
+/**
+ * Extract the information about a webform fields.
+ *
+ * This information will be used for fields data definition in the 'WebformFieldsDataDefinition' class.
+ */
+function rules_webform_extract_composite_elements(array $elements, array &$fields_definitions) {
+  foreach ($elements as $name => $options) {
+    if (isset($options['#webform_composite_elements'])) {
+      rules_webform_extract_composite_elements($options['#webform_composite_elements'], $fields_definitions);
+    }
+    else {
+      // Exclude wizard pages and buttons from the list of elements.
+      if (($options['#type'] != 'webform_wizard_page') && ($options['#type'] != "webform_actions")) {
+        $fields_definitions[$name] = (string) $options['#title'];
+      }
+    }
+  }
+}
+
+/**
+ * If a submission is new then fire 'Webform submit' rules event.
+ *
+ * Implements hook_ENTITY_TYPE_insert().
+ */
+function rules_webform_webform_submission_insert(WebformSubmission $submission) {
+  $event = new WebformSubmitEvent($submission);
+  \Drupal::service('event_dispatcher')->dispatch($event::EVENT_NAME, $event);
+}
+
+/**
+ * If a submission is not new then fire 'Updating a submission' rules event.
+ *
+ * Implements hook_ENTITY_TYPE_presave().
+ */
+function rules_webform_webform_submission_presave(WebformSubmission $submission) {
+  if (!$submission->isNew()) {
+    $event = new UpdatingSubmissionEvent($submission);
+    \Drupal::service('event_dispatcher')->dispatch($event::EVENT_NAME, $event);
+  }
+}
+
+/**
+ * If a submission has been deleted then fire 'Delete a submission' rules event.
+ *
+ * Implements hook_ENTITY_TYPE_delete().
+ */
+function rules_webform_webform_submission_delete(WebformSubmission $submission) {
+  $event = new DeletingSubmissionEvent($submission);
+  \Drupal::service('event_dispatcher')->dispatch($event::EVENT_NAME, $event);
+}
+
+/**
+ * If a submission is viewing then fire 'Viewing a submission' rules event.
+ *
+ * Implements hook_ENTITY_TYPE_view().
+ */
+function rules_webform_webform_submission_view(array &$build, WebformSubmission $submission) {
+  $event = new ViewingSubmissionEvent($submission);
+  \Drupal::service('event_dispatcher')->dispatch($event::EVENT_NAME, $event);
+}
+
+/**
+ * Implements hook_help().
+ */
+function rules_webform_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the rules_webform module.
+    case 'help.page.rules_webform':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>';
+      $output .= t("The 'Rules Webform' module provides integration of 'Rules' and 'Webform' modules.") . ' ';
+      $output .= t('It enables site builders and administrators to get access to webform submission data from rules.');
+      $output .= ' ';
+      $output .= t('Also it provides possibility of altering and removing webform submissions from rules.');
+      $output .= '</p>';
+      $output .= '<h3>' . t('Uses') . '</h3>';
+      $output .= '<h4>' . t('Read a webform submission') . '</h4>';
+      $output .= t('To access webform submission data from a rule you need to do two things:');
+      $output .= '<ol>';
+      $output .= '<li>' . t("Select the 'Webform submit' event from the 'React on event' listbox.") . '</li>';
+      $output .= '<li>' . t("Select  necessary webform from the 'Webform' listbox that will appear below.") . '</li>';
+      $output .= '</ol>';
+      $output .= '<p>';
+      $output .= t("After that will be available two new variables: 'webform_fields' and 'webform_info'.") . ' ';
+      $output .= t('You can use them in your rule actions and conditions.') . ' ' . '<br/>';
+      $output .= t("'webform_fields' contains values of webform fields and 'webform_info' contains") . ' ';
+      $output .= t('additional information like submission date, author and so on.');
+      $output .= '</p>';
+      $output .= '<p>';
+      $output .= t("To investigate them it's conveniently to use 'Data selection mode'.") . ' ';
+      $output .= t("Therefore click on 'Switch to data selection mode' button in your condition or action page.") . ' ';
+      $output .= t("Then type variable name with dot at the end, like this: 'webform_fields.'") . ' ';
+      $output .= t('After that you will see all webform fields and you can choose any of them.') . ' ';
+      $output .= t("But you can also use 'Direct input mode'.") . ' ';
+      $output .= t("For instance, if you need to get the value of 'message' field you can use Twig syntax like this:");
+      $output .= ' ';
+      $output .= '{{&nbsp; webform_fields.message &nbsp;}}';
+      $output .= '</p>';
+      $output .= '<h4>' . t('Alter a webform submission') . '</h4>';
+      $output .= '<p>';
+      $output .= t("To alter a webform field value you need to do the following:");
+      $output .= '</p>';
+      $output .= '<p>';
+      $output .= t("1. Add 'Set webform field value' action.");
+      $output .= '</p>';
+      $output .= '<p>';
+      $output .= t('2. Select a webform field you want to alter.');
+      $output .= '</br>';
+      $output .= t("Keep in mind that it's possible to select a webform field only in 'Data selection' mode.");
+      $output .= ' ';
+      $output .= t("Therefore click on 'Switch to data selection' button before you start typing.");
+      $output .= ' ';
+      $output .= t('Then type the name of a necessary webfrom field.');
+      $output .= ' ';
+      $output .= t("For instance, if you want to alter the value of 'message' field, type the following:");
+      $output .= '</br>';
+      $output .= ' webform_fields.message';
+      $output .= '<p>';
+      $output .= t("3. Input a new value of webform field into the 'VALUE' field.");
+      $output .= '</br>';
+      $output .= t('Remember that you can completely replace field value as well as to complement existing value.');
+      $output .= ' ';
+      $output .= t("Let's say you want to complement the value of field 'name' with 'Sir'.");
+      $output .= ' ';
+      $output .= t("Then stay in the 'Direct input' mode and type the following:");
+      $output .= '</br>';
+      $output .= 'Sir {{ webform_field.name }}';
+      $output .= '</p>';
+      $output .= '<h4>' . t('Delete a webform submission') . '</h4>';
+      $output .= '<p>';
+      $output .= t("To delete a webform submission from a rule use 'Delete webform submission' action.");
+      $output .= '</p>';
+      $output .= '<h3>' . t('Known issues') . '</h3>';
+      $output .= '<p>';
+      $output .= t("Before adding 'Delete webform submission' action ensure that you save previous changes of your rule");
+      $output .= ' (';
+      $output .= t("click on 'Save' button");
+      $output .= ').';
+      $output .= '</p>';
+      return $output;
+  }
+}
