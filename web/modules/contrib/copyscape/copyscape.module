@@ -1,0 +1,183 @@
+<?php
+
+use Drupal\copyscape\Copyscape\Api;
+use Drupal\copyscape\Copyscape\Utility;
+use Drupal\Core\Entity\ContentEntityForm;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\user\Entity\User;
+
+/**
+ * Implements hook_help().
+ */
+function copyscape_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.copyscape':
+      $output = '<h3>' . $this->t('About') . '</h3>';
+      $output .= '<p>' . $this->t('The Copyscape module allows you to validate the uniqueness of the content your site editors are posting, using the Copyscape API.') . '</p>';
+      $output .= '<h3>' . $this->t('Notice') . '</h3>';
+      $output .= '<p>' . $this->t('You will need a Copyscape Premium account in order to use this module. You can create one')
+        . ' ' . '<a href="http://www.copyscape.com/signup.php?sign_up&pro=1" target="_blank">'
+        . t('here')
+        . '</a></p>';
+
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ */
+function copyscape_node_insert(EntityInterface $entity) {
+  /** @var Utility $utility */
+  $utility = \Drupal::service('copyscape.utility');
+
+  $utility->saveResults($entity->copyscape_results, $entity->id());
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update().
+ */
+function copyscape_node_update(EntityInterface $entity) {
+  /** @var Utility $utility */
+  $utility = \Drupal::service('copyscape.utility');
+  $utility->saveResults($entity->copyscape_results, $entity->id());
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function copyscape_form_field_config_edit_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $currentPath = \Drupal::service('path.current')->getPath();
+  $pathParts = explode('/', $currentPath);
+  $lastPart = $pathParts[count($pathParts) - 1];
+
+  list($entityType, $bundle, $field) = explode('.', $lastPart);
+
+  if ($entityType !== 'node') {
+    return;
+  }
+
+  /** @var Utility $utility */
+  $utility = \Drupal::service('copyscape.utility');
+  $fieldChecked = $utility->isCopyscaped($bundle, $field);
+
+  $form['bundle'] = [
+    '#type' => 'hidden',
+    '#value' => $bundle,
+  ];
+
+  $form['field'] = [
+    '#type' => 'hidden',
+    '#value' => $field,
+  ];
+
+  $form['copyscape'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Check this field with Copyscape'),
+    '#default_value' => $fieldChecked,
+  ];
+
+  $form['actions']['submit']['#submit'][] = 'copyscape_form_field_config_edit_form_submit';
+}
+
+/**
+ * Submit callback for field_config_edit_form.
+ */
+function copyscape_form_field_config_edit_form_submit($form, FormStateInterface $form_state) {
+  $formValues = $form_state->getValues();
+
+  if (!isset($formValues['copyscape'])) {
+    return;
+  }
+
+  $copyscaped = $formValues['copyscape'];
+
+  /** @var Utility $utility */
+  $utility = \Drupal::service('copyscape.utility');
+  $utility->updateField($formValues['bundle'], $formValues['field'], $copyscaped);
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function copyscape_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $regex = '/(node_\w+_form$)|(node_\w+_edit_form$)/';
+
+  // Only apply to node create and node edit forms.
+  if (preg_match($regex, $form_id) === 0) {
+    return;
+  }
+
+  /** @var Utility $utility */
+  $utility = \Drupal::service('copyscape.utility');
+  $user = \Drupal::currentUser();
+  if ($utility->userCanBypass($user)) {
+    return;
+  }
+
+  $bundle = FALSE;
+  $formObject = $form_state->getFormObject();
+  if ($formObject instanceof ContentEntityForm) {
+    $bundle = $formObject->getEntity()->bundle();
+  }
+
+  if (!$bundle || !$utility->isCopyscaped($bundle)) {
+    return;
+  }
+
+  $form_state->set('bundle', $bundle);
+
+  $form['#validate'][] = 'copyscape_form_validate';
+}
+
+/**
+ * Validate callback for copyscape_form_alter.
+ */
+function copyscape_form_validate($form, FormStateInterface $form_state) {
+  /** @var Utility $utility */
+  $utility = \Drupal::service('copyscape.utility');
+  $fields = $utility->copyscapedFields($form_state->get('bundle'));
+
+  /** @var Api $api */
+  $api = \Drupal::service('copyscape.api');
+
+  $formValues = $form_state->getValues();
+  $copyscapeResults = [];
+  foreach ($fields as $field) {
+    $value = $formValues[$field][0]['value'];
+
+    $response = $api->textSearchInternet($value);
+
+    if (FALSE === $response) {
+      continue;
+    }
+
+    if (TRUE === $utility->wasSuccessful($response)) {
+      $copyscapeResults[] = $response;
+      continue;
+    }
+
+    // The copyscape for this field failed.
+    $fails = $utility->updateUserFails();
+
+    $message = t('The copyscape check has failed for this field: ') . $field;
+    $form_state->setErrorByName($field, $message);
+
+    if (!$utility->failsCapped($fails)) {
+      continue;
+    }
+
+    // The user has reached the accepted fail count cap, block it.
+    $utility->resetUserFails();
+    $user = User::load(\Drupal::currentUser()->id());
+    $user->block();
+    $user->save();
+    user_logout();
+  }
+
+  /** @var \Drupal\node\Entity\Node $node */
+  $node = $form_state->getFormObject()->getEntity();
+  $node->copyscape_results = $copyscapeResults;
+}
