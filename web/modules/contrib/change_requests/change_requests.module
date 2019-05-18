@@ -1,0 +1,211 @@
+<?php
+
+/**
+ * @file
+ * Contains change_requests.module.
+ */
+
+use Drupal\Core\Cache\CacheableMetadata;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+
+use Drupal\changed_fields\NodeSubject;
+use Drupal\change_requests\NodeObserver;
+use Drupal\node\NodeInterface;
+use Symfony\Component\HttpFoundation\RedirectResponse;
+
+/**
+ * Implements hook_help().
+ */
+function change_requests_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the change_requests module.
+    case 'help.page.change_requests':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Provides the possibility to patch changes from a entity revision into the current revision.') . '</p>';
+      return $output;
+
+    default:
+      return '';
+  }
+}
+
+/**
+ * Implements hook_help().
+ */
+function change_requests_theme($existing, $type, $theme, $path) {
+  return [
+    'patch' => [
+      'render element' => 'elements',
+    ],
+    'field_patches' => [
+      'variables' => [
+        'items' => NULL,
+        'title' => NULL,
+      ],
+    ],
+    'field_patch' => [
+      'variables' => [
+        'col' => NULL,
+        'patch' => NULL,
+      ],
+    ],
+    'cr_patch_header' => [
+      'variables' => [
+        'created' => NULL,
+        'creator' => NULL,
+        'log_message' => NULL,
+      ],
+    ],
+    'cr_view_image' => [
+      'variables' => [
+        'center' => NULL,
+        'left' => NULL,
+        'right' => NULL,
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_node_presave().
+ *
+ * Start patch creation with changed fields api.
+ */
+function change_requests_node_presave(NodeInterface $node) {
+  /** @var \Drupal\change_requests\AccessService $access_service */
+  $access_service = \Drupal::service('change_requests.access_service');
+
+  if ($access_service->startPatchCreateProcess()) {
+
+    // Create NodeSubject that will check node fields by DefaultFieldComparator.
+    $nodeSubject = new NodeSubject($node, 'default_field_comparator');
+
+    // Add your observer object to NodeSubject.
+    $nodeSubject->attach(NodeObserver::create(\Drupal::getContainer()));
+
+    // Check if node fields have been changed.
+    $nodeSubject->notify();
+
+  }
+
+  // If excluded fields were changed, the user may come to this point.
+  if (!$access_service->bypassChangeRequest()) {
+    if (isset($nodeSubject)) {
+      drupal_set_message(t('Content type is managed by Change Requests. No relevant changes were found.'), 'warning');
+
+    } else {
+      drupal_set_message(t('Content type is managed by Change Requests. You don\'t have permission to save this content.'), 'error');
+    }
+
+    $response = new RedirectResponse($node->toUrl()->toString());
+    $response->send();
+    exit;
+  }
+
+  // node saving goes on.
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK().
+ */
+function change_requests_theme_suggestions_patch(array $variables) {
+  $suggestions = [];
+  $suggestions[] = 'patch__' . $variables['elements']['#view_mode'];
+  return $suggestions;
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function change_requests_form_node_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  /** @var \Drupal\change_requests\AccessService $access_service */
+  $access_service = \Drupal::service('change_requests.access_service');
+
+  if ($access_service->disableCreateNewRevision()) {
+    $form['revision']['#default_value'] = TRUE;
+    $form['revision']['#disabled'] = TRUE;
+  }
+
+  // Insert checkbox create patch to node form.
+  /** @var \Drupal\node\NodeInterface $node */
+  if ($access_service->displayCheckboxCreatePatch()) {
+    $form['create_patch'] = [
+      '#type' => 'checkbox',
+      '#title' => t('Create change request from changes.'),
+      '#default_value' => $access_service->defaultValueCheckboxCreatePatch(),
+      '#access' => TRUE,
+      '#group' => 'revision_information',
+      '#disabled' => $access_service->disableCheckboxCreatePatch(),
+      '#description' => t('A change request will not be assigned in the revision history of the content entity. It can be reviewed and submitted to a later revision.'),
+      '#weight' => 19,
+    ];
+  }
+
+  // Set log message required.
+  if ($access_service->isLogMessageRequired()) {
+    if (isset($form['revision_log']['widget'][0]['value']['#required'])) {
+      $form['revision_log']['widget'][0]['value']['#required'] = TRUE;
+    }
+  }
+
+  // Set title of log message textarea.
+  if ($title = $access_service->allowOverrideLogMessageTitle()) {
+    $form['revision_log']['widget'][0]['value']['#title'] = $title;
+  }
+}
+
+/**
+ * Implements hook_menu_local_tasks_alter().
+ *
+ * Remove tab from node, if node_type not enabled in change_requests.config.
+ * $data
+ *   Array with tabs (for change_requests
+ *   configed in change_requests.links.task.yml).
+ */
+function change_requests_menu_local_tasks_alter(array &$data, $route_name) {
+  /** @var \Drupal\change_requests\AccessService $access_service */
+  $access_service = \Drupal::service('change_requests.access_service');
+
+  if (isset($data['tabs'][0]) && array_key_exists('patch.overview_page', $data['tabs'][0])) {
+    $node = \Drupal::request()->get('node');
+    $node_type = ($node instanceof NodeInterface) ? $node->bundle() : '<none>';
+    $config = \Drupal::config('change_requests.config')->get('node_types');
+    if (!isset($config[$node_type]) || $config[$node_type] === 0) {
+      unset($data['tabs'][0]['patch.overview_page']);
+    }
+    if ($data['cacheability'] instanceof CacheableMetadata) {
+      $data['cacheability']->addCacheTags(['local-tasks-node-list-cache-tag']);
+    }
+  }
+}
+
+/**
+ * Check if permissions are set correct for Change Requests.
+ *
+ * @param $return_bool boolean
+ *   Return boolean if set or array with error messages.
+ *
+ * @return array|boolean
+ *   Returns TRUE if all permissions are set correct.
+ *   Return array[TranslateableMarkup] if errors.
+ */
+function _change_requests_check_permissions($return_bool = TRUE) {
+  $enabled_node_types = \Drupal::configFactory()->get('change_requests.config')->get('node_types');
+  $users_permitted = user_roles(NULL,'add patch entities');
+  $feedback = [];
+  foreach($enabled_node_types as $name => $enabled) {
+    foreach ($users_permitted as $role) {
+      /** @var $role \Drupal\user\RoleInterface */
+      if ($enabled && !$role->hasPermission("edit any $name content")) {
+        if ($return_bool) { return FALSE; }
+        $feedback[] = t('For the user role "@role" the permission "edit any @node content" must be set.', [
+          '@role' => $role->label(),
+          '@node' => $name
+        ]);
+      }
+    }
+  }
+  return empty($feedback) ?: $feedback;
+}
