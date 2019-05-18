@@ -1,0 +1,403 @@
+<?php
+
+/**
+ * @file
+ * Contains B cubed module.
+ */
+
+use Drupal\bcubed\Entity\ConditionSetInterface;
+use Drupal\Core\Link;
+use Drupal\Core\Url;
+use Drupal\Core\Entity\ContentEntityInterface;
+use Drupal\field\Entity\FieldStorageConfig;
+use Drupal\Component\Plugin\Exception\PluginNotFoundException;
+
+/**
+ * Implements hook_module_installed().
+ *
+ * Provides a tour invitation on installation.
+ */
+function bcubed_modules_installed($modules) {
+  if (in_array('bcubed', $modules)) {
+    $tour_link = Link::fromTextAndUrl(t('Take a Tour'), Url::fromRoute('bcubed.admin_settings_form', [], ['query' => ['tour' => 1], 'attributes' => ['class' => 'button button--primary']]));
+    drupal_set_message(t('You have successfully installed BCubed! Learn how to configure BCubed @link', ['@link' => $tour_link->toString()]));
+    $string_generator = \Drupal::service('bcubed.string_generator');
+    $string_generator->registerDictionary('bcubed', [
+      ['key' => 'settings_key', 'length' => ['min' => 8, 'max' => 12]],
+      ['key' => 'adblocker_bait', 'length' => ['min' => 8, 'max' => 12]],
+    ]);
+  }
+}
+
+/**
+ * Implements hook_page_attachments().
+ *
+ * Insert JavaScript to the appropriate scope/region of the page.
+ */
+function bcubed_page_attachments(array &$page) {
+  // Only run if the current page is not an admin route.
+  if (!\Drupal::service('router.admin_context')->isAdminRoute(\Drupal::routeMatch()->getRouteObject())) {
+    $condition_set_settings = [];
+    $config = \Drupal::config('bcubed.settings');
+    $query = \Drupal::entityQuery('condition_set');
+    $query->condition('status', TRUE);
+    $entity_ids = $query->execute();
+    $conditionsets = \Drupal::entityTypeManager()->getStorage('condition_set')->loadMultiple($entity_ids);
+
+    if (empty($conditionsets)) {
+      $config_link = Link::fromTextAndUrl(t('Bcubed Event Manager Configuration'), Url::fromRoute('bcubed.admin_settings_form'));
+      drupal_set_message(t('No enabled condition sets available. @link', ['@link' => $config_link->toString()]), 'warning');
+    }
+    else {
+      $eventmanager = \Drupal::service('plugin.manager.bcubed.event');
+      $conditionmanager = \Drupal::service('plugin.manager.bcubed.condition');
+      $actionmanager = \Drupal::service('plugin.manager.bcubed.action');
+      $libraries = [];
+      $plugin_libraries = $config->get('active_js_plugins');
+
+      foreach ($conditionsets as $conditionset) {
+        $id = $conditionset->id();
+        $conditions = $conditionset->get('conditions');
+        foreach ($conditions as $condition) {
+          try {
+            if (!empty($condition['data'])) {
+              // Create pre-configured instance.
+              $plugin = $conditionmanager->createInstance($condition['id'], ['settings' => $condition['data']]);
+            }
+            else {
+              // Create instance without configuration.
+              $plugin = $conditionmanager->createInstance($condition['id']);
+            }
+
+            // Check precondition.
+            if (!$plugin->preCondition()) {
+              // A precondition has failed... remove settings and skip to next condition set.
+              if (isset($condition_set_settings[$id])) {
+                unset($condition_set_settings[$id]);
+              }
+              continue 2;
+            }
+            $library = $plugin->getLibrary();
+            if ($library) {
+              foreach ($plugin_libraries[$library]['dependencies'] as $dependency) {
+                if (!empty($dependency) && !in_array($dependency, $libraries)) {
+                  $libraries[] = $dependency;
+                }
+              }
+            }
+
+            $condition_set_settings[$id]['conditions'][$condition['id']]['plugin'] = $library;
+
+            if ($plugin->getPluginDefinition()['instances']) {
+              $condition_set_settings[$id]['conditions'][$condition['id']]['settings'][] = $condition['data'];
+            }
+            else {
+              $condition_set_settings[$id]['conditions'][$condition['id']]['settings'] = $condition['data'];
+            }
+            $condition_set_settings[$id]['conditions'][$condition['id']]['generated_strings'] = $plugin->getStrings();
+
+          }
+          catch (PluginNotFoundException $e) {
+            $config_link = $conditionset->toLink(t('Bcubed Event Manager Configuration'), 'edit-form')->toString();
+            drupal_set_message(t('Bcubed error: a configured condition is not available in the system. @msg @link', ['@msg' => $e->getMessage(), '@link' => $config_link]), 'error');
+          }
+        }
+
+        $actions = $conditionset->get('actions');
+        foreach ($actions as $action) {
+          try {
+            if (!empty($action['data'])) {
+              // Create pre-configured instance.
+              $plugin = $actionmanager->createInstance($action['id'], ['settings' => $action['data']]);
+            }
+            else {
+              // Create instance without configuration.
+              $plugin = $actionmanager->createInstance($action['id']);
+            }
+
+            $library = $plugin->getLibrary();
+            foreach ($plugin_libraries[$library]['dependencies'] as $dependency) {
+              if (!empty($dependency) && !in_array($dependency, $libraries)) {
+                $libraries[] = $dependency;
+              }
+            }
+
+            $condition_set_settings[$id]['actions'][$action['id']]['plugin'] = $library;
+
+            if ($plugin->getPluginDefinition()['instances']) {
+              $condition_set_settings[$id]['actions'][$action['id']]['settings'][] = $action['data'];
+            }
+            else {
+              $condition_set_settings[$id]['actions'][$action['id']]['settings'] = $action['data'];
+            }
+            $condition_set_settings[$id]['actions'][$action['id']]['generated_strings'] = $plugin->getStrings();
+          }
+          catch (PluginNotFoundException $e) {
+            $config_link = $conditionset->toLink(t('Bcubed Event Manager Configuration'), 'edit-form')->toString();
+            drupal_set_message(t('Bcubed error: a configured action is not available in the system. @msg @link', ['@msg' => $e->getMessage(), '@link' => $config_link]), 'error');
+          }
+        }
+
+        $events = $conditionset->get('events');
+        foreach ($events as $event) {
+          try {
+            if (!empty($event['data'])) {
+              // Create pre-configured instance.
+              $plugin = $eventmanager->createInstance($event['id'], ['settings' => $event['data']]);
+            }
+            else {
+              // Create instance without configuration.
+              $plugin = $eventmanager->createInstance($event['id']);
+            }
+            $library = $plugin->getLibrary();
+            if ($library) {
+              foreach ($plugin_libraries[$library]['dependencies'] as $dependency) {
+                if (!empty($dependency) && !in_array($dependency, $libraries)) {
+                  $libraries[] = $dependency;
+                }
+              }
+            }
+
+            $condition_set_settings[$id]['events'][$event['id']]['plugin'] = $library;
+            $condition_set_settings[$id]['events'][$event['id']]['settings'] = $event['data'];
+            $condition_set_settings[$id]['events'][$event['id']]['generated_strings'] = $plugin->getStrings();
+            $condition_set_settings[$id]['events'][$event['id']]['bcubed_js_event'] = $plugin->getEventName();
+          }
+          catch (PluginNotFoundException $e) {
+            $config_link = $conditionset->toLink(t('Bcubed Event Manager Configuration'), 'edit-form')->toString();
+            drupal_set_message(t('Bcubed error: a configured event is not available in the system. @msg @link', ['@msg' => $e->getMessage(), '@link' => $config_link]), 'error');
+          }
+        }
+      }
+
+      // Add bcubed type information.
+      $request = \Drupal::request();
+      $value = '';
+      if ($request->attributes->has('node')) {
+        $node = $request->attributes->get('node');
+        if ($node->hasField('bcubed')) {
+          // Try reading field.
+          $value = $node->bcubed->getString();
+          if (empty($value)) {
+            // Try default for node type.
+            $default = $node->bcubed->getFieldDefinition()->getDefaultValue($node);
+            if (isset($default[0]['value'])) {
+              $value = $default[0]['value'];
+            }
+          }
+        }
+      }
+
+      // All else failed, use general default.
+      if (empty($value)) {
+        $value = $config->get('default_type');
+      }
+
+      foreach ($libraries as $library) {
+        $page['#attached']['library'][] = $library;
+      }
+
+      $page['#attached']['library'][] = 'bcubed/bcubed';
+      $settings = [];
+      $settings['pagetype'] = $value;
+      $settings['conditionsets'] = $condition_set_settings;
+      $string_generator = \Drupal::service('bcubed.string_generator');
+      $settings_key = $string_generator->getStrings('bcubed')['settings_key'];
+      $page['#attached']['drupalSettings'][$settings_key] = base64_encode(json_encode($settings));
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert() for 'condition_set'.
+ */
+function bcubed_condition_set_insert(ConditionSetInterface $entity) {
+  // Update generated js.
+  bcubed_generate_js();
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update() for 'condition_set'.
+ */
+function bcubed_condition_set_update(ConditionSetInterface $entity) {
+  // Update generated js if plugins have changed.
+  if ($entity->status() !== $entity->original->status()) {
+    bcubed_generate_js();
+  }
+  else {
+    $originalplugins = $entity->original->getJsPlugins();
+    $plugins = $entity->getJsPlugins();
+    $added = array_diff($originalplugins, $plugins);
+    $removed = array_diff($plugins, $originalplugins);
+    if ($added !== $removed) {
+      bcubed_generate_js();
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete() for 'condition_set'.
+ */
+function bcubed_condition_set_delete(ConditionSetInterface $entity) {
+  // Update generated js.
+  bcubed_generate_js();
+}
+
+/**
+ * Generate bcubed.js.
+ */
+function bcubed_generate_js($force_rebuild = FALSE, $cacheclear = FALSE) {
+  $config = \Drupal::service('config.factory')->getEditable('bcubed.settings');
+  $query = \Drupal::entityQuery('condition_set');
+  $query->condition('status', TRUE);
+  $entity_ids = $query->execute();
+  $conditionsets = \Drupal::entityTypeManager()->getStorage('condition_set')->loadMultiple($entity_ids);
+  $plugins = [];
+
+  foreach ($conditionsets as $conditionset) {
+    foreach ($conditionset->getJsPlugins() as $p) {
+      if (!isset($plugins[$p])) {
+        $plugins[$p] = TRUE;
+      }
+    }
+  }
+
+  $currentplugins = $config->get('active_js_plugins') ? $config->get('active_js_plugins') : [];
+  $added = array_diff_key($plugins, $currentplugins);
+  $removed = array_diff_key($currentplugins, $plugins);
+  if ($added !== $removed || $force_rebuild) {
+    // Invalidate libraries cache so that it will be rebuilt with new file.
+    if (!$cacheclear) {
+      \Drupal::service('cache_tags.invalidator')->invalidateTags(['library_info']);
+    }
+    $library_discovery = \Drupal::service('library.discovery');
+    $assetdumper = \Drupal::service('asset.js.dumper');
+    $string_generator = \Drupal::service('bcubed.string_generator');
+    $settings = $string_generator->getStrings('bcubed');
+    $js = '';
+    foreach ($plugins as $plugin => $value) {
+      list($extension, $name) = explode('/', $plugin, 2);
+      $definition = $library_discovery->getLibraryByName($extension, $name);
+      $plugins[$plugin] = ['dependencies' => $definition['dependencies']];
+      $pluginjs = file_get_contents($definition['js'][0]['data']);
+      $pluginjs = substr($pluginjs, 0, strrpos($pluginjs, ')'));
+      $js .= "plugins['" . $plugin . "'] = " . $pluginjs . ");\n";
+    }
+    $bcubed = $library_discovery->getLibraryByName('bcubed', 'template');
+    $template = file_get_contents($bcubed['js'][0]['data']);
+    $generatedjs = str_replace(['/* plugins added here */', 'drupalSettings.bcubed'], [$js, 'drupalSettings["' . $settings['settings_key'] . '"]'], $template);
+    $uri = $assetdumper->dump($generatedjs, 'js');
+    $adbait = $library_discovery->getLibraryByName('bcubed', 'adbait');
+    $adtemplate = file_get_contents($adbait['js'][0]['data']);
+    $adjs = str_replace('baitid', $settings['adblocker_bait'], $adtemplate);
+    $baituri = bcubed_write_js($adjs, 'ads.js');
+    $config->set('active_js_plugins', $plugins);
+    $config->set('bcubed_js', $uri);
+    $config->set('adblocker_bait_js', $baituri);
+    // Save generation time to be used as version string. Forces browsers to download new file.
+    $config->set('generated', base_convert(time(), 10, 36));
+    $config->save();
+    return $uri;
+  }
+  return FALSE;
+}
+
+/**
+ * Write unmanaged file to JS directory.
+ */
+function bcubed_write_js($contents, $filename) {
+  // Create the css/ or js/ path within the files folder.
+  $path = 'public://js';
+  $uri = $path . '/' . $filename;
+  // Create the JS file.
+  file_prepare_directory($path, FILE_CREATE_DIRECTORY);
+  if (!file_unmanaged_save_data($contents, $uri, FILE_EXISTS_REPLACE)) {
+    return FALSE;
+  }
+  return $uri;
+}
+
+/**
+ * Implements hook_rebuild().
+ */
+function bcubed_rebuild() {
+  bcubed_rebuild_cache([
+    'js' => FALSE,
+    'generated_strings' => TRUE,
+    'routes' => FALSE,
+  ]);
+  bcubed_generate_js(TRUE, TRUE);
+}
+
+/**
+ * Handles rebuilding cached information.
+ */
+function bcubed_rebuild_cache($settings = []) {
+  $defaults = ['js' => TRUE, 'generated_strings' => TRUE, 'routes' => FALSE];
+  $settings = array_merge($defaults, $settings);
+  if ($settings['generated_strings']) {
+    \Drupal::service('bcubed.string_generator')->regenerateAllStrings();
+  }
+  if ($settings['routes']) {
+    // Rebuild routes.
+    \Drupal::service('router.builder')->setRebuildNeeded();
+  }
+  if ($settings['js']) {
+    bcubed_generate_js(TRUE);
+  }
+}
+
+/**
+ * Implements hook_library_info_build().
+ */
+function bcubed_library_info_build() {
+  $config = \Drupal::config('bcubed.settings');
+
+  $libraries = [];
+
+  $libraries['bcubed'] = [
+    'version' => $config->get('generated', '1'),
+    'js' => [
+      file_url_transform_relative(file_create_url($config->get('bcubed_js'))) => [],
+    ],
+    'dependencies' => [
+      'core/drupalSettings',
+    ],
+  ];
+
+  $libraries['adblockerbait'] = [
+    'version' => $config->get('generated', '1'),
+    'js' => [
+      file_url_transform_relative(file_create_url($config->get('adblocker_bait_js'))) => [
+        'weight' => -50,
+        'preprocess' => FALSE,
+      ],
+    ],
+  ];
+
+  return $libraries;
+}
+
+/**
+ * Set allowed values for the bcubed field.
+ *
+ * @param \Drupal\field\Entity\FieldStorageConfig $definition
+ *   The field definition.
+ * @param \Drupal\Core\Entity\ContentEntityInterface|null $entity
+ *   The entity being created if applicable.
+ * @param bool $cacheable
+ *   Boolean indicating if the results are cacheable.
+ *
+ * @return array
+ *   An array of possible key and value options.
+ *
+ * @see options_allowed_values()
+ */
+function bcubed_allowed_values(FieldStorageConfig $definition, ContentEntityInterface $entity = NULL, $cacheable) {
+  $options = [
+    'brand' => 'Brand',
+    'buy' => 'Buy',
+    'behave' => 'Behave',
+  ];
+  return $options;
+}
