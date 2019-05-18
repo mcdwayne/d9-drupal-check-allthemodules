@@ -1,0 +1,306 @@
+<?php
+
+/**
+ * @file
+ * Google Places API autocomplete module.
+ */
+
+use DrupalPsr\Cache\Pool;
+use GooglePlaceAutocomplete\Component\Country;
+use GooglePlaceAutocomplete\Exception\RequestException;
+use GooglePlaceAutocomplete\Parameter\Components;
+use GooglePlaceAutocomplete\Parameter\Language;
+use GooglePlaceAutocomplete\Parameter\Location;
+use GooglePlaceAutocomplete\Parameter\PlaceType;
+use GooglePlaceAutocomplete\Request\Request;
+use GoogleSupportedLanguages\LanguageFactory;
+use Markenwerk\Iso3166Country\Iso3166CountryInformation;
+
+/**
+ * Implements hook_menu().
+ */
+function places_api_autocomplete_menu() {
+  $items['places/autocomplete'] = array(
+    'title' => 'Places autocomplete',
+    'page callback' => 'places_api_autocomplete',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['places/autocomplete/%/%/%'] = array(
+    'title' => 'Places autocomplete',
+    'page callback' => 'places_api_autocomplete',
+    'page arguments' => array(2, 3, 4),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['admin/config/services/places'] = array(
+    'title' => 'Google Places API',
+    'description' => 'Configure Google Places API settings',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('places_api_autocomplete_admin_settings'),
+    'file' => 'places_api_autocomplete.admin.inc',
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+}
+
+/**
+ * Returns autocomplete suggestions.
+ *
+ * Returns autocomplete suggestions based on a given field, entity type, bundle
+ * and string or just use the globally defined values for places api parameters.
+ *
+ * @param string $field_name
+ *   The field name.
+ * @param string $entity_type
+ *   The entity type.
+ * @param string $bundle
+ *   The bundle.
+ * @param string $string
+ *   The string for the search.
+ */
+function places_api_autocomplete($field_name = 'global', $entity_type = NULL, $bundle = NULL, $string = '') {
+  global $language;
+  $matches = array();
+
+  // If this is not a field, but instead used in a global context, use the
+  // global options.
+  if ($field_name == 'global') {
+    $options = variable_get('places_api_autocomplete_options', places_api_autocomplete_get_default_options());
+  }
+  else {
+    // We grab parameter options from the field instance settings.
+    $instance = field_info_instance($entity_type, $field_name, $bundle);
+    $options = $instance['widget']['settings']['places_api_autocomplete_options'];
+  }
+
+  // Add the active language as a parameter to get the results in the site's
+  // active language.
+  if (empty($options['language'])) {
+    $options['language'] = $language->language;
+  }
+
+  if ($string && strlen($string) >= $options['minlength']) {
+    try {
+      // Perform the actual search.
+      $response = places_api_autocomplete_execute($string, $options);
+
+      // Map the results in the format drupal autocomplete API needs it.
+      foreach ($response as $prediction) {
+        $matches[$prediction->getDescription()] = check_plain($prediction->getDescription());
+      }
+    }
+    catch (RequestException $e) {
+      // Search failed, log error message
+      watchdog('google places api autocomplete', $e->getMessage(), array(), WATCHDOG_ERROR);
+    }
+  }
+
+  // Return the matches in json format, and stop the page execution.
+  drupal_json_output($matches);
+}
+
+/**
+ * @param string $input
+ * @param array $options
+ * @return \GooglePlaceAutocomplete\Response\Response|void
+ * @throws \GooglePlaceAutocomplete\Exception\RequestException
+ */
+function places_api_autocomplete_execute($input, $options) {
+  $key = variable_get('places_api_autocomplete_key', NULL);
+  if (!$key) {
+    return;
+  }
+
+  $cache_pool = new Pool($bin = 'cache');
+
+  $request = new Request($key, $cache_pool);
+  $request->setInput($input);
+
+  if (!empty($options['offset'])) {
+    $request->setOffset((int) $options['offset']);
+  }
+
+  if (!empty($options['location'])) {
+    list($lat, $lng) = explode(',', $options['location']);
+    $location = new Location($lat, $lng);
+    $request->setLocation($location);
+  }
+
+  if (!empty($options['radius'])) {
+    $request->setRadius((int) $options['radius']);
+  }
+
+  if (!empty($options['language'])) {
+    $languageFactory = new LanguageFactory();
+    $language = $languageFactory->create($options['language']);
+    $language_parameter = new Language($language);
+    $request->setLanguage($language_parameter);
+  }
+
+  if (!empty($options['type'])) {
+    $type = new PlaceType($options['type']);
+    $request->setTypes($type);
+  }
+
+  if (!empty($options['components'])) {
+    list ($type, $value) = explode(':', $options['components']);
+    if ($type == 'country') {
+      $country = Iso3166CountryInformation::getByIso3166Alpha2($value);
+      $component = new Country($country);
+      $components = new Components();
+      $components->addComponent($component);
+      $request->setComponents($components);
+    }
+  }
+
+  return $request->execute();
+}
+
+/**
+ * Implements hook_init().
+ */
+function places_api_autocomplete_init() {
+  // Get the Google API key.
+  $key = variable_get('places_api_autocomplete_key', NULL);
+  // Check if key doesn't exist and set warning message.
+  if ($key == NULL) {
+    drupal_set_message(t('Google API key is missing, you need to enter the API key <a href="@url">here</a>', array('@url' => url('admin/config/services/places'))), 'warning');
+  }
+}
+
+/**
+ * Implements hook_field_widget_info().
+ */
+function places_api_autocomplete_field_widget_info() {
+  return array(
+    'places_api_autocomplete' => array(
+      'label' => 'Google Places Autocomplete',
+      'description' => 'A text field with Google Places API Autocomplete',
+      'field types' => array('text'),
+      'settings' => array(
+        'size' => 60,
+        'offset' => '',
+        'location' => '',
+        'radius' => '',
+        'language' => '',
+        'type' => '',
+        'components' => '',
+        'minlength' => '',
+      ),
+    ),
+  );
+}
+
+/**
+ * Implements hook_field_widget_settings_form().
+ */
+function places_api_autocomplete_field_widget_settings_form($field, $instance) {
+  $widget = $instance['widget'];
+  $settings = $widget['settings'];
+
+  if ($widget['type'] == 'places_api_autocomplete') {
+    $form['size'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Size of textfield'),
+      '#default_value' => $settings['size'],
+      '#required' => TRUE,
+      '#element_validate' => array('element_validate_integer_positive'),
+    );
+
+    $documentation_link = variable_get('places_api_autocomplete_documentation_link');
+    $options = variable_get('places_api_autocomplete_options', places_api_autocomplete_get_default_options());
+
+    $form['places_api_autocomplete_options'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Places API parameters'),
+      '#tree' => TRUE,
+      '#description' => t('Documentation about the parameters, can be found <a target="_blank" href="@url">here</a>.', array('@url' => $documentation_link)),
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+    );
+
+    $form['places_api_autocomplete_options']['offset'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Offset'),
+      '#default_value' => isset($settings['places_api_autocomplete_options']['offset']) ? $settings['places_api_autocomplete_options']['offset'] : $options['offset'],
+    );
+    $form['places_api_autocomplete_options']['location'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Location'),
+      '#default_value' => isset($settings['places_api_autocomplete_options']['location']) ? $settings['places_api_autocomplete_options']['location'] : $options['location'],
+    );
+    $form['places_api_autocomplete_options']['radius'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Radius'),
+      '#default_value' => isset($settings['places_api_autocomplete_options']['radius']) ? $settings['places_api_autocomplete_options']['radius'] : $options['radius'],
+    );
+    $form['places_api_autocomplete_options']['language'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Language'),
+      '#default_value' => isset($settings['places_api_autocomplete_options']['language']) ? $settings['places_api_autocomplete_options']['language'] : $options['language'],
+    );
+    $form['places_api_autocomplete_options']['types'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Types'),
+      '#default_value' => isset($settings['places_api_autocomplete_options']['types']) ? $settings['places_api_autocomplete_options']['types'] : $options['types'],
+    );
+    $form['places_api_autocomplete_options']['components'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Components'),
+      '#default_value' => isset($settings['places_api_autocomplete_options']['components']) ? $settings['places_api_autocomplete_options']['components'] : $options['components'],
+    );
+    $form['places_api_autocomplete_options']['minlength'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Minimum Query Length'),
+      '#default_value' => isset($settings['places_api_autocomplete_options']['minlength']) ? $settings['places_api_autocomplete_options']['minlength'] : $options['minlength'],
+    );
+  }
+
+  return $form;
+}
+
+/**
+ * Implements hook_field_widget_form().
+ */
+function places_api_autocomplete_field_widget_form(&$form, &$form_state, $field, $instance, $langcode, $items, $delta, $element) {
+  $element['value'] = array(
+    '#type' => 'textfield',
+    '#title' => check_plain($instance['label']),
+    '#default_value' => isset($items[$delta]['value']) ? $items[$delta]['value'] : NULL,
+    '#size' => $instance['widget']['settings']['size'],
+    '#maxlength' => $field['settings']['max_length'],
+    '#attributes' => array('class' => array('text-full')),
+    '#required' => $instance['required'],
+    '#autocomplete_path' => 'places/autocomplete/' . $instance['field_name'] . '/' . $instance['entity_type'] . '/' . $instance['bundle'],
+    '#minlength' => $instance['widget']['settings']['minlength'],
+  );
+
+  return $element;
+}
+
+/**
+ * Return default options.
+ */
+function places_api_autocomplete_get_default_options() {
+  return array(
+    'offset' => '',
+    'location' => '',
+    'radius' => '',
+    'language' => '',
+    'types' => '',
+    'components' => '',
+    'minlength' => '',
+  );
+}
+
+/**
+ * Implements hook_flush_caches().
+ */
+function places_api_autocomplete_flush_caches() {
+  return array('cache_places');
+}
