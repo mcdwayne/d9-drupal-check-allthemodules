@@ -1,0 +1,147 @@
+<?php
+use \Drupal\Core\Form\FormStateInterface;
+use \Drupal\taxonomy\Entity\Term;
+use \Drupal\Core\Url;
+use Drupal\field\Entity\FieldConfig;
+use Drupal\Core\Entity\EntityType;
+use Drupal\Core\Routing\RouteMatchInterface;
+use \Drupal\views\Views;
+
+/**
+ * Implements hook_form_alter().
+ */
+function prevent_term_delete_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+
+  if(strpos($form_id, 'taxonomy_term') !== false && strpos($form_id, 'delete_form') !== false) {
+    $map = [];
+    $path = \Drupal::request()->getpathInfo();
+    $arg  = explode('/',$path);
+    $tid = $arg[3];
+    $term = Term::load($tid);
+    $terms_vocabulary = $term->bundle();
+    $ptd_config =  \Drupal::config("prevent_term_delete.settings");
+    $vocabularies = array_keys(array_filter($ptd_config->get("vocabulary")));
+
+    if(in_array($terms_vocabulary, $vocabularies)) {
+      $limit = $ptd_config->get("limit");
+      $show_button = $ptd_config->get("delete_button");
+
+      $field_map = \Drupal::entityManager()->getFieldMap();
+
+      $entity_reference_fields = [];
+
+      foreach ($field_map as $key => $entity_type) {
+        foreach ($entity_type as $field_name => $fields) {
+          if($fields["type"] == "entity_reference" && strpos($field_name,"field_") !== false) {
+            $entity_reference_fields[$key][$field_name] = $fields;
+          }
+        }
+      }
+     foreach ($entity_reference_fields as $entity_type => $field_array) {
+       foreach ($field_array as $field_name => $values) {
+         foreach($values['bundles'] as $bundle) {
+            $field_config = FieldConfig::loadByName($entity_type, $bundle, $field_name);
+            if($field_config != null) {
+              $field_settings = $field_config->getSettings();
+              if($field_settings["target_type"] == "taxonomy_term" && $field_settings['handler'] == "default:taxonomy_term"  && isset($field_settings['handler_settings']['target_bundles'])) { 
+                 if(in_array($terms_vocabulary, $field_settings['handler_settings']['target_bundles'])) {
+                    $map[$entity_type][$field_name] = $field_name;
+                  }
+
+              }else if ($field_settings["target_type"] == "taxonomy_term" && $field_settings['handler'] == "views") {
+                 $field_settings['handler_settings']['view']['view_name'];
+                 $field_settings['handler_settings']['view']['display_name'];
+                 $view = Views::getView($field_settings['handler_settings']['view']['view_name']);
+                $view->setDisplay($field_settings['handler_settings']['view']['display_name']);
+                $displayObj = $view->getDisplay();
+                $settings = $displayObj->getOption('filters');
+                if(isset($settings['vid'])) {
+                    if($settings['vid']['entity_type'] == "taxonomy_term" && $settings['vid']['entity_field'] == "vid" && in_array($terms_vocabulary, $settings['vid']['value'])) {
+                    $map[$entity_type][$field_name] = $field_name;
+                    }
+                }               
+              } 
+            }
+         }
+       }
+     }
+    // die;
+        $iterate_limit = $limit;
+         $result = [];
+         foreach ($map as $entity_type => $fields) {
+         $revisionable =  \Drupal::entityTypeManager()->getDefinition($entity_type)->isRevisionable();
+          //isRevisionable
+         foreach ($fields as $key => $value) {
+
+          if($iterate_limit != 0) {
+            if($revisionable) {
+              $entities = \Drupal::entityTypeManager()->getStorage($entity_type)->getQuery()
+          ->latestRevision()
+          ->condition($value, $tid, '=')->range(0,$iterate_limit)->execute();
+           }else{
+            $entities = \Drupal::entityTypeManager()->getStorage($entity_type)->getQuery()->condition($value, $tid, '=')->range(0,$iterate_limit)->execute();
+           }
+          }else {
+            continue 2;
+          }
+           if(count($entities) > 0){
+            $iterate_limit = $iterate_limit - count($entities); 
+            $entity_stack[$entity_type] = $entities;
+            $result = $result + $entity_stack;
+           } 
+         }
+        }
+          if (count($result) > 0) {
+            $markup = t('This term is being used in entities and cannot be deleted. Please remove this taxonomy term from the following entities first:') . '<ul>';
+             foreach ($result as $entity_type => $results) {
+               $revisionable =  \Drupal::entityTypeManager()->getDefinition($entity_type)->isRevisionable();
+
+             foreach($results as $id) {
+              $entity =  \Drupal::entityTypeManager()->getStorage($entity_type)->load($id);
+              $entity_obj = $entity;
+              if($revisionable) {
+              $revision_ids = \Drupal::entityTypeManager()->getStorage($entity_type)->revisionIds($entity);
+              $last_revision_id = end($revision_ids);
+              $entity_obj = \Drupal::entityTypeManager()->getStorage($entity_type)->loadRevision($last_revision_id);
+              }
+              if (!$entity_obj)
+                continue;
+              $slug = str_replace("_", "/", $entity_type);
+              $markup .= '<li>' . \Drupal::l($entity_obj->label(), Url::fromUri('internal:/'.$slug.'/'.$entity_obj->id()), array('attributes' => array('target'=>'_blank'))) . '</li>';
+              }
+            } 
+            if ($iterate_limit == 0)
+              $markup .= '<li>' . t("... only the first @limit results are displayed.", array('@limit' => $limit)) . '</li>';
+            $markup .= '</ul>';
+   
+            $form['description']['#markup'] = $markup;
+            $form['actions']['submit']['#access'] = $show_button ? TRUE : FALSE;
+          }
+        
+    }
+  }
+}
+
+/**
+ * Implements hook_help().
+ */
+function prevent_term_delete_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.prevent_term_delete':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Prevent Term Delete module is built to prevent the taxonomy term deletion when the taxonomy term is associated with entites using taxonomy term reference') . '</p>';
+      $output .= '<h3>' . t('Uses') . '</h3>';
+      $output .= '<dl>';
+
+      $output .= '<dt>' . t('Configuring Prevent Term Delete') . '</dt>';
+      $output .= '<dd>' . t('The Prevent Term Delete module provides page for configuring the vocabularies, show delete button, limit, format  <a href=":config">Prevent Term Delete settings</a>. Configure vocabularies & test  it by deleting taxomomy term associated with the  entities ', [':config' => \Drupal::url('prevent_term_delete.settings')]) . '</dd>';
+
+      $output .= '</dl>';
+      return $output;
+
+    case 'prevent_term_delete.settings':
+      return '<p>' . t('This page shows you all available administration tasks for Prevent Term Delete module.') . '</p>';
+
+  }
+}
