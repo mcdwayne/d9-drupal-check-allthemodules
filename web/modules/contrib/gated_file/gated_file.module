@@ -1,0 +1,166 @@
+<?php
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Entity\FieldableEntityInterface;
+use Drupal\file\Plugin\Field\FieldType\FileFieldItemList;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\gated_file\Entity\GatedFile;
+use Drupal\Core\Url;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Ajax\AjaxResponse;
+use Drupal\Core\Ajax\CloseModalDialogCommand;
+use Drupal\Core\Ajax\RedirectCommand;
+use Drupal\file\Entity\File;
+use Drupal\Core\Link;
+
+/**
+ * Implements hook_help().
+ */
+function gated_file_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the gated_file module.
+    case 'help.page.gated_file':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('This module enables the protection of file download with a Contact Form') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Save the form which will be displayed before to download a file.
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ *   The entity which contains the file fields.
+ */
+function gated_file_save(EntityInterface $entity) {
+  if (isset($entity) && $entity instanceof FieldableEntityInterface) {
+    // Loop all fields of the saved entity.
+    foreach ($entity->getFields() as $entity_fields) {
+      if ($entity_fields instanceof FileFieldItemList) {
+        foreach ($entity_fields->getValue() as $file_element) {
+          if (isset($file_element['form_wrapper'])) {
+            $query = \Drupal::entityQuery('gated_file')
+              ->condition('fid', $file_element['target_id']);
+
+            if ($gatedFileId = $query->execute()) {
+              $gated = GatedFile::load(array_pop($gatedFileId));
+              if (empty($file_element['form_wrapper']['form'])) {
+                $gated->delete();
+              }
+              else {
+                $gated->setForm($file_element['form_wrapper']['form']);
+                $gated->save();
+              }
+            }
+            elseif (!empty($file_element['form_wrapper']['form'])) {
+              $gated = GatedFile::create([
+                'fid' => $file_element['target_id'],
+                'form' => $file_element['form_wrapper']['form'],
+              ]);
+              $gated->save();
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_insert().
+ */
+function gated_file_entity_insert(EntityInterface $entity) {
+  gated_file_save($entity);
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function gated_file_entity_update(EntityInterface $entity) {
+  gated_file_save($entity);
+}
+
+// @todo If a file is being deleted check if it has a form associated and delete the gatedFile entity.
+// function gated_fiel_entity_delete($entity)...
+
+/**
+ * Implements hook_form_alter().
+ */
+function gated_file_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $route = \Drupal::routeMatch()->getRouteName();
+
+  // Only change the form behaviour if we are in the corrent route.
+  if ($route != "entity.gated_file.canonical") {
+    return;
+  }
+
+  $form['actions']['submit']['#submit'][] = '_gated_file_redirect_submit';
+  $form['actions']['submit']['#attributes']['class'][] = 'use-ajax-submit';
+
+}
+
+/**
+ * Download the file after filling out the form.
+ *
+ * @param array $form
+ *   The form that will be altered.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   FormState Object.
+ */
+function _gated_file_redirect_submit(array $form, FormStateInterface &$form_state) {
+  /** @var \Drupal\gated_file\entity\GatedFileInterface $gated_file */
+  $gated_file = \Drupal::routeMatch()->getParameter('gated_file');
+  $file = \Drupal::entityTypeManager()->getStorage('file')->load($gated_file->getFid());
+  $fileUrl = Url::fromUri(file_create_url($file->getFileUri()));
+
+  user_cookie_save(['gated_file_' . $gated_file->getFormId() => TRUE]);
+  $response = new AjaxResponse();
+  $response->addCommand(new CloseModalDialogCommand());
+  $response->addCommand(new RedirectCommand($fileUrl->toString()));
+  $form_state->setResponse($response);
+}
+
+/**
+ * Implements hook_theme().
+ */
+function gated_file_theme($existing, $type, $theme, $path) {
+  return [
+    'gated_file_form_wrapper' => [
+      'variables' => [
+        'form' => NULL,
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_preprocess_file_link().
+ */
+function gated_file_preprocess_file_link(&$variables) {
+  $file = $variables['file'];
+  $file_entity = ($file instanceof File) ? $file : File::load($file->fid);
+  $url = file_create_url($file_entity->getFileUri());
+  // Use the description as the link text if available.
+  if (empty($variables['description'])) {
+    $link_text = $file_entity->getFilename();
+  }
+  else {
+    $link_text = $variables['description'];
+    $options['attributes']['title'] = $file_entity->getFilename();
+  }
+
+  // Replace the link with the GatedFile link.
+  $query = \Drupal::entityQuery('gated_file')
+    ->condition('fid', $file->id());
+  if ($gatedFileId = $query->execute()) {
+    $gatedFileId = array_pop($gatedFileId);
+    $gatedFile = \Drupal::entityTypeManager()->getStorage('gated_file')->load($gatedFileId);
+    $url = $gatedFile->toUrl();
+    $url->setOption('attributes', ['title' => $file_entity->getFilename(), 'class' => 'use-ajax']);
+  }
+
+  $variables['link'] = Link::fromTextAndUrl($link_text, $url);
+}
