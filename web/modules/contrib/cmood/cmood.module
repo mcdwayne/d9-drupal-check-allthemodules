@@ -1,0 +1,171 @@
+<?php
+
+/**
+ * @file
+ * Used to allow site admin to know the mood of a user who created the node.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+
+/**
+ * Implements hook_help().
+ */
+function cmood_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.cmood':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('This module allows site admin to know about the mood of the user who post the content in the site. Node moods can be detected by the help of this module. For every node created, this module calculates a mood for the particular node and stores it or updates it.') . '</p>';
+      $output .= '<p>' . t('Site admin must add mood words for which he wants the mood of content can be calculated. He must also add rank words for increasing the mode by rank number of times.') . '</p>';
+      $output .= '<p>' . t('Site admin can <a href="@manage-mood-words">Manage mood words</a>. Site admin can <a href="@manage-rank-words">Manage rank words</a>.', [
+        '@manage-mood-words' => Drupal::url('cmood.admin_cmood_word'),
+        '@manage-rank-words' => Drupal::url('cmood.admin_cmood_rank'),
+      ]) . '</p>';
+      $output .= '<p>' . t('Site admin can <a href="@choose-content-type">Choose content type</a> for calculation of mood and <a href="@view-node-moods">View node moods</a>.', [
+        '@view-node-moods' => Drupal::url('cmood.admin_cmood'),
+        '@choose-content-type' => Drupal::url('cmood.admin_cmood_settings'),
+      ]) . '</p>';
+      $output .= '<h3>' . t('Ussage example') . '</h3>';
+      $output .= '<p>' . t('If site admin adds a mood word "good" with a weigth of +2 and a rank word "very" with weight of +3, Then if a node title or body contains a word or phrase with "very good" then a mood is calculated which equals to 6 (3 * 2 = 6). If the title and body contains only word "good" then a mood will be calculated which equals to 2. Sample: If a user creates a node which contains a text of "Hi, I am a very good boy. And I have a good smile.", then taking into the above word and rank weights the mood is calculated which equals to (3 * 2) + 2 = 8.') . '</p>';
+
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_node_presave().
+ */
+function cmood_node_presave(EntityInterface $node) {
+  $default_type_options = \Drupal::config('cmood.settings')
+    ->get('cmood_enabled_types');
+  if (empty($default_type_options)) {
+    $default_type_options = ['all' => 'all'];
+  }
+  if ($default_type_options['all'] === 'all' || array_key_exists($node->getType(), $default_type_options)) {
+    // Calculate mood for only content types chosen in the
+    // cmood settings form.
+    $string_to_calculate_mood = cmood_get_string_from_node($node);
+    $mood = cmood_calculate($string_to_calculate_mood);
+    $nid = $node->id();
+    // Update mood.
+    if (isset($nid)) {
+      db_merge('node_mood')
+        ->key(['nid' => $nid])
+        ->fields([
+          'nid' => $nid,
+          'mood' => $mood,
+        ])
+        ->execute();
+    }
+  }
+}
+
+/**
+ * Implements hook_node_insert().
+ *
+ * Here we insert node_mood table to store mood of nodes.
+ * Mood is calculated considering title and body of nodes.
+ */
+function cmood_node_insert(EntityInterface $node) {
+  $default_type_options = \Drupal::config('cmood.settings')
+    ->get('cmood_enabled_types');
+  if (empty($default_type_options)) {
+    $default_type_options = ['all' => 'all'];
+  }
+  if ($default_type_options['all'] === 'all' || array_key_exists($node->getType(), $default_type_options)) {
+    // Calculate mood for only content types chosen in the
+    // cmood settings form.
+    $string_to_calculate_mood = cmood_get_string_from_node($node);
+    $mood = cmood_calculate($string_to_calculate_mood);
+    $nid = $node->id();
+    // Update mood.
+    if (isset($nid)) {
+      db_merge('node_mood')
+        ->key(['nid' => $nid])
+        ->fields([
+          'nid' => $nid,
+          'mood' => $mood,
+        ])
+        ->execute();
+    }
+  }
+}
+
+/**
+ * Function to return string to calculate the mood of node.
+ *
+ * @param object $node
+ *   Complete node object to fetch the string to calculate the mood.
+ *
+ * @return string
+ *   This variable contains the concatinated value of title and body strings
+ */
+function cmood_get_string_from_node($node) {
+  if (isset($node->get('body')->value)) {
+    $string_to_calculate_mood = $node->getTitle() . '. '
+      . $node->get('body')->value;
+  }
+  else {
+    $string_to_calculate_mood = $node->getTitle() . '.';
+  }
+
+  return $string_to_calculate_mood;
+}
+
+/**
+ * Function to calculate the mood of nodes.
+ *
+ * @param string $scalc_mood
+ *   String whose mood needs to be determined and can be any length long.
+ *
+ * @return int
+ *   This variable contains the mood calculated for the string passed.
+ */
+function cmood_calculate($scalc_mood = NULL) {
+  $mood = 0;
+  $sentances = [];
+  $matches = [];
+  $trank = [];
+  $acmood_words = db_select('word_with_weight', 'www')
+    ->fields('www', ['wid', 'name', 'weight'])
+    ->execute()->fetchAll();
+  // Splitting text into sentances by splitting text by ".", "!"
+  // and "?" so that we can match mood words precede by rank words.
+  preg_match_all('([^\.\!\?]+[\.\?\!]*)', $scalc_mood, $sentances);
+  $asentances = $sentances[0];
+  $arank_multiplier = db_select('rank_word_with_weight', 'rwww')
+    ->fields('rwww', ['rwid', 'name', 'weight'])
+    ->execute()->fetchAll();
+  foreach ($asentances as $svalue) {
+    foreach ($acmood_words as $wvalue) {
+      $word_pattern = '/\b' . $wvalue->name . '\b/';
+      // Checking if the sentance has any mood words in it if yes then simply
+      // add mood weight value and then check for rank words,
+      // if no then skip to next mood word.
+      $cword_mood = preg_match_all($word_pattern, $svalue, $matches);
+      unset($matches);
+      if ($cword_mood > 0) {
+        $mood += $wvalue->weight;
+        foreach ($arank_multiplier as $var) {
+          $multi_pattern = '/\b' . $var->name . " " . $wvalue->name . '\b/';
+          // Checking if the mood word precede by rank word exists in the
+          // sentance if yes then subtract the mood weight added earlier
+          // and add mood weight which equals to product of rank word weight
+          // and mood word weight and number of occurrences.
+          $phrase_mood = preg_match_all($multi_pattern, $svalue, $trank);
+          unset($trank);
+          if ($phrase_mood > 0) {
+            $mood -= $wvalue->weight;
+            $mood += ($phrase_mood * ($wvalue->weight * $var->weight));
+          }
+        }
+      }
+      else {
+        // This word not found in this sentance.
+      }
+    }
+  }
+
+  return $mood;
+}
