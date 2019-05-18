@@ -1,0 +1,630 @@
+<?php
+
+/**
+ * @file
+ * Role Expire module
+ *
+ * Enables user roles to expire on given time.
+ */
+
+use Drupal\Component\Utility\Html;
+use Drupal\Component\Render\FormattableMarkup;
+use Drupal\role_expire\RoleExpireApiService;
+use Drupal\role_expire\Event\RoleExpiresEvent;
+use Drupal\Core\Database\Database;
+use Drupal\Core\Form\FormStateInterface;
+
+/*******************************************************************************
+ * API functions (deprecated, use role_expire.api service instead)
+ ******************************************************************************/
+
+/**
+ * API function; Get expiration time of a user role.
+ *
+ * @param $uid
+ *   User ID.
+ * @param $rid
+ *   Role ID.
+ * @return
+ *  Array with the expiration time.
+ *
+ * @deprecated Use the new service role_expire.api instead.
+ */
+function role_expire_get_user_role_expiry_time($uid, $rid) {
+  return \Drupal::service('role_expire.api')->getUserRoleExpiryTime($uid, $rid);
+}
+
+/**
+ * API function; Get expiration of all roles of a user.
+ *
+ * @param $uid
+ *   User ID.
+ * @return
+ *  Array with the expiration time.
+ *
+ * @deprecated Use the new service role_expire.api instead.
+ */
+function role_expire_get_all_user_records($uid) {
+  return \Drupal::service('role_expire.api')->getAllUserRecords($uid);
+}
+
+/**
+ * API function; Delete a record from the database.
+ *
+ * @param $uid
+ *   User ID.
+ * @param $rid
+ *   Role ID.
+ * @return
+ *
+ * @deprecated Use the new service role_expire.api instead.
+ */
+function role_expire_delete_record($uid, $rid) {
+  \Drupal::service('role_expire.api')->deleteRecord($uid, $rid);
+}
+
+/**
+ * API function; Delete all records for role.
+ *
+ * @param $rid
+ *   Role ID.
+ * @return
+ *
+ * @deprecated Use the new service role_expire.api instead.
+ */
+function role_expire_delete_role_records($rid) {
+  \Drupal::service('role_expire.api')->deleteRoleRecords($rid);
+}
+
+/**
+ * API function; Delete all user expirations.
+ *
+ * @param $uid
+ *   User ID.
+ * @return
+ *
+ * @deprecated Use the new service role_expire.api instead.
+ */
+function role_expire_delete_user_records($uid) {
+  \Drupal::service('role_expire.api')->deleteUserRecords($uid);
+}
+
+/**
+ * API function; Insert or update a record in the database.
+ *
+ * @param $uid
+ *   User ID.
+ * @param $rid
+ *   Role ID.
+ * @param $expiry_timestamp
+ *   The expiration timestamp.
+ *
+ * @deprecated Use the new service role_expire.api instead.
+ */
+function role_expire_write_record($uid, $rid, $expiry_timestamp) {
+  \Drupal::service('role_expire.api')->writeRecord($uid, $rid, $expiry_timestamp);
+}
+
+/**
+ * API function; Get the default duration for a role.
+ *
+ * @param $rid
+ *   Required. The role_id to check.
+ *
+ * @return
+ *  String containing the strtotime compatible default duration of the role
+ *  or empty string if not set.
+ *
+ * @deprecated Use the new service role_expire.api instead.
+ */
+function role_expire_get_default_duration($rid) {
+  return \Drupal::service('role_expire.api')->getDefaultDuration($rid);
+}
+
+/**
+ * API function; Insert or update the default expiry duration for a role.
+ *
+ * @param $rid
+ *   Role ID.
+ * @param $duration
+ *   The strtotime-compatible duration string.
+ *
+ * @deprecated Use the new service role_expire.api instead.
+ */
+function role_expire_set_default_duration($rid, $duration) {
+  \Drupal::service('role_expire.api')->setDefaultDuration($rid, $duration);
+}
+
+/**
+ * API function; Delete default duration(s) for a role.
+ *
+ * @param $rid
+ *   Required. The role_id to remove.
+ *
+ * @deprecated Use the new service role_expire.api instead.
+ */
+function role_expire_delete_default_duration($rid) {
+  \Drupal::service('role_expire.api')->deleteDefaultDuration($rid);
+}
+
+/**
+ * API function; Get all records that should be expired.
+ *
+ * @param $time
+ *   Optional. The time to check, if not set it will check current time.
+ *
+ * @deprecated Use the new service role_expire.api instead.
+ */
+function role_expire_get_expired($time = '') {
+  return \Drupal::service('role_expire.api')->getExpired($time);
+}
+
+/**
+ * API function; Get roles to assign on expiration (global configuration).
+ *
+ * @return array
+ *   Returns an array where the key is the original rid and the value the
+ *   one that has to be assigned on expiration. The array will be empty if
+ *   configuration is not set.
+ *
+ * @deprecated Use the new service role_expire.api instead.
+ */
+function role_expire_get_roles_after_expiration() {
+  return \Drupal::service('role_expire.api')->getRolesAfterExpiration();
+}
+
+/*******************************************************************************
+ * Hook implementations
+ ******************************************************************************/
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Add role expiration fields to user register/edit forms.
+ */
+function role_expire_form_user_form_alter(&$form, FormStateInterface $form_state) {
+  $current_path = \Drupal::service('path.current')->getPath();
+  $path_args = explode('/', $current_path);
+
+  $account_id = is_numeric($path_args[2]) ? $path_args[2] : NULL;
+
+  if (!empty($account_id)) {
+    // User edit form.
+    $account = \Drupal\user\Entity\User::load($account_id);
+  }
+  else {
+    // User register form.
+    $account = NULL;
+  }
+
+  $form = array_merge_recursive($form, role_expire_add_expiration_input($account));
+  $form['#validate'][] = 'role_expire_user_form_submit_validate';
+  $form['actions']['submit']['#submit'][] = 'role_expire_user_form_submit';
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Add role default duration field to role edit form.
+ */
+function role_expire_form_user_role_form_alter(&$form, FormStateInterface $form_state) {
+
+  $formatted_link = new FormattableMarkup(
+    '<a href="@link" target="_blank">strtotime</a>',
+    [
+      '@link' => 'http://php.net/manual/en/function.strtotime.php',
+    ]
+  );
+
+  $form['role_expire'] = array(
+    '#title' => t("Default duration for the role %role",
+      array('%role' => ucfirst($form['label']['#default_value']))),
+    '#type' => 'textfield',
+    '#size' => 30,
+    '#default_value' => \Drupal::service('role_expire.api')->getDefaultDuration($form['id']['#default_value']),
+    '#maxlength' => 32,
+    '#attributes' => array('class' => array('role-expire-role-expiry')),
+    '#description' => t('Enter the time span you want to set as the default duration for this role. Examples: 12 hours, 1 day, 3 days, 4 weeks, 3 months, 1 year. Leave blank for no default duration. (If you speak php, this value may be any @link-compatible relative form.)',
+      ['@link' => $formatted_link]
+    )
+  );
+  $form['#validate'][] = 'role_expire_user_admin_role_validate';
+  $form['actions']['submit']['#submit'][] = 'role_expire_user_admin_role_submit';
+  $form['actions']['delete']['#submit'][] = 'role_expire_user_admin_role_submit_delete';
+}
+
+/**
+ * Form validation handler invoked by role_expire_form_user_admin_role_alter.
+ *
+ * Ensure that the specified duration is a valid, relative, positive strtotime-
+ * compatible string.
+ */
+function role_expire_user_admin_role_validate($form, FormStateInterface &$form_state) {
+  $values = $form_state->getValues();
+
+  if (!empty($values['role_expire'])) {
+    $duration_string = Html::escape($values['role_expire']);
+    /*
+     * Make sure it's a *relative* duration string. That is, it will result in a
+     * different strtotime when a different 'now' value is used.
+     */
+    $now = time();
+    $timestamp = strtotime($duration_string, $now);
+    $timestamp2 = strtotime($duration_string, $now - 100);
+
+    if ($timestamp === FALSE || $timestamp < 0) {
+      // Invalid format.
+      $form_state->setErrorByName('role_expire', 'Role expiry default duration must be a strtotime-compatible string.');
+    }
+    elseif ($timestamp < $now) {
+      // In the past.
+      $form_state->setErrorByName('role_expire', 'Role expiry default duration must be a <strong>future</strong> strtotime-compatible string.');
+    }
+    elseif ($timestamp == $timestamp2) {
+      // This is an absolute (or special) timestamp. That's not allowed (not relative).
+      $form_state->setErrorByName('role_expire', 'Role expiry default duration must be a <strong>relative</strong> strtotime-compatible string.');
+    }
+  }
+}
+
+/**
+ * Form submit handler invoked by role_expire_form_user_admin_role_alter.
+ *
+ * Updates default duration in database.
+ */
+function role_expire_user_admin_role_submit($form, FormStateInterface &$form_state) {
+  $values = $form_state->getValues();
+
+  /*
+   * If the form doesn't specify a default duration, then delete default duration.
+   * Otherwise, set the default duration to what's specified.
+   */
+  if (!empty($values['role_expire'])) {
+    $duration_string = Html::escape($values['role_expire']);
+    \Drupal::service('role_expire.api')->setDefaultDuration($values['id'], $duration_string);
+    \Drupal::service('messenger')->addMessage('New default role expiration set.');
+  }
+  else {
+    \Drupal::service('role_expire.api')->deleteDefaultDuration($values['id']);
+  }
+}
+
+/**
+ * Form delete handler invoked by role_expire_form_user_admin_role_alter.
+ *
+ * Removes default duration in database.
+ */
+function role_expire_user_admin_role_submit_delete($form, FormStateInterface &$form_state) {
+  $values = $form_state->getValues();
+
+  \Drupal::service('role_expire.api')->deleteDefaultDuration($values['id']);
+}
+
+/**
+ * Form validation handler invoked by user_register_form and user_form alter hooks.
+ *
+ * Allows to get and save the current roles of the user before the new user data is
+ * actually saved. By doing this, in the submit method we can ensure role expire data
+ * consistency.
+ *
+ * https://drupal.stackexchange.com/questions/200620/insert-a-value-to-form-state
+ */
+function role_expire_user_form_submit_validate($form, FormStateInterface &$form_state) {
+  $account = $form_state->getFormObject()->getEntity();
+  $original_roles = $account->getRoles();
+  $form_state->set('original_roles', $original_roles);
+}
+
+/**
+ * Form submit handler invoked by user_register_form and user_form alter hooks.
+ *
+ * TODO: This method needs debugging.
+ *
+ * On D7 version, this code was inside hook_user_update. Updates default duration in database.
+ */
+function role_expire_user_form_submit($form, FormStateInterface &$form_state) {
+  $values = $form_state->getValues();
+  $account = $form_state->getFormObject()->getEntity();
+  $original_roles = $form_state->get('original_roles');
+
+  if ((\Drupal::currentUser()->hasPermission('administer role expire') || \Drupal::currentUser()->hasPermission('administer users'))) {
+
+    // Add roles expiry information for the user role.
+    foreach ($values as $key => $value) {
+      if (strpos($key, 'role_expire_') === 0) {
+        $rid = substr($key, strlen('role_expire_'));
+        if ($value != '' && in_array($rid, $values['roles'])) {
+          $expiry_timestamp = strtotime($value);
+          \Drupal::service('role_expire.api')->writeRecord($account->id(), $rid, $expiry_timestamp);
+        }
+        else {
+          \Drupal::service('role_expire.api')->deleteRecord($account->id(), $rid);
+        }
+      }
+    }
+
+    if (isset($values['roles'])) {
+
+      // Add default expiration to any new roles that have been given to the user.
+      $new_roles = array_diff($values['roles'], $original_roles);
+      if (isset($new_roles)) {
+        // We have the new roles, loop over them and see whether we need to assign expiry to them.
+        foreach ($new_roles as $role_id) {
+          \Drupal::service('role_expire.api')->processDefaultRoleDurationForUser($role_id, $account->id());
+        }
+      }
+
+      // Remove expiration for roles that have been removed from the user.
+      $del_roles = array_diff($original_roles, $values['roles']);
+      if (isset($del_roles)) {
+        // We have the deleted roles, loop over them and remove their expiry info.
+        foreach ($del_roles as $role_id) {
+          \Drupal::service('role_expire.api')->deleteRecord($account->id(), $role_id);
+        }
+      }
+
+    } // if values[roles]
+
+  } // if permissions
+
+}
+
+/**
+ * Implements hook_user_insert().
+ */
+function role_expire_user_insert($account) {
+
+  if ((\Drupal::currentUser()->hasPermission('administer role expire') || \Drupal::currentUser()->hasPermission('administer users'))) {
+
+    // This adds default expiration to any new roles that have been given to the user.
+    $new_roles = $account->getRoles();
+    // We have the new roles, loop over them and see whether we need to assign expiry to them.
+    foreach ($new_roles as $role_id) {
+      \Drupal::service('role_expire.api')->processDefaultRoleDurationForUser($role_id, $account->id());
+    }
+  }
+}
+
+/**
+ * Implements hook_user_cancel().
+ */
+function role_expire_user_cancel($edit, $account, $method) {
+  // Delete user records.
+  \Drupal::service('role_expire.api')->deleteUserRecords($account->id());
+}
+
+/**
+ * Implements hook_user_delete().
+ */
+function role_expire_user_delete($account) {
+  // Delete user records.
+  \Drupal::service('role_expire.api')->deleteUserRecords($account->id());
+}
+
+/**
+ * Implements hook_user_load().
+ */
+function role_expire_user_load($users) {
+  // We don't load the information to the user object. Other modules can use
+  // our API to query the information.
+
+  /**
+   * Load the starter roles into a static cache so it is easy to
+   * see what has changed later on.
+   */
+  foreach ($users as $account) {
+    _role_static_user_roles($account->id(), $account->getRoles());
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_view().
+ *
+ * This new hook replaces D7 hook_user_view.
+ */
+function role_expire_user_view(&$build, $entity, $display, $view_mode) {
+  $account = $build['#user'];
+  $currentUser = \Drupal::currentUser();
+
+  if ($currentUser->hasPermission('administer role expire') || $currentUser->hasPermission('administer users') || $currentUser->id() == $account->id()) {
+
+    // 1. Gather all role expiration information.
+    $roles = array();
+    $expiry_roles = \Drupal::service('role_expire.api')->getAllUserRecords($account->id());
+    foreach (($account->getRoles()) as $rid) {
+      if (array_key_exists($rid, $expiry_roles)) {
+        $roles[] =  t("%role role expiration date: %timedate", array('%role' => ucfirst($rid), '%timedate' => \Drupal::service('date.formatter')->format($expiry_roles[$rid])));
+      }
+    }
+
+    // 2. Print all role expiration information.
+    if ($roles) {
+
+      $render_array = array(
+        '#theme' => 'item_list',
+        '#items' => $roles,
+        '#title' => t('Role expiration'),
+        '#attributes' => array('class' => array('role-expiry-roles')),
+        '#weight' => 1000,
+      );
+      $build['role_expire'] = $render_array;
+    }
+  }
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * TODO: This method needs intensive debugging.
+ */
+function role_expire_cron() {
+  $expires = \Drupal::service('role_expire.api')->getExpired();
+
+  if ($expires) {
+    $roles = _role_expire_get_role();
+    foreach ($expires as $expire) {
+
+      // Remove the role expiration record from the role_expires table.
+      \Drupal::service('role_expire.api')->deleteRecord($expire->uid, $expire->rid);
+
+      // Remove the role from the user.
+      $account = \Drupal\user\Entity\User::load($expire->uid);
+
+      // If the account *does* exist, update it.
+      if (!empty($account)) {
+
+        // Assign a new role after expiration if requested given configuration.
+        $new_roles = \Drupal::service('role_expire.api')->getRolesAfterExpiration();
+        if (!empty($new_roles) && !empty($new_roles[$expire->rid])) {
+          $new_rid = $new_roles[$expire->rid];
+          $account->addRole($new_rid);
+          \Drupal::service('role_expire.api')->processDefaultRoleDurationForUser($new_rid, $account->id());
+          \Drupal::logger('role_expire')->notice(t('Added role @role to user @account.', array('@role' => $new_rid, '@account' => $account->id())));
+        }
+
+        $account->removeRole($expire->rid);
+        $account->save();
+
+        /*
+         * Rules integration.
+         * https://fago.gitbooks.io/rules-docs/content/extending_rules/events.html
+         */
+        if (\Drupal::moduleHandler()->moduleExists('rules')) {
+          $event = new RoleExpiresEvent($account, $expire->rid);
+          $event_dispatcher = \Drupal::service('event_dispatcher');
+          $event_dispatcher->dispatch(RoleExpiresEvent::EVENT_NAME, $event);
+        }
+
+        \Drupal::logger('role_expire')->notice(t('Removed role @role from user @account.', array('@role' => $expire->rid, '@account' => $account->id())));
+      }
+      else {
+
+        // The account doesn't exist. Throw a warning message.
+        \Drupal::logger('role_expire')->notice(t('Data integrity warning: Role_expire table updated, but no user with uid @uid.', array('@uid' => $expire->uid)));
+      }
+    }
+  }
+}
+
+
+/**
+ * Add form element that accepts the role expiration time.
+ *
+ * @param User $account
+ *   Edited user or null.
+ *
+ * @return
+ *   Form element.
+ */
+function role_expire_add_expiration_input($account) {
+  $form = array();
+
+  if (\Drupal::currentUser()->hasPermission('administer users') || \Drupal::currentUser()->hasPermission('administer role expire')) {
+
+    $form['#attached']['library'][] = 'role_expire/role_expire';
+    $form['roles']['#attributes'] = array('class' => array('role-expire-roles'));
+
+    foreach (_role_expire_get_role() as $rid => $role) {
+      if (!is_null($account)) {
+        $expiry_timestamp = \Drupal::service('role_expire.api')->getUserRoleExpiryTime($account->id(), $rid);
+      }
+      else {
+        $expiry_timestamp = '';
+      }
+
+      $form['role_expire_' . $rid] = array(
+        '#title' => t("%role role expiration date/time", array('%role' => $role)),
+        '#type' => 'textfield',
+        '#default_value' => !empty($expiry_timestamp) ? date("Y-m-d H:i:s", $expiry_timestamp) : '',
+        '#attributes' => array('class' => array('role-expire-role-expiry')),
+        '#description' => t("Leave blank for default role expiry (never, or the duration you have set for the role), enter date and time in format: <em>yyyy-mm-dd hh:mm:ss</em> or use relative time i.e. 1 day, 2 months, 1 year, 3 years.")
+      );
+    }
+
+    $form['#validate'][] = '_role_expire_validate_role_expires';
+  }
+
+  return $form;
+}
+
+/*******************************************************************************
+ * Helper functions
+ ******************************************************************************/
+
+/**
+ * Helper function; Store user roles for this page request.
+ *
+ * @return
+ *   array of roles
+ */
+function _role_static_user_roles($id, $roles = '') {
+  static $user_roles = array();
+
+  if (!isset($user_roles[$id]) && is_array($roles)) {
+    $user_roles[$id] = $roles;
+  }
+  if (!isset($user_roles[$id])) {
+    return FALSE;
+  }
+  else {
+    return $user_roles[$id];
+  }
+
+}
+
+/**
+ * Helper function; Get valid roles.
+ *
+ * @return array
+ */
+function _role_expire_get_role() {
+  $roles_out = array();
+  $roles = user_roles(TRUE);
+  unset($roles[Drupal\Core\Session\AccountInterface::AUTHENTICATED_ROLE]);
+
+  // Return in the same format as in D7 version to simplify D8 upgrade.
+  foreach ($roles as $label => $role) {
+    $roles_out[$role->id()] = $role->label();
+  }
+  return $roles_out;
+}
+
+/**
+ * Form validation handler for the role expiration on the user_profile_form().
+ *
+ * @see user_profile_form()
+ */
+function _role_expire_validate_role_expires(&$form, FormStateInterface &$form_state) {
+
+  $values = $form_state->getValues();
+  date_default_timezone_set(drupal_get_user_timezone());
+  $time = \Drupal::time()->getRequestTime();
+
+  foreach ($values as $name => $value) {
+    if (strpos($name, 'role_expire_') === 0 && trim($value) != '') {
+      $expiry_time = strtotime($value);
+      if (!$expiry_time) {
+        $form_state->setErrorByName($name, t("Role expiry is not in correct format."));
+      }
+      if ($expiry_time <= $time) {
+        $form_state->setErrorByName($name, t("Role expiry must be in the future."));
+      }
+    }
+  }
+}
+
+/**
+ * Sets the default role duration for the current user/role combination.
+ *
+ * It won't override the current expiration time for user's role.
+ *
+ * @param $role_id
+ *   The ID of the role.
+ * @param $uid
+ *   The user ID.
+ *
+ * @deprecated Use the new service role_expire.api instead.
+ */
+function role_expire_process_default_role_duration_for_user($role_id, $uid) {
+  \Drupal::service('role_expire.api')->processDefaultRoleDurationForUser($role_id, $uid);
+}
