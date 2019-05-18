@@ -1,0 +1,1 @@
+HideEmail provides a content field filter to hide email addresses from bots.  HideEmail also provides an option to automatically create mailto links for email addresses.
