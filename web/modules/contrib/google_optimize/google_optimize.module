@@ -1,0 +1,249 @@
+<?php
+
+/**
+ * @file
+ * google_optimize.module
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+
+/**
+ * Implements hook_help().
+ */
+function google_optimize_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'admin.config.system.google_optimize':
+      return t(
+        'The <a href="@opt_url">Optimize page-hiding snippet</a> supports loading
+ your Optimize container asynchronously while hiding the page until the container is ready,
+ ensuring that users don\'t see the initial page content prior to it being modified by an experiment.',
+        ['@opt_url' => 'https://developers.google.com/optimize/#the_page-hiding_snippet_code']
+      );
+  }
+}
+
+/**
+ * Whether to use the Google Optimize page-hiding snippet.
+ *
+ * @return bool
+ *   google_optimize_hide_page_enable
+ */
+function google_optimize_hide_page_enabled() {
+  $config = \Drupal::config('google_optimize.settings');
+  return (bool) $config->get('hide_page_enable') ?: FALSE;
+}
+
+/**
+ * The Optimize container ids.
+ *
+ * @see https://developers.google.com/optimize/#loading_multiple_containers
+ *
+ * @return array
+ *   google_optimize_container_ids
+ */
+function google_optimize_container_ids() {
+  static $ids;
+
+  if (!is_null($ids)) {
+    return $ids;
+  }
+
+  $config = \Drupal::config('google_optimize.settings');
+  $csv = $config->get('container_ids') ?: '';
+  if (empty($csv)) {
+    $ids = [];
+  }
+  else {
+    $ids = str_getcsv($csv);
+  }
+
+  return $ids;
+}
+
+/**
+ * The default amount of time Optimize will wait before removing.
+ *
+ * The .async-hide class from the <html> element.
+ *
+ * @see https://developers.google.com/optimize/#changing_the_timeout
+ *
+ * @return int
+ *   google_optimize_hide_page_timeout
+ */
+function google_optimize_hide_page_timeout() {
+  $config = \Drupal::config('google_optimize.settings');
+  return (integer) $config->get('hide_page_timeout') ?: 4000;
+}
+
+/**
+ * If the async-hide class name is already defined in your CSS.
+ *
+ * You can choose a different name.
+ *
+ * @see https://developers.google.com/optimize/#changing_the_async-hide_class_name
+ *
+ * @return string
+ *   google_optimize_hide_page_class_name
+ */
+function google_optimize_hide_page_class_name() {
+  $config = \Drupal::config('google_optimize.settings');
+  return $config->get('hide_page_class_name') ?: 'async-hide';
+}
+
+/**
+ * The list of pages to add the snippet.
+ *
+ * @return bool
+ *   hide_page_pages
+ */
+function google_optimize_hide_page_pages() {
+  $config = \Drupal::config('google_optimize.settings');
+  return $config->get('hide_page_pages') ?: '';
+}
+
+/**
+ * The list of roles to add the snippet.
+ *
+ * @return array
+ *   hide_page_roles
+ */
+function google_optimize_hide_page_roles() {
+  $config = \Drupal::config('google_optimize.settings');
+  $roles = $config->get('hide_page_roles') ?: [];
+  foreach($roles as $key => $value) {
+    if (!$value) {
+      unset($roles[$key]);
+    }
+  }
+  return $roles;
+}
+
+/**
+ * Whether to put the snippet on the page.
+ *
+ * @return bool
+ *   google_optimize_hide_page_active
+ */
+function google_optimize_hide_page_active() {
+  if (!google_optimize_hide_page_enabled()) {
+    // Not enabled so do nothing.
+    return FALSE;
+  }
+
+  $admin_context = \Drupal::service('router.admin_context');
+  if ($admin_context->isAdminRoute()) {
+    // This is an admin page.
+    return FALSE;
+  }
+
+  $container_ids = google_optimize_container_ids();
+  if (empty($container_ids)) {
+    // No container configured, so do nothing.
+    return FALSE;
+  }
+
+  // See if restricted to certain pages.
+  if ($pages = google_optimize_hide_page_pages()) {
+    $current_path = \Drupal::service('path.current')->getPath();
+    if (strpos($current_path, '/node/') !== FALSE) {
+      $current_path = \Drupal::service('path.alias_manager')->getAliasByPath($current_path);
+    }
+    if (!$match = \Drupal::service('path.matcher')->matchPath($current_path, $pages)) {
+      // Not for this page.
+      return FALSE;
+    }
+  }
+
+  // See if restricted to certain role(s)
+  if ($roles = google_optimize_hide_page_roles()) {
+    $current_user = \Drupal::currentUser();
+    $user_roles = $current_user->getRoles();
+    foreach($user_roles as $role) {
+      if (in_array($role, $roles, TRUE)) {
+        // Add for this user.
+        return TRUE;
+      }
+    }
+    // Not in the list of allowed roles
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+/**
+ * Implements hook_page_attachments().
+ *
+ * Attach JavaScript to the appropriate scope/region of the page.
+ */
+function google_optimize_page_attachments(array &$attachments) {
+  if (!google_optimize_hide_page_active()) {
+    return;
+  }
+  // Create the container string 'GTM-XXXXXX':true,'GTM-YYYYYY':true.
+  $container_ids = google_optimize_container_ids();
+  $container_ids = array_map(
+    function ($value) {
+      return "'" . trim($value) . "':true";
+    },
+    $container_ids
+  );
+  $container_str = implode(',', $container_ids);
+  $class_name = google_optimize_hide_page_class_name();
+  $timeout = google_optimize_hide_page_timeout();
+
+  $js = sprintf(
+    "(function(a,s,y,n,c,h,i,d,e){s.className+=' '+y;h.start=1*new Date;
+h.end=i=function(){s.className=s.className.replace(RegExp(' ?'+y),'')};
+(a[n]=a[n]||[]).hide=h;setTimeout(function(){i();h.end=null},c);h.timeout=c;
+})(window,document.documentElement,'%s','dataLayer',%d,
+{%s});",
+    $class_name,
+    $timeout,
+    $container_str
+  );
+  // Insert the hide page snippet immediantly before the
+  // Google Analytics script. Can't splice to begining of html_head
+  // As datalayers-js may be 1st and this would redefine dataLayer.
+  foreach ($attachments['#attached']['html_head'] as $key => $tag) {
+    if (count($tag) && $tag[1] == 'google_analytics_tracking_script') {
+      array_splice($attachments['#attached']['html_head'], $key, 0, [
+        [
+          [
+            '#type' => 'html_tag',
+            '#tag' => 'script',
+            '#value' => $js,
+            '#attributes' => [],
+          ],
+          'google-optimize-hide-page-js',
+        ],
+      ]);
+      break;
+    }
+  }
+
+  $css = '.' . $class_name . ' { opacity: 0 !important} ';
+  $attachments['#attached']['html_head'][] = [
+    [
+      '#type' => 'html_tag',
+      '#tag' => 'style',
+      '#value' => $css,
+    ],
+    'google-optimize-hide-page-css',
+  ];
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ *
+ * Sets the hook_page_attachments to be loaded last.
+ *
+ * So google_analytics_tracking_script will already be loaded.
+ */
+function google_optimize_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'page_attachments') {
+    $group = $implementations['google_optimize'];
+    unset($implementations['google_optimize']);
+    $implementations['google_optimize'] = $group;
+  }
+}
