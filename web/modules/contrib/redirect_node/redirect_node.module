@@ -1,0 +1,125 @@
+<?php
+
+/**
+ * @file
+ * Contains redirect_node.module.
+ */
+
+use Drupal\Component\Utility\UrlHelper;
+use Drupal\Core\Block\BlockPluginInterface;
+use Drupal\Core\Url;
+use Drupal\node\Entity\Node;
+
+/**
+ * Implements hook_block_view_BASE_BLOCK_ID_alter().
+ *
+ * Add a prerender callback after all other callbacks to rewrite the displayed
+ * url in menus blocks.
+ *
+ * @See _redirect_node_block_render_alter().
+ */
+function redirect_node_block_view_system_menu_block_alter(array &$build, BlockPluginInterface $block) {
+  $build['#pre_render'][] = '_redirect_node_block_render_alter';
+}
+
+/**
+ * Pre render callback callback to alter urls for redirect nodes in menus.
+ *
+ * Calls _redirect_node_replace_node_url_walk_array() recursively on all menu
+ * items and their children. If the url for a menu item is rewritten, then a js
+ * script is attached that will inject edit links on each of the menu items.
+ *
+ * @See _redirect_node_replace_node_url_walk_array().
+ */
+function _redirect_node_block_render_alter(array $build) {
+  if (isset($build['content']['#items'])) {
+    $includeLibrary = _redirect_node_replace_node_url_walk_array($build['content']['#items']);
+    if ($includeLibrary) {
+      $build['#attached']['library'][] = 'redirect_node/redirect_node.edit_link';
+    }
+  }
+  return $build;
+}
+
+/**
+ * Rewrites the urls of redirect nodes in menus to display the destination.
+ *
+ * Recursively called on each layer of a menu's menu items. Detects if the item
+ * is a link to a redirect nodes, then rewrites it to the destination for
+ * the node. Also sets classes and edit url as a data attribute on the element,
+ * so that javascript can add edit links into the menu for the node.
+ *
+ * @param array &$items
+ *   A layer of a menu tree to be rewritten.
+ *
+ * @return bool
+ *   Returns TRUE if a menu item has been rewriten so that the library can be
+ *   Attached to the block.
+ */
+function _redirect_node_replace_node_url_walk_array(array &$items) {
+  $includeLibrary = FALSE;
+
+  // Iterate over the current layer and update urls of any redirect nodes.
+  foreach ($items as &$item) {
+    $url = $item['original_link']->getUrlObject();
+    if ($url->isRouted() && $url->getRouteName() === 'entity.node.canonical') {
+      // If the route is to the node view page test if the node is a redirect.
+      $params = $url->getRouteParameters();
+      // The node id will be stored in `'node' => {nid}`.
+      if (array_key_exists('node', $params)) {
+        // Load node and test its type.
+        $node = Node::load($params['node']);
+        if (!empty($node) && $node->bundle() === 'redirect') {
+          // For redirect nodes, unwrap the field value (if any).
+          $uris = array_column($node->redirect_destination->getValue(), 'uri');
+          $destination = array_shift($uris);
+          $newUrl = NULL;
+          // Check for valid url, and get a url object for it.
+          if (!empty($destination)) {
+            if (UrlHelper::isExternal($destination)) {
+              // If the url is external, assume its a real url.
+              $newUrl = Url::fromUri($destination);
+            }
+            else {
+              // For internal urls, Check if they are a valid path.
+              // Returns FALSE, if the url is invalid.
+              $newUrl = \Drupal::service('path.validator')->getUrlIfValid($destination);
+            }
+          }
+          // If the url is valid, update the display with the destination url.
+          if (!empty($newUrl)) {
+            $options = $url->getOptions();
+            if (!isset($options['attributes']) || !isset($options['attributes']['target'])) {
+              $options['attributes']['target'] = '_blank';
+            }
+            $newUrl->setOptions($options);
+            $item['url'] = $newUrl;
+          }
+
+          // Check if the user can edit the node.
+          $user = \Drupal::currentUser();
+          if ($user && $node->access('update', $user)) {
+            // If the user can edit the node, setup the classes and data so
+            // the edit link can be added in the browser via js.
+            if (!isset($item['attributes']['class'])) {
+              $item['attributes']['class'] = [];
+            }
+            $item['attributes']['class'][] = 'redirect-node-can-edit';
+            $item['attributes']['class'][] = 'js-redirect-node-can-edit';
+            // Construct the edit url from the route and add the attribute.
+            $editUrl = Url::fromRoute('entity.node.edit_form', ['node' => $node->id()]);
+            $item['attributes']['data-rn-edit-url'] = $editUrl->toString();
+            // Set the library flag since we change the url of this node.
+            $includeLibrary = TRUE;
+          }
+        }
+      }
+    }
+    if (isset($item['below'])) {
+      // Set flag to true, if an item was rewritten at a lower level.
+      $includeLibrary = _redirect_node_replace_node_url_walk_array($item['below']) || $includeLibrary;
+    }
+  }
+  // Return flag for including the menu.
+  return $includeLibrary;
+}
