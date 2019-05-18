@@ -1,0 +1,1258 @@
+<?php
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Entity\Entity\EntityViewDisplay;
+use Drupal\Core\Render\Markup;
+use Drupal\Core\Link;
+use Drupal\Core\Url;
+use Drupal\field\Entity\FieldConfig;
+use Drupal\field\Entity\FieldStorageConfig;
+use Drupal\views\ViewExecutable;
+use Drupal\office_hours\OfficeHoursDateHelper;
+use Drupal\commerce_product\Entity\ProductType;
+use Drupal\commerce_product\Entity\ProductVariationType;
+use Drupal\commerce_product\Entity\Product;
+use Drupal\commerce_product\Entity\ProductVariation;
+use Drupal\commerce_order\Entity\OrderItemType;
+use Drupal\commerce_order\Entity\OrderItemInterface;
+use Drupal\commerce_store\Entity\Store;
+
+/**
+ * Implements hook_form_alter().
+ */
+function bee_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  if ($form_id == 'node_type_edit_form' || $form_id == 'node_type_add_form') {
+    if (\Drupal::currentUser()->hasPermission('administer bee settings')) {
+      $node_type = $form_state->getFormObject()->getEntity();
+
+      $bee_settings = \Drupal::config('node.type.' . $node_type->id())->get('bee');
+
+      $form['bee'] = [
+        '#type' => 'details',
+        '#title' => t('BEE'),
+        '#group' => 'additional_settings',
+        '#tree' => TRUE,
+      ];
+      $form['bee']['bookable'] = [
+        '#type' => 'checkbox',
+        '#title' => t('Make this entity type bookable'),
+        '#default_value' => isset($bee_settings['bookable']) ? $bee_settings['bookable'] : 0,
+      ];
+      $form['bee']['bookable_type'] = [
+        '#type' => 'container',
+        'radios' => [
+          '#type' => 'radios',
+          '#title' => t('Booking Length'),
+          '#options' => [
+            'daily' => t('Daily Bookings (allows bookings of 1 or more full days)'),
+            'hourly' => t('Flexible Bookings (allows bookings of any length)'),
+          ],
+          '#default_value' => isset($bee_settings['bookable_type']) ? $bee_settings['bookable_type'] : 'daily',
+          '#disabled' => isset($bee_settings['bookable_type']),
+        ],
+        '#states' => [
+          'visible' => [
+            ':input[name="bee[bookable]"]' => ['checked' => TRUE],
+          ],
+        ],
+      ];
+      $form['bee']['availability'] = [
+        '#type' => 'container',
+        'radios' => [
+          '#type' => 'radios',
+          '#title' => t('Availability'),
+          '#options' => [
+            'available' => t('Generally available (Use for resources that are usually available unless there is a booking. Examples are meeting rooms and equipment)'),
+            'unavailable' => t('Periodically available (Use for resources that are only available on certain days or times. Examples are tours and open mic nights)'),
+          ],
+          '#default_value' => isset($bee_settings['availability']) ? $bee_settings['availability'] : 'available',
+          '#disabled' => isset($bee_settings['availability']),
+        ],
+        '#states' => [
+          'visible' => [
+            ':input[name="bee[bookable]"]' => ['checked' => TRUE],
+          ],
+        ],
+      ];
+      $form['bee']['payment'] = [
+        '#type' => 'checkbox',
+        '#title' => t('Enable payment for bookings'),
+        '#default_value' => isset($bee_settings['payment']) ? $bee_settings['payment'] : 0,
+        '#states' => [
+          'visible' => [
+            ':input[name="bee[bookable]"]' => ['checked' => TRUE],
+          ],
+        ],
+      ];
+
+      if (!(\Drupal::moduleHandler()->moduleExists('commerce_checkout') &&
+            \Drupal::moduleHandler()->moduleExists('commerce_payment'))) {
+        $form['bee']['payment']['#disabled'] = TRUE;
+        $form['bee']['payment']['#description'] = t('To enable payments for bookings, install and enable the Drupal Commerce checkout and payment modules and configure a Commerce Store.');
+      }
+      elseif (\Drupal::moduleHandler()->moduleExists('commerce')) {
+        if (empty(Store::loadMultiple())) {
+          $form['bee']['payment']['#disabled'] = TRUE;
+          $form['bee']['payment']['#description'] = t('To enable payments for bookings, install and enable the Drupal Commerce checkout and payment modules and configure a Commerce Store.');
+        }
+      }
+
+      if (isset($bee_settings['type_id'])) {
+        $form['bee']['type_id'] = [
+          '#type' => 'hidden',
+          '#value' => $bee_settings['type_id'],
+        ];
+      }
+
+      $form['actions']['submit']['#submit'][] = 'bee_node_type_edit_form_submit';
+
+      $form['#attached']['library'][] = 'bee/bee';
+    }
+  }
+  elseif (preg_match('/^node_.*_edit_form$/', $form_id)) {
+    $node = $form_state->getFormObject()->getEntity();
+
+    $bee_settings = \Drupal::config('node.type.' . $node->bundle())->get('bee');
+
+    if (isset($bee_settings['bookable']) && $bee_settings['bookable']) {
+      $units_count = count($node->get('field_availability_' . $bee_settings['bookable_type'])->getValue());
+
+      $form['bee'] = [
+        '#type' => 'details',
+        '#title' => t('BEE'),
+        '#tree' => TRUE,
+        '#prefix' => '<div id="bee-node-wrapper">',
+        '#suffix' => '</div>',
+        '#weight' => 9000,
+      ];
+
+      $form['bee']['units_count'] = [
+        '#type' => 'item',
+        '#title' => t('Number of referenced units'),
+        '#markup' => $units_count,
+        '#prefix' => '<div class="container-inline">',
+        '#suffix' => '</div>',
+        '#weight' => $form['field_open_hours']['#weight'] + 1,
+      ];
+
+      $form['bee']['number_units'] = [
+        '#type' => 'number',
+        '#title' => t('Number of units to add'),
+        '#min' => 1,
+        '#step' => 1,
+        '#weight' => $form['field_open_hours']['#weight'] + 1,
+      ];
+
+      $form['bee']['add_more'] = [
+        '#type' => 'submit',
+        '#value' => t('Add units'),
+        '#limit_validation_errors' => [
+          ['bee', 'number_units'],
+          ['changed'],
+        ],
+        '#submit' => ['bee_node_add_more_units_submit'],
+        '#ajax' => [
+          'callback' => 'bee_node_add_more_units_ajax_callback',
+          'wrapper' => 'bee-node-wrapper',
+        ],
+        '#weight' => $form['field_open_hours']['#weight'] + 1,
+      ];
+
+      if ($bee_settings['payment']) {
+        $form['payments'] = [
+          '#type' => 'details',
+          '#title' => t('Payments'),
+          '#open' => TRUE,
+          '#group' => 'bee',
+          '#weight' => $form['field_open_hours']['#weight'] + 1,
+        ];
+
+        if ($bee_settings['bookable_type'] == 'daily') {
+          $form['field_price']['#group'] = 'payments';
+          $form['field_price']['widget'][0]['#title'] = t('Price per day');
+
+          $form['field_price_frequency']['#access'] = FALSE;
+
+          $form['field_price']['#prefix'] = '<div class="container-inline">';
+          $form['field_price']['#suffix'] = '</div>';
+        }
+        else {
+          $form['field_price']['#group'] = 'payments';
+          $form['field_price']['widget'][0]['#title'] = t('Price');
+
+          $form['field_price_frequency']['#group'] = 'payments';
+          $form['field_price_frequency']['widget']['#default_value'] = 'hour';
+          $form['field_price_frequency']['widget']['#title'] = t('per');
+          unset($form['field_price_frequency']['widget']['#options']['_none']);
+
+          $form['field_price']['#prefix'] = '<div class="container-inline">';
+          $form['field_price_frequency']['#suffix'] = '</div>';
+        }
+      }
+      else {
+        $form['field_price']['#access'] = FALSE;
+        $form['field_price_frequency']['#access'] = FALSE;
+      }
+
+      if ($bee_settings['bookable_type'] == 'hourly') {
+        $form['field_use_open_hours']['#group'] = 'bee';
+        $form['field_use_open_hours']['#weight'] = $form['field_open_hours']['#weight'] - 1;
+
+        $form['field_open_hours']['#group'] = 'bee';
+        $form['field_open_hours']['#states'] = [
+          'visible' => [
+            ':input[name="field_use_open_hours[value]"]' => ['checked' => TRUE],
+          ],
+        ];
+      }
+      else {
+        $form['field_use_open_hours']['#access'] = FALSE;
+        $form['field_open_hours']['#access'] = FALSE;
+      }
+    }
+    else {
+      if (isset($form['field_use_open_hours'])) {
+        $form['field_use_open_hours']['#access'] = FALSE;
+      }
+
+      if (isset($form['field_open_hours'])) {
+        $form['field_open_hours']['#access'] = FALSE;
+      }
+    }
+  }
+  elseif (preg_match('/^node_.*_form$/', $form_id)) {
+    if (isset($form['field_price'])) {
+      $form['field_price']['#access'] = FALSE;
+    }
+
+    if (isset($form['field_price_frequency'])) {
+      $form['field_price_frequency']['#access'] = FALSE;
+    }
+
+    if (isset($form['field_use_open_hours'])) {
+      $form['field_use_open_hours']['#access'] = FALSE;
+    }
+
+    if (isset($form['field_open_hours'])) {
+      $form['field_open_hours']['#access'] = FALSE;
+    }
+  }
+}
+
+/**
+ * Submit function for the "Add units" button.
+ */
+function bee_node_add_more_units_submit($form, FormStateInterface $form_state) {
+  $number_units = $form_state->getValue(['bee', 'number_units']);
+
+  if (is_numeric($number_units) && $number_units > 0) {
+    $node = $form_state->getFormObject()->getEntity();
+
+    $bee_settings = \Drupal::config('node.type.' . $node->bundle())->get('bee');
+
+    $units_ids = $node->get('field_availability_' . $bee_settings['bookable_type'])->getValue();
+
+    for ($i = 0; $i < $number_units; $i++) {
+      $bat_unit = bat_unit_create(
+        [
+          'name' => $node->label() . ' ' . (count($units_ids) + 1),
+          'type' => 'default',
+          'unit_type_id' => $bee_settings['type_id'],
+        ]
+      );
+      bat_unit_save($bat_unit);
+
+      $units_ids[]['target_id'] = $bat_unit->id();
+    }
+
+    $node->set('field_availability_' . $bee_settings['bookable_type'], $units_ids);
+    $node->changed_time = $form_state->getValue('changed');
+    $node->setNewRevision(FALSE);
+    $node->save();
+
+    $units_count = count($node->get('field_availability_' . $bee_settings['bookable_type'])->getValue());
+
+    $form['bee']['units_count']['#markup'] = $units_count;
+
+    $form['bee']['number_units']['#value'] = '';
+
+    drupal_set_message(t('@number Units added.', ['@number' => $number_units]));
+  }
+  elseif ($number_units === '') {
+    drupal_set_message(t('Number of units is required.'), 'error');
+  }
+  else {
+    drupal_set_message(t('Number of units must be a positive integer.'), 'error');
+  }
+
+  $form['bee']['#open'] = TRUE;
+}
+
+/**
+ * Ajax callback for the "Add units" button.
+ */
+function bee_node_add_more_units_ajax_callback($form, FormStateInterface $form_state) {
+  return $form['bee'];
+}
+
+/**
+ * Custom submit function for the node_type_edit_form and node_type_add_form.
+ */
+function bee_node_type_edit_form_submit(array &$form, FormStateInterface $form_state) {
+  $node_type = $form_state->getFormObject()->getEntity();
+
+  $bee_settings = $form_state->getValue('bee');
+
+  $bee_settings['bookable_type'] = $bee_settings['bookable_type']['radios'];
+  $bee_settings['availability'] = $bee_settings['availability']['radios'];
+
+  if ($bee_settings['bookable']) {
+    bee_add_use_open_hours_field('field_use_open_hours', $node_type);
+    bee_add_open_hours_field('field_open_hours', $node_type);
+
+    bee_add_availability_field('field_availability_' . $bee_settings['bookable_type'], $node_type);
+
+    $view_display = \Drupal::entityTypeManager()->getStorage('entity_view_display')->load('node.' . $node_type->id() . '.default');
+    if ($view_display !== NULL) {
+      $view_display->setComponent('field_availability_' . $bee_settings['bookable_type'], [
+          'type' => 'entity_reference_entity_view',
+          'region' => 'content',
+          'label' => 'above',
+          'settings' => [
+            'view_mode' => $bee_settings['bookable_type'] . '_calendar',
+        ],
+      ]);
+      $view_display->save();
+    }
+
+    if (!isset($bee_settings['type_id'])) {
+      $bat_type = bat_type_create(
+        [
+          'name' => $node_type->label(),
+          'type' => $bee_settings['bookable_type'],
+        ]
+      );
+
+      if ($bee_settings['availability'] == 'available') {
+        $state = bat_event_load_state_by_machine_name('bee_' . $bee_settings['bookable_type'] . '_available');
+      }
+      else {
+        $state = bat_event_load_state_by_machine_name('bee_' . $bee_settings['bookable_type'] . '_not_available');
+      }
+      $bat_type->set('field_availability_' . $bee_settings['bookable_type'], $state->id());
+
+      bat_type_save($bat_type);
+
+      $bee_settings['type_id'] = $bat_type->id();
+    }
+
+    if ($bee_settings['payment']) {
+      bee_create_bee_product_variation_type();
+      bee_create_bee_order_item_type();
+      bee_create_bee_booking_type();
+
+      bee_create_node_product_type($node_type);
+
+      bee_add_product_reference_field('field_product', $node_type);
+      bee_add_price_field('field_price', $node_type);
+      bee_add_price_frequency_field('field_price_frequency', $node_type);
+
+      if (!$form['bee']['payment']['#default_value']) {
+        $node_storage = \Drupal::entityManager()->getStorage('node');
+
+        $query = \Drupal::entityQuery('node')
+          ->condition('type', $node_type->id());
+
+        $nids = $query->execute();
+        foreach ($node_storage->loadMultiple($nids) as $node) {
+          if (!$node->get('field_product')->entity) {
+            $product = bee_create_node_product($node);
+
+            $node->set('field_product', $product->id());
+            $node->save();
+          }
+        }
+      }
+    }
+
+    \Drupal::configFactory()->getEditable('node.type.' . $node_type->id())->set('bee', $bee_settings)->save();
+  }
+  else {
+    if (isset($bee_settings['type_id'])) {
+      $node_storage = \Drupal::entityManager()->getStorage('node');
+
+      $query = \Drupal::entityQuery('node')
+        ->condition('type', $node_type->id());
+
+      $nids = $query->execute();
+      foreach ($node_storage->loadMultiple($nids) as $node) {
+        if ($node->hasField('field_availability_' . $bee_settings['bookable_type'])) {
+          if ($bat_unit = $node->get('field_availability_' . $bee_settings['bookable_type'])->entity) {
+            bat_unit_delete($bat_unit);
+          }
+        }
+      }
+
+      $bat_type = bat_type_load($bee_settings['type_id']);
+      $bat_type->delete();
+    }
+
+    \Drupal::configFactory()->getEditable('node.type.' . $node_type->id())->clear('bee')->save();
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_presave().
+ */
+function bee_node_presave(EntityInterface $node) {
+  if (isset($node->changed_time)) {
+    $node->setChangedTime($node->changed_time);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ */
+function bee_node_insert(EntityInterface $node) {
+  $bee_settings = \Drupal::config('node.type.' . $node->bundle())->get('bee');
+
+  if (isset($bee_settings['bookable']) && $bee_settings['bookable']) {
+    if ($bee_settings['payment']) {
+      $product = bee_create_node_product($node);
+
+      $node->set('field_product', $product->id());
+    }
+
+    $bat_unit = bat_unit_create(
+      [
+        'name' => $node->label() . ' 1',
+        'type' => 'default',
+        'unit_type_id' => $bee_settings['type_id'],
+      ]
+    );
+    bat_unit_save($bat_unit);
+
+    $node->set('field_availability_' . $bee_settings['bookable_type'], $bat_unit->id());
+    $node->setNewRevision(FALSE);
+    $node->save();
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ */
+function bee_node_delete(EntityInterface $node) {
+  $bee_settings = \Drupal::config('node.type.' . $node->bundle())->get('bee');
+
+  if ($node->hasField('field_availability_' . $bee_settings['bookable_type'])) {
+    if ($bat_unit = $node->get('field_availability_' . $bee_settings['bookable_type'])->entity) {
+      bat_unit_delete($bat_unit);
+    }
+
+    if ($bee_settings['payment']) {
+      if ($product = $node->get('field_product')->entity) {
+        $product->delete();
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ */
+function bee_commerce_order_item_delete(OrderItemInterface $order_item) {
+  if ($order_item->bundle() == 'bee') {
+    if ($booking = $order_item->get('field_booking')->entity) {
+      $booking->delete();
+    }
+  }
+}
+
+/**
+ * Implements hook_theme_registry_alter().
+ */
+function bee_theme_registry_alter(&$theme_registry) {
+  $theme_registry['field__node__field_availability_hourly'] = [
+    'template' => 'field-availability-hourly',
+    'path' => drupal_get_path('module', 'bee') . '/templates',
+    'render element' => 'element',
+    'base hook' => 'field',
+    'type' => 'module',
+    'theme path' => drupal_get_path('module', 'bee'),
+    'preprocess functions' => [
+      'template_preprocess',
+      'template_preprocess_field',
+    ],
+  ];
+
+  $theme_registry['field__node__field_availability_daily'] = [
+    'template' => 'field-availability-daily',
+    'path' => drupal_get_path('module', 'bee') . '/templates',
+    'render element' => 'element',
+    'base hook' => 'field',
+    'type' => 'module',
+    'theme path' => drupal_get_path('module', 'bee'),
+    'preprocess functions' => [
+      'template_preprocess',
+      'template_preprocess_field',
+    ],
+  ];
+}
+
+/**
+ * Implements hook_entity_view_display_alter().
+ */
+function bee_entity_view_display_alter(EntityViewDisplayInterface $display, $context) {
+  if ($context['entity_type'] == 'node') {
+    if ($node = \Drupal::routeMatch()->getParameter('node')) {
+      if ($display->getComponent('field_open_hours')) {
+        if (!($node->get('field_use_open_hours')->value)) {
+          $display->removeComponent('field_open_hours');
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_view_alter().
+ */
+function bee_entity_view_alter(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display) {
+  if ($entity->getEntityTypeId() == 'bat_unit') {
+    if ($display->id() == 'bat_unit.default.daily_calendar' || $display->id() == 'bat_unit.default.hourly_calendar') {
+      $bat_type = $entity->get('unit_type_id')->entity;
+
+      $unit_type = $bat_type->id();
+
+      $node = $build['#bat_unit']->_referringItem->getEntity();
+
+      $units_ids = [];
+      foreach ($node->get('field_availability_' . $bat_type->bundle()) as $unit) {
+        $units_ids[] = $unit->entity->id();
+      }
+
+      if ($bat_type->bundle() == 'daily') {
+        $event_type = 'availability_daily';
+        $event_granularity = 'bat_daily';
+
+        $fc_user_settings = [
+          'batCalendar' => [
+            [
+              'unitType' => $unit_type,
+              'unitIds' => implode(',', $units_ids),
+              'eventType' => $event_type,
+              'eventGranularity' => $event_granularity,
+              'editable' => FALSE,
+              'selectable' => FALSE,
+              'defaultView' => 'month',
+              'views' => 'month',
+              'headerLeft' => 'today',
+              'headerCenter' => 'title',
+              'headerRight' => 'prev, next',
+              'resourceLabelText' => ' ',
+              'background' => 'hide-book',
+            ],
+          ],
+        ];
+      }
+      else {
+        if ($node->get('field_use_open_hours')) {
+          $business_hours = [];
+
+          foreach ($node->get('field_open_hours')->getValue() as $value) {
+            $business_hours[] = [
+              'dow' => [$value['day']],
+              'start' => OfficeHoursDateHelper::format($value['starthours'], 'H:i'),
+              'end' => OfficeHoursDateHelper::format($value['endhours'], 'H:i'),
+            ];
+          }
+        }
+        else {
+          $business_hours = [
+            'start' => '00:00',
+            'end' => '24:00',
+            'dow' => [0, 1, 2, 3, 4, 5, 6],
+          ];
+        }
+
+        $event_type = 'availability_hourly';
+        $event_granularity = 'bat_hourly';
+
+        $fc_user_settings = [
+          'batCalendar' => [
+            [
+              'unitType' => $unit_type,
+              'unitIds' => implode(',', $units_ids),
+              'eventType' => $event_type,
+              'eventGranularity' => $event_granularity,
+              'editable' => FALSE,
+              'selectable' => FALSE,
+              'defaultView' => 'timelineDay',
+              'views' => 'timelineDay',
+              'viewsTimelineDaySlotDuration' => '01:00',
+              'headerLeft' => 'today',
+              'headerCenter' => 'title',
+              'headerRight' => 'prev, next',
+              'resourceLabelText' => ' ',
+              'background' => 'hide-book',
+              'businessHours' => $business_hours,
+            ],
+          ],
+        ];
+      }
+
+      $calendar_settings['user_settings'] = $fc_user_settings;
+      $calendar_settings['calendar_id'] = 'fullcalendar-scheduler';
+
+      $render_array = [
+        'calendar' => [
+          '#theme' => 'bat_fullcalendar',
+          '#calendar_settings' => $calendar_settings,
+          '#attached' => ['library' => ['bat_event_ui/bat_event_ui', 'bat_fullcalendar/bat-fullcalendar-scheduler']],
+        ],
+      ];
+
+      $build = [
+        '#markup' => render($render_array),
+      ];
+    }
+  }
+}
+
+/**
+ * Implements hook_bat_api_events_index_calendar_alter().
+ */
+function bee_bat_api_events_index_calendar_alter(&$events, $context) {
+  if ($context['background'] == 'hide-book') {
+    foreach ($events as $id => $event) {
+      if ($event['type'] == 'availability_daily' || $event['type'] == 'availability_hourly') {
+        unset($events[$id]['rendering']);
+
+        if ($event['blocking']) {
+          if ($event['type'] == 'availability_daily') {
+            $state = bat_event_load_state_by_machine_name('bee_daily_not_available');
+          }
+          else {
+            $state = bat_event_load_state_by_machine_name('bee_hourly_not_available');
+          }
+
+          $events[$id]['color'] = $state->getColor();
+          $events[$id]['title'] = $state->getCalendarLabel();
+        }
+
+        $start_date = new DateTime($event['start']);
+        $end_date = new DateTime($event['end']);
+
+        if ($start_date->format('Y-m-d') != $end_date->format('Y-m-d')) {
+          $events[$id]['end'] = $end_date->add(new DateInterval('P1D'))->format('Y-m-d') . 'T00:00:00';
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_views_pre_render().
+ */
+function bee_views_pre_render(ViewExecutable $view) {
+  if ($view->id() == 'commerce_order_item_table') {
+    foreach ($view->result as $id => $result) {
+      if ($result->_entity->bundle() == 'bee') {
+        if (($booking = $result->_entity->get('field_booking')->entity) &&
+            ($node = $result->_entity->get('field_node')->entity)) {
+          $url = Url::fromRoute('entity.node.canonical', ['node' => $node->id()]);
+          $link = Link::fromTextAndUrl($node->label(), $url)->toString();
+
+          $start_date = $booking->get('booking_start_date')->value;
+          $end_date = $booking->get('booking_end_date')->value;
+
+          $title = Markup::create('Booking for ' . $link . ' from ' . $start_date . ' to ' . $end_date);
+
+          $view->result[$id]->_entity->set('title', $title);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Add "Availability" field to the node type.
+ *
+ * @param $field_name
+ * @param $node_type
+ */
+function bee_add_availability_field($field_name, $node_type) {
+  $field_storage = FieldStorageConfig::loadByName('node', $field_name);
+  $field = FieldConfig::loadByName('node', $node_type->id(), $field_name);
+
+  if (empty($field_storage)) {
+    $field_storage = FieldStorageConfig::create([
+      'field_name' => $field_name,
+      'entity_type' => 'node',
+      'type' => 'entity_reference',
+      'cardinality' => -1,
+      'locked' => 1,
+      'settings' => [
+        'target_type' => 'bat_unit',
+      ],
+    ]);
+    $field_storage->save();
+  }
+
+  if (empty($field)) {
+    $field = FieldConfig::create([
+      'field_storage' => $field_storage,
+      'entity_type' => 'node',
+      'label' => 'Availability',
+      'bundle' => $node_type->id(),
+      'required' => FALSE,
+      'settings' => [
+        'handler' => 'default',
+        'handler_settings' => [],
+      ],
+    ]);
+    $field->save();
+  }
+}
+
+/**
+ * Add "Open Hours" field to the node type.
+ *
+ * @param $field_name
+ * @param $node_type
+ */
+function bee_add_open_hours_field($field_name, $node_type) {
+  $field_storage = FieldStorageConfig::loadByName('node', $field_name);
+  $field = FieldConfig::loadByName('node', $node_type->id(), $field_name);
+
+  if (empty($field_storage)) {
+    $field_storage = FieldStorageConfig::create([
+      'field_name' => $field_name,
+      'entity_type' => 'node',
+      'type' => 'office_hours',
+      'cardinality' => -1,
+      'locked' => 1,
+      'settings' => [
+        'cardinality_per_day' => 2,
+        'time_format' => 'G',
+        'element_type' => 'office_hours_datetime',
+        'increment' => 60,
+        'comment' => FALSE,
+        'valhrs' => FALSE,
+        'limit_start' => '',
+        'limit_end' => '',
+      ],
+    ]);
+    $field_storage->save();
+  }
+
+  if (empty($field)) {
+    $field = FieldConfig::create([
+      'field_storage' => $field_storage,
+      'entity_type' => 'node',
+      'label' => 'Open Hours',
+      'bundle' => $node_type->id(),
+      'required' => FALSE,
+      'settings' => [
+        'handler' => 'default',
+        'handler_settings' => [],
+      ],
+    ]);
+    $field->save();
+
+    $form_display = \Drupal::entityTypeManager()->getStorage('entity_form_display')->load('node.' . $node_type->id() . '.default');
+    if ($form_display !== NULL) {
+      $form_display->setComponent($field_name, [
+        'type' => 'office_hours_default',
+        'weight' => 3,
+      ]);
+      $form_display->save();
+    }
+
+    $view_display = \Drupal::entityTypeManager()->getStorage('entity_view_display')->load('node.' . $node_type->id() . '.default');
+    if ($view_display !== NULL) {
+      $view_display->setComponent($field_name, [
+        'type' => 'office_hours_table',
+        'region' => 'content',
+        'label' => 'above',
+        'settings' => [],
+      ]);
+      $view_display->save();
+    }
+  }
+}
+
+/**
+ * Add "Set Open Hours" field to the node type.
+ *
+ * @param $field_name
+ * @param $node_type
+ */
+function bee_add_use_open_hours_field($field_name, $node_type) {
+  $field_storage = FieldStorageConfig::loadByName('node', $field_name);
+  $field = FieldConfig::loadByName('node', $node_type->id(), $field_name);
+
+  if (empty($field_storage)) {
+    $field_storage = FieldStorageConfig::create([
+      'field_name' => $field_name,
+      'entity_type' => 'node',
+      'type' => 'boolean',
+      'cardinality' => 1,
+      'locked' => 1,
+      'settings' => [],
+    ]);
+    $field_storage->save();
+  }
+
+  if (empty($field)) {
+    $field = FieldConfig::create([
+      'field_storage' => $field_storage,
+      'entity_type' => 'node',
+      'label' => 'Set Open Hours',
+      'bundle' => $node_type->id(),
+      'required' => FALSE,
+      'settings' => [
+        'handler' => 'default',
+        'handler_settings' => [],
+      ],
+    ]);
+    $field->save();
+
+    $form_display = \Drupal::entityTypeManager()->getStorage('entity_form_display')->load('node.' . $node_type->id() . '.default');
+    if ($form_display !== NULL) {
+      $form_display->setComponent($field_name, [
+        'type' => 'boolean_checkbox',
+        'weight' => 2,
+      ]);
+      $form_display->save();
+    }
+  }
+}
+
+/**
+ * Add "Product" field to the node type.
+ *
+ * @param $field_name
+ * @param $node_type
+ */
+function bee_add_product_reference_field($field_name, $node_type) {
+  $field_storage = FieldStorageConfig::loadByName('node', $field_name);
+  $field = FieldConfig::loadByName('node', $node_type->id(), $field_name);
+
+  if (empty($field_storage)) {
+    $field_storage = FieldStorageConfig::create([
+      'field_name' => $field_name,
+      'entity_type' => 'node',
+      'type' => 'entity_reference',
+      'cardinality' => 1,
+      'locked' => 1,
+      'settings' => [
+        'target_type' => 'commerce_product',
+      ],
+    ]);
+    $field_storage->save();
+  }
+
+  if (empty($field)) {
+    $field = FieldConfig::create([
+      'field_storage' => $field_storage,
+      'entity_type' => 'node',
+      'label' => 'Product',
+      'bundle' => $node_type->id(),
+      'required' => FALSE,
+      'settings' => [
+        'handler' => 'default:commerce_product',
+        'handler_settings' => [
+          'target_bundles' => [
+            'bee_' . $node_type->id() => 'bee_' . $node_type->id(),
+          ],
+        ],
+      ],
+    ]);
+    $field->save();
+  }
+}
+
+/**
+ * Add "Price" field to the node type.
+ *
+ * @param $field_name
+ * @param $node_type
+ */
+function bee_add_price_field($field_name, $node_type) {
+  $field_storage = FieldStorageConfig::loadByName('node', $field_name);
+  $field = FieldConfig::loadByName('node', $node_type->id(), $field_name);
+
+  if (empty($field_storage)) {
+    $field_storage = FieldStorageConfig::create([
+      'field_name' => $field_name,
+      'entity_type' => 'node',
+      'type' => 'commerce_price',
+      'cardinality' => 1,
+      'locked' => 1,
+      'settings' => [],
+    ]);
+    $field_storage->save();
+  }
+
+  if (empty($field)) {
+    $store_storage = \Drupal::entityTypeManager()->getStorage('commerce_store');
+    $default_store = $store_storage->loadDefault();
+
+    $field = FieldConfig::create([
+      'field_storage' => $field_storage,
+      'entity_type' => 'node',
+      'label' => 'Price',
+      'bundle' => $node_type->id(),
+      'required' => TRUE,
+      'default_value' => [
+        'number' => 0,
+        'currency_code' => $default_store->getDefaultCurrencyCode(),
+      ],
+      'settings' => [],
+    ]);
+    $field->save();
+
+    $form_display = \Drupal::entityTypeManager()->getStorage('entity_form_display')->load('node.' . $node_type->id() . '.default');
+    if ($form_display !== NULL) {
+      $form_display->setComponent($field_name, [
+        'type' => 'commerce_price_default',
+        'weight' => 3,
+      ]);
+      $form_display->save();
+    }
+  }
+}
+
+/**
+ * Add "Price frequency" field to the node type.
+ *
+ * @param $field_name
+ * @param $node_type
+ */
+function bee_add_price_frequency_field($field_name, $node_type) {
+  $field_storage = FieldStorageConfig::loadByName('node', $field_name);
+  $field = FieldConfig::loadByName('node', $node_type->id(), $field_name);
+
+  if (empty($field_storage)) {
+    $field_storage = FieldStorageConfig::create([
+      'field_name' => $field_name,
+      'entity_type' => 'node',
+      'type' => 'list_string',
+      'cardinality' => 1,
+      'locked' => 1,
+      'settings' => [
+        'allowed_values' => [
+          'hour' => 'Hour',
+          'minute' => 'Minute',
+        ],
+      ],
+    ]);
+    $field_storage->save();
+  }
+
+  if (empty($field)) {
+    $field = FieldConfig::create([
+      'field_storage' => $field_storage,
+      'entity_type' => 'node',
+      'label' => 'Price frequency',
+      'bundle' => $node_type->id(),
+      'required' => FALSE,
+      'settings' => [],
+    ]);
+    $field->save();
+
+    $form_display = \Drupal::entityTypeManager()->getStorage('entity_form_display')->load('node.' . $node_type->id() . '.default');
+    if ($form_display !== NULL) {
+      $form_display->setComponent($field_name, [
+        'type' => 'options_select',
+        'weight' => 4,
+      ]);
+      $form_display->save();
+    }
+  }
+}
+
+/**
+ * Create "Product variation" type for BEE.
+ */
+function bee_create_bee_product_variation_type() {
+  if (ProductVariationType::load('bee') === NULL) {
+    $variation_type = ProductVariationType::create([
+      'id' => 'bee',
+      'label' => 'BEE',
+      'orderItemType' => 'default',
+      'generateTitle' => TRUE,
+    ]);
+    $variation_type->save();
+
+    $view_display = \Drupal::entityTypeManager()->getStorage('entity_view_display')->load('commerce_product_variation.bee.default');
+    if (!$view_display) {
+      $view_display = EntityViewDisplay::create([
+        'targetEntityType' => 'commerce_product_variation',
+        'bundle' => 'bee',
+        'mode' => 'default',
+        'status' => TRUE,
+      ]);
+    }
+    $view_display->setComponent('price', ['type' => 'commerce_price_calculated']);
+    $view_display->save();
+  }
+}
+
+/**
+ * Create a "Product" type for each node type in BEE.
+ *
+ * @param $node_type
+ */
+function bee_create_node_product_type($node_type) {
+  $id = 'bee_' . $node_type->id();
+
+  if (ProductType::load($id) === NULL) {
+    $product_type = ProductType::create([
+      'id' => $id,
+      'label' => $node_type->label(),
+      'variationType' => 'bee',
+    ]);
+    $product_type->save();
+    commerce_product_add_stores_field($product_type);
+    commerce_product_add_variations_field($product_type);
+  }
+}
+
+/**
+ * Create "Order item" type for BEE.
+ */
+function bee_create_bee_order_item_type() {
+  $id = 'bee';
+
+  if (OrderItemType::load($id) === NULL) {
+    OrderItemType::create([
+      'id' => $id,
+      'label' => 'BEE',
+      'purchasableEntityType' => 'commerce_product_variation',
+      'orderType' => 'default',
+    ])->save();
+
+    $view_display = \Drupal::entityTypeManager()->getStorage('entity_view_display')->load('commerce_order_item.bee.default');
+    if (!$view_display) {
+      $view_display = EntityViewDisplay::create([
+        'targetEntityType' => 'commerce_order_item',
+        'bundle' => 'bee',
+        'mode' => 'default',
+        'status' => TRUE,
+      ]);
+      $view_display->setComponent('total_price', [
+        'type' => 'commerce_price_default',
+        'region' => 'content',
+        'label' => 'above',
+        'settings' => [
+          'strip_trailing_zeroes' => FALSE,
+          'display_currency_code' => FALSE,
+        ],
+      ]);
+      $view_display->setComponent('purchased_entity', [
+        'type' => 'entity_reference_entity_view',
+        'region' => 'content',
+        'label' => 'above',
+        'settings' => [
+          'view_mode' => 'default',
+          'link' => FALSE,
+        ],
+      ]);
+      $view_display->setComponent('quantity', [
+        'type' => 'number_decimal',
+        'region' => 'content',
+        'label' => 'above',
+        'settings' => [
+          'thousand_separator' => '',
+          'decimal_separator' => '.',
+          'scale' => 2,
+          'prefix_suffix' => TRUE,
+        ],
+      ]);
+      $view_display->setComponent('unit_price', [
+        'type' => 'commerce_price_default',
+        'region' => 'content',
+        'label' => 'above',
+        'settings' => [
+          'strip_trailing_zeroes' => FALSE,
+          'display_currency_code' => FALSE,
+        ],
+      ]);
+      $view_display->save();
+    }
+  }
+
+  $field_name = 'field_booking';
+
+  $field_storage = FieldStorageConfig::loadByName('commerce_order_item', $field_name);
+  $field = FieldConfig::loadByName('commerce_order_item', 'bee', $field_name);
+
+  if (empty($field_storage)) {
+    $field_storage = FieldStorageConfig::create([
+      'field_name' => $field_name,
+      'entity_type' => 'commerce_order_item',
+      'type' => 'entity_reference',
+      'cardinality' => 1,
+      'locked' => 1,
+      'settings' => [
+        'target_type' => 'bat_booking',
+      ],
+    ]);
+    $field_storage->save();
+  }
+
+  if (empty($field)) {
+    $field = FieldConfig::create([
+      'field_storage' => $field_storage,
+      'entity_type' => 'commerce_order_item',
+      'label' => 'Booking',
+      'bundle' => 'bee',
+      'required' => FALSE,
+      'settings' => [
+        'handler' => 'default:bat_booking',
+        'handler_settings' => [
+          'target_bundles' => [
+            'bee' => 'bee',
+          ],
+        ],
+      ],
+    ]);
+    $field->save();
+  }
+
+  $field_name = 'field_node';
+
+  $field_storage = FieldStorageConfig::loadByName('commerce_order_item', $field_name);
+  $field = FieldConfig::loadByName('commerce_order_item', 'bee', $field_name);
+
+  if (empty($field_storage)) {
+    $field_storage = FieldStorageConfig::create([
+      'field_name' => $field_name,
+      'entity_type' => 'commerce_order_item',
+      'type' => 'entity_reference',
+      'cardinality' => 1,
+      'locked' => 1,
+      'settings' => [
+        'target_type' => 'node',
+      ],
+    ]);
+    $field_storage->save();
+  }
+
+  if (empty($field)) {
+    $field = FieldConfig::create([
+      'field_storage' => $field_storage,
+      'entity_type' => 'commerce_order_item',
+      'label' => 'Node',
+      'bundle' => 'bee',
+      'required' => FALSE,
+      'settings' => [
+        'handler' => 'default:node',
+        'handler_settings' => [
+          'target_bundles' => [],
+        ],
+      ],
+    ]);
+    $field->save();
+  }
+}
+
+/**
+ * Create "Booking" type for BEE.
+ */
+function bee_create_bee_booking_type() {
+  $id = 'bee';
+
+  if (bat_booking_type_load($id) === NULL) {
+    $booking_type = bat_booking_type_create([
+      'name' => 'BEE',
+      'type' => $id,
+    ]);
+    $booking_type->save();
+
+    bee_set_booking_event_reference_field_cardinality();
+    bee_create_booking_capacity_field();
+  }
+}
+
+/**
+ * Set cardinality as unlimited for the "booking_event_reference" field.
+ */
+function bee_set_booking_event_reference_field_cardinality() {
+  $field_storage = FieldStorageConfig::loadByName('bat_booking', 'booking_event_reference');
+  $field_storage->setCardinality(-1);
+  $field_storage->save();
+}
+
+/**
+ * Add booking "Capacity" field.
+ */
+function bee_create_booking_capacity_field() {
+  $field_name = 'booking_capacity';
+
+  $field_storage = FieldStorageConfig::loadByName('bat_booking', $field_name);
+  $field = FieldConfig::loadByName('bat_booking', 'bee', $field_name);
+
+  if (empty($field_storage)) {
+    $field_storage = FieldStorageConfig::create([
+      'field_name' => $field_name,
+      'entity_type' => 'bat_booking',
+      'type' => 'integer',
+      'cardinality' => 1,
+      'locked' => 1,
+      'settings' => [
+        'unsigned' => true,
+        'size' => 'normal',
+      ],
+    ]);
+    $field_storage->save();
+  }
+
+  if (empty($field)) {
+    $field = FieldConfig::create([
+      'field_storage' => $field_storage,
+      'entity_type' => 'bat_booking',
+      'label' => 'Capacity',
+      'bundle' => 'bee',
+      'required' => FALSE,
+      'settings' => [
+        'min' => null,
+        'max' => null,
+        'prefix' => '',
+        'suffix' => '',
+      ],
+    ]);
+    $field->save();
+  }
+}
+
+/**
+ * Create a Product instance for this node.
+ */
+function bee_create_node_product($node) {
+  $store_storage = \Drupal::entityTypeManager()->getStorage('commerce_store');
+  $default_store = $store_storage->loadDefault();
+
+  $variation = ProductVariation::create([
+    'type' => 'bee',
+    'sku' => 'bee_' . $node->bundle() . '_' . $node->id(),
+    'price' => [
+      'number' => 0,
+      'currency_code' => $default_store->getDefaultCurrencyCode(),
+    ],
+  ]);
+  $variation->save();
+  $product = Product::create([
+    'type' => 'bee_' . $node->bundle(),
+    'title' => $node->label(),
+    'variations' => [$variation],
+    'stores' => Store::loadMultiple(),
+  ]);
+  $product->save();
+
+  return $product;
+}
