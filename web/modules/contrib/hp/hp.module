@@ -1,0 +1,141 @@
+<?php
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\hp\Entity\FormStrategy;
+use Drupal\Core\Plugin\DefaultSingleLazyPluginCollection;
+use Drupal\hp\Plugin\hp\FormStrategyInterface;
+use Drupal\Core\Cache\CacheBackendInterface;
+
+/**
+ * @file
+ * Integrates with Human Presence to protect your forms.
+ */
+
+/**
+ * Implements hook_library_info_build()
+ */
+function hp_library_info_build() {
+  $config = \Drupal::config('hp.settings');
+  $api_key = $config->get('api_key');
+  $libraries = [];
+
+  $libraries['monitor'] = [
+    'version' => '1.x',
+    'js' => [
+      // The nojson url removes a JSON3 library dependency that conflicts with
+      // some drupal js.
+      'https://script.metricode.com/wotjs/ellipsis.js?api_key='. $api_key => [
+        'type' => 'external',
+        'minified' => TRUE,
+      ],
+    ],
+  ];
+
+  return $libraries;
+}
+
+/**
+ * Decide whether Human Presence should start or not.
+ *
+ * Checks the enable setting, permissions, maintenance mode and the admin
+ * bypass setting.
+ *
+ * @return boolean
+ *   TRUE if it is enabled, FALSE otherwise.
+ */
+function hp_enabled() {
+  $enabled = &drupal_static(__FUNCTION__);
+  if (!isset($enabled)) {
+    $maintenance = \Drupal::state()->get('system.maintenance_mode');
+    $settings = \Drupal::config('hp.settings');
+    $current_user = \Drupal::currentUser();
+    if ($maintenance) {
+      $enabled = FALSE;
+    }
+    elseif (!$settings->get('status')) {
+      $enabled = FALSE;
+    }
+    elseif ($current_user->id() == 1 && $settings->get('admin_bypass')) {
+      $enabled = FALSE;
+    }
+    elseif ($current_user->id() != 1 && $current_user->hasPermission('bypass human presence')) {
+      $enabled = FALSE;
+    }
+    else {
+      $enabled = TRUE;
+    }
+  }
+  return $enabled;
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function hp_page_attachments(array &$attachments) {
+  if (hp_enabled()) {
+    $attachments['#attached']['library'][] = 'hp/monitor';
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function hp_form_alter(&$form, FormStateInterface $form_state) {
+  if (!hp_enabled()) {
+    return;
+  }
+
+  $cache = \Drupal::cache()->get('hp_form_strategy_form_ids');
+  if ($cache) {
+    $sorted_form_strategy_ids = $cache->data;
+  }
+  else {
+    $hp_form_strategy_ids = \Drupal::entityQuery('hp_form_strategy')
+      ->execute();
+    $form_strategies = FormStrategy::loadMultiple($hp_form_strategy_ids);
+    $sorted_form_strategy_ids = ['regexp' => [], 'no_regexp' => []];
+    foreach ($form_strategies as $form_strategy) {
+      $regexp = $form_strategy->getRegexp();
+      if (!empty($regexp)) {
+        $sorted_form_strategy_ids['regexp'][] = $form_strategy->id();
+      }
+      else {
+        $sorted_form_strategy_ids['no_regexp'][] = $form_strategy->id();
+      }
+    }
+    $tags = [
+      'config:hp.hp_form_strategy',
+    ];
+    \Drupal::cache()->set('hp_form_strategy_form_ids', $sorted_form_strategy_ids, CacheBackendInterface::CACHE_PERMANENT, $tags);
+  }
+
+  $enabled_for_this_form = FALSE;
+  if (in_array($form['#form_id'], $sorted_form_strategy_ids['no_regexp'])) {
+    $enabled_for_this_form = TRUE;
+    $hp_form_strategy = FormStrategy::load($form['#form_id']);
+  }
+  else {
+    foreach ($sorted_form_strategy_ids['regexp'] as $hp_form_strategy_id) {
+      $hp_form_strategy = FormStrategy::load($hp_form_strategy_id);
+      $regexp = $hp_form_strategy->getRegexp();
+      $enabled_for_this_form = preg_match($regexp, $form['#form_id']);
+      if ($enabled_for_this_form) {
+        break;
+      }
+    }
+  }
+  if ($enabled_for_this_form) {
+    /** @var FormStrategyInterface $hp_form_strategy_plugin */
+    $hp_form_strategy_plugin = $hp_form_strategy->getPlugin();
+    if ($hp_form_strategy_plugin->access()) {
+      $hp_form_strategy_plugin->formAlter($form, $form_state);
+    }
+  }
+}
+
+/**
+ * Returns the URL a Drupal user can use to register at Human Presence.
+ */
+function hp_registration_url() {
+  return 'https://www.humanpresence.io/sign-up.php#Drupal';
+}
