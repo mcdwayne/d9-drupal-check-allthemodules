@@ -1,0 +1,493 @@
+<?php
+/**
+* @file
+* Pulls information about web components and Drupal modules developed by BYU.
+*/
+
+use Drupal\node\Entity\Node;
+use Drupal\Core\Render\Element;
+include drupal_get_path('module', 'byu_resources') . '/vendor/erusev/parsedown/Parsedown.php';
+
+/**
+ * Implements hook_preprocess_html()
+ * @param $variables
+ */
+
+function byu_resources_preprocess_html(&$variables) {
+  if ($variables['root_path'] == 'byu-resources') {
+    $variables['#attached']['library'] = 'byu_resources/default';
+  }
+
+  // Set a warning message if the parsedown library doesn't exist. This is required so that the documentation text is parsed correctly.
+  // The library is found at https://github.com/erusev/parsedown
+
+  if(!file_exists(drupal_get_path('module', 'byu_resources') . '/vendor/erusev/parsedown/Parsedown.php')) {
+    drupal_set_message('The module BYU Resources requires the Parsedown library to work properly. Please run composer install in the directory of this module.', 'warning');
+  }
+}
+
+/**
+ * Implements hook_preprocess_node()
+ * @param $variables
+ */
+
+function byu_resources_preprocess_node(&$variables) {
+  $type = $variables['node']->bundle();
+  if ($type == 'byu_resource') {
+    $variables['#attached']['library'] = 'byu_resources/default';
+  }
+}
+
+/**
+ * Implements hook_theme()
+ * @return mixed
+ */
+
+function byu_resources_theme() {
+  $theme['node__view__byu_resources'] = [
+    'template' => 'node--view--byu-resources'
+  ];
+  $theme['field__field_byu_source_code_link'] = [
+    'template' => 'field--field-byu-source-code-link'
+  ];
+  $theme['field__field_byu_resource_download_link'] = [
+    'template' => 'field--field-byu-resource-download-link'
+  ];
+  $theme['field__field_byu_resource_demo_link'] = [
+    'template' => 'field--field-byu-resource-demo-link'
+  ];
+  return $theme;
+}
+
+/**
+ * @param $variables - Variables to be used in the template.
+ */
+
+function template_preprocess_node__view__byu_resources(&$variables) {
+  foreach (Element::children($variables['elements']) as $key) {
+    $variables['content'][$key] = $variables['elements'][$key];
+  }
+}
+
+/**
+ * @param $variables - Variables that are used in the template
+ */
+
+function template_preprocess_field__field_byu_source_code_link(&$variables) {
+  $variables['url'] = $variables['element'][0]['#url']->getUri();
+  $variables['title'] = 'Source Code';
+}
+
+/**
+ * @param $variables - Variables that are used in the template
+ */
+
+function template_preprocess_field__field_byu_resource_download_link(&$variables) {
+  $variables['url'] = $variables['element'][0]['#url']->getUri();
+  $variables['title'] = 'Download';
+}
+
+/**
+ * @param $variables - Variables that are used in the template
+ */
+
+function template_preprocess_field__field_byu_resource_demo_link(&$variables) {
+  $variables['url'] = $variables['element'][0]['#url']->getUri();
+  $variables['title'] = 'Demo';
+}
+
+/**
+ * Implements hook_install()
+ */
+
+function byu_resources_install() {
+  get_web_components();
+  get_drupal_modules();
+}
+
+/**
+ * Implements hook_cron()
+ */
+
+function byu_resources_cron() {
+  $tomorrow = new DateTime("tomorrow");
+  $tomorrow = $tomorrow->getTimestamp();
+  $requestTime = \Drupal::time()->getRequestTime();
+  $interval = \Drupal::config('automated_cron.settings')->get('interval');
+  if (($tomorrow - $requestTime < $interval) || ($interval > 86400)) {
+    // Make functions to update components. Possibly make a menu that allows you to control what you want to update.
+    get_web_components();
+    get_drupal_modules();
+    update_resources();
+  }
+}
+
+/**
+ * This function takes the machine like name of the component and makes it look more like a title.
+ * @param $input
+ * @return mixed|string
+ */
+
+function make_title($input) {
+  $input = str_replace('-', ' ', $input);
+  $input = str_replace('_', ' ', $input);
+  $input = str_replace('byu', 'BYU', $input);
+  $input = ucwords($input);
+  return $input;
+}
+
+/**
+ * This function fetches the machine names of all the existing resources. This is used to
+ * make sure no duplicate byu resource nodes are made.
+ * @return array - An array containing all the machine names of the existing BYU resources.
+ */
+
+function get_existing_resources() {
+  $nids = \Drupal::entityQuery('node')->condition('type','byu_resource')->execute();
+  $nodes = Node::loadMultiple($nids);
+  $names = [];
+  foreach ($nodes as $node) {
+    $names[] = $node->get('field_byu_resource_machine_name')->getValue()[0];
+  }
+  $names[] = ['value' => 'byu_theme'];
+  $names[] = ['value' => 'byu-theme-components'];
+  return $names;
+}
+
+/**
+ * This function fetches the web components / HTML 5 resources and then adds a BYU Resource node for
+ * each one if it doesn't already exist.
+ */
+
+function get_web_components() {
+  // Get the initial JSON
+  $json = file_get_contents('https://cdn.byu.edu/manifest.json');
+  $json = json_decode($json);
+
+  // Load the existing BYU resources for later use.
+  $names = get_existing_resources();
+
+  // Load the module path
+  $modulePath = drupal_get_path('module', 'byu_resources');
+
+  // Get the HTML 5 logo
+  $imagePath = $modulePath . '/icons/html5.png';
+  $imageData = file_get_contents($imagePath);
+  $image = file_save_data($imageData, 'public://html5.png', FILE_EXISTS_REPLACE);
+
+  foreach($json->libraries as $library => $item) {
+    if ($item->type == 'web-component') {
+
+      // Set all the variables for the fields.
+      $sourceURL = $item->links->source;
+      $downloadURL = $sourceURL . '/archive/master.zip';
+      $parts = explode('/', $sourceURL);
+      $machineName = $parts[count($parts) - 1];
+      $nodeName = make_title($machineName);
+      $description = $item->description;
+
+
+      // Load and parse the readme.
+      $Parsedown = new Parsedown();
+      $readmeLink = $item->links->readme;
+      $readme = file_get_contents($readmeLink);
+      $readme = $Parsedown->text($readme);
+
+      // Check to see if resource already exists.
+      $resourceExists = false;
+      foreach($names as $name) {
+        if ($machineName == $name['value']) {
+          $resourceExists = true;
+        }
+      }
+
+      // Check for deprecation
+      if ($item->deprecated) $nodeName .= ' DEPRECATED';
+
+      // Create the BYU Resource
+      if (!$resourceExists) {
+        $node = Node::create([
+          'type' => 'byu_resource',
+          'title' => $nodeName,
+          'field_byu_resource_cms_icon' => [
+            'target_id' => $image->id(),
+            'alt' => 'HTML 5 Logo',
+            'title' => 'HTML 5'
+          ],
+          'field_byu_resource_classes' => 'gray-title',
+          'field_byu_resource_maintainer' => 'Engineering Group',
+          'field_byu_resource_cms' => 'HTML 5',
+          'field_byu_resource_resource_type' => 'Web Component',
+          'field_byu_resource_machine_name' => $machineName,
+          'field_byu_resource_description' => $description,
+          'field_byu_resource_doc_link' => 'Documentation',
+          'field_byu_resource_readme' => [
+            'value' => $readme,
+            'format' => 'markdown'
+          ],
+          'field_byu_source_code_link' => $sourceURL,
+          'field_byu_resource_download_link' => $downloadURL
+        ]);
+        try {
+          $node->save();
+        } catch (Exception $e) {
+          drupal_set_message('Caught exception: ' . $e->getMessage(), 'error');
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Parses the html pulled from drupal.org to get the machine names and regular names of all the
+ * BYU drupal modules.
+ *
+ * @param $input string - Raw html from drupal.org
+ * @return array Contains machine names and titles of modules.
+ */
+
+function parse_drupal_org($input) {
+
+  // Initialize array that will hold the module information.
+  $modules = [
+    'machine_name' => [],
+    'link' => [],
+    'title' => []
+  ];
+
+  // Cut the part of the html out of the page that has the module information.
+  $lastPosition = strpos($input, '<h4 id="projects-supported">');
+  $endPosition = strpos($input, '</p>', $lastPosition) + strlen('</p>');
+  $input = substr($input, $lastPosition, $endPosition - $lastPosition);
+
+  // Reset lastPosition and put nextPosition where the machine name of the first module is.
+  $lastPosition = 0;
+  $nextPosition = strpos($input, '/project/') + strlen('/project/');
+
+  // Loop through grabbing machine names and titles of the modules. Until one loop through
+  // the portion of the html is completed.
+  while ($nextPosition >= $lastPosition) {
+    // Get machine name. It's found between the /project/ part of the href, and the end quotes.
+    $lastPosition = strpos($input, '"', $nextPosition);
+    $machineName = substr($input, $nextPosition, $lastPosition - $nextPosition);
+    $modules['machine_name'][] = $machineName;
+
+    // Set the link to the module, which is just https://www.drupal.org/project/machine_name
+    $modules['link'][] = 'https://www.drupal.org/project/' . $machineName;
+
+    // Get title. It's found between the last carat of the <a> tag, and the end tag </a>.
+    $nextPosition = strpos($input, '>', $lastPosition) + 1;
+    $lastPosition = strpos($input, '</a>', $nextPosition);
+    $modules['title'][] = substr($input, $nextPosition, $lastPosition - $nextPosition);
+
+    // Set nextPosition for next machine name. It's placed here so the condition statement in
+    // the while loop makes sense.
+    $nextPosition = strpos($input, '/project/', $lastPosition) + strlen('/project/');
+  }
+
+  return $modules;
+}
+
+/**
+ * This function fetches the drupal modules from drupal.org. It uses the parse_drupal_org function to fetch
+ * the machine names and titles of the existing drupal modules byu has developed.
+ */
+
+function get_drupal_modules() {
+  $client = \Drupal::service('http_client');
+  $result = $client->get('https://www.drupal.org/brigham-young-university');
+  $output = $result->getBody()->getContents();
+  $modules = parse_drupal_org($output);
+
+  // Load the module path
+  $modulePath = drupal_get_path('module', 'byu_resources');
+
+  // Load the existing resources.
+  $names = get_existing_resources();
+
+  // Get the drupal logo.
+  $imagePath = $modulePath . '/icons/drupal-logo.png';
+  $imageData = file_get_contents($imagePath);
+  $image = file_save_data($imageData, 'public://drupal-logo.png', FILE_EXISTS_REPLACE);
+
+  foreach ($modules['machine_name'] as $index => $machineName) {
+
+    // Set various variables for the fields.
+    $sourceURL = 'https://cgit.drupalcode.org/' . $machineName;
+    $downloadURL = $modules['link'][$index];
+
+    // Grab module description from the module's project page.
+    $result = $client->get($downloadURL);
+    $output = $result->getBody()->getContents();
+    $descriptionStart = strpos($output, 'field-name-body');
+    $descriptionStart = strpos($output, '<p>', $descriptionStart) + strlen('<p>');
+    $descriptionEnd = strpos($output, '</p>', $descriptionStart);
+    $description = substr($output, $descriptionStart, $descriptionEnd - $descriptionStart);
+
+    // Grab the readme from drupal's git repository and parse the markdown.
+    $readmeCode = file_get_contents($sourceURL . '/tree/README.md');
+    $readmeStart = strpos($readmeCode, '<div class="highlight"><pre>') + strlen('<div class="highlight"><pre>');
+    $readmeEnd = strpos($readmeCode, '</pre>', $readmeStart);
+    $readme = substr($readmeCode, $readmeStart, $readmeEnd - $readmeStart);
+    $Parsedown = new Parsedown();
+    $readme = $Parsedown->text($readme);
+
+    // Check to see if resource already exists.
+    $resourceExists = false;
+    foreach ($names as $name) {
+      if ($machineName == $name['value']) {
+        $resourceExists = true;
+      }
+    }
+
+    // Create the new BYU resource if the resource doesn't already exist.
+    if (!$resourceExists) {
+      $node = Node::create([
+        'type' => 'byu_resource',
+        'title' => $modules['title'][$index],
+        'field_byu_resource_cms_icon' => [
+          'target_id' => $image->id(),
+          'alt' => 'Drupal Logo',
+          'title' => 'Drupal'
+        ],
+        'field_byu_resource_classes' => 'drupal-blue-title',
+        'field_byu_resource_maintainer' => 'Drupal Users Group',
+        'field_byu_resource_cms' => 'Drupal 8',
+        'field_byu_resource_resource_type' => 'Drupal Module',
+        'field_byu_resource_description' => [
+          'value' => $description,
+          'format' => 'basic_html'
+        ],
+        'field_byu_resource_doc_link' => 'Documentation',
+        'field_byu_resource_machine_name' => $machineName,
+        'field_byu_resource_readme' => [
+          'value' => $readme,
+          'format' => 'markdown'
+        ],
+        'field_byu_source_code_link' => $sourceURL,
+        'field_byu_resource_download_link' => $downloadURL
+      ]);
+      try {
+        $node->save();
+      } catch(Exception $e) {
+        drupal_set_message('Caught exception: ' . $e->getMessage(), 'error');
+      }
+    }
+  }
+}
+
+/**
+ * Updates the existing resources. Currently only updates the documentation and short description.
+ */
+
+function update_resources() {
+  $config = \Drupal::config('byu_resources.settings');
+  $updateRequested = false;
+  $nodes = null;
+
+  $options['readme'] = $config->get('fields_to_update')['readme'];
+  $options['description'] = $config->get('fields_to_update')['description'];
+
+  foreach($options as $option) {
+    if ($option != 0) {
+      $updateRequested = true;
+      $query = \Drupal::entityQuery('node');
+      $query->condition('type', 'byu_resource');
+      $nids = $query->execute();
+      $nodes = Node::loadMultiple($nids);
+    }
+    else {
+      return false;
+    }
+  }
+
+  $modulePath = drupal_get_path('module', 'byu_resources');
+
+  if ($updateRequested) {
+    foreach ($nodes as $node) {
+      switch ($node->field_byu_resource_resource_type->value) {
+        case 'Drupal Module':
+          $updateNeeded = false;
+
+          // Update the readme. Uses same code as used by get_drupal_modules() to get and parse the readme from drupal.org
+          if ($options['readme'] == 'readme') {
+            $readmeCode = file_get_contents('https://cgit.drupalcode.org/' . $node->field_byu_resource_machine_name->value . '/tree/README.md');
+            $readmeStart = strpos($readmeCode, '<div class="highlight"><pre>') + strlen('<div class="highlight"><pre>');
+            $readmeEnd = strpos($readmeCode, '</pre>', $readmeStart);
+            $readme = substr($readmeCode, $readmeStart, $readmeEnd - $readmeStart);
+            $Parsedown = new Parsedown();
+            $readme = $Parsedown->text($readme);
+            if ($node->field_byu_resource_readme->value != $readme) {
+              $node->field_byu_resource_readme->value = $readme;
+              $node->field_byu_resource_readme->format = 'markdown';
+              $updateNeeded = true;
+            }
+          }
+
+          // Update the short description for the module. Uses same code as used by get_drupal_modules().
+          if ($options['description'] == 'description') {
+            $client = \Drupal::service('http_client');
+            $result = $client->get('https://www.drupal.org/project/' . $node->field_byu_resource_machine_name->value);
+            $output = $result->getBody()->getContents();
+            $descriptionStart = strpos($output, 'field-name-body');
+            $descriptionStart = strpos($output, '<p>', $descriptionStart) + strlen('<p>');
+            $descriptionEnd = strpos($output, '</p>', $descriptionStart);
+            $description = substr($output, $descriptionStart, $descriptionEnd - $descriptionStart);
+            if ($node->field_byu_resource_description->value != $description) {
+              $node->field_byu_resource_description->value = $description;
+              $node->field_byu_resource_description->format = 'basic_html';
+              $updateNeeded = true;
+            }
+          }
+
+          if ($updateNeeded) {
+            try {
+              $node->save();
+            } catch (Exception $e) {
+              drupal_set_message('Caught exception: ' . $e->getMessage(), 'error');
+            }
+          }
+          break;
+
+        case 'Web Component':
+          $updateNeeded = false;
+
+          // Update the readme. Uses the same code as used by get_web_components() to get and parse the readme from cdn.byu.edu.
+          if ($options['readme'] == 'readme') {
+            $Parsedown = new Parsedown();
+            $readmeLink = 'https://raw.githubusercontent.com/byuweb/' . $node->field_byu_resource_machine_name->value . '/master/README.md';
+            $readme = file_get_contents($readmeLink);
+            $readme = $Parsedown->text($readme);
+            if ($node->field_byu_resource_readme->value != $readme) {
+              $node->field_byu_resource_readme->value = $readme;
+              $node->field_byu_resource_readme->format = 'markdown';
+              $updateNeeded = true;
+            }
+          }
+
+          // Update the short description. Uses the same code as used by get_web_components().
+          if ($options['description'] == 'description') {
+            $json = file_get_contents('https://cdn.byu.edu/manifest.json');
+            $json = json_decode($json);
+            $machineName = $node->field_byu_resource_machine_name->value;
+            $description = $json->libraries->$machineName->description;
+
+            if ($node->field_byu_resource_description->value != $description) {
+              $node->field_byu_resource_description->value = $description;
+              $node->field_byu_resource_description->format = 'basic_html';
+              $updateNeeded = true;
+            }
+          }
+
+          if ($updateNeeded) {
+            try {
+              $node->save();
+            } catch (Exception $e) {
+              drupal_set_message('Caught exception: ' . $e->getMessage(), 'error');
+            }
+          }
+          break;
+      }
+    }
+  }
+}
