@@ -1,0 +1,1 @@
+Direct Checkout by URL
