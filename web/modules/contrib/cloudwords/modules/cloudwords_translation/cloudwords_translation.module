@@ -1,0 +1,681 @@
+<?php
+
+/**
+ * @file
+ * Integrates Cloudwords with the Contnent translation module.
+ */
+
+use Drupal\Component\Render\HtmlEscapedText;
+use Drupal\Core\Language\Language;
+use Drupal\content_translation;
+
+// @todo remove if not used "cloudwords_translation_menu_alter"
+/**
+ * Implements hook_menu_alter().
+ *
+ * Take control of node/%node/translate.
+ */
+function cloudwords_translation_menu_alter(&$items) {
+  $items['node/%node/translate']['page callback'] = 'cloudwords_translation_node_overview_page';
+  $items['node/%node/translate']['file'] = 'cloudwords_translation.pages.inc';
+  $items['node/%node/translate']['file path'] = drupal_get_path('module', 'cloudwords_translation');
+  $items['node/%node/translate']['module'] = 'cloudwords_translation';
+}
+
+// @todo remove if not used "cloudwords_module_implements_alter"
+/**
+ * Implements hook_module_implements_alter().
+ *
+ * Move our hook_menu_alter() to the end.
+ */
+function cloudwords_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'menu_alter') {
+    $group = $implementations['cloudwords_translation'];
+    unset($implementations['cloudwords_translation']);
+    $implementations['cloudwords_translation'] = $group;
+  }
+}
+
+/**
+ * Implements hook_cloudwords_translatable_info().
+ */
+function cloudwords_translation_cloudwords_translatable_info() {
+  // @todo only specify translatable configured entities?
+  $entity_types = \Drupal::entityTypeManager()->getDefinitions();
+  foreach($entity_types as $entity_type){
+    // @todo prevent entity_reference_revisions from having a source controller
+    if($entity_type->isTranslatable() && $entity_type->getConfigDependencyKey() == 'content') {
+      $entity_controllers[$entity_type->id()] = [
+        'controller class' => '\Drupal\cloudwords_translation\CloudwordsEntitySourceController',
+      ];
+    }
+  }
+
+  return $entity_controllers;
+}
+
+
+/**
+ * Populates a field on an object with the provided field values.
+ *
+ * @param stdClass $entity
+ *   The object to be populated.
+ * @param array $data
+ *   An array of values.
+ * @param string $language
+ *   The field language.
+ */
+function cloudwords_field_populate_entity($entity, array $data, $language, $hostLanguage, &$translated_fields) {
+  $attachableEntityTypes = ['entity_reference_revisions'];
+
+  $source_data = cloudwords_field_get_source_data($entity->getEntityTypeId(), $entity);
+
+  $translated_fields = [];
+
+  foreach (\Drupal\Core\Render\Element::children($data) as $field_name) {
+    if ($info =\Drupal\field\Entity\FieldConfig::loadByName($entity->getEntityTypeId(), $entity->bundle(), $field_name)) {
+      foreach (\Drupal\Core\Render\Element::children($data[$field_name]) as $delta) {
+
+        //$langcode = $info->get('translatable') ? $language : \Drupal\Core\Language\Language::LANGCODE_NOT_SPECIFIED;
+        //exclude attached entity fields
+        $module = $info->getFieldStorageDefinition()->get('module');
+        if(!in_array($module,$attachableEntityTypes)){
+          $columns = [];
+          foreach (\Drupal\Core\Render\Element::children($data[$field_name][$delta]) as $column) {
+            if (isset($data[$field_name][$delta][$column]['#translation']['#text'])) {
+              $columns[$column] = $data[$field_name][$delta][$column]['#translation']['#text'];
+            }
+            // For elements which are not translatable, keep using the original value
+            elseif (isset($data[$field_name][$delta][$column]['#translate']) && $data[$field_name][$delta][$column]['#translate'] == FALSE) {
+              $columns[$column] = $data[$field_name][$delta][$column]['#text'];
+            }
+          }
+
+          $translated_fields[$field_name][$delta] = $columns;
+
+          //map field metadata
+          // @todo refactor to use more self explanatory data structure. "#text" doesn't make sense for format values, uris, etc.
+          foreach($source_data[$field_name][$delta] as $source_item_key => $source_item_value){
+            if(is_array($source_item_value) && isset($source_item_value['#translate']) && $source_item_value['#translate'] == FALSE){
+              $translated_fields[$field_name][$delta][$source_item_key] = $source_item_value['#text'];
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// @todo alter this to work with entity reference revisions - not field collection specific
+/**
+ * Populates entities attached via reference.  Currently only supports field collections.
+ *
+ * @param string $entity_type
+ *   The entity type.
+ * @param stdClass $entity
+ *   The object to be populated.
+ * @param array $data
+ *   An array of values.
+ * @param string $language
+ *   The field language.
+ * @param string $hostLanguage
+ *   The host entity's language.
+ * @param string $iterationCount
+ *   The iteration count for recursion. Does not recurse past $maxDepth int.
+ */
+function cloudwords_field_populate_attached_entities($entity_type, $entity, array $data, $language, $hostLanguage, $iterationCount = 0) {
+  $maxDepth = 5;
+  foreach (\Drupal\Core\Render\Element::children($data) as $field_name) {
+    if ($info =\Drupal\field\Entity\FieldConfig::loadByName($entity->getEntityTypeId(), $entity->bundle(), $field_name)) {
+      $module = $info->getFieldStorageDefinition()->get('module');
+      if($module == 'entity_reference_revisions'){
+        foreach (\Drupal\Core\Render\Element::children($data[$field_name]) as $delta) {
+          // load entity
+          $target_type = $entity->{$field_name}->getFieldDefinition()->getSetting('target_type');
+          $e_ref_entity = \Drupal::entityTypeManager()->getStorage($target_type)->load($entity->{$field_name}[$delta]->target_id);
+          $a_data = reset($data[$field_name][$delta]['value']);
+
+          // populate entity values
+          $translated_fields = [];
+          cloudwords_field_populate_entity($e_ref_entity, $a_data, $language, $hostLanguage, $translated_fields);
+          if(!$e_ref_entity->hasTranslation($language)){
+            $e_ref_entity->addTranslation($language);
+          }
+          $translation = $e_ref_entity->getTranslation($language);
+
+          foreach($translated_fields as $name => $value) {
+            $translation->$name = $value;
+          }
+// @todo implement depth
+//          if($iterationCount < $maxDepth) {
+//            $iterationCount++;
+//            cloudwords_field_populate_attached_entities($e_ref_entity->getEntityTypeId(), $e_ref_entity, $a_data, $language, $hostLanguage);
+//          }
+          $translation->save();
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_cloudwords_source_translation_structure().
+ *
+ * This hook is implemented on behalf of the core text module.
+ */
+function text_cloudwords_source_translation_structure($field_name, $entity_type, $entity, $field_instance) {
+  $structure = [];
+  if (!empty($entity->get($field_name)->value)) {
+    $field_info = \Drupal\field\Entity\FieldConfig::loadByName($entity_type, $entity->bundle(), $field_name);
+
+    $structure['#label'] = \Drupal\Component\Utility\Html::escape($field_instance->get('label'));
+
+    foreach ($entity->get($field_name) as $delta => $value) {
+      $structure[$delta]['#label'] = t('Delta #@delta', ['@delta' => $delta]);
+      $structure[$delta]['value'] = [
+        '#label' => $structure['#label'],
+        '#text' => $value->value,
+        '#translate' => TRUE,
+      ];
+
+      // Add format.
+      if(!empty($value->format)) {
+        $structure[$delta]['format'] = [
+          '#label' => '',
+          '#text' => $value->format,
+          '#translate' => FALSE,
+        ];
+      }
+      // @todo text_with_summary
+      if ($field_info->get('field_type') == 'text_with_summary' && !empty($value->summary)) {
+        $structure[$delta]['summary'] = [
+          '#label' => t('Summary'),
+          '#text' => $value->summary,
+          '#translate' => TRUE,
+        ];
+      }
+    }
+  }
+  return $structure;
+}
+
+/**
+ * Implements hook_cloudwords_source_translation_structure().
+ *
+ * Translate the title field of a link
+ */
+function link_cloudwords_source_translation_structure($field_name, $entity_type, $entity, $field_instance) {
+  $structure = [];
+
+  if (!empty($entity->get($field_name)->getLangcode())){
+    foreach ($entity->get($field_name) as $delta => $value) {
+      $structure[$delta]['#label'] = t('Delta #@delta', ['@delta' => $delta]);
+      $structure[$delta]['title'] = [
+        '#label' => 'Title',
+        '#text' => $value->title,
+        '#translate' => TRUE,
+      ];
+      $structure[$delta]['uri'] = [
+        '#label' => 'URI',
+        '#text' => $value->uri,
+        '#translate' => FALSE,
+      ];
+    }
+  }
+  return $structure;
+}
+
+/**
+ * Implements hook_cloudwords_source_translation_structure().
+ *
+ * This hook is implemented on behalf of the entity_reference_revisions module.
+ */
+function entity_reference_revisions_cloudwords_source_translation_structure($field_name, $entity_type, $entity, $field_instance) {
+  $structure = [];
+
+  $structure['#label'] = $field_instance->getLabel();
+  foreach ($entity->{$field_name} as $delta => $value) {
+    $target_type = $value->getFieldDefinition()->getSetting('target_type');
+    $e_ref_entity = \Drupal::entityTypeManager()->getStorage($target_type)->load($value->target_id);
+
+    $e_ref_structure = cloudwords_field_get_source_data($target_type, $e_ref_entity);
+    $structure[$delta]['#label'] = t('Delta #@delta', ['@delta' => $delta]);
+    $structure[$delta]['value'] = [
+      '#label' => $structure['#label'],
+      $e_ref_entity->id() => $e_ref_structure,
+      '#translate' => TRUE,
+    ];
+  }
+
+  return $structure;
+}
+
+// @todo remove and use handler for entity reference revisions which works on paragraphs (likely successor to field_collections)
+/**
+ * Implements hook_cloudwords_source_translation_structure().
+ *
+ * This hook is implemented on behalf of the field_collection module.
+ */
+//function field_collection_cloudwords_source_translation_structure($field_name, $entity_type, $entity, $field_instance) {
+//  $field_lang = field_language($entity_type, $entity, $field_name);
+//  $structure = array();
+//  if (!empty($entity->{$field_name}[$field_lang])) {
+//    $field_info = field_info_field($field_name);
+//    $structure['#label'] = \Drupal\Component\Utility\Html::escape($field_instance['label']);
+//    foreach ($entity->{$field_name}[$field_lang] as $delta => $value) {
+//      $fc = \Drupal::entityManager()->getStorage('field_collection_item', array($value['value']));
+//      $fc = reset($fc);
+//      $fc_structure = cloudwords_field_get_source_data('field_collection_item', $fc);
+//      $structure[$delta]['#label'] = t('Delta #@delta', array('@delta' => $delta));
+//      $structure[$delta]['value'] = array(
+//        '#label' => $structure['#label'],
+//        $fc->item_id => $fc_structure,
+//        '#translate' => TRUE,
+//      );
+//    }
+//  }
+//
+//  return $structure;
+//}
+
+/**
+ * Helper function for retrieving all translatable field values from an entity.
+ *
+ * @param string $entity_type
+ *   The entity type.
+ * @param object $entity
+ *   An entity object.
+ *
+ * @return array
+ *   The structured field data for all translatable fields
+ */
+function cloudwords_field_get_source_data($entity_type, $entity, $field_translation = FALSE) {
+  $fields = [];
+  $translate_field_instance = FALSE;
+  // @todo figure out field instance translation handling
+  $field_definitions = \Drupal::service('entity_field.manager')->getFieldDefinitions($entity_type, $entity->bundle());
+
+  $instances = [];
+  foreach ($field_definitions as $key => $definition) {
+
+    if ($definition instanceof \Drupal\field\Entity\FieldConfig) {
+      $instances[$key] = $definition;
+    }
+  }
+
+  foreach ($instances as $field_name => $field_instance) {
+    $info = \Drupal\field\Entity\FieldConfig::loadByName($entity_type, $entity->bundle(), $field_name);
+
+    // @todo clean up value access for module - there are likely other fields that should utilize the text_ hook
+    $module = $info->getFieldStorageDefinition()->get('module');
+    if($module == 'core' && $info->getFieldStorageDefinition()->get('type') == 'string'){
+      $module = 'text';
+    }
+
+    if($module == 'entity_reference_revisions'){
+      $translate_field_instance = TRUE;
+    }elseif(!$field_translation || $info->isTranslatable()){
+      $translate_field_instance = TRUE;
+    }else{
+      $translate_field_instance = FALSE;
+    }
+
+    if ($translate_field_instance && $data = \Drupal::moduleHandler()->invoke($module, 'cloudwords_source_translation_structure', [$field_name, $entity_type, $entity, $field_instance])) {
+      $fields[$field_name] = $data;
+    }
+  }
+
+  return $fields;
+}
+
+function cloudwords_translation_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id){
+  switch($form_id){
+    case 'node_page_edit_form':
+      $form['actions']['submit']['#submit'][] = 'Drupal\cloudwords_translation\Form\CloudwordsTranslationFormAlter::entityFormSubmit';
+    break;
+  }
+}
+
+// @todo remove if not used
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+//function cloudwords_translation_form_node_form_alter(&$form, &$form_state) {
+//  $user = \Drupal::currentUser();
+//  $node = $form['#node'];
+//
+//  // workaround/fix for translation.module line 164, where the groups are not taken into consideration
+//  // $languages = language_list('enabled');
+//  $languages = \Drupal::languageManager()->getLanguages();
+//  $disabled_languages = isset($languages[0]) ? $languages[0] : FALSE;
+//  $translator_widget = $disabled_languages && \Drupal::currentUser()->hasPermission('translate content');
+//  $groups = array(t('Disabled'), t('Enabled'));
+//  if (!empty($node->nid) && !empty($node->tnid)) {
+//    // Disable languages for existing translations, so it is not possible to switch this
+//    // node to some language which is already in the translation set. Also remove the
+//    // language neutral option.
+//    if ($translator_widget) {
+//      foreach ($groups as $group) {
+//        unset($form['language']['#options'][$group][\Drupal\Core\Language\Language::LANGCODE_NOT_SPECIFIED]);
+//      }
+//    }
+//    else {
+//      unset($form['language']['#options'][\Drupal\Core\Language\Language::LANGCODE_NOT_SPECIFIED]);
+//    }
+//  }
+//  // end of fix
+//
+//
+//  // prevent primary node from switching to neutral if active translatables exist
+//  if (!empty($node->nid)) {
+//    $translatables = cloudwords_get_translatables_by_property(array(
+//      'type' => 'node_content',
+//      'textgroup' => 'node',
+//      'objectid' => !empty($node->tnid) ? $node->tnid : $node->nid,
+//    ), 'language');
+//
+//    $allow_neutral = TRUE;
+//    $disabled_langs = array();
+//    foreach ($translatables as $langcode => $translatable) {
+//      if ($translatable->status != CLOUDWORDS_QUEUE_NOT_IN_QUEUE || $translatable->uid != 0) {
+//        $disabled_langs[] = $langcode;
+//        $allow_neutral = FALSE;
+//      }
+//    }
+//
+//    if (!$allow_neutral) {
+//      if ($translator_widget) {
+//        foreach ($groups as $group) {
+//          unset($form['language']['#options'][$group][\Drupal\Core\Language\Language::LANGCODE_NOT_SPECIFIED]);
+//          foreach ($disabled_langs as $disabled_lang) {
+//            unset($form['language']['#options'][$group][$disabled_lang]);
+//          }
+//        }
+//      }
+//      else {
+//        unset($form['language']['#options'][\Drupal\Core\Language\Language::LANGCODE_NOT_SPECIFIED]);
+//        foreach ($disabled_langs as $disabled_lang) {
+//          unset($form['language']['#options'][$disabled_lang]);
+//        }
+//      }
+//    }
+//  }
+//
+//  $element = array(
+//    '#type' => 'checkbox',
+//    '#title' => t('Mark all languages for translation.'),
+//    '#states' => array(
+//      'invisible' => array(
+//        ':input[name="language"]' => array(
+//          'value' => 'und',
+//        ),
+//      ),
+//    ),
+//  );
+//
+//  if (empty($node->nid) && empty($node->translation_source) && cloudwords_translation_supported_type($node->type)) {
+//    $form['cloudwords_add_to_queue'] = $element;
+//  }
+//  elseif (cloudwords_translation_supported_type($node->type)) {
+//    $form['cloudwords_add_to_queue'] = $element;
+//  }
+//}
+
+/**
+ * Determines if the node is the primary node in a translation set.
+ *
+ * @param stdClass $node
+ *   A node object.
+ *
+ * @return bool
+ *   TRUE if the node is the primary node, and FALSE if not.
+ */
+function cloudwords_translation_is_primary_node(\Drupal\node\NodeInterface $node) {
+  return !$node->tnid || $node->tnid == $node->id();
+}
+
+// @todo refresh translatables
+/**
+ * Implements hook_cloudwords_refresh_translatables().
+ */
+
+function cloudwords_translation_cloudwords_refresh_translatables(&$context) {
+  $langcodes = array_keys(cloudwords_language_list());
+  $default_langcode = \Drupal::languageManager()->getDefaultLanguage()->getId();
+  $langcodes = array_diff($langcodes, [$default_langcode]);
+  $context['finished'] = 0;
+
+  if(!isset($context['sandbox']['processed_runs'])){
+    $context['sandbox']['processed_runs'] = 0;
+  }
+
+  if (!isset($context['sandbox']['translatable_items'])) {
+    $context['sandbox']['translatables_created'] = 0;
+    $entity_types = \Drupal::entityTypeManager()->getDefinitions();
+    // @todo entityManager is deprecated, change
+    $bundles = \Drupal::entityManager()->getAllBundleInfo();
+    foreach ($entity_types as $entity_type_id => $entity_type) {
+      if (!$entity_type instanceof \Drupal\Core\Entity\ContentEntityType || !$entity_type->hasKey('langcode') || !isset($bundles[$entity_type_id])) {
+        continue;
+      }
+      foreach ($bundles[$entity_type_id] as $bundle => $bundle_info) {
+        $config = \Drupal\language\Entity\ContentLanguageSettings::loadByEntityTypeBundle($entity_type_id, $bundle);
+        $bundle_langs = array_diff($langcodes, [$config->language()->getId()]);
+        $content_translation_settings = $config->getThirdPartySettings('content_translation');
+        if(isset($content_translation_settings['enabled']) && $content_translation_settings['enabled'] == 1) {
+          $additional = $entity_type->get('additional');
+          // @todo find better mechanism for filtering out entity reference revision item and other translatable items with parent id
+          if(!isset($additional['entity_revision_parent_type_field'])) {
+            $ids = \Drupal::entityQuery($entity_type_id)->condition($entity_type->getKey('bundle'), $bundle)->execute();
+            foreach($ids as $id){
+              $context['sandbox']['translatable_items'][$entity_type_id][$bundle][$id] = array_combine($bundle_langs, $bundle_langs);
+            }
+            $context['sandbox']['total'] += count($ids);
+          }
+        }
+      }
+    }
+
+    $context['sandbox']['last'] = 0;
+    $context['sandbox']['count'] = 0;
+
+  } else {
+    // prune the translatable items index to remove existing translatables
+    foreach($context['sandbox']['translatable_items'] as $entity_type_id => $bundle_group){
+      foreach($bundle_group as $bundle => $ids){
+
+        $translatables = cloudwords_get_translatables_by_property([
+          'translation_module' => CLOUDWORDS_CONTENT_TRANSLATION_TYPE,
+          'type' => $entity_type_id,
+          'objectid' => array_keys($ids),
+          'bundle' => $bundle,
+        ]);
+
+        foreach($translatables as $translatable){
+          $id = $translatable->getObjectId();
+          $lang = $translatable->getLanguage();
+
+          // If translatable exists, remove it from queue
+          if(in_array($translatable->getObjectId(), array_keys($ids))){
+            unset($context['sandbox']['translatable_items'][$entity_type_id][$bundle][$id][$lang]);
+            if(count($context['sandbox']['translatable_items'][$entity_type_id][$bundle][$id]) == 0){
+              unset($context['sandbox']['translatable_items'][$entity_type_id][$bundle][$id]);
+            }
+          }
+        }
+      }
+    }
+    // @todo batch this out to only run a few hundred or so at a time in case tens of thousands or translatables need saving
+    // process translatable items
+    foreach($context['sandbox']['translatable_items'] as $entity_type_id => $bundle_group){
+      foreach($bundle_group as $bundle => $ids){
+        foreach($ids as $id => $langs){
+          $entity = \Drupal::entityTypeManager()->getStorage($entity_type_id)->load($id);
+          foreach($langs as $lang) {
+            $new = cloudwords_translatable_create([
+              'translation_module' => CLOUDWORDS_CONTENT_TRANSLATION_TYPE,
+              'objectid' => $id,
+              'language' => $lang,
+              'name' => $entity->label(),
+              'textgroup' => $entity_type_id,
+              'type' => $entity_type_id,
+              'bundle' => $bundle,
+              'user_id' => 0,
+            ]);
+            $new->save();
+            $context['sandbox']['translatables_created'] += 1;
+            unset($context['sandbox']['translatable_items'][$entity_type_id][$bundle][$id][$lang]);
+            if(count($context['sandbox']['translatable_items'][$entity_type_id][$bundle][$id]) == 0){
+              unset($context['sandbox']['translatable_items'][$entity_type_id][$bundle][$id]);
+            }
+          }
+        }
+        if(count($context['sandbox']['translatable_items'][$entity_type_id][$bundle]) == 0){
+          unset($context['sandbox']['translatable_items'][$entity_type_id][$bundle]);
+        }
+        if(count($context['sandbox']['translatable_items'][$entity_type_id]) == 0){
+          unset($context['sandbox']['translatable_items'][$entity_type_id]);
+        }
+      }
+    }
+
+    if (empty($context['sandbox']['translatable_items'])) {
+      $msg = \Drupal::translation()->formatPlural($context['sandbox']['translatables_created'],
+        'Content Translation: Created @count translatable',
+        'Content Translation: Created @count translatables',
+        ['%count' => $context['sandbox']['translatables_created']]);
+      drupal_set_message($msg);
+      $context['finished'] = 1;
+    }
+
+    // safeguard to prevent batch from running forever in the case of a data anomaly
+    $context['sandbox']['processed_runs'] += 1;
+    if($context['sandbox']['processed_runs'] == 100){
+      $context['finished'] = 1;
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_insert().
+ */
+function cloudwords_translation_entity_insert(Drupal\Core\Entity\EntityInterface $entity){
+  _cloudwords_translation_entity_upsert($entity);
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function cloudwords_translation_entity_update(Drupal\Core\Entity\EntityInterface $entity) {
+  _cloudwords_translation_entity_upsert($entity);
+}
+
+
+function _cloudwords_translation_entity_upsert(Drupal\Core\Entity\EntityInterface $entity) {
+
+  $entity_type_id = $entity->getEntityTypeId();
+  $entity_info = \Drupal::entityTypeManager()->getDefinition($entity_type_id);
+
+  $entity_values = $entity->toArray();
+  //@TODO prohibit entity items with parents as well as entity items without labels.  Need better logic for rules defining which entities with parents shoudl be prohibited
+
+  $content_translation_manager = \Drupal::service('content_translation.manager');
+
+  if ($entity_info->isTranslatable() && $content_translation_manager->isEnabled($entity->getEntityTypeId(), $entity->bundle()) && !empty($entity->label()) && !isset($entity_values['parent_id']) && $entity->language()->isDefault()) {
+
+    $queue_status = !empty($entity->cloudwords_add_to_queue) ? CLOUDWORDS_QUEUE_QUEUED : CLOUDWORDS_QUEUE_NOT_IN_QUEUE;
+    //$entity_ids = entity_extract_ids($entity_type_id, $entity);
+    $objectid = $entity->id();
+    $textgroup = $entity_info->id();
+    //@TODO change type
+    $type = $entity_info->id();
+    $label = $entity->label();
+    $bundle = $entity->bundle();
+
+    if ($entity->language() != \Drupal\Core\Language\Language::LANGCODE_NOT_SPECIFIED) {
+
+      //@todo translation_type and queue_status
+      $translatables = cloudwords_get_translatables_by_property([
+        'textgroup' => $textgroup,
+     //   'type' => $translatable_type,
+        'objectid' => $objectid,
+      ], 'language');
+
+      foreach (cloudwords_language_list() as $langcode => $language) {
+        if(!isset($translatables[$langcode]) && $entity->language()->getId() != $langcode){
+          $translatables[$langcode] = cloudwords_translatable_create([
+            'translation_module' => CLOUDWORDS_CONTENT_TRANSLATION_TYPE,
+            'textgroup' => $textgroup,
+            'type' => $type,
+            'objectid' => $objectid,
+            'language' => $langcode,
+            'name' => $label,
+            'bundle' => $bundle,
+            'user_id' => 0,
+          ]);
+        }
+      }
+
+      foreach($translatables as $translatable){
+        $translatable->name = $entity->label();
+     //   $translatable->status = $queue_status;
+        $translatable->save();
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function cloudwords_translation_entity_delete(Drupal\Core\Entity\EntityInterface $entity) {
+  $entity_type_id = $entity->getEntityTypeId();
+  $entity_info = \Drupal::entityTypeManager()->getDefinition($entity_type_id);
+  $objectid = $entity->id();
+  $textgroup = $entity_info->id();
+  //@TODO change type
+  $type = $entity_info->id();
+//  $label = $entity->label();
+//  $bundle = $entity->bundle();
+  $translatables = cloudwords_get_translatables_by_property([
+    'translation_module' => CLOUDWORDS_CONTENT_TRANSLATION_TYPE,
+    'textgroup' => $textgroup,
+    'type' => $type,
+    'objectid' => $objectid,
+  ], 'language');
+
+  if(!empty($translatables)){
+    cloudwords_translatable_delete_by_property([
+      'translation_module' => CLOUDWORDS_CONTENT_TRANSLATION_TYPE,
+      'type' => $type,
+      'textgroup' => $textgroup,
+      'objectid' => $objectid,
+    ]);
+  }
+}
+
+//function cloudwords_translation_before_entity_save(&$node, $data, $source_language, $translation_type) {
+//  foreach (\Drupal::moduleHandler()->getImplementations('cloudwords_translation_before_entity_save') as $module) {
+//    $function = $module . '_cloudwords_translation_before_entity_save';
+//    $function($node, $data, $source_language, $translation_type);
+//  }
+//}
+/**
+ * Implements hook_menu_links_discovered_alter().
+ */
+function cloudwords_translation_menu_links_discovered_alter(array &$links) {}
+
+/**
+ * Implements hook_menu_local_tasks_alter().
+ */
+function cloudwords_translation_menu_local_tasks_alter(array &$data, $route_name) {}
+
+/**
+ * Implements hook_menu_local_actions_alter().
+ */
+function cloudwords_translation_menu_local_actions_alter(array &$local_actions) {}
+
+/**
+ * Implements hook_contextual_links_view_alter().
+ */
+function cloudwords_translation_contextual_links_view_alter(array &$element, array $items) {}
