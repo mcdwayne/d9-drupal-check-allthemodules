@@ -1,0 +1,114 @@
+<?php
+
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Session\AccountInterface;
+
+CONST MODE_FIELD_SUFFIX = 'mode';
+CONST VALUE_FIELD_SUFFIX = 'value';
+
+/**
+ * Implements hook_entity_access().
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ * @param $operation
+ * @param \Drupal\Core\Session\AccountInterface $account
+ *
+ * @return \Drupal\Core\Access\AccessResultInterface|\Drupal\Core\Access\AccessResultNeutral
+ */
+function scheduling_entity_access(EntityInterface $entity, $operation, AccountInterface $account) {
+
+  // Provide a hook to allow other modules to override this module's entity access logic.
+  $active = TRUE;
+  \Drupal::moduleHandler()->invokeAll('scheduling_access', [&$active]);
+
+  // Only use scheduling entity access logic if other module's don't deactivate it.
+  if ($active) {
+    scheduling_expiries($entity, $operation);
+    return scheduling_access($entity, $operation, $account);
+  } else {
+    scheduling_expiries($entity, $operation);
+    return AccessResult::neutral();
+  }
+
+}
+
+/**
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ * @param $operation
+ * @param \Drupal\Core\Session\AccountInterface $account
+ *
+ * @return $this|\Drupal\Core\Access\AccessResultInterface
+ */
+function scheduling_access(EntityInterface $entity, $operation, AccountInterface $account) {
+
+  if (_has_scheduling($entity)) {
+
+    // Only interfere when viewing entity.
+    if ($operation === 'view') {
+      /** @var \Drupal\Core\Entity\ContentEntityInterface $entity */
+      if ($entity->hasField('scheduling_mode') && $mode = $entity->get('scheduling_mode')->value) {
+
+        if ($mode === 'published' || $account->hasPermission('bypass scheduling access')) {
+          return AccessResult::neutral()->addCacheableDependency($entity)->addCacheableDependency($account);
+        }
+
+        if ($mode === 'unpublished') {
+          return AccessResult::forbidden()->addCacheableDependency($entity)->addCacheableDependency($account);
+        }
+
+        // Process actual status from entity's scheduling values.
+        if ($entity->hasField('scheduling_value') && $values = $entity->get('scheduling_value')) {
+          /** @var \Drupal\scheduling\Service\Scheduling $scheduling */
+          $scheduling = \Drupal::service('scheduling');
+          if ($scheduling->getStatus($mode, $values)) {
+            return AccessResult::neutral()->addCacheableDependency($entity)->addCacheableDependency($account);
+          } else {
+            return AccessResult::forbidden()->addCacheableDependency($entity)->addCacheableDependency($account);
+          }
+        }
+
+      }
+    }
+  }
+
+  return AccessResult::neutral();
+}
+
+/**
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ * @param $operation
+ */
+function scheduling_expiries(EntityInterface $entity, $operation) {
+  $expiries =& drupal_static('scheduling_expires', []);
+
+  if (_has_scheduling($entity)) {
+    if ($operation === 'view') {
+      /** @var \Drupal\Core\Entity\ContentEntityInterface $entity */
+      if ($entity->hasField('scheduling_mode') && $mode = $entity->get('scheduling_mode')->value) {
+        // Only proceed if we're dealing with actual scheduling.
+        if (($mode === 'range' || $mode === 'recurring') && $entity->hasField('scheduling_value') && $values = $entity->get('scheduling_value')) {
+          /** @var \Drupal\scheduling\Service\Scheduling $scheduling */
+          $scheduling = \Drupal::service('scheduling');
+          // Calculate entity's possible upcoming status change in seconds & add
+          // that to its cache dependencies as well as the static list of
+          // request-bound entity expiries.
+          if ($expires = $scheduling->getNextStatusChangeInSeconds($mode, $values)) {
+            $entity->mergeCacheMaxAge($expires);
+            $expiries[] = $expires;
+          }
+        }
+      }
+    }
+  }
+
+}
+
+/**
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ *
+ * @return bool
+ */
+function _has_scheduling(EntityInterface $entity) {
+  return in_array($entity->getEntityTypeId(), \Drupal::service('config.factory')->get('scheduling.settings')->get('entity_types'), TRUE);
+}
