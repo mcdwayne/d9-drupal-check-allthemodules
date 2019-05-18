@@ -1,0 +1,249 @@
+<?php
+
+/**
+ * @file
+ * Get metrics for system and db.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Component\Utility\Html;
+
+/**
+ * Implements hook_help().
+ */
+function sys_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.sys':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('This Module help to get metrics for system and database, without using complexe solutions muning or nagios') . '</p>';
+      $output .= '</dl>';
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function sys_theme($existing, $type, $theme, $path) {
+  return [
+    'sys_dashboard' => [
+      'variables' => [
+        'db_data' => [],
+        'disk_data' => [],
+        'memory_data' => [],
+        'size' => []
+      ],
+      'path' => drupal_get_path('module', 'sys') . '/templates',
+    ],
+    'sys_php_metrics' => [
+      'variables' => [
+        'variables_php_metrics' => sys_ge_values_php_metrics(),
+      ],
+      'path' => drupal_get_path('module', 'sys') . '/templates',
+    ],
+
+  ];
+}
+
+/**
+ * List and the size of the database tables.
+ *
+ * @return array
+ *   An array with a list of database tables.
+ */
+function _sys_tables_list() {
+  $tables = FALSE;
+
+  switch (\Drupal::database()->driver()) {
+    case 'mysql':
+      $tables = \Drupal::database()->query("SHOW TABLE STATUS")->fetchAll();
+      break;
+
+    case 'pgsql':
+      $tables = \Drupal::database()->query("SELECT table_name as \"Name\",
+        pg_total_relation_size(table_name) AS \"Data_length\",
+        0 as \"Index_length\"
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+        ORDER BY table_name")->fetchAll();
+      break;
+  }
+
+  $result = array();
+
+  if ($tables) {
+    $size_tables = 0;
+
+    foreach ($tables as $table) {
+      $length = $table->Data_length + $table->Index_length;
+
+      $result[$table->Name] = array(
+        'name' => $table->Name,
+        'size' => format_size($length),
+        'size_byte' => $length,
+      );
+
+      $size_tables += $length;
+    }
+  }
+  return (array) $result;
+}
+
+/**
+ * Get activated database size.
+ *
+ * @return array
+ *    Return array contains database size & name.
+ */
+function _sys_database_size() {
+  $databaseService = \Drupal::database();
+  $dbName = $databaseService->getConnectionOptions()['database'];
+  $size = ["name" => '', "size" => ''];
+  switch (\Drupal::database()->driver()) {
+    case 'mysql':
+      $size = $databaseService->query("SELECT table_schema \"name\",
+        Round(Sum(data_length + index_length) / 1024 / 1024, 1) \"size\"
+        FROM   information_schema.tables
+        WHERE TABLE_SCHEMA = :db
+        GROUP  BY table_schema;", [':db' => $dbName])->fetchAssoc();
+      $size['size'] = !empty($size['size']) ? $size['size'] . ' MB' : '';
+      break;
+
+    case 'pgsql':
+      $size = $databaseService->query("SELECT pg_size_pretty(pg_database_size(:db)) as size", [':db' => $dbName])
+        ->fetchAssoc();
+      $size['name'] = $dbName;
+      break;
+  }
+  return (array) $size;
+}
+
+/**
+ * List server disk usage & partitions.
+ *
+ * @return array
+ *   An array contains statistics about the amount of used disk space containing:
+ *    - 4 = Size of partition.
+ *    - 3 = Used space in human-readable bytes.
+ *    - 2 = Free space in human-readable bytes.
+ *    - 1 = Used percentage.
+ *    - 0 = Partition name.
+ */
+function _sys_disk_usage() {
+  // Run df if not Mac OS X (Darwin) systems.
+  if (PHP_OS != 'Darwin') {
+    $space_list = rtrim(`df -lH  | grep -vE '^Filesystem|hosts|none|cdrom|shm|varrun|varlock|udev' | awk '{ print $2 "," $3 "," $4 "," $5 "," $6 }'`);
+  }
+  $space_array = explode("\n", $space_list);
+  $reported_space = [];
+  foreach ($space_array as $space_line) {
+    $row = explode(',', $space_line);
+    $reported_space[] = array_reverse($row);
+  }
+
+  return $reported_space;
+}
+
+/**
+ * List used memory.
+ *
+ * @return array
+ *   An array contains statistics about the amount of used memory space containing:
+ *    - 0 = Name.
+ *    - 1 = Memory size.
+ *    - 2 = Used Memory.
+ *    - 3 = Free memory.
+ *    - 4 = Shared.
+ *    - 5 = Buffers.
+ *    - 6 = Cached.
+ */
+function _sys_memory_usage() {
+  $memory_list = rtrim(`free -h  | grep -vE 'none|buffers' | awk '{ print $1 "," $2 "," $3 "," $4 "," $5 "," $6 "," $7 }'`);
+  $memory_array = explode("\n", $memory_list);
+
+  $reported_memory = [];
+  foreach ($memory_array as $array_line) {
+    $row = explode(',', $array_line);
+    $reported_memory[] = [
+      'name' => $row[0],
+      'total' => $row[1],
+      'used' => $row[2],
+      'free' => $row[3],
+      'shared' => $row[4],
+      'buffers' => $row[5],
+      'cached' => $row[6],
+    ];
+  }
+  return $reported_memory;
+}
+
+/**
+ * Implements hook_cron().
+ */
+function sys_cron() {
+  // Get settings and send emails tu users.
+  $site_name = \Drupal::config('system.site')->get('name');
+  $config = \Drupal::config('sys.settings');
+  $service = \Drupal::service('sys.service');
+  $state = \Drupal::state();
+  if (!empty($config->get('get_notified')) && $config->get('get_notified') === 1) {
+    $notif = $config->get('cron');
+    if (($notif == 'weekly' && date('l') == 'Monday') || $notif == 'daily') {
+      if (!empty($state->get('sys_settings')) && $state->get('sys_settings') == date('d/m')) {
+        return;
+      }
+      $mailManager = \Drupal::service('plugin.manager.mail');
+      $module = 'sys';
+      $key = 'email';
+      $params['from'] = $config->get('email_from_address');
+      $emails_to = explode("\n", $config->get('email_to'));
+      $params['subject'] = "{$site_name} - generated metrics at : " . date('d/m/Y H:i') . ' By Sys';
+      $params['body'] = $config->get('message');
+      $params['body'] .= $service->getTables();
+
+      $langcode = \Drupal::currentUser()->getPreferredLangcode();
+      foreach ($emails_to as $email) {
+        $result = $mailManager->mail($module, $key, trim($email), $langcode, $params, NULL, TRUE);
+        if ($result['result'] !== TRUE) {
+          drupal_set_message(t('There was a problem sending your message and it was not sent.'), 'error');
+        }
+        else {
+          drupal_set_message(t('Your message has been sent.'));
+        }
+      }
+      $state->set('sys_settings', date('d/m'));
+    }
+  }
+}
+
+/**
+ * Implements hook_mail().
+ */
+function sys_mail($key, &$message, $params) {
+  switch ($key) {
+    case 'email':
+      $message['from'] = $params['from'];
+      $message['subject'] = $params['subject'];
+      $message['body'][] = Html::escape($params['body']);
+      $message['headers'] = [
+        'MIME-Version' => '1.0',
+        'Content-Type' => 'text/html; charset=UTF-8; format=flowed; delsp=yes',
+        'Content-Transfer-Encoding' => '8Bit',
+        'X-Mailer' => 'Drupal',
+      ];
+      break;
+  }
+}
+
+function sys_ge_values_php_metrics(){
+  $data = [];
+  $data['memory_limit']  =  ini_get('memory_limit');
+  $data['max_input_time']  =  ini_get('max_input_time');
+  $data['max_input_time']  =  ini_get('max_input_time');
+  $data['max_input_vars']  =  ini_get('max_input_vars');
+  $data['max_execution_time']  =  ini_get('max_execution_time');
+  $data['post_max_size']  =  ini_get('post_max_size');
+  $data['upload_max_filesize']  =  ini_get('upload_max_filesize');
+  return $data;
+}
