@@ -1,0 +1,297 @@
+<?php
+
+/**
+ * @file
+ * - Disables PHP block visibility permission and gives status error if a role
+ *   has this permission.
+ * - Disables the PHP module.
+ * - Hides the PHP and paranoia modules from the modules page.
+ * - Prevents user/1 editing which could give access to abitrary contrib module
+ *   php execution.
+ */
+
+use Drupal\Core\Database\Database;
+use Drupal\Core\Extension\Extension;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Render\Element;
+use Drupal\user\Entity\Role;
+use Drupal\user\RoleInterface;
+
+/**
+ * Implements hook_system_info_alter().
+ *
+ * Hide designated modules.
+ */
+function paranoia_system_info_alter(array &$info, Extension $file, $type) {
+  $hidden_modules = \Drupal::moduleHandler()->invokeAll('paranoia_hide_modules');
+  if ($type == 'module' && in_array($file->getName(), $hidden_modules)) {
+    $info['hidden'] = TRUE;
+  }
+}
+
+/*
+ * Implements hook_ENTITY_TYPE_presave() for user_role entities.
+ */
+function paranoia_user_role_presave(RoleInterface $role) {
+  $role->setIsAdmin(FALSE);
+  \Drupal::service('logger.channel.paranoia')->alert('An attempt to elevate the role %role_label to admin was detected and blocked.', ['%role_label' => $role->label()]);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Hides the admin role on the user settings form.
+ */
+function paranoia_form_user_admin_settings_alter(&$form, FormStateInterface $form_state) {
+  $form['admin_role']['#access'] = FALSE;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Hides designated modules from the module uninstall form.
+ */
+function paranoia_form_system_modules_uninstall_alter(&$form, FormStateInterface $form_state) {
+  $hidden_modules = \Drupal::moduleHandler()->invokeAll('paranoia_hide_modules');
+  foreach ($hidden_modules as $module) {
+    if (isset($form['modules'][$module])) {
+      unset($form['modules'][$module]);
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Hides Paranoia and PHP modules from module admin form.
+ */
+function paranoia_form_system_modules_alter(&$form, FormStateInterface $form_state) {
+  // Invoke custom validation function to disable banned modules on submit.
+  $form['#validate'][] = 'paranoia_module_validate';
+}
+
+/**
+ * Custom validation function to make sure no banned modules were enabled.
+ */
+function paranoia_module_validate($form, FormStateInterface $form_state) {
+  paranoia_remove_disabled_modules();
+}
+
+/**
+ * Disables modules based on the list in hook_paranoia_disable_modules().
+ */
+function paranoia_remove_disabled_modules() {
+  $module_handler = \Drupal::moduleHandler();
+  $disabled_modules = $module_handler->invokeAll('paranoia_disable_modules');
+  foreach ($disabled_modules as $module) {
+    if ($module_handler->moduleExists($module)) {
+      drupal_set_message(t('The module %module has been disabled as it is not allowed on this site.',
+        ['%module' => $module]));
+      \Drupal::service('module_installer')->uninstall([$module]);
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function paranoia_form_user_form_alter(&$form, FormStateInterface $form_state) {
+  $user_id = $form_state->getBuildInfo()['callback_object']->getEntity()->id();
+  if ($user_id == 1) {
+    $user = \Drupal::currentUser();
+    // Allow user/1 to edit own details.
+    if ($user->id() != 1) {
+      drupal_set_message(t('You must log in as this user (user/1) to modify the name, email address, and password for this account.'), 'warning');
+      $form['account']['name']['#access'] = FALSE;
+      $form['account']['mail']['#access'] = FALSE;
+      $form['account']['pass']['#access'] = FALSE;
+      $form['account']['current_pass']['#access'] = FALSE;
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Hides permissions considered risky by hook_paranoia_hide_permissions().
+ */
+function paranoia_form_user_admin_permissions_alter(&$form, FormStateInterface $form_state) {
+  $banned_permissions = \Drupal::moduleHandler()->invokeAll('paranoia_hide_permissions');
+  $permissions = \Drupal::service('user.permissions')->getPermissions();
+  $permissions_by_provider = [];
+  foreach ($permissions as $permission_name => $permission) {
+    $permissions_by_provider[$permission['provider']][$permission_name] = $permission;
+  }
+  $has_hidden = FALSE;
+  foreach ($permissions_by_provider as $provider => $provider_permissions) {
+    $hidden_count = 0;
+    foreach ($provider_permissions as $permission_name => $permission) {
+      // If the permission is banned, remove it.
+      if (in_array($permission_name, $banned_permissions)) {
+        unset($form['permissions'][$permission_name]);
+        $hidden_count++;
+        $has_hidden = TRUE;
+      }
+      // If the permission is restricted, lock it down for anonymous and
+      // authenticated.
+      elseif (!empty($permission['restrict access'])) {
+        foreach ([RoleInterface::ANONYMOUS_ID, RoleInterface::AUTHENTICATED_ID] as $rid) {
+          $form['permissions'][$permission_name][$rid]['#disabled'] = TRUE;
+          $form['permissions'][$permission_name][$rid]['#default_value'] = FALSE;
+        }
+      }
+    }
+    // If all permissions for a provider were hidden, remove the provider name.
+    if ($hidden_count == count($provider_permissions)) {
+      unset($form['permissions'][$provider]);
+    }
+  }
+  if ($has_hidden) {
+    drupal_set_message(t('To make this site more secure, some permissions have been removed from this form.'));
+  }
+  $form['#submit'][] = 'paranoia_permissions_submit';
+}
+
+/**
+ * Helper function to remove all risky permissions from any role.
+ *
+ * Separated out from paranoia_permissions_submit so that there is
+ * clearly no dependency on a form or form state.
+ */
+function _paranoia_remove_risky_permissions() {
+  $banned_permissions = \Drupal::moduleHandler()->invokeAll('paranoia_hide_permissions');
+  $roles = Role::loadMultiple();
+  foreach ($roles as $role) {
+    foreach ($banned_permissions as $permission) {
+      $role->revokePermission($permission);
+    }
+    $role->save();
+  }
+}
+
+/**
+ * Remove extremely-risky permissions from any role.
+ */
+function paranoia_permissions_submit($form, FormStateInterface $form_state) {
+  _paranoia_remove_risky_permissions();
+}
+
+/**
+ * Implements hook_paranoia_disable_modules().
+ */
+function paranoia_paranoia_disable_modules() {
+  return [
+    'php',
+    'skinr_ui',
+  ];
+}
+
+/**
+ * Implements hook_paranoia_hide_permissions().
+ *
+ * On behalf of Drupal Core.
+ */
+function paranoia_paranoia_hide_permissions() {
+  return [
+    'use PHP for settings',
+    'use text format php_code',
+  ];
+}
+
+/**
+ * Implements hook_paranoia_hide().
+ */
+function paranoia_paranoia_hide_modules() {
+  $hidden_modules = [
+    'paranoia',
+  ];
+  // Disabled modules should also be hidden.
+  $disabled_modules = \Drupal::moduleHandler()->invokeAll('paranoia_disable_modules');
+  return array_unique(array_merge($hidden_modules, $disabled_modules));
+}
+
+/**
+ * Implements hook_paranoia_hide_permissions().
+ *
+ * On behalf of devel.module.
+ */
+function devel_paranoia_hide_permissions() {
+  return ['execute php code'];
+}
+
+/**
+ * Implements hook_paranoia_hide_permissions().
+ *
+ * On behalf of googleanalytics.module.
+ */
+function googleanalytics_paranoia_hide_permissions() {
+  return ['use PHP for tracking visibility'];
+}
+
+/**
+ * Implements hook_paranoia_hide_permissions().
+ *
+ * On behalf of bueditor.module.
+ */
+function bueditor_paranoia_hide_permissions() {
+  return ['administer bueditor'];
+}
+
+/**
+ * Implements hook_paranoia_hide_permissions().
+ *
+ * On behalf of auto_username.module.
+ */
+function auto_username_paranoia_hide_permissions() {
+  return ['use PHP for username patterns'];
+}
+
+/**
+ * Implements hook_paranoia_hide_permissions().
+ *
+ * On behalf of auto_entitylabel.module.
+ */
+function auto_entitylabel_paranoia_hide_permissions() {
+  return ['use PHP for auto entity labels'];
+}
+
+/**
+ * Implements hook_paranoia_hide_routes().
+ *
+ * On behalf of devel.module
+ */
+function devel_paranoia_hide_routes() {
+  return ['devel.execute_php'];
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Hides forms that allow php arrays for importing to avoid RCE.
+ * http://heine.familiedeelstra.com/security/unserialize
+ */
+function paranoia_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $forms_to_disable = \Drupal::moduleHandler()->invokeAll('paranoia_risky_forms');
+  $forms_to_disable = array_combine($forms_to_disable, $forms_to_disable);
+  if (array_key_exists($form_id, $forms_to_disable)) {
+    $form['#access'] = FALSE;
+    $form['#validate'][] = 'paranoia_form_validate_always_fail';
+    drupal_set_message(t('This form is disabled for security reasons. See <a href="https://www.drupal.org/node/2313945">details</a> on why this form is disabled.'), 'error');
+  }
+}
+
+/**
+ * Form validation that will always throw an error to prevent submits.
+ */
+function paranoia_form_validate_always_fail() {
+  $form_state->setErrorByName('', t('This form is disabled for security reasons. See <a href="https://www.drupal.org/node/2313945">details</a> on why this form is disabled.'));
+}
+
+/**
+ * Implements paranoia_risky_forms().
+ *
+ * On behalf of devel module.
+ */
+function devel_paranoia_risky_forms() {
+  return ['devel_execute_php'];
+}
