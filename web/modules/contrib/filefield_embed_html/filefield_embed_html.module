@@ -1,0 +1,167 @@
+<?php
+
+/**
+ * @file
+ * Contains core functions for the File (Field) Embed HTML module.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\field\Entity\FieldConfig;
+use Drupal\file\Plugin\Field\FieldType\FileFieldItemList;
+use Drupal\filefield_embed_html\Unarchiver;
+use Drupal\file\Entity\File;
+use Drupal\Core\Url;
+
+/**
+ * Define the base URI in public scheme.
+ */
+define('BASE_URI', 'public://filefield_embed_html/');
+
+/**
+ * Implements hook_page_attachments().
+ */
+function filefield_embed_html_page_attachments(array &$attachments) {
+  $attachments['#attached']['library'][] = 'filefield_embed_html/iframe-resizer.parent';
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function filefield_embed_html_form_field_config_edit_form_alter(array &$form, FormStateInterface $form_state) {
+  /** @var Drupal\field\Entity\FieldConfig $field */
+  $field = $form_state->getFormObject()->getEntity();
+
+  if ($field->getClass() == '\Drupal\file\Plugin\Field\FieldType\FileFieldItemList') {
+    $entity_info = \Drupal::entityTypeManager()->getDefinition($field->getTargetEntityTypeId());
+    $settings = $field->getThirdPartySettings('filefield_embed_html');
+
+    $form['settings']['filefield_embed_html'] = [
+      '#type'    => 'container',
+      '#tree'    => TRUE,
+      '#weight'  => 2,
+      '#parents' => ['third_party_settings', 'filefield_embed_html'],
+    ];
+
+    $form['settings']['filefield_embed_html']['enabled'] = [
+      '#type'          => 'checkbox',
+      '#title'         => t('Enable File (Field) Embed HTML'),
+      '#default_value' => isset($settings['enabled']) ? $settings['enabled'] : FALSE,
+      '#description'   => t('Adds ability to upload and automatically embed an HTML package.'),
+    ];
+
+    $form['#validate'][] = '_filefield_embed_html_form_field_config_edit_form_validate';
+  }
+}
+
+/**
+ * Custom validation handler for filefield_embed_html.
+ */
+function _filefield_embed_html_form_field_config_edit_form_validate(array &$form, FormStateInterface $form_state) {
+  $settings = $form_state->getValue('third_party_settings')['filefield_embed_html'];
+
+  // If filefield_embed_html is enabled for this field.
+  if ($settings['enabled']) {
+    // Load field object.
+    $field = $form_state->getFormObject()->getEntity();
+
+    // Get extension list.
+    $extension_list = array_filter(preg_split('/\s?[, ]\s?/', $field->getSetting('file_extensions')));
+
+    // List of supported extensions.
+    $supported_extensions = ['zip'];
+
+    // If there's one unsupported extension, return a validation error.
+    if (array_diff($extension_list, $supported_extensions)) {
+      $form_state->setErrorByName('settings][file_extensions', t('In order to enable Filefield Embed HTML for this field, you must allow only the following extensions: %extensions.', ['%extensions' => implode(', ', $supported_extensions)]));
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_view().
+ */
+function filefield_embed_html_entity_view(array &$build, \Drupal\Core\Entity\EntityInterface $entity, \Drupal\Core\Entity\Display\EntityViewDisplayInterface $display, $view_mode) {
+  if ($entity instanceof \Drupal\node\Entity\Node || $entity instanceof \Drupal\paragraphs\Entity\Paragraph) {
+    foreach ($entity->getFields() as $field) {
+      if ($field instanceof FileFieldItemList) {
+        /** @var FieldConfig $definition */
+        $definition = $field->getFieldDefinition();
+        if (method_exists($definition, 'getThirdPartySettings')) {
+          $settings = $definition->getThirdPartySettings('filefield_embed_html');
+
+          if (isset($settings['enabled']) && $settings['enabled']) {
+            $field_values = $field->getValue();
+
+            foreach ($field_values as $field_value) {
+              // Load file.
+              $file = File::load($field_value['target_id']);
+
+              // Load full path.
+              $file_path = _filefield_embed_html_build_path_from_uri($file->getFileUri());
+
+              // Instance of Unarchiver class.
+              $unarchiver = new Unarchiver($file_path);
+
+              // Build destination folder.
+              $destination = _filefield_embed_html_build_destination($file);
+
+              // If the specified destination folder still doesn't exists.
+              if (!is_dir($destination)) {
+                // Extract the archive.
+                $unarchiver->extractTo($destination);
+
+                // Inject iframe-resizer script.
+                _filefield_embed_html_inject_iframe_resizer($destination);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Inject iframe-resizer script into the HTML.
+ */
+function _filefield_embed_html_inject_iframe_resizer($destination) {
+  // Get the HTML file path.
+  $file_path = $destination . '/index.html';
+
+  // Load original content.
+  $content = file_get_contents($file_path);
+
+  // Generate iframe-resizer absolute url.
+  $library_path = drupal_get_path('module', 'filefield_embed_html') . '/js/iframe-resizer/iframeResizer.contentWindow.min.js';
+  $resizer_url = Url::fromUri('internal:/' . $library_path, ['absolute' => TRUE, 'language' => FALSE])->toString(TRUE)->getGeneratedUrl();
+
+  // Build script tag.
+  $script = '<script src="'. $resizer_url .'"></script>';
+
+  // Inject script tag into content.
+  $content = str_replace('</body>', $script . '</body>', $content);
+
+  // Save updated content.
+  $file = fopen($file_path, 'w');
+  fwrite($file, $content);
+  fclose($file);
+}
+
+/**
+ * Build full file path from URI.
+ */
+function _filefield_embed_html_build_path_from_uri($uri) {
+  $wrapper = \Drupal::service('stream_wrapper_manager')->getViaUri($uri);
+
+  return $wrapper->realpath();
+}
+
+/**
+ * Build destination path from $file.
+ */
+function _filefield_embed_html_build_destination(File $file) {
+  $file_path = _filefield_embed_html_build_path_from_uri(BASE_URI);
+
+  return $file_path . '/' . $file->id();
+}
