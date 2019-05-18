@@ -1,0 +1,145 @@
+<?php
+
+/**
+ * @file
+ * Contains installation hooks for module.
+ */
+
+use Drupal\user\Entity\Role;
+
+/**
+ * Implements hook_requirements().
+ */
+function ivw_integration_requirements($phase) {
+  $requirements = [];
+
+  if ($phase == 'runtime') {
+    $config = \Drupal::config('ivw_integration.settings');
+
+    // Raise warning if Google user account has not been set yet.
+    if (empty($config->get('site'))) {
+      $requirements['ivw_integration'] = [
+        'title' => t('IVW'),
+        'description' => t('IVW has not been configured yet. Please configure its settings from the <a href="@url">IVW settings page</a>.', ['@url' => \Drupal::url('ivw_integration.admin_settings')]),
+        'severity' => REQUIREMENT_WARNING,
+        'value' => t('Not configured'),
+      ];
+    }
+  }
+
+  return $requirements;
+}
+
+/**
+ * Add missing field columns to field tables.
+ *
+ * @param string $field_type
+ *   The field types id.
+ *
+ * @return array
+ *   Gathered messages.
+ */
+function ivw_integration_add_missing_field_columns($field_type) {
+  $messages = [];
+  $entity_type_manager = \Drupal::entityTypeManager();
+  $database_schema = \Drupal::database()->schema();
+
+  // Get all of the field storage entities of type ivw_integration_settings.
+  $field_storage_configs = $entity_type_manager
+    ->getStorage('field_storage_config')
+    ->loadByProperties(['type' => $field_type]);
+
+  foreach ($field_storage_configs as $field_storage) {
+    // The name of the field.
+    $field_name = $field_storage->getName();
+    $field_schema = $field_storage->getSchema();
+
+    // The entity type to which this field is attached.
+    $target_entity_type_id = $field_storage->getTargetEntityTypeId();
+    $target_entity_type = $entity_type_manager->getDefinition($target_entity_type_id);
+    $target_entity_type_storage = $entity_type_manager->getStorage($target_entity_type_id);
+
+    // Table mapping is used to generate the table names of the found fields.
+    $table_mapping = $target_entity_type_storage->getTableMapping();
+
+    // The full column name mapping of this field type.
+    $field_column_names = $table_mapping->getColumnNames($field_name);
+
+    // Get the table name, that needs to be updated.
+    $field_table_names = [$table_mapping->getDedicatedDataTableName($field_storage)];
+
+    // If the entity is revisionable, also update the revision table.
+    if ($target_entity_type->isRevisionable()) {
+      $field_table_names[] = $table_mapping->getDedicatedRevisionTableName(
+        $field_storage
+      );
+    }
+
+    foreach ($field_table_names as $field_table_name) {
+      if (!$database_schema->tableExists($field_table_name)) {
+        continue;
+      }
+      foreach ($field_schema['columns'] as $column => $definition) {
+        // The actual column name in the database for this column in this
+        // field and entity.
+        $column_name = $field_column_names[$column];
+        if (!$database_schema->fieldExists(
+            $field_table_name,
+            $column_name
+          )
+        ) {
+          $messages[] = t(
+            'Adding field @field to table @table',
+            [
+              '@field' => $column_name,
+              '@table' => $field_table_name,
+            ]
+          );
+          $database_schema->addField(
+            $field_table_name,
+            $column_name,
+            $definition
+          );
+        }
+      }
+    }
+    \Drupal::entityDefinitionUpdateManager()->updateFieldStorageDefinition($field_storage);
+  }
+
+  return $messages;
+}
+
+/**
+ * Add missing fields to ivw_settings field tables.
+ */
+function ivw_integration_update_8101() {
+  $messages = ivw_integration_add_missing_field_columns('ivw_integration_settings');
+  return implode('<br /><br />', $messages);
+}
+
+/**
+ * Update all current users for the new permission.
+ */
+function ivw_integration_update_8102() {
+  $roles = Role::loadMultiple();
+  foreach ($roles as $role) {
+    if ($role->hasPermission("administer site configuration")) {
+      $role->grantPermission("administer ivw integration configuration");
+    }
+  }
+}
+
+/**
+ * Grant new permission to users who can administer site config.
+ */
+function ivw_integration_update_8103() {
+  // Update hook 8102 did not include the save operation, thus retry it here.
+  $roles = Role::loadMultiple();
+  /** @var \Drupal\user\RoleInterface $role */
+  foreach ($roles as $role) {
+    if ($role->hasPermission("administer site configuration") && !$role->hasPermission("administer ivw integration configuration")) {
+      $role->grantPermission("administer ivw integration configuration");
+      $role->save();
+    }
+  }
+}
