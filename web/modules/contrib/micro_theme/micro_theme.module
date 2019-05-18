@@ -1,0 +1,398 @@
+<?php
+
+/**
+ * @file
+ * Contains micro_theme.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\micro_site\Entity\SiteType;
+use Drupal\micro_site\Entity\Site;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\field\Entity\FieldStorageConfig;
+use Drupal\Core\Entity\ContentEntityInterface;
+use Drupal\Core\Field\FieldDefinitionInterface;
+use Drupal\micro_site\Entity\SiteInterface;
+use Drupal\micro_theme\MicroAssetFileStorage;
+use Drupal\Component\Utility\UrlHelper;
+use Drupal\Core\Cache\Cache;
+
+function micro_theme_form_system_theme_settings_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state) {
+
+  $args = $form_state->getBuildInfo()['args'];
+  $theme = isset($args[0]) ? $args[0] : '';
+
+  $form['micro_theme'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Micro theme Settings'),
+  );
+
+  // Add a checkbox to enable micro site using this theme.
+  $form['micro_theme']['micro_theme_enable'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Theme available to micro site'),
+    '#default_value' => theme_get_setting('micro_theme_enable', $theme),
+    '#description' => t('Check this option allows a micro site to select and use this theme.'),
+  );
+
+  $type_options = array_map(function (SiteType $siteType) { return $siteType->label(); }, SiteType::loadMultiple());
+  $type_default_value = theme_get_setting('micro_theme_site_type', $theme);
+
+  $form['micro_theme']['site_types'] = array(
+    '#type' => 'details',
+    '#title' => t('Limit per site type'),
+    '#open' => (bool) (count($type_options) <= 10),
+    '#states' => [
+      'visible' => [
+        ':input[name="micro_theme_enable"]' => ['checked' => TRUE],
+      ],
+    ]
+  );
+
+
+  $form['micro_theme']['site_types']['micro_theme_site_type'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Site types'),
+    '#description'   => t('Select the site types which can select and use this theme. Leave empty to allow all.'),
+    '#default_value' => $type_default_value ? array_filter($type_default_value) : [],
+    '#options' => $type_options,
+    '#attributes' => [
+      'class' => ['inline-checkboxes'],
+    ],
+    '#states' => [
+      'visible' => [
+        ':input[name="micro_theme_enable"]' => ['checked' => TRUE],
+      ],
+    ]
+  );
+
+
+  $entity_options = array_map(function (Site $site) { return $site->label(); }, Site::loadMultiple());
+  $entity_default_value = theme_get_setting('micro_theme_site_entity', $theme);
+
+  $form['micro_theme']['site_entities'] = array(
+    '#type' => 'details',
+    '#title' => t('Limit per site entity'),
+    '#open' => (bool) (count($entity_options) <= 10),
+    '#states' => [
+      'visible' => [
+        ':input[name="micro_theme_enable"]' => ['checked' => TRUE],
+      ],
+    ]
+  );
+
+
+  $form['micro_theme']['site_entities']['micro_theme_site_entity'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Site entities'),
+    '#description'   => t('Select the site entities which can select and use this theme. Leave empty to allow all.'),
+    '#default_value' => $entity_default_value ? array_filter($entity_default_value) : [],
+    '#options' => $entity_options,
+    '#attributes' => [
+      'class' => ['inline-checkboxes'],
+    ],
+    '#states' => [
+      'visible' => [
+        ':input[name="micro_theme_enable"]' => ['checked' => TRUE],
+      ],
+    ]
+  );
+
+}
+
+/**
+ * Implements hook_entity_base_field_info().
+ */
+function micro_theme_entity_base_field_info(EntityTypeInterface $entity_type) {
+  $fields = [];
+
+  if ($entity_type->id() === 'site') {
+    $fields['theme'] = BaseFieldDefinition::create('list_string')
+      ->setLabel(t('Theme'))
+      ->setDescription(t('Select the theme used by the site. Leave empty to use the default active theme.'))
+      ->setRevisionable(FALSE)
+      ->setSettings([
+        'allowed_values_function' => 'micro_theme_allowed_values_themes',
+      ])
+      ->setDefaultValueCallback('micro_theme_default_value_themes')
+      ->setDisplayOptions('form', [
+        'type' => 'options_select',
+        'weight' => 0,
+      ])
+      ->setDisplayConfigurable('form', TRUE);
+  }
+
+  return $fields;
+}
+
+/**
+ * Set dynamic allowed values for the theme field on the site entity.
+ *
+ * @param \Drupal\Core\Field\BaseFieldDefinition $definition
+ *   The base field definition.
+ * @param \Drupal\Core\Entity\ContentEntityInterface|null $entity
+ *   The entity being created if applicable.
+ * @param bool $cacheable
+ *   Boolean indicating if the results are cacheable.
+ *
+ * @return array
+ *   An array of possible key and value options.
+ *
+ * @see options_allowed_values()
+ */
+function micro_theme_allowed_values_themes(BaseFieldDefinition $definition, ContentEntityInterface $entity = NULL, $cacheable) {
+  $options = [];
+
+  if (!$entity instanceof SiteInterface) {
+    return $options;
+  }
+
+  $themes = \Drupal::service('theme_handler')->listInfo();
+  foreach ($themes as $key => $theme) {
+    $theme_enable = theme_get_setting('micro_theme_enable', $key);
+    if ($theme_enable) {
+      $limit_site_type = array_filter(theme_get_setting('micro_theme_site_type', $key));
+      $limit_site_entity = array_filter(theme_get_setting('micro_theme_site_entity', $key));
+      if (empty($limit_site_type) && empty($limit_site_entity)) {
+        $options[$key] = $theme->info['name'];
+      }
+      elseif (!empty($limit_site_type) && in_array($entity->bundle(), $limit_site_type)) {
+        $options[$key] = $theme->info['name'];
+      }
+      elseif (!empty($limit_site_entity) && in_array($entity->id(), $limit_site_entity)) {
+        $options[$key] = $theme->info['name'];
+      }
+
+    }
+
+  }
+  return $options;
+}
+
+/**
+ * Sets the default value for the theme field.
+ *
+ * @param \Drupal\Core\Entity\ContentEntityInterface $entity
+ *   The entity being created.
+ * @param \Drupal\Core\Field\FieldDefinitionInterface $definition
+ *   The field definition.
+ *
+ * @return array
+ *   An array of default value keys with each entry keyed with the “value” key.
+ *
+ * @see \Drupal\Core\Field\FieldConfigBase::getDefaultValue()
+ */
+function micro_theme_default_value_themes(ContentEntityInterface $entity, FieldDefinitionInterface $definition) {
+  $default = '';
+
+  return [
+    ['value' => $default],
+  ];
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function micro_theme_form_site_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $form['micro_theme'] = [
+    '#type' => 'details',
+    '#title' => t('Theme'),
+    '#group' => 'advanced',
+    '#attributes' => [
+      'class' => ['site-form-theme'],
+    ],
+    '#weight' => 100,
+    '#optional' => TRUE,
+  ];
+
+  if (isset($form['theme'])) {
+    $form['theme']['#group'] = 'micro_theme';
+    $form['theme']['#access'] = (bool) (count($form['theme']['widget']['#options']) > 1);
+  }
+
+}
+
+function micro_theme_preprocess_image_widget(&$variables) {
+  $element = $variables['element'];
+
+  $variables['attributes'] = array('class' => array('image-widget', 'js-form-managed-file', 'form-managed-file', 'clearfix'));
+
+  if (!empty($element['fids']['#value'])) {
+    $file = reset($element['#files']);
+    $element['file_' . $file->id()]['filename']['#suffix'] = ' <span class="file-size">(' . format_size($file->getSize()) . ')</span> ';
+    $file_variables = array(
+      'style_name' => $element['#preview_image_style'],
+      'uri' => $file->getFileUri(),
+    );
+
+    // Determine image dimensions.
+    if (isset($element['#value']['width']) && isset($element['#value']['height'])) {
+      $file_variables['width'] = $element['#value']['width'];
+      $file_variables['height'] = $element['#value']['height'];
+    } else {
+      $image = \Drupal::service('image.factory')->get($file->getFileUri());
+      if ($image->isValid()) {
+        $file_variables['width'] = $image->getWidth();
+        $file_variables['height'] = $image->getHeight();
+      }
+      else {
+        $file_variables['width'] = $file_variables['height'] = NULL;
+      }
+    }
+
+    $element['preview'] = array(
+      '#weight' => -10,
+      '#theme' => 'image_style',
+      '#width' => $file_variables['width'],
+      '#height' => $file_variables['height'],
+      '#style_name' => $file_variables['style_name'],
+      '#uri' => $file_variables['uri'],
+    );
+
+    // Store the dimensions in the form so the file doesn't have to be
+    // accessed again. This is important for remote files.
+    $element['width'] = array(
+      '#type' => 'hidden',
+      '#value' => $file_variables['width'],
+    );
+    $element['height'] = array(
+      '#type' => 'hidden',
+      '#value' => $file_variables['height'],
+    );
+  }
+
+  $variables['data'] = array();
+  foreach (\Drupal\Core\Render\Element::children($element) as $child) {
+    $variables['data'][$child] = $element[$child];
+  }
+}
+
+/**
+ * Implements hook_cache_flush().
+ *
+ * Delete all asset files.
+ */
+function micro_theme_cache_flush() {
+  MicroAssetFileStorage::deleteAllFiles();
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function micro_theme_page_attachments(array &$attachments) {
+  /** @var \Drupal\micro_theme\MicroManagerAssetInterface $manager */
+  $manager = \Drupal::service('micro_theme.manager');
+  if (!$manager->isDefaultTheme()) {
+    return;
+  }
+
+  /** @var \Drupal\micro_site\SiteNegotiatorInterface $negotiator */
+  $negotiator = \Drupal::service('micro_site.negotiator');
+  /** @var \Drupal\micro_site\Entity\SiteInterface $site */
+  $site = $negotiator->getActiveSite();
+  if (!$site instanceof SiteInterface) {
+    return;
+  }
+
+  $site_id = $site->id();
+  /** @var \Drupal\micro_theme\MicroLibrariesServiceInterface $libraries_service */
+  $libraries_service = \Drupal::service('micro_theme.libraries');
+  $active_theme = $manager->getActiveTheme();
+
+  if (!isset($attachments['#cache']['tags'])) {
+    $attachments['#cache']['tags'] = [];
+  }
+  $attachments['#cache']['tags'] = Cache::mergeTags($attachments['#cache']['tags'], ['micro_theme:' . $site_id]);
+
+  // Font override.
+  if ($manager->hasAssetOverride('font', $site_id)) {
+    $module_libraries = $libraries_service->getModuleLibraries('micro_theme');
+    $theme_libraries = $libraries_service->getThemeLibraries($active_theme);
+    // We allow to the themes to provide custom font libraries. A font library
+    // provided by a theme has the priority on the default libraries provided by
+    // the module. Others modules can provide additionnal colors (@See
+    $libraries = $theme_libraries + $module_libraries;
+
+    $base_font = $manager->getValue('font', $site->id(), 'base_font');
+    if ($base_font) {
+      if (isset($libraries[$base_font])) {
+        $css = $libraries[$base_font]['css'][0]['data'];
+        $type = $libraries[$base_font]['css'][0]['type'];
+        $base_font_css = [
+          '#tag' => 'link',
+          '#attributes' => [
+            'rel' => 'stylesheet',
+            'href' => $css,
+          ],
+        ];
+        $attachments['#attached']['html_head'][] = [$base_font_css, 'micro_theme_font_base'];
+      }
+    }
+
+    $title_font = $manager->getValue('font', $site->id(), 'title_font');
+    if ($title_font) {
+      if (isset($libraries[$title_font])) {
+        $css = $libraries[$title_font]['css'][0]['data'];
+        $type = $libraries[$title_font]['css'][0]['type'];
+        $title_font_css = [
+          '#tag' => 'link',
+          '#attributes' => [
+            'rel' => 'stylesheet',
+            'href' => $css,
+          ],
+        ];
+        $attachments['#attached']['html_head'][] = [$title_font_css, 'micro_theme_font_title'];
+      }
+    }
+
+    $font_asset = $manager->getAsset('font', $site_id);
+    if ($font_asset) {
+      $font_css = [
+        '#tag' => 'link',
+        '#attributes' => [
+          'rel' => 'stylesheet',
+          'href' => $font_asset,
+        ],
+      ];
+      $attachments['#attached']['html_head'][] = [$font_css, 'micro_theme_font_asset'];
+    }
+  }
+
+  if ($manager->hasAssetOverride('color', $site_id)) {
+    $color_asset = $manager->getAsset('color', $site_id);
+    if ($color_asset) {
+      $color_css = [
+        '#tag' => 'link',
+        '#attributes' => [
+          'rel' => 'stylesheet',
+          'href' => $color_asset,
+        ],
+      ];
+      $attachments['#attached']['html_head'][] = [$color_css, 'micro_theme_color_asset'];
+    }
+  }
+
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ */
+function micro_theme_preprocess_html(&$variables) {
+  /** @var \Drupal\micro_site\SiteNegotiatorInterface $negotiator */
+  $negotiator = \Drupal::service('micro_site.negotiator');
+  /** @var \Drupal\micro_site\Entity\SiteInterface $site */
+  $site = $negotiator->getActiveSite();
+  if (!$site instanceof SiteInterface) {
+    return;
+  }
+  /** @var \Drupal\micro_theme\MicroManagerAssetInterface $manager */
+  $manager = \Drupal::service('micro_theme.manager');
+  if ($manager->hasAssetOverride('font', $site->id())) {
+    $variables['attributes']['class'][] = 'override-font';
+  }
+  if ($manager->hasAssetOverride('color', $site->id())) {
+    $variables['attributes']['class'][] = 'override-color';
+  }
+}
