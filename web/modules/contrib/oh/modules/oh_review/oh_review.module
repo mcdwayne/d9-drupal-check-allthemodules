@@ -1,0 +1,211 @@
+<?php
+
+/**
+ * @file
+ * Hooks for OH Review module.
+ */
+
+use Drupal\Core\Datetime\DrupalDateTime;
+use Drupal\Core\Template\Attribute;
+use Drupal\oh\OhOccurrence;
+use Drupal\oh\OhUtility;
+use Drupal\oh_review\Form\OhReviewSidebarForm;
+use Drupal\oh_review\OhReviewUtility;
+
+/**
+ * Implements hook_theme().
+ */
+function oh_review_theme(array $existing, string $type, string $theme, string $path): array {
+  $info['oh_review_occurrences_list'] = [
+    'variables' => [
+      'time_separator' => ' — ',
+      'range' => NULL,
+      'occurrences' => NULL,
+      'mode' => OhReviewSidebarForm::PREVIEW_MODE_ALL,
+      'messages_no_occurrences' => \t('Closed'),
+      'format_month' => 'F Y',
+      'format_time' => 'g:ia',
+      'format_day' => 'D jS',
+    ],
+  ];
+  $info['oh_review_report_list'] = [
+    'variables' => [
+      'range' => NULL,
+      'occurrences' => NULL,
+      'format_day' => 'D',
+      'format_day_full' => 'jS F Y',
+    ],
+  ];
+  return $info;
+}
+
+/**
+ * Preprocessor for 'oh_review_occurrences_list' theming function.
+ *
+ * @param array $variables
+ *   An array of variables.
+ *
+ * @see oh_review_theme
+ */
+function template_preprocess_oh_review_occurrences_list(array &$variables): void {
+  $variables['#attached']['library'][] = 'oh_review/occurrences_list';
+
+  $isFullDay = function (DrupalDateTime $start, DrupalDateTime $end): bool {
+    $fullDay = new \DateInterval('PT' . ((60 * 60 * 24) - 60) . 'S');
+    $startPlusFullDay = OhUtility::toPhpDateTime($start)->add($fullDay);
+    $end = OhUtility::toPhpDateTime($end);
+    return $end >= $startPlusFullDay;
+  };
+
+  /** @var \Drupal\oh\OhOccurrence[] $occurrences */
+  $occurrences = $variables['occurrences'];
+  /** @var \Drupal\oh\OhDateRange $range */
+  $range = $variables['range'];
+
+  uasort($occurrences, [OhOccurrence::class, 'sort']);
+
+  // Programmatic formats.
+  $monthFormat = 'Y-m';
+  $weekFormat = 'Y-W';
+  $dayFormat = 'Y-m-d';
+
+  // Display formats.
+  $monthNameFormat = $variables['format_month'];
+  $timeFormat = $variables['format_time'];
+  $dayStringFormat = $variables['format_day'];
+
+  $todayString = (new DateTime('now'))->format($dayFormat);
+  $currentWeekString = (new DateTime('now'))->format($weekFormat);
+
+  $fillDays = OhReviewSidebarForm::PREVIEW_MODE_ALL === $variables['mode'];
+  $groupedOccurrences = OhReviewUtility::occurrencesByWeek($range, $occurrences, $fillDays);
+
+  $weeks = [];
+  foreach ($groupedOccurrences as $weekCode => $days) {
+    // Sort the days as fill days are inserted on the end only.
+    ksort($days);
+
+    $startOfWeek = (new \DateTime())
+      ->setISODate(...explode('-', $weekCode))
+      ->setTime(0, 0, 0, 0);
+    $week = [
+      'days' => [],
+      'attributes' => new Attribute(),
+    ];
+    if ($startOfWeek->format($weekFormat) == $currentWeekString) {
+      $week['attributes']->addClass('this-week');
+    }
+    foreach ($days as $dayCode => $occurrences) {
+      $day = DrupalDateTime::createFromFormat($dayFormat, $dayCode);
+      $dayInfo = [
+        'times' => [],
+        'day' => $day->format($dayStringFormat),
+        'month' => $day->format($monthFormat),
+        'month_name' => $day->format($monthNameFormat),
+        'attributes' => new Attribute(),
+      ];
+
+      // Whether the day has at least open occurrence.
+      $open = FALSE;
+      if (count($occurrences)) {
+        foreach ($occurrences as $occurrence) {
+          $dayInfo['times'][] = [
+            'start' => $occurrence->getStart()->format($timeFormat),
+            'end' => $occurrence->getEnd()->format($timeFormat),
+            'is_open' => $occurrence->isOpen(),
+            'is_full_day' => $isFullDay($occurrence->getStart(), $occurrence->getEnd()),
+            'message' => $occurrence->getMessage(),
+          ];
+          $open = ($open or $occurrence->isOpen());
+        }
+      }
+      else {
+        // No occurrences for this day.
+        // This happens when fill days are inserted (mode: all).
+        $dayInfo['times'][] = [
+          'is_open' => $open,
+          'is_full_day' => TRUE,
+          'message' => $variables['messages_no_occurrences'],
+        ];
+      }
+
+      $dayInfo['attributes']->addClass($open ? 'day-is-open' : 'day-is-closed');
+      if ($day->format($dayFormat) == $todayString) {
+        $dayInfo['attributes']->addClass('today');
+      }
+
+      $week['days'][] = $dayInfo;
+    }
+
+    $weeks[] = $week;
+  }
+
+  $variables['weeks'] = $weeks;
+}
+
+/**
+ * Preprocessor for 'oh_review_report_list' theming function.
+ *
+ * @param array $variables
+ *   An array of variables.
+ *
+ * @see oh_review_theme
+ */
+function template_preprocess_oh_review_report_list(array &$variables): void {
+  $variables['#attached']['library'][] = 'oh_review/report_list';
+
+  /** @var \Drupal\oh\OhOccurrence[] $occurrences */
+  $occurrences = $variables['occurrences'];
+
+  /** @var \Drupal\oh\OhDateRange $range */
+  $range = $variables['range'];
+
+  $dayFormat = 'Y-m-d';
+  $groupedByWeek = OhReviewUtility::occurrencesByWeek($range, $occurrences, TRUE);
+
+  $weeks = [];
+  foreach ($groupedByWeek as $weekCode => $days) {
+    $week = [
+      'days' => [],
+      'attributes' => new Attribute(),
+    ];
+    foreach ($days as $dayCode => $occurrences) {
+      $day = DrupalDateTime::createFromFormat($dayFormat, $dayCode);
+      $dayInfo = [
+        'attributes' => new Attribute(),
+        'openings' => 0,
+        'closures' => 0,
+        'day' => substr($day->format($variables['format_day']), 0, 1),
+        'day_full' => $day->format($variables['format_day_full']),
+      ];
+      foreach ($occurrences as $occurrence) {
+        $k = $occurrence->isOpen() ? 'openings' : 'closures';
+        $dayInfo[$k]++;
+      }
+
+      // Omissions day.
+      $omissionDay = ($dayInfo['openings'] + $dayInfo['closures']) === 0;
+      $openingsOnly = $dayInfo['openings'] > 0 && $dayInfo['closures'] === 0;
+      $closuresOnly = $dayInfo['openings'] === 0 && $dayInfo['closures'] > 0;
+      if ($omissionDay) {
+        $dayInfo['attributes']->addClass('omissions-only');
+      }
+      elseif ($openingsOnly) {
+        $dayInfo['attributes']->addClass('openings-only');
+      }
+      elseif ($closuresOnly) {
+        $dayInfo['attributes']->addClass('closures-only');
+      }
+      else {
+        // Mixed openings and closures.
+        $dayInfo['attributes']->addClass('partial-opening');
+      }
+
+      $week['days'][] = $dayInfo;
+    }
+
+    $weeks[] = $week;
+  }
+
+  $variables['weeks'] = $weeks;
+}
