@@ -1,0 +1,217 @@
+<?php
+
+/**
+ * @file
+ * Contains prefetcher.module.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+
+/**
+ * Implements hook_cron().
+ */
+function prefetcher_cron() {
+  if ($config = \Drupal::config('prefetcher.settings')) {
+    if ($limit = (int) $config->get('cron_limit')) {
+      $logger = \Drupal::logger('prefetcher');
+      $lock = \Drupal::lock();
+      $lock_timeout = ini_get('max_execution_time') ? : 60;
+      if ($lock->acquire('prefetcher', $lock_timeout)) {
+        $logger->info(t("Started crawling process for a total of @total items via @env.", ['@total' => $limit, '@env' => 'Cron']));
+        $start = microtime(TRUE);
+        /**
+         * @var \Drupal\prefetcher\PrefetcherCrawlerManager $crawler_manager
+         */
+        $crawler_manager = \Drupal::service('plugin.manager.prefetcher_crawler');
+        /**
+         * @var \Drupal\prefetcher\CrawlerInterface $crawler
+         */
+        $crawler = NULL;
+        $crawler_settings = $config->get('crawler');
+        if (!empty($crawler_settings['plugin_id']) && $crawler_manager->hasDefinition($crawler_settings['plugin_id'])) {
+          $crawler = $crawler_manager->createInstance($crawler_settings['plugin_id']);
+        }
+        else {
+          $crawler = $crawler_manager->getDefaultCrawler();
+        }
+        $entity_storage = \Drupal::entityTypeManager()
+          ->getStorage('prefetcher_uri');
+        $query = $entity_storage->getQuery();
+        $expiry_date = new \DateTime('now');
+        $expiry = (int) $config->get('expiry');
+        if ($expiry > 0) {
+          $expiry_date->add(new \DateInterval("PT" . $expiry . "S"));
+        }
+        $or = $query->orConditionGroup();
+        $or->condition('expires', $expiry_date->format('Y-m-d\TH:i:s'), '<');
+        $or->notExists('expires');
+        $query->condition($or);
+        $query->sort('last_crawled', 'ASC');
+        $query->range(0, $limit);
+        $entity_ids = $query->execute();
+        $entities = [];
+        if (!empty($entity_ids)) {
+          $entities = $entity_storage->loadMultiple($entity_ids);
+          $crawler->crawlMultiple($entities);
+        }
+
+        $time_taken = round(microtime(TRUE) - $start);
+        $logger->info(t("Crawling completed on @total items via @env. Time taken: @time seconds", ['@total' => count($entities), '@env' => 'Cron', '@time' => $time_taken]));
+        $lock->release('prefetcher');
+      }
+      else {
+        $logger->warning(t("@env tried to run a prefetcher while another prefetcher is already running.", ['@env' => 'Cron']));
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_insert().
+ */
+function prefetcher_entity_insert(EntityInterface $entity) {
+  if (!in_array($entity->getEntityTypeId(), _prefetcher_uri_types())) {
+    return;
+  }
+  _prefetcher_uri_for_entity($entity);
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function prefetcher_entity_update(EntityInterface $entity) {
+  if (!in_array($entity->getEntityTypeId(), _prefetcher_uri_types())) {
+    return;
+  }
+  _prefetcher_uri_for_entity($entity);
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function prefetcher_entity_delete(EntityInterface $entity) {
+  if (!in_array($entity->getEntityTypeId(), _prefetcher_uri_types())) {
+    return;
+  }
+  try {
+    $url = $entity->toUrl()->setAbsolute(FALSE)->toString();
+  }
+  catch (\Exception $e) {
+    return;
+  }
+  $storage = \Drupal::entityTypeManager()->getStorage('prefetcher_uri');
+  /** @var \Drupal\prefetcher\Entity\PrefetcherUriInterface $prefetcher_uri */
+  if (!empty($url)) {
+    if ($prefetcher_uris = $storage->loadByProperties(['relpath' => $url])) {
+      $storage->delete($prefetcher_uris);
+    }
+  }
+}
+
+/**
+ * Implements hook_path_insert().
+ */
+function prefetcher_path_insert($path) {
+  if (!empty($path['source']) && !empty($path['alias'])) {
+    $storage = \Drupal::entityTypeManager()->getStorage('prefetcher_uri');
+    /** @var \Drupal\prefetcher\Entity\PrefetcherUriInterface $prefetcher_uri */
+    if ($prefetcher_uris = $storage->loadByProperties(['relpath' => $path['source']])) {
+      foreach ($prefetcher_uris as $prefetcher_uri) {
+        $prefetcher_uri->setPath($path['alias']);
+        $prefetcher_uri->jumpTheQueue();
+        $storage->save($prefetcher_uri);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_path_update().
+ */
+function prefetcher_path_update($path) {
+  if (($path['alias'] != $path['original']['alias']) && !empty($path['original']['alias'])) {
+    $storage = \Drupal::entityTypeManager()->getStorage('prefetcher_uri');
+    /** @var \Drupal\prefetcher\Entity\PrefetcherUriInterface $prefetcher_uri */
+    if ($prefetcher_uris = $storage->loadByProperties(['relpath' => $path['original']['alias']])) {
+      foreach ($prefetcher_uris as $prefetcher_uri) {
+        $prefetcher_uri->setPath($path['alias']);
+        $prefetcher_uri->jumpTheQueue();
+        $storage->save($prefetcher_uri);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_path_delete().
+ */
+function prefetcher_path_delete($path) {
+  if (!empty($path['alias'])) {
+    $storage = \Drupal::entityTypeManager()->getStorage('prefetcher_uri');
+    if ($prefetcher_uris = $storage->loadByProperties(['relpath' => $path['alias']])) {
+      $storage->delete($prefetcher_uris);
+    }
+  }
+}
+
+/**
+ * Implements hook_manual_custom_purge().
+ */
+function prefetcher_manual_custom_purge($urls) {
+  $storage = \Drupal::entityTypeManager()->getStorage('prefetcher_uri');
+  foreach ($urls as $url) {
+    $url = parse_url($url);
+    if (!empty($url['path'])) {
+      if ($prefetcher_uris = $storage->loadByProperties(['relpath' => $url['path']])) {
+        /** @var \Drupal\prefetcher\Entity\PrefetcherUriInterface $prefetcher_uri */
+        foreach ($prefetcher_uris as $prefetcher_uri) {
+          $prefetcher_uri->jumpTheQueue();
+          $storage->save($prefetcher_uri);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Ensures a refresh on the prefetcher uri corresponding to the given entity.
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ *   The entity to refresh the uri data for.
+ */
+function _prefetcher_uri_for_entity(EntityInterface $entity) {
+  if ($account = \Drupal::entityTypeManager()->getStorage('user')->load(0)) {
+    if ($entity->access('view', $account)) {
+      try {
+        $url = $entity->toUrl()->setAbsolute(FALSE)->toString();
+      }
+      catch (\Exception $e) {
+        return;
+      }
+      if (!empty($url)) {
+        $storage = \Drupal::entityTypeManager()->getStorage('prefetcher_uri');
+        if (empty($prefetcher_uri = $storage->loadByProperties(['relpath' => $url]))) {
+          /** @var \Drupal\prefetcher\Entity\PrefetcherUriInterface $prefetcher_uri */
+          $prefetcher_uri = $storage->create();
+          $prefetcher_uri->setPath($url);
+        }
+        else {
+          $prefetcher_uri = reset($prefetcher_uri);
+        }
+        $prefetcher_uri->set('entity_type', $entity->getEntityTypeId());
+        $prefetcher_uri->set('entity_id', $entity->id());
+        $prefetcher_uri->jumpTheQueue();
+        $storage->save($prefetcher_uri);
+      }
+    }
+  }
+}
+
+/**
+ * Get a list of entity types which have uris with a need for being crawled.
+ *
+ * @return array
+ */
+function _prefetcher_uri_types() {
+  return ['node', 'taxonomy_term', 'user', 'profile'];
+}
