@@ -1,0 +1,635 @@
+<?php
+
+/**
+ * @file
+ * Module functions and hooks for message_thread.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Url;
+use Drupal\message_thread\Entity\MessageThreadTemplate;
+use Drupal\message_thread\Entity\MessageThread;
+use Drupal\views\Views;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\message\Entity\MessageTemplate;
+use Drupal\user\Entity\User;
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\StringTranslation\TranslatableMarkup;
+use Drupal\Core\Render\Element;
+use Drupal\Component\Utility\Xss;
+use Drupal\Component\Utility\Html;
+use Drupal\Core\Access\AccessResultForbidden;
+
+/**
+ * Implements hook_installed().
+ */
+function message_thread_modules_installed() {
+  // Flush cache after install to ensure that all routes are read.
+  drupal_flush_all_caches();
+}
+
+/**
+ * Implements hook_help().
+ */
+function message_thread_help($route_name, RouteMatchInterface $arg) {
+  switch ($route_name) {
+    case 'help.page.message_thread':
+      $output = file_get_contents(drupal_get_path('module', 'message_thread') . '/README.md');
+      return \Drupal::moduleHandler()->moduleExists('markdown') ? Xss::filterAdmin(\Drupal::moduleHandler()->invoke('markdown', 'filter', [
+        'process', 0, -1, $output,
+      ]
+        )) : '<h3>Message Private README</h3><pre>' . Html::escape($output) . '</pre>';
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function message_thread_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+
+  if (substr($form_id, 0, 8) != 'message_') {
+    return;
+  }
+
+  // When a message is created we need to ensure that the participants
+  // are included.
+  // This is best done in the validation hook
+  // to ensure participants are not missed from submit functions.
+  $thread_templates = \Drupal::entityTypeManager()->getListBuilder('message_thread_template')->load();
+  foreach ($thread_templates as $name => $template) {
+    $settings = $template->getSettings();
+    $message_template = MessageTemplate::load($settings['message_template']);
+    $message_form_id = 'message_' . $message_template->getTemplate() . '_form';
+    if ($form_id == $message_form_id) {
+      $thread_id = NULL;
+      $parameters = \Drupal::routeMatch()->getParameters();
+      if ($parameters->has('message_thread')) {
+        if (is_object($parameters->get('message_thread'))) {
+          $thread_id = $parameters->get('message_thread')->id();
+        }
+        else {
+          $thread_id = $parameters->get('message_thread');
+        }
+      }
+      if ($form_state->get('thread_id') != NULL) {
+        $thread_id = $form_state->get('thread_id');
+      }
+
+      $owner = $form['uid']['widget'][0]['target_id']['#default_value'];
+
+      if ($thread_id) {
+        $form['message_thread'] = [
+          '#type' => 'hidden',
+          '#value' => $thread_id,
+        ];
+        $message_thread = MessageThread::load($thread_id);
+        $participants = $message_thread->get('field_thread_participants')->getValue();
+        $widget_base = $form['field_message_private_to_user']['widget'][0];
+        foreach ($participants as $key => $participant) {
+          // Don't include the sender.
+          if ($participant['target_id'] == $owner->id()) {
+            unset($form['field_message_private_to_user']['widget'][$key]);
+            continue;
+          }
+          $form['field_message_private_to_user']['widget'][$key] = $widget_base;
+          $form['field_message_private_to_user']['widget'][$key]['target_id']['#default_value'] = User::load($participant['target_id']);
+        }
+        // We also should disable the to field
+        // because this is controlled from the thread.
+        $form['field_message_private_to_user']['#disabled'] = TRUE;
+
+        foreach (array_keys($form['actions']) as $action) {
+          if ($action != 'preview' && isset($form['actions'][$action]['#type']) && $form['actions'][$action]['#type'] === 'submit') {
+            $form['actions'][$action]['#submit'][] = 'message_thread_submit_message';
+          }
+        }
+
+        break;
+        // Todo If there is no message thread parameter then we abort.
+      }
+
+    }
+
+  }
+}
+
+/**
+ * Submit handler.
+ */
+function message_thread_submit_message(array &$form, FormStateInterface $form_state) {
+  $thread_id = $form_state->getValue('message_thread');
+  // Save the relationship between the thread and the message.
+  db_insert('message_thread_index')
+    ->fields(
+      [
+        'mid' => $form_state->getValue('mid'),
+        'thread_id' => $thread_id,
+        'created' => REQUEST_TIME,
+      ]
+    )->execute();
+
+  // Redirect to the thread not the message.
+  $params = [
+    'message_thread' => $thread_id,
+  ];
+  $url = Url::fromRoute('entity.message_thread.canonical', $params);
+  $form_state->setRedirectUrl($url);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function message_thread_form_message_private_message_edit_form_alter(array &$form, FormStateInterface $form_state) {
+  // Redirect to the thread not the message.
+  $mid = $form_state->getFormObject()->getEntity()->id();
+  if (message_thread_relationship($mid)) {
+    $params = [
+      'message_thread' => message_thread_relationship($mid),
+    ];
+    $url = Url::fromRoute('entity.message_thread.canonical', $params);
+    $form_state->setRedirectUrl($url);
+    $link = [
+      '#type' => 'link',
+      '#url' => $url,
+      '#title' => t('Cancel'),
+    ];
+    $form['actions']['cancel'] = $link;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function message_thread_form_message_private_message_form_alter(array &$form, FormStateInterface $form_state) {
+  // Get the message thread id from the url.
+  if (isset($_GET['destination'])) {
+    $parts = explode('/', $_GET['destination']);
+    $thread_id = array_pop($parts);
+    if (is_numeric($thread_id)) {
+      $params = [
+        'message_thread' => $thread_id,
+      ];
+      $url = Url::fromRoute('entity.message_thread.canonical', $params);
+      $form_state->setRedirectUrl($url);
+      $link = [
+        '#type' => 'link',
+        '#url' => $url,
+        '#title' => t('Cancel'),
+      ];
+      $form['actions']['cancel'] = $link;
+    }
+
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function message_thread_form_message_thread_conversation_edit_form_alter(array &$form, FormStateInterface $form_state) {
+  $form['field_thread_participants']['widget']['add_more']['#value'] = new TranslatableMarkup('Add another user');
+  $form['owner']['#access'] = \Drupal::currentUser()->hasPermission('bypass private message access control');
+  $form['advanced']['#access'] = \Drupal::currentUser()->hasPermission('bypass private message access control');
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function message_thread_form_message_thread_conversation_form_alter(array &$form, FormStateInterface $form_state) {
+  $form['field_thread_participants']['widget']['add_more']['#value'] = new TranslatableMarkup('Add another user');
+  $form['owner']['#access'] = \Drupal::currentUser()->hasPermission('bypass private message access control');
+  $form['advanced']['#access'] = \Drupal::currentUser()->hasPermission('bypass private message access control');
+}
+
+/**
+ * Implements hook_preprocess_links().
+ *
+ * Todo should use this hook: message_ui_message_ui_views_contextual_links_info.
+ */
+function message_thread_preprocess_links(&$variables) {
+
+  if (!message_thread_is_message_route()) {
+    return;
+  }
+
+  if ($variables['theme_hook_original'] == 'links__dropbutton__operations') {
+    $account = \Drupal::currentUser();
+
+    foreach ($variables['links'] as $key => $link) {
+      $route_name = $link['link']['#url']->getRouteName();
+      $route_parameters = $link['link']['#url']->getRouteParameters();
+
+      $entity_type = key($route_parameters);
+      $entity = \Drupal::entityTypeManager()->getStorage($entity_type)->load($route_parameters[$entity_type]);
+
+      if (!$entity) {
+        continue;
+      }
+      $operation = strtolower($link['link']['#title']->__toString());
+      if (substr($route_name, 0, 15) == 'entity.message.') {
+        // $message_access_manager =
+        // new MessagePrivateAccessControlHandler($entity->getEntityType());.
+        // $access = $message_access_manager->checkAccess(
+        // $entity, $operation, $account);.
+        $access = message_private_message_access($entity, $operation, $account);
+        // Disable link if user does not have access.
+        if ($access instanceof AccessResultForbidden) {
+          unset($variables['links'][$key]);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Test if the current route is a message thread or message route.
+ */
+function message_thread_is_message_route() {
+  $message = \Drupal::routeMatch()->getParameter('message');
+  if ($message) {
+    return TRUE;
+  }
+  $message_thread = \Drupal::routeMatch()->getParameter('message>_thread');
+  if ($message_thread) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function message_thread_theme() {
+  return [
+    'message_thread' => [
+      'render element' => 'elements',
+    ],
+  ];
+}
+
+/**
+ * Prepares variables for message_thread templates.
+ *
+ * Default template: message_thread.html.twig.
+ *
+ * Most themes use their own copy of message_thread.html.twig.
+ * The default is located
+ * inside "/core/modules/message_thread/templates/message_thread.html.twig".
+ * Look in there for the full list of variables.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - elements: An array of elements to display in view mode.
+ *   - message_thread: The message_thread object.
+ *   - view_mode: View mode; e.g., 'full', 'teaser', etc.
+ */
+function template_preprocess_message_thread(array &$variables) {
+
+  $variables['view_mode'] = $variables['elements']['#view_mode'];
+  // Provide a distinct $teaser boolean.
+  $variables['teaser'] = $variables['view_mode'] == 'teaser';
+  $variables['message_thread'] = $variables['elements']['#message_thread'];
+  /** @var \Drupal\message_thread\messageThreadInterface $message_thread */
+  $message_thread = $variables['message_thread'];
+  $variables['date'] = \Drupal::service('renderer')->render($variables['elements']['created']);
+  $variables['author_name'] = \Drupal::service('renderer')->render($variables['elements']['uid']);
+
+  $variables['url'] = $message_thread->url('canonical', [
+    'language' => $message_thread->language(),
+  ]);
+
+  // Helpful $content variable for templates.
+  $variables += ['content' => []];
+  foreach (Element::children($variables['elements']) as $key) {
+    $variables['content'][$key] = $variables['elements'][$key];
+  }
+
+  // Add article ARIA role.
+  $variables['attributes']['role'] = 'article';
+}
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function message_thread_entity_extra_field_info() {
+  $bundles = \Drupal::entityManager()->getBundleInfo('message_thread');
+
+  foreach ($bundles as $machine_name => $bundle) {
+
+    $extra_fields['message_thread'][$machine_name]['display']['message_thread_messages'] = [
+      'label' => t('Messages'),
+      'description' => t('Show all messages inside a thread'),
+      'weight' => 0,
+      'visible' => FALSE,
+    ];
+
+    $extra_fields['message_thread'][$machine_name]['display']['message_thread_reply'] = [
+      'label' => t('Reply'),
+      'description' => t('Reply to this thread'),
+      'weight' => 0,
+      'visible' => FALSE,
+    ];
+
+    $extra_fields['message_thread'][$machine_name]['display']['message_thread_reply_form'] = [
+      'label' => t('Reply Form'),
+      'description' => t('Reply to this thread using embedded form'),
+      'weight' => 0,
+      'visible' => FALSE,
+    ];
+
+  }
+
+  return $extra_fields;
+}
+
+/**
+ * Implements hook_entity_view_alter().
+ */
+function message_thread_entity_view_alter(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display) {
+
+  // Add the link to all message thread types.
+  // Maybe this should be controlled through settings
+  // but let's see if there are other uses for this module first.
+  // Other than as conversation threads.
+  if ($entity->getEntityTypeId() === 'message_thread') {
+    if ($component = $display->getComponent('message_thread_messages')) {
+      $template = $entity->bundle();
+      $config_entity = MessageThreadTemplate::load($template);
+      $settings = $config_entity->getSettings();
+
+      $build['message_thread_messages'] = [
+        0 => message_thread_get_messages_display($settings, $entity),
+        '#weight' => $component['weight'],
+      ];
+    }
+
+    if ($component = $display->getComponent('message_thread_reply')) {
+      $build['reply'] = message_thread_reply_link($entity, $component);
+    }
+
+    if ($component = $display->getComponent('message_thread_reply_form')) {
+      $build['message_thread_reply_form'] = message_thread_reply_form($entity, $component);
+    }
+
+  }
+}
+
+/**
+ * Helper function to display the messages as a View.
+ *
+ * @param array $settings
+ *   Template settings.
+ *
+ * @return array|bool|false
+ *   Display inof or false.
+ */
+function message_thread_get_messages_display(array $settings, $entity) {
+
+  $view_name = $settings['view_id'];
+  $display_id = $settings['view_display_id'];
+  $view = Views::getView($view_name);
+  // Someone may have deleted the View.
+  if (!is_object($view)) {
+    return FALSE;
+  }
+
+  $view->setDisplay($display_id);
+  $view->setArguments([$entity->id()]);
+  $view->build($display_id);
+  $view->preExecute();
+  $view->execute($display_id);
+  $view->element['#attached']['library'][] = 'message_thread/thread-styles';
+
+  if (!empty($view->result) || !empty($view->empty)) {
+    return $view->buildRenderable($display_id);
+  }
+  return FALSE;
+}
+
+/**
+ * Helper function to build the reply link.
+ */
+function message_thread_reply_link($entity, $component) {
+  // Find out if any messages in this conversation.
+  $label = t('Send a message');
+  $count = message_thread_message_count($entity);
+  if ($count > 0) {
+    $label = t('Reply');
+  }
+  // Todo template should reference actual template.
+  $params = [
+    'message_template' => 'private_message',
+    'message_thread' => $entity->id(),
+  ];
+  $options = [
+    'query' => [
+      'destination' => '/message/thread/' . $entity->id(),
+    ],
+  ];
+  $url = Url::fromRoute('message_thread.reply', $params, $options);
+  return [
+    '#type' => 'link',
+    '#url' => $url,
+    '#title' => $label,
+    '#weight' => $component['weight'],
+    '#attributes' => [
+      'class' => ['message-thread-reply'],
+    ],
+  ];
+}
+
+/**
+ * Helper function to build the reply form.
+ */
+function message_thread_reply_form($entity, $component) {
+  $user = \Drupal::currentUser();
+  $account = User::load($user->id());
+  $ref = User::load(1);
+  $message = \Drupal::entityTypeManager()->getStorage('message')->create([
+    'template' => 'private_message',
+    'uid' => $account->id(),
+  ]);
+
+  $args = [
+    'thread_id' => $entity->id(),
+  ];
+  $form = \Drupal::service('entity.form_builder')->getForm($message, 'default', $args);
+  return $form;
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ */
+function message_thread_message_delete(EntityInterface $entity) {
+  // Delete from index when deleting a private message.
+  switch ($entity->getTemplate()->id()) {
+    case 'private_message':
+      drupal_set_message(t('Deleting index'));
+      db_delete('message_thread_index', ['mid' => $entity->id()]);
+      break;
+  }
+}
+
+/**
+ * Helper function to return number of messages attached to a thread.
+ */
+function message_thread_message_count($entity) {
+  $query = \Drupal::database()->select('message_thread_index', 't');
+  $query->condition('t.thread_id', $entity->id());
+  $query->addExpression('COUNT(*)');
+  return $query->execute()->fetchField();
+}
+
+/**
+ * Message submit callback.
+ *
+ * See Drupal\message_thread\Controller\MessageThreadController.php.
+ */
+function message_thread_add_message_form_submit(&$form, FormStateInterface &$form_state) {
+  $values = $form_state->getValues();
+}
+
+/**
+ * Implements hook_entity_base_field_info_alter().
+ *
+ * Extend the message entity type's field by providing display handlers.
+ */
+function message_thread_entity_base_field_info_alter(&$fields, EntityTypeInterface $entity_type) {
+  // Alter the uid and created field to include display settings.
+  if ($entity_type->id() != 'message_thread') {
+    return;
+  }
+
+  if (!empty($fields['uid'])) {
+    /* @var Drupal\Core\Field\BaseFieldDefinition $fields['uid'] */
+    $fields['uid']
+      ->setDisplayOptions('form', [
+        'type' => 'entity_reference_autocomplete',
+        'weight' => 5,
+        '#group' => 'advanced',
+        'settings' => [
+          'match_operator' => 'CONTAINS',
+          'size' => '60',
+          'placeholder' => '',
+        ],
+      ])
+      ->setDisplayConfigurable('form', TRUE)
+      ->setRequired(TRUE);
+  }
+  if (!empty($fields['created'])) {
+    $fields['created']
+      ->setDisplayOptions('form', [
+        'type' => 'datetime_timestamp',
+        'weight' => 10,
+      ])
+      ->setDisplayConfigurable('form', TRUE);
+  }
+}
+
+/**
+ * Implements hook_local_tasks_alter().
+ */
+function message_thread_local_tasks_alter(&$local_tasks) {
+  // We no longer need the private message local task on the user page.
+  unset($local_tasks['message_private.messages']);
+}
+
+/**
+ * Views Plugin access callback.
+ *
+ * @return \Drupal\Core\Access\AccessResult
+ *   Access result object.
+ */
+function message_thread_tab_access_check() {
+  $account = \Drupal::currentUser();
+  // Load the current node.
+  $uid = \Drupal::routeMatch()->getParameter('user');
+
+  // Check if the current user owns the inbox.
+  if (!empty($uid) && $account->id() == $uid) {
+    return AccessResult::allowed();
+  }
+
+  // Allow if the user has the bypass permission.
+  return AccessResult::allowedIfHasPermission($account, 'bypass private message access control');
+}
+
+/**
+ * Helper function to relate a message to its thread.
+ */
+function message_thread_relationship($mid) {
+  $thread_id = db_select('message_thread_index', 'mdi')
+    ->condition('mdi.mid', $mid)
+    ->fields('mdi', ['thread_id'])
+    ->execute()
+    ->fetchField();
+
+  return $thread_id;
+}
+
+/**
+ * Helper function to get all message ids in a thread.
+ */
+function message_thread_get_messages($thread_id) {
+  $result = db_select('message_thread_index', 'mdi')
+    ->condition('mdi.thread_id', $thread_id)
+    ->fields('mdi', ['mid'])
+    ->execute()
+    ->fetchAll();
+
+  $messages = [];
+  foreach ($result as $record) {
+    $messages[] = $record->mid;
+  }
+  return $messages;
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_view_alter() for message thread entities.
+ */
+function message_thread_message_thread_view_alter(array &$build,
+                                                   EntityInterface $message_thread,
+                                                   EntityViewDisplayInterface $display) {
+
+  // Update the message_history table,
+  // stating that this user viewed all messages in this thread.
+  if (!\Drupal::service('module_handler')->moduleExists('message_history')) {
+    return;
+  }
+
+  if (!in_array($display->getOriginalMode(), ['default', 'full'])) {
+    return;
+  }
+
+  $build['#cache']['contexts'][] = 'user.roles:authenticated';
+  if (!\Drupal::currentUser()->isAuthenticated()) {
+    return;
+  }
+  // Find all messages in this thread and mark them read.
+  $messages = message_thread_get_messages($message_thread->id());
+  foreach ($messages as $mid) {
+    $build['#attached']['drupalSettings']['message_history']['itemsToMarkAsRead'][$mid] = TRUE;
+  }
+  $build['#attached']['library'][] = 'message_history/mark-as-read';
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK().
+ */
+function message_thread_theme_suggestions_message_thread(array $variables) {
+  $suggestions = [];
+
+  /** @var \Drupal\message\MessageInterface $message */
+  $message_thread = $variables['elements']['#message_thread'];
+  $sanitized_view_mode = strtr($variables['elements']['#view_mode'], '.', '_');
+
+  $suggestions[] = 'message_thread__' . $sanitized_view_mode;
+  $suggestions[] = 'message_thread__' . $message_thread->bundle();
+  $suggestions[] = 'message_thread__' . $message_thread->bundle() . '__' . $sanitized_view_mode;
+  $suggestions[] = 'message_thread__' . $message_thread->id();
+  $suggestions[] = 'message_thread__' . $message_thread->id() . '__' . $sanitized_view_mode;
+
+  return $suggestions;
+}

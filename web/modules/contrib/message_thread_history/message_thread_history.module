@@ -1,0 +1,140 @@
+<?php
+
+/**
+ * @file
+ * Records which users have read which message thread.
+ */
+
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\Form\FormStateInterface;
+
+/**
+ * Updates 'last viewed' timestamp of the message thread for the current user.
+ *
+ * @param int $mid
+ *   The message ID that has been read.
+ * @param \Drupal\Core\Session\AccountInterface $account
+ *   (optional) The user account to update the message_thread history for.
+ *   Defaults to the current user.
+ */
+function message_thread_history_write(int $mid, AccountInterface $account = NULL) {
+  if (!isset($account)) {
+    $account = \Drupal::currentUser();
+  }
+  if ($account->isAuthenticated()) {
+    // Find out what thread the message belongs to.
+    $thread_id = message_thread_relationship($mid);
+    if ($thread_id) {
+      // Then mark thread as read.
+      // Ignore the possibility of reading message independent of thread.
+      // When one message read, mark thread as read.
+      db_merge('message_thread_history')
+        ->keys([
+          'uid' => $account->id(),
+          'thread_id' => $thread_id,
+        ])
+        ->fields([
+          'timestamp' => \REQUEST_TIME,
+          'mid' => $mid,
+        ])
+        ->execute();
+    }
+  }
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Similar to message_history_cron().
+ */
+function message_thread_history_cron() {
+  db_delete('message_thread_history')
+    ->condition('timestamp', \HISTORY_READ_LIMIT, '<')
+    ->execute();
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_view_alter() for message_thread entities.
+ */
+function message_thread_history_message_thread_view_alter(array &$build, EntityInterface $message_thread, EntityViewDisplayInterface $display) {
+  // Update the message_thread_history table, stating that this user viewed this
+  // message_thread.
+  // @todo: make displays configurable.
+  if (!in_array($display->getOriginalMode(), ['default', 'full'])) {
+    return;
+  }
+  $build['#cache']['contexts'][] = 'user.roles:authenticated';
+  if (!\Drupal::currentUser()->isAuthenticated()) {
+    return;
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function message_thread_history_form_alter(array &$form, FormStateInterface $form_state, string $form_id) {
+
+  if (substr($form_id, 0, 8) != 'message_') {
+    return;
+  }
+
+  foreach (array_keys($form['actions']) as $action) {
+    if ($action != 'preview' && isset($form['actions'][$action]['#type']) && $form['actions'][$action]['#type'] === 'submit') {
+      $form['actions'][$action]['#submit'][] = 'message_thread_history_submit_message';
+    }
+  }
+
+}
+
+/**
+ * Submit callback.
+ */
+function message_thread_history_submit_message(array &$form, FormStateInterface $form_state) {
+  $thread_id = $form_state->getValue('message_thread');
+
+  if ($thread_id) {
+    $entity = $form_state->getFormObject()->getEntity();
+    $account = \Drupal::currentUser();
+    \Drupal::logger('pfizer')->notice('account id  ' . $account->id());
+    // Update history with newly inserted message details.
+    // Avoid updating the author of this message.
+    $query = db_update('message_thread_history')
+      ->fields(['mid' => $entity->id(), 'created' => \REQUEST_TIME])
+      ->condition('uid', $account->id(), '!=')
+      ->condition('thread_id', $thread_id)
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete() for message_thread entities.
+ */
+function message_thread_history_message_thread_delete(EntityInterface $message_thread) {
+  db_delete('message_thread_history')
+    ->condition('thread_id', $message_thread->id())
+    ->execute();
+}
+
+/**
+ * Implements hook_user_cancel().
+ */
+function message_thread_history_user_cancel($edit, $account, $method) {
+  switch ($method) {
+    case 'user_cancel_reassign':
+      db_delete('message_thread_history')
+        ->condition('uid', $account->id())
+        ->execute();
+      break;
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete() for user entities.
+ */
+function message_thread_history_user_delete($account) {
+  db_delete('message_thread_history')
+    ->condition('uid', $account->id())
+    ->execute();
+}
