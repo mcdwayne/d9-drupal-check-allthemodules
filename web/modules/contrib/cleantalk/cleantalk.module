@@ -1,0 +1,543 @@
+<?php
+
+use Drupal\Core\Language\Language;
+use Drupal\cleantalk\CleantalkHelper;
+use Drupal\cleantalk\CleantalkFuncs;
+use Drupal\cleantalk\CleantalkCustomConfig;
+
+define("CLEANTALK_USER_AGENT", 'drupal8-28');
+define("APBCT_REMOTE_CALL_SLEEP", 10);
+
+$cleantalk_executed = false;
+
+/**
+ * Implements hook_page_attachments_alter()
+ */
+
+function cleantalk_page_attachments_alter(array &$page) {
+
+  if (!\Drupal::request()->query->get('amp') && !\Drupal::service('router.admin_context')->isAdminRoute()) {
+
+    $js_template = "var apbct_check_js_val = '%s';";
+    $js_addon_body = sprintf($js_template, CleantalkFuncs::_cleantalk_get_checkjs_value());
+    $page['#attached']['html_head'][] = array(array(
+        '#tag' => 'script',
+        '#value' => $js_addon_body,
+      ), 'ga_scripts'); 
+    $page['#attached']['library'][] = 'cleantalk/apbct-public';  
+
+  }
+
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter()
+ */
+
+function cleantalk_form_alter(&$form, &$form_state, $form_id) {
+
+  _cleantalk_form_alter($form, $form_state, $form_id);
+
+}
+
+/**
+ * Cleantalk inner function - registration validation function.
+ */
+
+function cleantalk_validate_register(&$form, &$form_state) {
+
+  if (\Drupal::config('cleantalk.settings')->get('cleantalk_check_register') == 1 && CleantalkFuncs::_cleantalk_check_form_submit_handlers($form_state->getSubmitHandlers())) {
+
+    $spam_check = array();
+    $spam_check['type'] = 'register';
+    $spam_check['sender_email'] = !empty($form_state->getValue('mail')) ? $form_state->getValue('mail') : '';
+    $spam_check['sender_nickname'] = !empty($form_state->getValue('name')) ? $form_state->getValue('name') : '';
+    $spam_check['timezone'] = !empty($form_state->getValue('timezone')) ? $form_state->getValue('timezone') : '';
+    $spam_result = CleantalkFuncs::_cleantalk_check_spam($spam_check, $form_state->getErrors());
+
+    if (isset($spam_result) && is_array($spam_result) && $spam_result['errno'] == 0 && $spam_result['allow'] != 1) {
+
+      // Value of ct_result_comment is sanitized already (before storing).
+
+      $form_state->setErrorByName('mail', strip_tags($spam_result['ct_result_comment'], '<p><a>'));
+
+    } 
+
+  }
+
+}
+
+/**
+ * Cleantalk inner function - comment validation function.
+ */
+
+function cleantalk_validate_comment(&$form, &$form_state) {
+
+  if (\Drupal::config('cleantalk.settings')->get('cleantalk_check_comments') == 1 && CleantalkFuncs::_cleantalk_check_form_submit_handlers($form_state->getSubmitHandlers())) {
+
+    $current_user  = \Drupal::currentUser();
+    $ct_temp_msg_data = CleantalkFuncs::_cleantalk_get_fields_any(\Drupal::request()->request->all());
+    $comment_lang = !empty($form_state->getValue('language')) ? $form_state->getValue('language') : Language::LANGCODE_NOT_SPECIFIED;
+    $spam_check = array();
+    $spam_check['type'] = 'comment';
+
+    if ($current_user ->id()) {
+
+      $user = \Drupal\user\Entity\User::load($current_user->id());
+      $spam_check['sender_nickname'] = !empty($user->get('name')) ? $user->get('name')->value : '';
+      $spam_check['sender_email'] = !empty($user->get('mail')->value) ? $user->get('mail')->value: '';
+
+    }
+
+    else {
+
+      if (empty($form_state->getValue('name'))) {
+
+          $spam_check['sender_nickname'] = ($ct_temp_msg_data['nickname'] ? $ct_temp_msg_data['nickname'] : '');
+
+      }
+
+      else {
+
+        $spam_check['sender_nickname'] = $form_state->getValue('name');
+
+      }
+
+      if (empty($form_state->getValue('mail'))) {
+
+          $spam_check['sender_email'] = ($ct_temp_msg_data['email']    ? $ct_temp_msg_data['email']    : '');
+
+      }
+
+      else {
+
+        $spam_check['sender_email'] = $form_state->getValue('mail'); 
+
+      }
+
+    }
+
+    if (empty($form_state->getValue('subject')[0]['value'])) {
+
+        $spam_check['message_title'] = ($ct_temp_msg_data['subject'] ? $ct_temp_msg_data['subject'] : '');
+
+    }
+        
+    else {
+
+      $spam_check['message_title'] = $form_state->getValue('subject')[0]['value'];
+
+    }
+
+    if (empty($form_state->getValue('comment_body')[0]['value'])) {
+
+        $spam_check['message_body'] = ($ct_temp_msg_data['message'] ? $ct_temp_msg_data['message'] : '');
+    }
+
+    else {
+
+      $spam_check['message_body'] = $form_state->getValue('comment_body')[0]['value'];  
+
+    }
+        
+    $spam_result = CleantalkFuncs::_cleantalk_check_spam($spam_check, $form_state->getErrors());
+
+    if (isset($spam_result) && is_array($spam_result) && $spam_result['errno'] == 0 && $spam_result['allow'] != 1) {
+
+      // Value of ct_result_comment is sanitized already (before storing).
+
+      if (\Drupal::config('cleantalk.settings')->get('cleantalk_check_comments_automod') == 0 || $spam_result['stop_queue'] == 1) {
+
+        $form_state->setErrorByName('comment_body', strip_tags($spam_result['ct_result_comment'], '<p><a>'));
+
+      }
+
+    }
+
+  }
+
+}
+
+/**
+ * Cleantalk inner function - contact message validation function.
+ */
+
+function cleantalk_validate_contact_message(&$form, &$form_state) {
+
+  if (\Drupal::config('cleantalk.settings')->get('cleantalk_check_contact_forms') == 1 && CleantalkFuncs::_cleantalk_check_form_submit_handlers($form_state->getSubmitHandlers())) {
+
+    $current_user  = \Drupal::currentUser();
+    $ct_temp_msg_data = CleantalkFuncs::_cleantalk_get_fields_any(\Drupal::request()->request->all());
+    $spam_check = array();
+    $spam_check['type'] = 'contact';
+
+    if ($current_user ->id()) {
+
+      $user = \Drupal\user\Entity\User::load($current_user->id());
+      $spam_check['sender_nickname'] = !empty($user->get('name')) ? $user->get('name')->value : '';
+      $spam_check['sender_email'] = !empty($user->get('mail')->value) ? $user->get('mail')->value: ''; 
+
+    }
+
+    else {
+
+      if (empty($form_state->getValue('name'))) {
+
+          $spam_check['sender_nickname'] = ($ct_temp_msg_data['nickname'] ? $ct_temp_msg_data['nickname'] : '');
+
+      }
+
+      else {
+
+        $spam_check['sender_nickname'] = $form_state->getValue('name'); 
+
+      }
+      if (empty($form_state->getValue('mail'))) {
+
+          $spam_check['sender_email'] = ($ct_temp_msg_data['email']    ? $ct_temp_msg_data['email']    : '');
+
+      }
+
+      else {
+
+        $spam_check['sender_email'] = $form_state->getValue('mail');  
+
+      }
+
+    }
+
+    if (empty($form_state->getValue('subject')[0]['value'])) {
+
+        $spam_check['message_title'] = ($ct_temp_msg_data['subject'] ? $ct_temp_msg_data['subject'] : '');
+
+    }
+        
+    else {
+
+      $spam_check['message_title'] = $form_state->getValue('subject')[0]['value'];
+
+    }
+
+    if (empty($form_state->getValue('message')[0]['value'])) {
+
+        $spam_check['message_body'] = ($ct_temp_msg_data['message'] ? $ct_temp_msg_data['message'] : '');
+
+    }
+
+    else {
+
+      $spam_check['message_body'] = $form_state->getValue('message')[0]['value'];
+
+    }
+
+    $spam_result = CleantalkFuncs::_cleantalk_check_spam($spam_check, $form_state->getErrors());
+
+    if (isset($spam_result) && is_array($spam_result) && $spam_result['errno'] == 0 && $spam_result['allow'] != 1) {
+
+      // Value of ct_result_comment is sanitized already (before storing).
+
+      $form_state->setErrorByName('message', strip_tags($spam_result['ct_result_comment'], '<p><a>'));
+
+    } 
+
+  }
+
+}
+
+/**
+ * Cleantalk inner function - forum topic validation function.
+ */
+
+function cleantalk_validate_forum_topic(&$form, &$form_state) {
+  if (\Drupal::config('cleantalk.settings')->get('cleantalk_check_forum_topics') == 1 && CleantalkFuncs::_cleantalk_check_form_submit_handlers($form_state->getSubmitHandlers())) {
+
+    $current_user  = \Drupal::currentUser();
+    $ct_temp_msg_data = CleantalkFuncs::_cleantalk_get_fields_any(\Drupal::request()->request->all());
+    $spam_check = array();
+    $spam_check['type'] = 'forum_topic';
+
+    if ($current_user ->id()) {
+
+      $user = \Drupal\user\Entity\User::load($current_user->id());
+      $spam_check['sender_nickname'] = !empty($user->get('name')) ? $user->get('name')->value : '';
+      $spam_check['sender_email'] = !empty($user->get('mail')->value) ? $user->get('mail')->value: '';
+
+    }
+
+    else {
+
+      if (empty($form_state->getValue('name'))) {
+
+          $spam_check['sender_nickname'] = ($ct_temp_msg_data['nickname'] ? $ct_temp_msg_data['nickname'] : '');
+
+      }
+
+      else {
+
+        $spam_check['sender_nickname'] = $form_state->getValue('name'); 
+
+      }
+      if (empty($form_state->getValue('mail'))) {
+
+          $spam_check['sender_email'] = ($ct_temp_msg_data['email']    ? $ct_temp_msg_data['email']    : '');
+
+      }
+
+      else {
+
+        $spam_check['sender_email'] = $form_state->getValue('mail');   
+
+      }
+
+    }
+
+    if (empty($form_state->getValue('title')[0]['value'])) {
+
+        $spam_check['message_title'] = ($ct_temp_msg_data['subject'] ? $ct_temp_msg_data['subject'] : '');
+
+    }
+
+    else {
+
+      $spam_check['message_title'] = $form_state->getValue('title')[0]['value'];
+
+    }
+
+    if (empty($form_state->getValue('body')[0]['value'])) {
+
+        $spam_check['message_body'] = ($ct_temp_msg_data['message'] ? $ct_temp_msg_data['message'] : '');
+
+    }
+
+    else {
+
+      $spam_check['message_body'] = $form_state->getValue('body')[0]['value'];
+
+    }
+
+    $spam_result = CleantalkFuncs::_cleantalk_check_spam($spam_check, $form_state->getErrors());
+
+    if (isset($spam_result) && is_array($spam_result) && $spam_result['errno'] == 0 && $spam_result['allow'] != 1) {
+
+      // Value of ct_result_comment is sanitized already (before storing).
+
+      $form_state->setErrorByName('message', strip_tags($spam_result['ct_result_comment'], '<p><a>'));
+
+    }  
+
+  }
+
+}
+
+/**
+ * Cleantalk inner function - webform validation function.
+ */
+
+function cleantalk_validate_webform(&$form, &$form_state) {
+
+  if (\Drupal::config('cleantalk.settings')->get('cleantalk_check_webforms') == 1 && CleantalkFuncs::_cleantalk_check_form_submit_handlers($form_state->getSubmitHandlers())) {
+
+    $current_user  = \Drupal::currentUser();
+    $ct_temp_msg_data = CleantalkFuncs::_cleantalk_get_fields_any(\Drupal::request()->request->all());
+    $spam_check = array();
+    $spam_check['type'] = 'webform';
+
+    if ($current_user ->id()) {
+
+      $user = \Drupal\user\Entity\User::load($current_user->id());
+      $spam_check['sender_nickname'] = !empty($user->get('name')) ? $user->get('name')->value : '';
+      $spam_check['sender_email'] = !empty($user->get('mail')->value) ? $user->get('mail')->value: '';   
+
+    }
+
+    else {
+
+      if (empty($form_state->getValue('name'))) {
+
+          $spam_check['sender_nickname'] = ($ct_temp_msg_data['nickname'] ? $ct_temp_msg_data['nickname'] : '');
+
+      }
+
+      else {
+
+        $spam_check['sender_nickname'] = $form_state->getValue('name'); 
+
+      }
+
+      if (empty($form_state->getValue('mail'))) {
+
+          $spam_check['sender_email'] = ($ct_temp_msg_data['email']    ? $ct_temp_msg_data['email']    : '');
+
+      }
+
+      else {
+
+        $spam_check['sender_email'] = $form_state->getValue('mail');    
+
+      }
+
+    }
+
+    if (empty($form_state->getValue('subject'))) {
+
+        $spam_check['message_title'] = ($ct_temp_msg_data['subject'] ? $ct_temp_msg_data['subject'] : '');
+
+    }
+
+    else {
+
+      $spam_check['message_title'] = $form_state->getValue('subject');
+
+    }
+
+    if (empty($form_state->getValue('message'))) {
+
+        $spam_check['message_body'] = ($ct_temp_msg_data['message'] ? $ct_temp_msg_data['message'] : '');
+
+    }
+
+    else {
+
+      $spam_check['message_body'] = $form_state->getValue('message');
+
+    }
+
+    $spam_result = CleantalkFuncs::_cleantalk_check_spam($spam_check, $form_state->getErrors());
+
+    if (isset($spam_result) && is_array($spam_result) && $spam_result['errno'] == 0 && $spam_result['allow'] != 1) {
+
+      // Value of ct_result_comment is sanitized already (before storing).
+
+      $form_state->setErrorByName('message', strip_tags($spam_result['ct_result_comment'], '<p><a>'));
+
+    } 
+
+  }
+
+}
+
+/**
+ * Implements hook_comment_presave().
+ */
+
+function cleantalk_comment_presave(\Drupal\comment\CommentInterface $comment) {
+
+  $ct_result = CleantalkFuncs::_cleantalk_ct_result();
+
+  if (!empty($ct_result['ct_request_id'])) {
+
+    if ($ct_result['ct_result_allow'] === 0 && \Drupal::config('cleantalk.settings')->get('cleantalk_check_comments_automod') === 1) {
+
+      $comment->setPublished(false);
+
+    }
+
+  }
+
+}
+
+/**
+ * Cleantalk inner function - alters needed form.
+ */
+
+function _cleantalk_form_alter(&$form, &$form_state, $form_id) {
+
+    $url_exclusion = CleantalkCustomConfig::get_url_exclusions();
+
+    if ($url_exclusion) {
+
+      foreach ($url_exclusion as $key => $value) {
+
+        if (strpos(\Drupal::request()->server->get('REQUEST_URI'),$value) !== false) {
+
+          return; 
+
+        }
+
+      }
+
+    }
+
+    if (\Drupal::currentUser()->hasPermission('access administration menu') || $form_id == 'search_form' || $form_id == 'user_login_form') {
+
+      return;
+
+    }
+
+    if (\Drupal::config('cleantalk.settings')->get('cleantalk_link') != 0) {
+
+      $form['cleantalk_link'] = array(
+        '#type' => 'item',
+        '#markup' => t("<a href='https://cleantalk.org/drupal-anti-spam-module-wo-captcha'>Drupal spam</a> blocked by CleanTalk."),
+        '#required' => FALSE,
+        '#weight' => 999,
+      );
+
+    }
+
+    if ($form_id == 'user_register_form') {
+
+      $form['#validate'][] = 'cleantalk_validate_register';
+
+    }
+
+    else {
+
+      if (preg_match('|comment(.*?)_form|', $form_id)) {
+
+        $form['#validate'][] = 'cleantalk_validate_comment';
+
+      }
+
+      if (preg_match('|contact(.*?)_form|', $form_id) ) {
+
+        $form['#validate'][] = 'cleantalk_validate_contact_message';
+
+      }
+
+      if (preg_match('|webform(.*?)_form|', $form_id)) {
+
+        $form['#validate'][] = 'cleantalk_validate_webform';
+
+      }
+
+      if (preg_match('|node_forum(.*?)_form|', $form_id)) {
+
+        $form['#validate'][] = 'cleantalk_validate_forum_topic';
+
+      }
+
+    }
+
+}
+
+/*
+* implemments hook_uc_order - UberCart hook for order processing
+*/
+
+function cleantalk_uc_order($op, $order, $arg2) {
+
+  global $cleantalk_executed;
+
+  $ct_temp_msg_data = CleantalkFuncs::_cleantalk_get_fields_any(\Drupal::request()->request->all());
+  $spam_check = array();
+  $spam_check['type'] = 'comment';
+  $spam_check['sender_email'] = ($ct_temp_msg_data['email']    ? $ct_temp_msg_data['email']    : '');
+  $spam_check['sender_nickname'] = ($ct_temp_msg_data['nickname'] ? $ct_temp_msg_data['nickname'] : '');
+  $spam_check['message_title'] = ($ct_temp_msg_data['subject']  ? $ct_temp_msg_data['subject']  : '');
+  $spam_check['message_body'] = ($ct_temp_msg_data['message']  ? implode("\n", $ct_temp_msg_data['message'])  : '');
+
+  if ($spam_check['sender_email'] != '' && !$cleantalk_executed && $op != 'total' && $op != 'presave' && $op != 'save') { 
+
+    $spam_result = CleantalkFuncs::_cleantalk_check_spam($spam_check);
+    $cleantalk_executed = true;
+
+    if (isset($spam_result) && is_array($spam_result) && $spam_result['errno'] == 0 && $spam_result['allow'] != 1 && $spam_result['stop_queue'] == 1) {
+
+        CleantalkFuncs::_cleantalk_die($spam_result['ct_result_comment']);
+
+    }
+
+  }
+
+}
