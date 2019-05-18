@@ -1,0 +1,215 @@
+<?php
+/**
+ * @file
+ * Implements chinese CAPTCHA for use with the CAPTCHA module
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Url;
+
+// Setup status flags.
+define('CHINESE_CAPTCHA_ERROR_NO_GDLIB', 1);
+define('CHINESE_CAPTCHA_ERROR_NO_TTF_SUPPORT', 2);
+
+/**
+ * Helper function for splitting an utf8 string correctly in characters.
+ *
+ * Assumes the given utf8 string is well formed.
+ * See http://en.wikipedia.org/wiki/Utf8 for more info.
+ *
+ * @param string $str
+ *   UTF8 string to be split.
+ *
+ * @return array
+ *   List of caracters given string consists of.
+ */
+function _chinese_captcha_utf8_split($str) {
+  $characters = [];
+  $len = strlen($str);
+
+  for ($i=0; $i < $len; ) {
+    $chr = ord($str[$i]);
+    // One byte character (0zzzzzzz).
+    if (($chr & 0x80) == 0x00) {
+      $width = 1;
+    }
+    else {
+      // Two byte character (first byte: 110yyyyy).
+      if (($chr & 0xE0) == 0xC0) {
+        $width = 2;
+      }
+      // Three byte character (first byte: 1110xxxx).
+      elseif (($chr & 0xF0) == 0xE0) {
+        $width = 3;
+      }
+      // Four byte character (first byte: 11110www).
+      elseif (($chr & 0xF8) == 0xF0) {
+        $width = 4;
+      }
+      else {
+        \Drupal::logger('CAPTCHA')->error('Encountered an illegal byte while splitting an utf8 string in characters.');
+        return $characters;
+      }
+    }
+
+    $characters[] = substr($str, $i, $width);
+    $i += $width;
+  }
+
+  return $characters;
+}
+
+/**
+ * Helper function for checking the setup of the Image CAPTCHA.
+ *
+ * The image CAPTCHA requires at least the GD PHP library.
+ * Support for TTF is recommended and the enabled
+ * font files should be readable.
+ * This functions checks these things.
+ *
+ * @return int
+ *   Status code: bitwise 'OR' of status flags like
+ *   CHINESE_CAPTCHA_ERROR_NO_GDLIB, CHINESE_CAPTCHA_ERROR_NO_TTF_SUPPORT.
+ */
+function _chinese_captcha_check_setup() {
+  $status = 0;
+  // Check if we can use the GD library.
+  // We need at least the imagepng function.
+  // Note that the imagejpg function is optionally also used, but not required.
+  if (!function_exists('imagepng')) {
+    $status = $status | CHINESE_CAPTCHA_ERROR_NO_GDLIB;
+  }
+
+  if (!function_exists('imagettftext')) {
+    $status = $status | CHINESE_CAPTCHA_ERROR_NO_TTF_SUPPORT;
+  }
+
+  return $status;
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function chinese_captcha_form_alter(&$form, FormStateInterface $form_state) {
+  module_load_include('inc', 'captcha', 'captcha');
+  $captcha_point = captcha_get_form_id_setting($form['#form_id']);
+  if ($captcha_point && $captcha_point->getCaptchaType() && $captcha_point->getCaptchaType() == 'chinese_captcha/Chinese') {
+    
+  }
+}
+
+/**
+ * Implements hook_element_info_alter().
+ */
+function chinese_captcha_element_info_alter(&$element) {
+  if (isset($element['captcha'])) {
+    $element['captcha']['#after_build'][] = 'chinese_captcha_refresh_after_build_process';
+  }
+}
+
+/**
+ * Add image refresh button to captcha form element.
+ *
+ * @return
+ *   The processed element.
+ *
+ * @see captcha_element_info()
+ * @see image_captcha_refresh_element_info_alter()
+ */
+function chinese_captcha_refresh_after_build_process($element, $form_state) {
+  $form_id = $element['#captcha_info']['form_id'];
+  $captcha_point = captcha_get_form_id_setting($form_id);
+  $url = Url::fromRoute('chinese_captcha_refresh.ajax_refresh', ['form_id' => $form_id]);
+  $link_options = array(
+    'attributes' => array(
+      'class' => array('reload-captcha'),
+    ),
+  );
+  $url->setOptions($link_options);
+  $internal_link = \Drupal::l(t('Generate a new captcha'), $url);
+
+  if ($captcha_point && $captcha_point->getCaptchaType() && $captcha_point->getCaptchaType() == 'chinese_captcha/Chinese') {
+    $element['captcha_widgets']['captcha_refresh'] = array(
+      '#markup' => $internal_link,
+    );
+  }
+  return $element;
+}
+
+/**
+ * Implements hook_captcha().
+ */
+function chinese_captcha_captcha($op, $captcha_type = '', $captcha_sid = NULL) {
+  $config = \Drupal::config('chinese_captcha.settings');
+
+  switch ($op) {
+    case 'list':
+      // Only offer the chinese CAPTCHA if it is possible to generate an image on this setup.
+      if (!(_chinese_captcha_check_setup() & CHINESE_CAPTCHA_ERROR_NO_GDLIB)) {
+        return ['Chinese'];
+      }
+      else {
+        return [];
+      }
+      break;
+
+    case 'generate':
+      if ($captcha_type == 'Chinese') {
+        // generate a CAPTCHA code
+        $allowed_chars = _chinese_captcha_utf8_split($config->get('chinese_captcha_image_allowed_chars'));
+        $code_length = (int) $config->get('chinese_captcha_code_length');
+        $code = '';
+
+        for ($i = 0; $i < $code_length; $i++) {
+          $xi = mt_rand(0, count($allowed_chars));
+          if ($xi % 2) {
+            $xi += 1;
+          }
+          $code .= $allowed_chars[$xi];
+        }
+
+        // Build the result to return.
+        $result = [];
+
+        $result['solution'] = $code;
+        // Generate image source URL (add timestamp to avoid problems with
+        // client side caching: subsequent images of the same CAPTCHA session
+        // have the same URL, but should display a different code).
+        $result['form']['chinese_captcha_image'] = [
+          '#theme' => 'image',
+          '#uri' => \Drupal::url('chinese_captcha.generator', ['session_id' => $captcha_sid, 'timestamp' => REQUEST_TIME]),
+          '#alt' => t('Chinese CAPTCHA'),
+          '#title' => t('Not clearly, click to change'),
+          '#attributes' => ['class' => 'zh-captcha'],
+          '#weight' => -2,
+        ];
+
+        $result['form']['captcha_response'] = [
+          '#type' => 'textfield',
+          '#title' => t('What word is in the image?'),
+          '#description' => t('Enter the characters shown in the image.'),
+          '#weight' => 0,
+          '#required' => TRUE,
+          '#size' => 15,
+          '#attributes' => ['autocomplete' => 'off'],
+          '#cache' => ['max-age' => 0],
+        ];
+    
+        $result['form']['#attached']['library'][] = 'chinese_captcha/chinese_captcha.refresh';
+
+        // Handle the case insensitive validation option combined with ignoring spaces.
+        switch (\Drupal::config('captcha.settings')->get('default_validation')) {
+          case CAPTCHA_DEFAULT_VALIDATION_CASE_SENSITIVE:
+            $result['captcha_validate'] = 'captcha_validate_ignore_spaces';
+            break;
+          case CAPTCHA_DEFAULT_VALIDATION_CASE_INSENSITIVE:
+            $result['captcha_validate'] = 'captcha_validate_case_insensitive_ignore_spaces';
+            break;
+        }
+        \Drupal::service('page_cache_kill_switch')->trigger();
+
+        return $result;
+      }
+      break;
+  }
+}
