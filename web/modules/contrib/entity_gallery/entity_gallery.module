@@ -1,0 +1,1654 @@
+<?php
+
+/**
+ * @file
+ * Allows entities to be grouped into galleries.
+ *
+ * Modules and scripts may programmatically submit entity galleries using the
+ * usual form API pattern.
+ */
+
+use Drupal\Component\Utility\Xss;
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Cache\Cache;
+use Drupal\Core\Cache\CacheableMetadata;
+use Drupal\Core\Database\Query\AlterableInterface;
+use Drupal\Core\Database\Query\SelectInterface;
+use Drupal\Core\Database\StatementInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Core\Field\FieldStorageDefinitionInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Template\Attribute;
+use Drupal\Core\Url;
+use Drupal\field\Entity\FieldConfig;
+use Drupal\field\Entity\FieldStorageConfig;
+use Drupal\language\ConfigurableLanguageInterface;
+use Drupal\entity_gallery\Entity\EntityGallery;
+use Drupal\entity_gallery\Entity\EntityGalleryType;
+use Drupal\entity_gallery\EntityGalleryInterface;
+use Drupal\entity_gallery\EntityGalleryTypeInterface;
+use Drupal\field_ui\FieldUI;
+use Drupal\menu_link_content\Entity\MenuLinkContent;
+
+/**
+ * Denotes that the entity gallery is not published.
+ */
+const ENTITY_GALLERY_NOT_PUBLISHED = 0;
+
+/**
+ * Denotes that the entity gallery is published.
+ */
+const ENTITY_GALLERY_PUBLISHED = 1;
+
+/**
+ * Implements hook_help().
+ */
+function entity_gallery_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.entity_gallery':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('The Node module manages the creation, editing, deletion, settings, and display of the main site content. Content items managed by the Node module are typically displayed as pages on your site, and include a title, some meta-data (author, creation time, content type, etc.), and optional fields containing text or other data (fields are managed by the <a href=":field">Field module</a>). For more information, see the <a href=":node">online documentation for the Node module</a>.', array(':node' => 'https://www.drupal.org/documentation/modules/node', ':field' => \Drupal::url('help.page', array('name' => 'field')))) . '</p>';
+      $output .= '<h3>' . t('Uses') . '</h3>';
+      $output .= '<dl>';
+      $output .= '<dt>' . t('Creating content') . '</dt>';
+      $output .= '<dd>' . t('When new content is created, the Node module records basic information about the content, including the author, date of creation, and the <a href=":content-type">Content type</a>. It also manages the <em>publishing options</em>, which define whether or not the content is published, promoted to the front page of the site, and/or sticky at the top of content lists. Default settings can be configured for each <a href=":content-type">type of content</a> on your site.', array(':content-type' => \Drupal::url('entity.entity_gallery_type.collection'))) . '</dd>';
+      $output .= '<dt>' . t('Creating custom content types') . '</dt>';
+      $output .= '<dd>' . t('The Node module gives users with the <em>Administer content types</em> permission the ability to <a href=":content-new">create new content types</a> in addition to the default ones already configured. Creating custom content types gives you the flexibility to add <a href=":field">fields</a> and configure default settings that suit the differing needs of various site content.', array(':content-new' => \Drupal::url('entity_gallery.type_add'), ':field' => \Drupal::url('help.page', array('name' => 'field')))) . '</dd>';
+      $output .= '<dt>' . t('Administering content') . '</dt>';
+      $output .= '<dd>' . t('The <a href=":content">Content</a> page lists your content, allowing you add new content, filter, edit or delete existing content, or perform bulk operations on existing content.', array(':content' => \Drupal::url('system.admin_content'))) . '</dd>';
+      $output .= '<dt>' . t('Creating revisions') . '</dt>';
+      $output .= '<dd>' . t('The Node module also enables you to create multiple versions of any content, and revert to older versions using the <em>Revision information</em> settings.') . '</dd>';
+      $output .= '<dt>' . t('User permissions') . '</dt>';
+      $output .= '<dd>' . t('The Node module makes a number of permissions available for each content type, which can be set by role on the <a href=":permissions">permissions page</a>.', array(':permissions' => \Drupal::url('user.admin_permissions', array(), array('fragment' => 'module-entity-gallery')))) . '</dd>';
+      $output .= '</dl>';
+      return $output;
+
+    case 'entity_gallery.type_add':
+      return '<p>' . t('Individual gallery types can have different fields, behaviors, and permissions assigned to them.') . '</p>';
+
+    case 'entity.entity_form_display.entity_gallery.default':
+    case 'entity.entity_form_display.entity_gallery.form_mode':
+      $type = $route_match->getParameter('entity_gallery_type');
+      return '<p>' . t('Content items can be edited using different form modes. Here, you can define which fields are shown and hidden when %type content is edited in each form mode, and define how the field form widgets are displayed in each form mode.', array('%type' => $type->label())) . '</p>' ;
+
+    case 'entity.entity_view_display.entity_gallery.default':
+    case 'entity.entity_view_display.entity_gallery.view_mode':
+      $type = $route_match->getParameter('entity_gallery_type');
+      return '<p>' . t('Content items can be displayed using different view modes: Teaser, Full content, Print, RSS, etc. <em>Teaser</em> is a short format that is typically used in lists of multiple content items. <em>Full content</em> is typically used when the content is displayed on its own page.') . '</p>' .
+        '<p>' . t('Here, you can define which fields are shown and hidden when %type content is displayed in each view mode, and define how the fields are displayed in each view mode.', array('%type' => $type->label())) . '</p>';
+
+    case 'entity.entity_gallery.version_history':
+      return '<p>' . t('Revisions allow you to track differences between multiple versions of your content, and revert to older versions.') . '</p>';
+
+    case 'entity.entity_gallery.edit_form':
+      $entity_gallery = $route_match->getParameter('entity_gallery');
+      $type = EntityGalleryType::load($entity_gallery->getType());
+      $help = $type->getHelp();
+      return (!empty($help) ? Xss::filterAdmin($help) : '');
+
+    case 'entity_gallery.add':
+      $type = $route_match->getParameter('entity_gallery_type');
+      $help = $type->getHelp();
+      return (!empty($help) ? Xss::filterAdmin($help) : '');
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function entity_gallery_theme() {
+  return array(
+    'entity_gallery' => array(
+      'render element' => 'elements',
+    ),
+    'entity_gallery_add_list' => array(
+      'variables' => array('content' => NULL),
+    ),
+    'entity_gallery_edit_form' => array(
+      'render element' => 'form',
+    ),
+    'field__entity_gallery__title' => array(
+      'base hook' => 'field',
+    ),
+    'field__entity_gallery__uid' => array(
+      'base hook' => 'field',
+    ),
+    'field__entity_gallery__created' => array(
+      'base hook' => 'field',
+    ),
+  );
+}
+
+/**
+ * Implements hook_entity_view_display_alter().
+ */
+function entity_gallery_entity_view_display_alter(EntityViewDisplayInterface $display, $context) {
+  if ($context['entity_type'] == 'entity_gallery') {
+    // Hide field labels in search index.
+    if ($context['view_mode'] == 'search_index') {
+      foreach ($display->getComponents() as $name => $options) {
+        if (isset($options['label'])) {
+          $options['label'] = 'hidden';
+          $display->setComponent($name, $options);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Gathers a listing of links to entity galleries.
+ *
+ * @param \Drupal\Core\Database\StatementInterface $result
+ *   A database result object from a query to fetch entity gallery entities. If
+ *   your query joins the {comment_entity_statistics} table so that the
+ *   comment_count field is available, a title attribute will be added to show
+ *   the number of comments.
+ * @param $title
+ *   (optional) A heading for the resulting list.
+ *
+ * @return array|false
+ *   A renderable array containing a list of linked entity gallery titles
+ *   fetched from $result, or FALSE if there are no rows in $result.
+ */
+function entity_gallery_title_list(StatementInterface $result, $title = NULL) {
+  $items = array();
+  $num_rows = FALSE;
+  $egids = [];
+  foreach ($result as $row) {
+    // Do not use $entity_gallery->label() or $entity_gallery->urlInfo() here, because we only have
+    // database rows, not actual entity galleries.
+    $egids[] = $row->egid;
+    $options = !empty($row->comment_count) ? array('attributes' => array('title' => \Drupal::translation()->formatPlural($row->comment_count, '1 comment', '@count comments'))) : array();
+    $items[] = \Drupal::l($row->title, new Url('entity.entity_gallery.canonical', ['entity_gallery' => $row->egid], $options));
+    $num_rows = TRUE;
+  }
+
+  return $num_rows ? array('#theme' => 'item_list__entity_gallery', '#items' => $items, '#title' => $title, '#cache' => ['tags' => Cache::mergeTags(['entity_gallery_list'], Cache::buildTags('entity_gallery', $egids))]) : FALSE;
+}
+
+/**
+ * Determines the type of marker to be displayed for a given entity gallery.
+ *
+ * @param int $egid
+ *   Entity gallery ID whose history supplies the "last viewed" timestamp.
+ * @param int $timestamp
+ *   Time which is compared against entity gallery's "last viewed" timestamp.
+ *
+ * @return int
+ *   One of the MARK constants.
+ */
+function entity_gallery_mark($egid, $timestamp) {
+
+  $cache = &drupal_static(__FUNCTION__, array());
+
+  if (\Drupal::currentUser()->isAnonymous() || !\Drupal::moduleHandler()->moduleExists('history')) {
+    return MARK_READ;
+  }
+  if (!isset($cache[$egid])) {
+    $cache[$egid] = history_read($egid);
+  }
+  if ($cache[$egid] == 0 && $timestamp > HISTORY_READ_LIMIT) {
+    return MARK_NEW;
+  }
+  elseif ($timestamp > $cache[$egid] && $timestamp > HISTORY_READ_LIMIT) {
+    return MARK_UPDATED;
+  }
+  return MARK_READ;
+}
+
+/**
+ * Returns a list of all the available entity gallery types.
+ *
+ * This list can include types that are queued for addition or deletion.
+ *
+ * @return \Drupal\entity_gallery\EntityGalleryTypeInterface[]
+ *   An array of entity gallery type entities, keyed by ID.
+ *
+ * @deprecated in Drupal 8.x, will be removed before Drupal 9.0.
+ *   Use \Drupal\entity_gallery\Entity\EntityGalleryType::loadMultiple().
+ *
+ * @see \Drupal\entity_gallery\Entity\EntityGalleryType::load()
+ */
+function entity_gallery_type_get_types() {
+  return EntityGalleryType::loadMultiple();
+}
+
+/**
+ * Returns a list of available entity gallery type names.
+ *
+ * This list can include types that are queued for addition or deletion.
+ *
+ * @return string[]
+ *   An array of entity gallery type labels, keyed by the entity gallery type
+ *   name.
+ */
+function entity_gallery_type_get_names() {
+  return array_map(function ($bundle_info) {
+    return $bundle_info['label'];
+  }, \Drupal::entityManager()->getBundleInfo('entity_gallery'));
+}
+
+/**
+ * Returns the entity gallery type label for the passed entity gallery.
+ *
+ * @param \Drupal\entity_gallery\EntityGalleryInterface $entity_gallery
+ *   An entity gallery entity to return the entity gallery type's label for.
+ *
+ * @return string|false
+ *   The entity gallery type label or FALSE if the entity gallery type is not found.
+ *
+ * @todo Add this as generic helper method for config entities representing
+ *   entity bundles.
+ */
+function entity_gallery_get_type_label(EntityGalleryInterface $entity_gallery) {
+  $type = EntityGalleryType::load($entity_gallery->bundle());
+  return $type ? $type->label() : FALSE;
+}
+
+/**
+ * Description callback: Returns the entity gallery type description.
+ *
+ * @param \Drupal\entity_gallery\EntityGalleryTypeInterface $entity_gallery_type
+ *   The entity gallery type object.
+ *
+ * @return string
+ *   The entity gallery type description.
+ */
+function entity_gallery_type_get_description(EntityGalleryTypeInterface $entity_gallery_type) {
+  return $entity_gallery_type->getDescription();
+}
+
+/**
+ * Menu argument loader: Loads an entity gallery type by string.
+ *
+ * @param $name
+ *   The machine name of an entity gallery type to load.
+ *
+ * @return \Drupal\entity_gallery\EntityGalleryTypeInterface
+ *   An entity gallery type object or NULL if $name does not exist.
+ *
+ * @deprecated in Drupal 8.x, will be removed before Drupal 9.0.
+ *   Use \Drupal\entity_gallery\Entity\EntityGalleryType::load().
+ */
+function entity_gallery_type_load($name) {
+  return EntityGalleryType::load($name);
+}
+
+/**
+ * Adds an entity reference field to an entity gallery type.
+ *
+ * @param \Drupal\entity_gallery\EntityGalleryTypeInterface $type
+ *   An entity gallery type object.
+ *
+ * @param $gallery_type
+ *   The entity type allowed to be referenced by the gallery.
+ *
+ * @param $gallery_type_bundles
+ *   The bundles of the entity type allowed to be referenced by the gallery.
+ *
+ * @return \Drupal\field\Entity\FieldConfig
+ *   Entity reference field instance.
+ */
+function entity_gallery_create_entity_reference_field(EntityGalleryTypeInterface $type, $gallery_type, $gallery_type_bundles) {
+  // Add or remove the gallery field, as needed.
+  $field_storage = FieldStorageConfig::loadByName('entity_gallery', 'entity_gallery_' . $gallery_type);
+  if (empty($field_storage)) {
+    $field_storage_config = _entity_gallery_entity_reference_field_definition($gallery_type);
+    $field_storage = FieldStorageConfig::create($field_storage_config);
+    $field_storage->save();
+  }
+
+  $field = FieldConfig::loadByName('entity_gallery', $type->id(), 'entity_gallery_' . $gallery_type);
+  if (empty($field)) {
+    $field_config = _entity_gallery_entity_reference_field_instance_definition($type, $gallery_type, $gallery_type_bundles);
+    $field_config['field_storage'] = $field_storage;
+    $field = FieldConfig::create($field_config);
+    $field->save();
+  }
+
+  return $field;
+}
+
+/**
+ * Updates an entity reference field on an entity gallery type.
+ *
+ * @param \Drupal\entity_gallery\EntityGalleryTypeInterface $type
+ *   An entity gallery type object.
+ *
+ * @param $target_type
+ *   The type of the entity allowed to be referenced by the gallery.
+ *
+ * @param $entity_type_bundles
+ *   The bundles of the entity allowed to be referenced by the gallery.
+ */
+function entity_gallery_update_entity_reference_field(EntityGalleryTypeInterface $type, $target_type, $entity_type_bundles) {
+  // Add or remove the entity reference field, as needed.
+  $field_storage = FieldStorageConfig::loadByName('entity_gallery', 'entity_gallery_' . $target_type);
+  $field = FieldConfig::loadByName('entity_gallery', $type->id(), 'entity_gallery_' . $target_type);
+  if (!empty($field_storage)) {
+    $field_storage_config = _entity_gallery_entity_reference_field_definition($target_type);
+    $field_storage->setSettings($field_storage_config);
+    $field_storage->save();
+  }
+  if (!empty($field)) {
+    $field_config = _entity_gallery_entity_reference_field_instance_definition($type, $target_type, $entity_type_bundles);
+    $field->setSettings(array_merge($field->getSettings(), $field_config['settings']));
+    $field->save();
+  }
+}
+
+/**
+ * Removes an entity reference field from an entity gallery type.
+ *
+ * @param \Drupal\entity_gallery\EntityGalleryTypeInterface $type
+ *   An entity gallery type object.
+ *
+ * @param $target_type
+ *   The type of the entity allowed to be referenced by the gallery.
+ */
+function entity_gallery_delete_entity_reference_field(EntityGalleryTypeInterface $type, $target_type) {
+  $field = FieldConfig::loadByName('entity_gallery', $type->id(), 'entity_gallery_' . $target_type);
+  if (!empty($field)) {
+    $field->delete();
+  }
+}
+
+/**
+ * Helper function to get the definition of an entity gallery entity reference field.
+ *
+ * @param $target_type
+ *   The type of the entity allowed to be referenced by the gallery.
+ *
+ * @return array
+ *   Entity reference field definition.
+ */
+function _entity_gallery_entity_reference_field_definition($target_type) {
+  $field = array(
+    'cardinality' => FieldStorageDefinitionInterface::CARDINALITY_UNLIMITED,
+    'field_name' => 'entity_gallery_' . $target_type,
+    'entity_type' => 'entity_gallery',
+    'locked' => TRUE,
+    'translatable' => TRUE,
+    'type' => 'entity_reference',
+    'settings' => array(
+      'target_type' => $target_type,
+    ),
+  );
+
+  return $field;
+}
+
+/**
+ * Helper function to get the definition of an entity gallery entity reference field instance.
+ *
+ * @param \Drupal\entity_gallery\EntityGalleryTypeInterface $type
+ *   An entity gallery type object.
+ *
+ * @param $target_type
+ *   The type of the entity allowed to be referenced by the gallery.
+ *
+ * @param $entity_type_bundles
+ *   The bundles of the entity allowed to be referenced by the gallery.
+ *
+ * @return array
+ *   Entity reference field instance definition.
+ */
+function _entity_gallery_entity_reference_field_instance_definition(EntityGalleryTypeInterface $type, $target_type, $entity_type_bundles) {
+  $instance = array(
+    'bundle' => $type->id(),
+    'description' => 'Reference one or more existing items to add to the gallery.',
+    'entity_type' => 'entity_gallery',
+    'field_name' => 'entity_gallery_' . $target_type,
+    'label' => 'Gallery Items',
+    'required' => TRUE,
+    'settings' => array(),
+  );
+
+  if (!empty($entity_type_bundles)) {
+    $instance['settings']['handler_settings'] = array(
+      'target_bundles' => array_filter($entity_type_bundles),
+    );
+  }
+
+  // Assign widget settings for the 'default' form mode.
+  entity_get_form_display('entity_gallery', $type->id(), 'default')
+    ->setComponent('entity_gallery_' . $target_type, array(
+      'type' => 'entity_reference_autocomplete',
+    ))
+    ->save();
+
+  // Assign display settings for the 'default' and 'teaser' view modes.
+  entity_get_display('entity_gallery', $type->id(), 'default')
+    ->setComponent('entity_gallery_' . $target_type, array(
+      'label' => 'hidden',
+      'type' => 'entity_reference_entity_view',
+      'settings' => array(
+        'view_mode' => 'default',
+      ),
+    ))
+    ->save();
+
+  // The teaser view mode is created by the Standard profile and therefore
+  // might not exist.
+  $view_modes = \Drupal::entityManager()->getViewModes('entity_gallery');
+  if (isset($view_modes['teaser'])) {
+    entity_get_display('entity_gallery', $type->id(), 'teaser')
+      ->setComponent('entity_gallery_' . $target_type, array(
+        'label' => 'hidden',
+        'type' => 'entity_reference_entity_view',
+        'settings' => array(
+          'view_mode' => 'teaser',
+        ),
+      ))
+      ->save();
+  }
+
+  return $instance;
+}
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function entity_gallery_entity_extra_field_info() {
+  $extra = array();
+  $description = t('Entity gallery module element');
+  foreach (EntityGalleryType::loadMultiple() as $bundle) {
+    $extra['entity_gallery'][$bundle->id()]['display']['links'] = array(
+      'label' => t('Links'),
+      'description' => $description,
+      'weight' => 100,
+      'visible' => TRUE,
+    );
+  }
+
+  return $extra;
+}
+
+/**
+ * Updates all entity galleries of one type to be of another type.
+ *
+ * @param string $old_id
+ *   The current entity gallery type of the entity galleries.
+ * @param string $new_id
+ *   The new entity gallery type of the entity galleries.
+ *
+ * @return
+ *   The number of entity galleries whose entity gallery type field was
+ *   modified.
+ */
+function entity_gallery_type_update_entity_galleries($old_id, $new_id) {
+  return \Drupal::entityManager()->getStorage('entity_gallery')->updateType($old_id, $new_id);
+}
+
+/**
+ * Loads entity gallery entities from the database.
+ *
+ * This function should be used whenever you need to load more than one entity
+ * gallery from the database. Entity galleries are loaded into memory and will
+ * not require database access if loaded again during the same page request.
+ *
+ * @param array $egids
+ *   (optional) An array of entity IDs. If omitted, all entities are loaded.
+ * @param bool $reset
+ *   (optional) Whether to reset the internal entity_gallery_load() cache.
+ *   Defaults to FALSE.
+ *
+ * @return \Drupal\entity_gallery\EntityGalleryInterface[]
+ *   An array of entity gallery entities indexed by egid.
+ *
+ * @deprecated in Drupal 8.x, will be removed before Drupal 9.0.
+ *   Use \Drupal\entity_gallery\Entity\EntityGallery::loadMultiple().
+ *
+ * @see entity_load_multiple()
+ * @see \Drupal\Core\Entity\Query\EntityQueryInterface
+ */
+function entity_gallery_load_multiple(array $egids = NULL, $reset = FALSE) {
+  if ($reset) {
+    \Drupal::entityManager()->getStorage('entity_gallery')->resetCache($egids);
+  }
+  return EntityGallery::loadMultiple($egids);
+}
+
+/**
+ * Loads an entity gallery entity from the database.
+ *
+ * @param int $egid
+ *   The entity gallery ID.
+ * @param bool $reset
+ *   (optional) Whether to reset the entity_gallery_load_multiple() cache.
+ *   Defaults to FALSE.
+ *
+ * @return \Drupal\entity_gallery\EntityGalleryInterface|null
+ *   A fully-populated entity gallery entity, or NULL if the entity gallery is
+ *   not found.
+ *
+ * @deprecated in Drupal 8.x, will be removed before Drupal 9.0.
+ *   Use \Drupal\entity_gallery\Entity\EntityGallery::load().
+ */
+function entity_gallery_load($egid = NULL, $reset = FALSE) {
+  if ($reset) {
+    \Drupal::entityManager()->getStorage('entity_gallery')->resetCache(array($egid));
+  }
+  return EntityGallery::load($egid);
+}
+
+/**
+ * Loads an entity gallery revision from the database.
+ *
+ * @param int $vid
+ *   The entity gallery revision id.
+ *
+ * @return \Drupal\entity_gallery\EntityGalleryInterface|null
+ *   A fully-populated entity gallery entity, or NULL if the entity gallery is
+ *   not found.
+ */
+function entity_gallery_revision_load($vid = NULL) {
+  return entity_revision_load('entity_gallery', $vid);
+}
+
+/**
+ * Deletes an entity gallery revision.
+ *
+ * @param $revision_id
+ *   The revision ID to delete.
+ *
+ * @return bool
+ *   TRUE if the revision deletion was successful; otherwise, FALSE.
+ */
+function entity_gallery_revision_delete($revision_id) {
+  entity_revision_delete('entity_gallery', $revision_id);
+}
+
+/**
+ * Checks whether the current page is the full page view of the passed-in entity
+ * gallery.
+ *
+ * @param \Drupal\entity_gallery\EntityGalleryInterface $entity_gallery
+ *   An entity gallery entity.
+ *
+ * @return int|false
+ *   The ID of the entity gallery if this is a full page view, otherwise FALSE.
+ */
+function entity_gallery_is_page(EntityGalleryInterface $entity_gallery) {
+  $route_match = \Drupal::routeMatch();
+  if ($route_match->getRouteName() == 'entity.entity_gallery.canonical') {
+    $page_entity_gallery = $route_match->getParameter('entity_gallery');
+  }
+  return (!empty($page_entity_gallery) ? $page_entity_gallery->id() == $entity_gallery->id() : FALSE);
+}
+
+/**
+ * Prepares variables for list of available entity gallery type templates.
+ *
+ * Default template: entity-gallery-add-list.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - content: An array of entity gallery types.
+ *
+ * @see entity_gallery_add_page()
+ */
+function template_preprocess_entity_gallery_add_list(&$variables) {
+  $variables['types'] = array();
+  if (!empty($variables['content'])) {
+    foreach ($variables['content'] as $type) {
+      $variables['types'][$type->id()] = array(
+        'type' => $type->id(),
+        'add_link' => \Drupal::l($type->label(), new Url('entity_gallery.add', array('entity_gallery_type' => $type->id()))),
+        'description' => array(
+          '#markup' => $type->getDescription(),
+        ),
+      );
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_HOOK() for HTML document templates.
+ */
+function entity_gallery_preprocess_html(&$variables) {
+  // If on an individual entity gallery page, add the entity gallery type to
+  // body classes.
+  if (($entity_gallery = \Drupal::routeMatch()->getParameter('entity_gallery')) && $entity_gallery instanceof EntityGalleryInterface) {
+    $variables['entity_gallery_type'] = $entity_gallery->getType();
+  }
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK().
+ */
+function entity_gallery_theme_suggestions_entity_gallery(array $variables) {
+  $suggestions = array();
+  $entity_gallery = $variables['elements']['#entity_gallery'];
+  $sanitized_view_mode = strtr($variables['elements']['#view_mode'], '.', '_');
+
+  $suggestions[] = 'entity_gallery__' . $sanitized_view_mode;
+  $suggestions[] = 'entity_gallery__' . $entity_gallery->bundle();
+  $suggestions[] = 'entity_gallery__' . $entity_gallery->bundle() . '__' . $sanitized_view_mode;
+  $suggestions[] = 'entity_gallery__' . $entity_gallery->id();
+  $suggestions[] = 'entity_gallery__' . $entity_gallery->id() . '__' . $sanitized_view_mode;
+
+  return $suggestions;
+}
+
+/**
+ * Prepares variables for entity gallery templates.
+ *
+ * Default template: entity_gallery.html.twig.
+ *
+ * Most themes use their own copy of entity_gallery.html.twig. The default is
+ * located inside
+ * "/core/modules/entity_gallery/templates/entity_gallery.html.twig". Look in
+ * there for the full list of variables.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - elements: An array of elements to display in view mode.
+ *   - entity_gallery: The entity gallery object.
+ *   - view_mode: View mode; e.g., 'full', 'teaser', etc.
+ */
+function template_preprocess_entity_gallery(&$variables) {
+  $variables['view_mode'] = $variables['elements']['#view_mode'];
+  // Provide a distinct $teaser boolean.
+  $variables['teaser'] = $variables['view_mode'] == 'teaser';
+  $variables['entity_gallery'] = $variables['elements']['#entity_gallery'];
+  /** @var \Drupal\entity_gallery\EntityGalleryInterface $entity_gallery */
+  $entity_gallery = $variables['entity_gallery'];
+  $variables['date'] = drupal_render($variables['elements']['created']);
+  unset($variables['elements']['created']);
+  $variables['author_name'] = drupal_render($variables['elements']['uid']);
+  unset($variables['elements']['uid']);
+
+  $variables['url'] = $entity_gallery->url('canonical', array(
+    'language' => $entity_gallery->language(),
+  ));
+  $variables['label'] = $variables['elements']['title'];
+  unset($variables['elements']['title']);
+  // The 'page' variable is set to TRUE in two occasions:
+  //   - The view mode is 'full' and we are on the 'entity_gallery.view' route.
+  //   - The entity gallery is in preview and view mode is either 'full' or
+  //     'default'.
+  $variables['page'] = ($variables['view_mode'] == 'full' && (entity_gallery_is_page($entity_gallery)) || (isset($entity_gallery->in_preview) && in_array($entity_gallery->preview_view_mode, array('full', 'default'))));
+
+  // Helpful $content variable for templates.
+  $variables += array('content' => array());
+  foreach (Element::children($variables['elements']) as $key) {
+    $variables['content'][$key] = $variables['elements'][$key];
+  }
+
+  // Display post information only on certain entity gallery types.
+  $entity_gallery_type = $entity_gallery->type->entity;
+  // Used by RDF to add attributes around the author and date submitted.
+  $variables['author_attributes'] = new Attribute();
+  $variables['display_submitted'] = $entity_gallery_type->displaySubmitted();
+  if ($variables['display_submitted']) {
+    if (theme_get_setting('features.entity_gallery_user_picture')) {
+      // To change user picture settings (e.g. image style), edit the 'compact'
+      // view mode on the User entity. Note that the 'compact' view mode might
+      // not be configured, so remember to always check the theme setting first.
+      $variables['author_picture'] = user_view($entity_gallery->getOwner(), 'compact');
+    }
+  }
+
+  // Add article ARIA role.
+  $variables['attributes']['role'] = 'article';
+}
+
+/**
+ * Implements hook_cron().
+ */
+function entity_gallery_cron() {
+  // Calculate the oldest and newest entity gallery created times, for use in
+  // search rankings. (Note that field aliases have to be variables passed by
+  // reference.)
+  if (\Drupal::moduleHandler()->moduleExists('search')) {
+    $min_alias = 'min_created';
+    $max_alias = 'max_created';
+    $result = \Drupal::entityQueryAggregate('entity_gallery')
+      ->aggregate('created', 'MIN', NULL, $min_alias)
+      ->aggregate('created', 'MAX', NULL, $max_alias)
+      ->execute();
+    if (isset($result[0])) {
+      // Make an array with definite keys and store it in the state system.
+      $array = array(
+        'min_created' => $result[0][$min_alias],
+        'max_created' => $result[0][$max_alias],
+      );
+      \Drupal::state()->set('entity_gallery.min_max_update_time', $array);
+    }
+  }
+}
+
+/**
+ * Implements hook_ranking().
+ */
+function entity_gallery_ranking() {
+  // Create the ranking array and add the basic ranking options.
+  $ranking = array(
+    'relevance' => array(
+      'title' => t('Keyword relevance'),
+      // Average relevance values hover around 0.15
+      'score' => 'i.relevance',
+    ),
+  );
+  // Add relevance based on updated date, but only if it the scale values have
+  // been calculated in entity_gallery_cron().
+  if ($entity_gallery_min_max = \Drupal::state()->get('entity_gallery.min_max_update_time')) {
+    $ranking['recent'] = array(
+      'title' => t('Recently created'),
+      // Exponential decay with half life of 14% of the age range of entity
+      // galleries.
+      'score' => 'EXP(-5 * (1 - (n.created - :entity_gallery_oldest) / :entity_gallery_range))',
+      'arguments' => array(
+        ':entity_gallery_oldest' => $entity_gallery_min_max['min_created'],
+        ':entity_gallery_range' => max($entity_gallery_min_max['max_created'] - $entity_gallery_min_max['min_created'], 1),
+      ),
+    );
+  }
+  return $ranking;
+}
+
+/**
+ * Implements hook_user_cancel().
+ */
+function entity_gallery_user_cancel($edit, $account, $method) {
+  switch ($method) {
+    case 'user_cancel_block_unpublish':
+      // Unpublish entity galleries (current revisions).
+      $egids = \Drupal::entityQuery('entity_gallery')
+        ->condition('uid', $account->id())
+        ->execute();
+      module_load_include('inc', 'entity_gallery', 'entity_gallery.admin');
+      entity_gallery_mass_update($egids, array('status' => 0), NULL, TRUE);
+      break;
+
+    case 'user_cancel_reassign':
+      // Anonymize all of the entity galleries for this old account.
+      module_load_include('inc', 'entity_gallery', 'entity_gallery.admin');
+      $vids = \Drupal::entityManager()->getStorage('entity_gallery')->userRevisionIds($account);
+      entity_gallery_mass_update($vids, array(
+        'uid' => 0,
+        'revision_uid' => 0,
+      ), NULL, TRUE, TRUE);
+      break;
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_predelete() for user entities.
+ */
+function entity_gallery_user_predelete($account) {
+  // Delete entity galleries (current revisions).
+  // @todo Introduce entity_gallery_mass_delete() or make
+  // entity_gallery_mass_update() more flexible.
+  $egids = \Drupal::entityQuery('entity_gallery')
+    ->condition('uid', $account->id())
+    ->execute();
+  entity_delete_multiple('entity_gallery', $egids);
+  // Delete old revisions.
+  $storage_controller = \Drupal::entityManager()->getStorage('entity_gallery');
+  $revisions = $storage_controller->userRevisionIds($account);
+  foreach ($revisions as $revision) {
+    entity_gallery_revision_delete($revision);
+  }
+}
+
+/**
+ * Finds the most recently changed entity galleries that are available to the
+ * current user.
+ *
+ * @param $number
+ *   (optional) The maximum number of entity galleries to find. Defaults to 10.
+ *
+ * @return \Drupal\entity_gallery\EntityGalleryInterface[]
+ *   An array of entity gallery entities or an empty array if there are no
+ *   recent entity galleries visible to the current user.
+ */
+function entity_gallery_get_recent($number = 10) {
+  $account = \Drupal::currentUser();
+  $query = \Drupal::entityQuery('entity_gallery');
+
+  if (!$account->hasPermission('bypass entity gallery access')) {
+    // If the user is able to view their own unpublished entity galleries, allow
+    // them to see these in addition to published entity galleries. Check that
+    // they actually have some unpublished entity galleries to view before
+    // adding the condition.
+    $access_query = \Drupal::entityQuery('entity_gallery')
+      ->condition('uid', $account->id())
+      ->condition('status', ENTITY_GALLERY_NOT_PUBLISHED);
+    if ($account->hasPermission('view own unpublished entity galleries') && ($own_unpublished = $access_query->execute())) {
+      $query->orConditionGroup()
+        ->condition('status', ENTITY_GALLERY_PUBLISHED)
+        ->condition('egid', $own_unpublished, 'IN');
+    }
+    else {
+      // If not, restrict the query to published entity galleries.
+      $query->condition('status', ENTITY_GALLERY_PUBLISHED);
+    }
+   }
+  $egids = $query
+    ->sort('changed', 'DESC')
+    ->range(0, $number)
+    ->addTag('entity_gallery_access')
+    ->execute();
+
+  $entity_galleries = EntityGallery::loadMultiple($egids);
+
+  return $entity_galleries ? $entity_galleries : array();
+}
+
+/**
+ * Generates an array for rendering the given entity gallery.
+ *
+ * @param \Drupal\entity_gallery\EntityGalleryInterface $entity_gallery
+ *   An entity gallery entity.
+ * @param $view_mode
+ *   (optional) View mode, e.g., 'full', 'teaser', etc. Defaults to 'full.'
+ * @param $langcode
+ *   (optional) A language code to use for rendering. Defaults to NULL which is
+ *   the global content language of the current request.
+ *
+ * @return array
+ *   An array as expected by drupal_render().
+ */
+function entity_gallery_view(EntityGalleryInterface $entity_gallery, $view_mode = 'full', $langcode = NULL) {
+  return entity_view($entity_gallery, $view_mode, $langcode);
+}
+
+/**
+ * Constructs a drupal_render() style array from an array of loaded entity
+ * galleries.
+ *
+ * @param $entity_galleries
+ *   An array of entity galleries as returned by EntityGallery::loadMultiple().
+ * @param $view_mode
+ *   (optional) View mode, e.g., 'full', 'teaser', etc. Defaults to 'teaser.'
+ * @param $langcode
+ *   (optional) A language code to use for rendering. Defaults to the global
+ *   content language of the current request.
+ *
+ * @return array
+ *   An array in the format expected by drupal_render().
+ */
+function entity_gallery_view_multiple($entity_galleries, $view_mode = 'teaser', $langcode = NULL) {
+  return entity_view_multiple($entity_galleries, $view_mode, $langcode);
+}
+
+/**
+ * Implements hook_page_top().
+ */
+function entity_gallery_page_top(array &$page) {
+  // Add 'Back to entity gallery editing' link on preview page.
+  $route_match = \Drupal::routeMatch();
+  if ($route_match->getRouteName() == 'entity.entity_gallery.preview') {
+    $page['page_top']['entity_gallery_preview'] = array(
+      '#type' => 'container',
+      '#attributes' => array(
+        'class' => array('entity-gallery-preview-container', 'container-inline')
+      ),
+    );
+
+    $form = \Drupal::formBuilder()->getForm('\Drupal\entity_gallery\Form\EntityGalleryPreviewForm', $route_match->getParameter('entity_gallery_preview'));
+    $page['page_top']['entity_gallery_preview']['view_mode'] = $form;
+  }
+}
+
+/**
+ * @defgroup entity_gallery_access Entity gallery access rights
+ * @{
+ * The entity gallery access system determines who can do what to which entity
+ * galleries.
+ *
+ * In determining access rights for a entity gallery,
+ * \Drupal\entity_gallery\EntityGalleryAccessControlHandler first checks whether
+ * the user has the "bypass entity gallery access" permission. Such users have
+ * unrestricted access to all entity galleries. user 1 will always pass this
+ * check.
+ *
+ * Next, all implementations of hook_entity_gallery_access() will be called.
+ * Each implementation may explicitly allow, explicitly forbid, or ignore the
+ * access request. If at least one module says to forbid the request, it will be
+ * rejected. If no modules deny the request and at least one says to allow it,
+ * the request will be permitted.
+ *
+ * In entity gallery listings (lists of entity galleries generated from a select
+ * query, such as an RSS feed, a recent content block, etc.), the process above
+ * is followed except that hook_entity_gallery_access() is not called on each
+ * entity gallery for performance reasons and for proper functioning of the
+ * pager system. When adding an entity gallery listing to your module, be sure
+ * to use an entity query, which will add a tag of "entity_gallery_access". This
+ * will allow modules dealing with entity gallery access to ensure only entity
+ * galleries to which the user has access are retrieved, through the use of
+ * hook_query_TAG_alter(). See the @link entity_api Entity API topic @endlink
+ * for more information on entity queries. Tagging a query with
+ * "entity_gallery_access" does not check the published/unpublished status of
+ * entity galleries, so the base query is responsible for ensuring that
+ * unpublished entity galleries are not displayed to inappropriate users.
+ *
+ * Note: Even a single module returning an AccessResultInterface object from
+ * hook_entity_gallery_access() whose isForbidden() method equals TRUE will
+ * block access to the entity gallery. Therefore, implementers should take care
+ * to not deny access unless they really intend to. Unless a module wishes to
+ * actively forbid access it should return an AccessResultInterface object whose
+ * isAllowed() nor isForbidden() methods return TRUE, to allow other modules to
+ * control access.
+ *
+ * To see how to write an entity gallery access module of your own, see
+ * entity_gallery_access_example.module.
+ */
+
+/**
+ * Implements hook_entity_gallery_access().
+ */
+function entity_gallery_entity_gallery_access(EntityGalleryInterface $entity_gallery, $op, $account) {
+  $type = $entity_gallery->bundle();
+
+  switch ($op) {
+    case 'create':
+      return AccessResult::allowedIfHasPermission($account, 'create ' . $type . ' entity galleries');
+
+    case 'update':
+      if ($account->hasPermission('edit any ' . $type . ' entity galleries', $account)) {
+        return AccessResult::allowed()->cachePerPermissions();
+      }
+      else {
+        return AccessResult::allowedIf($account->hasPermission('edit own ' . $type . ' entity galleries', $account) && ($account->id() == $entity_gallery->getOwnerId()))->cachePerPermissions()->cachePerUser()->addCacheableDependency($entity_gallery);
+      }
+
+    case 'delete':
+      if ($account->hasPermission('delete any ' . $type . ' entity galleries', $account)) {
+        return AccessResult::allowed()->cachePerPermissions();
+      }
+      else {
+        return AccessResult::allowedIf($account->hasPermission('delete own ' . $type . ' entity galleries', $account) && ($account->id() == $entity_gallery->getOwnerId()))->cachePerPermissions()->cachePerUser()->addCacheableDependency($entity_gallery);
+      }
+
+    default:
+      // No opinion.
+      return AccessResult::neutral();
+  }
+}
+
+/**
+ * Determines whether the user has a global viewing grant for all entity
+ * galleries.
+ *
+ * This function is called when an entity gallery listing query is tagged with
+ * 'entity_gallery_access'; when this function returns TRUE, no entity gallery
+ * access joins are added to the query.
+ *
+ * @param $account
+ *   (optional) The user object for the user whose access is being checked. If
+ *   omitted, the current user is used. Defaults to NULL.
+ *
+ * @return
+ *   TRUE if 'view' access to all entity galleries is granted, FALSE otherwise.
+ *
+ * @see entity_gallery_query_entity_gallery_access_alter()
+ */
+function entity_gallery_access_view_all_entity_galleries($account = NULL) {
+
+  if (!$account) {
+    $account = \Drupal::currentUser();
+  }
+
+  // Statically cache results in an array keyed by $account->id().
+  $access = &drupal_static(__FUNCTION__);
+  if (isset($access[$account->id()])) {
+    return $access[$account->id()];
+  }
+
+  // Access is always TRUE.
+  $access[$account->id()] = TRUE;
+
+  return $access[$account->id()];
+}
+
+
+/**
+ * Implements hook_query_TAG_alter().
+ *
+ * This is the hook_query_alter() for queries tagged with
+ * 'entity_gallery_access'. It adds entity gallery access checks for the user
+ * account given by the 'account' meta-data (or current user if not provided),
+ * for an operation given by the 'op' meta-data (or 'view' if not provided;
+ * other possible values are 'update' and 'delete').
+ *
+ * Queries tagged with 'entity_gallery_access' that are not against the
+ * {entity_gallery} table must add the base table as metadata. For example:
+ * @code
+ *   $query
+ *     ->addTag('entity_gallery_access')
+ *     ->addMetaData('base_table', 'taxonomy_index');
+ * @endcode
+ */
+function entity_gallery_query_entity_gallery_access_alter(AlterableInterface $query) {
+  // Read meta-data from query, if provided.
+  if (!$account = $query->getMetaData('account')) {
+    $account = \Drupal::currentUser();
+  }
+  if (!$op = $query->getMetaData('op')) {
+    $op = 'view';
+  }
+
+  // If $account can bypass entity gallery access, or there are no entity
+  // gallery access modules,  or the operation is 'view' and the $account has a
+  // global view grant (such as a view grant for entity gallery ID 0), we don't need to
+  // alter the query.
+  if ($account->hasPermission('bypass entity gallery access')) {
+    return;
+  }
+  if ($op == 'view' && entity_gallery_access_view_all_entity_galleries($account)) {
+    return;
+  }
+
+  $tables = $query->getTables();
+  $base_table = $query->getMetaData('base_table');
+  // If the base table is not given, default to one of the entity gallery base
+  // tables.
+  if (!$base_table) {
+    /** @var \Drupal\Core\Entity\Sql\DefaultTableMapping $table_mapping */
+    $table_mapping = \Drupal::entityTypeManager()->getStorage('entity_gallery')->getTableMapping();
+    $entity_gallery_base_tables = $table_mapping->getTableNames();
+
+    foreach ($tables as $table_info) {
+      if (!($table_info instanceof SelectInterface)) {
+        $table = $table_info['table'];
+        // Ensure that 'entity_gallery' and 'entity_gallery_field_data' are
+        // always preferred over 'entity_gallery_revision' and
+        // 'entity_gallery_field_revision'.
+        if ($table == 'entity_gallery' || $table == 'entity_gallery_field_data') {
+          $base_table = $table;
+          break;
+        }
+        // If one of the entity gallery base tables are in the query, add it to
+        // the list of possible base tables to join against.
+        if (in_array($table, $entity_gallery_base_tables)) {
+          $base_table = $table;
+        }
+      }
+    }
+
+    // Bail out if the base table is missing.
+    if (!$base_table) {
+      throw new Exception(t('Query tagged for entity gallery access but there is no entity gallery table, specify the base_table using meta data.'));
+    }
+  }
+}
+
+/**
+ * @} End of "defgroup entity_gallery_access".
+ */
+
+/**
+ * Implements hook_ENTITY_TYPE_delete() for 'configurable_language'.
+ */
+function entity_gallery_configurable_language_delete(ConfigurableLanguageInterface $language) {
+  // On entity galleries with this language, unset the language.
+  \Drupal::entityManager()->getStorage('entity_gallery')->clearRevisionsLanguage($language);
+}
+
+/**
+ * Marks an entity gallery to be re-indexed by the entity_gallery_search plugin.
+ *
+ * @param int $egid
+ *   The entity gallery ID.
+ */
+function entity_gallery_reindex_entity_gallery_search($egid) {
+  if (\Drupal::moduleHandler()->moduleExists('search')) {
+    // Reindex entity gallery context indexed by the entity gallery module
+    // search plugin.
+    search_mark_for_reindex('entity_gallery_search', $egid);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert() for comment entities.
+ */
+function entity_gallery_comment_insert($comment) {
+  // Reindex the entity gallery when comments are added.
+  if ($comment->getCommentedEntityTypeId() == 'entity_gallery') {
+    entity_gallery_reindex_entity_gallery_search($comment->getCommentedEntityId());
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update() for comment entities.
+ */
+function entity_gallery_comment_update($comment) {
+  // Reindex the entity gallery when comments are changed.
+  if ($comment->getCommentedEntityTypeId() == 'entity_gallery') {
+    entity_gallery_reindex_entity_gallery_search($comment->getCommentedEntityId());
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete() for comment entities.
+ */
+function entity_gallery_comment_delete($comment) {
+  // Reindex the entity gallery when comments are deleted.
+  if ($comment->getCommentedEntityTypeId() == 'entity_gallery') {
+    entity_gallery_reindex_entity_gallery_search($comment->getCommentedEntityId());
+  }
+}
+
+/**
+ * Implements hook_config_translation_info_alter().
+ */
+function entity_gallery_config_translation_info_alter(&$info) {
+  $info['entity_gallery_type']['class'] = 'Drupal\entity_gallery\ConfigTranslation\EntityGalleryTypeMapper';
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() on behalf of field_ui.module.
+ *
+ * Adds a button 'Save and manage fields' to the 'Create gallery type' form.
+ *
+ * @see entity_gallery_type_form()
+ * @see field_ui_form_entity_gallery_type_form_submit()
+ */
+function field_ui_form_entity_gallery_type_form_alter(&$form, FormStateInterface $form_state) {
+  // We want to display the button only on add page.
+  if ($form_state->getFormObject()->getEntity()->isNew()) {
+    $form['actions']['save_continue'] = $form['actions']['submit'];
+    $form['actions']['save_continue']['#value'] = t('Save and manage fields');
+    $form['actions']['save_continue']['#weight'] = $form['actions']['save_continue']['#weight'] + 5;
+    $form['actions']['save_continue']['#submit'][] = 'field_ui_form_entity_gallery_type_form_submit';
+    // Hide the 'Save content type' button.
+    $form['actions']['submit']['#access'] = FALSE;
+  }
+}
+
+/**
+ * Form submission handler for the 'Save and manage fields' button.
+ *
+ * @see field_ui_form_entity_gallery_type_form_alter()
+ */
+function field_ui_form_entity_gallery_type_form_submit($form, FormStateInterface $form_state) {
+  if ($form_state->getTriggeringElement()['#parents'][0] === 'save_continue' && $route_info = FieldUI::getOverviewRouteInfo('entity_gallery', $form_state->getValue('type'))) {
+    $form_state->setRedirectUrl($route_info);
+  }
+}
+
+/**
+ * Implements hook_theme_registry_alter().
+ *
+ * Adds a theme override for an entity gallery edit form when using classy.theme.
+ */
+function entity_gallery_theme_registry_alter(&$theme_registry) {
+  $active_theme = \Drupal::theme()->getActiveTheme();
+  $base_themes = $active_theme->getBaseThemes();
+  $base_theme_names = array_keys($base_themes);
+
+  // Classy.theme.
+  if ($active_theme->getName() == 'classy' || in_array('classy', $base_theme_names)) {
+    // Add list.
+    if (isset($theme_registry['entity_gallery_add_list'])) {
+      $module_path = drupal_get_path('module', 'entity_gallery');
+
+      $theme_registry['entity_gallery_add_list']['path'] = $module_path . '/templates/classy';
+      $theme_registry['entity_gallery_add_list']['theme path'] = 'core/themes/classy';
+    }
+
+    // Edit form.
+    if (isset($theme_registry['entity_gallery_edit_form'])) {
+      $module_path = drupal_get_path('module', 'entity_gallery');
+
+      $theme_registry['entity_gallery_edit_form']['path'] = $module_path . '/templates/classy';
+      $theme_registry['entity_gallery_edit_form']['theme path'] = 'core/themes/classy';
+    }
+  }
+
+  // Seven.theme.
+  if ($active_theme->getName() == 'seven' || in_array('seven', $base_theme_names)) {
+    // Add list.
+    if (isset($theme_registry['entity_gallery_add_list'])) {
+      $module_path = drupal_get_path('module', 'entity_gallery');
+
+      $theme_registry['entity_gallery_add_list']['path'] = $module_path . '/templates/seven';
+      $theme_registry['entity_gallery_add_list']['theme path'] = 'core/themes/seven';
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_HOOK() on behalf of seven.theme for list of available entity gallery type templates.
+ */
+function seven_preprocess_entity_gallery_add_list(&$variables) {
+  if (!empty($variables['content'])) {
+    /** @var \Drupal\entity_gallery\EntityGalleryTypeInterface $type */
+    foreach ($variables['content'] as $type) {
+      $variables['types'][$type->id()]['label'] = $type->label();
+      $variables['types'][$type->id()]['url'] = \Drupal::url('entity_gallery.add', array('entity_gallery_type' => $type->id()));
+    }
+  }
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter() on behalf of seven.theme for \Drupal\entity_gallery\EntityGalleryForm.
+ *
+ * Changes vertical tabs to container and adds meta information.
+ */
+function seven_form_entity_gallery_form_alter(&$form, FormStateInterface $form_state) {
+  /** @var \Drupal\entity_gallery\EntityGalleryInterface $entity_gallery */
+  $entity_gallery = $form_state->getFormObject()->getEntity();
+
+  $form['#theme'] = array('entity_gallery_edit_form');
+  $form['#attached']['library'][] = 'seven/entity-gallery-form';
+
+  $form['advanced']['#type'] = 'container';
+  $is_new = !$entity_gallery->isNew() ? format_date($entity_gallery->getChangedTime(), 'short') : t('Not saved yet');
+  $form['meta'] = array(
+    '#attributes' => array('class' => array('entity-meta__header')),
+    '#type' => 'container',
+    '#group' => 'advanced',
+    '#weight' => -100,
+    'published' => array(
+      '#type' => 'html_tag',
+      '#tag' => 'h3',
+      '#value' => $entity_gallery->isPublished() ? t('Published') : t('Not published'),
+      '#access' => !$entity_gallery->isNew(),
+      '#attributes' => array(
+        'class' => 'entity-meta__title',
+      ),
+    ),
+    'changed' => array(
+      '#type' => 'item',
+      '#wrapper_attributes' => array('class' => array('entity-meta__last-saved', 'container-inline')),
+      '#markup' => '<h4 class="label inline">' . t('Last saved') . '</h4> ' . $is_new,
+    ),
+    'author' => array(
+      '#type' => 'item',
+      '#wrapper_attributes' => array('class' => array('author', 'container-inline')),
+      '#markup' => '<h4 class="label inline">' . t('Author') . '</h4> ' . $entity_gallery->getOwner()->getUsername(),
+    ),
+  );
+  $form['revision_information']['#type'] = 'container';
+  $form['revision_information']['#group'] = 'meta';
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter() for \Drupal\entity_gallery\EntityGalleryForm.
+ */
+function path_form_entity_gallery_form_alter(&$form, FormStateInterface $form_state) {
+  $entity_gallery = $form_state->getFormObject()->getEntity();
+  $form['path_settings'] = [
+    '#type' => 'details',
+    '#title' => t('URL path settings'),
+    '#open' => !empty($form['path']['widget'][0]['alias']['#value']),
+    '#group' => 'advanced',
+    '#access' => !empty($form['path']['#access']) && $entity_gallery->hasField('path') && $entity_gallery->get('path')->access('edit'),
+    '#attributes' => [
+      'class' => ['path-form'],
+    ],
+    '#attached' => [
+      'library' => ['path/drupal.path'],
+    ],
+    '#weight' => 30,
+  ];
+  $form['path']['#group'] = 'path_settings';
+}
+
+/**
+ * Implements hook_entity_base_field_info().
+ */
+function entity_gallery_entity_base_field_info(EntityTypeInterface $entity_type) {
+  if (\Drupal::moduleHandler()->moduleExists('path') && $entity_type->id() === 'entity_gallery') {
+    $fields['path'] = BaseFieldDefinition::create('path')
+      ->setLabel(t('URL alias'))
+      ->setTranslatable(TRUE)
+      ->setDisplayOptions('form', [
+        'type' => 'path',
+        'weight' => 30,
+      ])
+      ->setDisplayConfigurable('form', TRUE)
+      ->setComputed(TRUE);
+
+    return $fields;
+  }
+}
+
+/**
+ * Helper function to create or update a menu link for an entity gallery.
+ *
+ * @param \Drupal\entity_gallery\EntityGalleryInterface $entity_gallery
+ *   Entity gallery entity.
+ * @param array $values
+ *   Values for the menu link.
+ */
+function _menu_ui_entity_gallery_save(EntityGalleryInterface $entity_gallery, array $values) {
+  /** @var \Drupal\menu_link_content\MenuLinkContentInterface $entity */
+  if (!empty($values['entity_id'])) {
+    $entity = MenuLinkContent::load($values['entity_id']);
+    if ($entity->isTranslatable()) {
+      if (!$entity->hasTranslation($entity_gallery->language()->getId())) {
+        $entity = $entity->addTranslation($entity_gallery->language()->getId(), $entity->toArray());
+      }
+      else {
+        $entity = $entity->getTranslation($entity_gallery->language()->getId());
+      }
+    }
+  }
+  else {
+    // Create a new menu_link_content entity.
+    $entity = MenuLinkContent::create([
+      'link' => ['uri' => 'entity:entity_gallery/' . $entity_gallery->id()],
+      'langcode' => $entity_gallery->language()->getId(),
+    ]);
+    $entity->enabled->value = 1;
+  }
+  $entity->title->value = trim($values['title']);
+  $entity->description->value = trim($values['description']);
+  $entity->menu_name->value = $values['menu_name'];
+  $entity->parent->value = $values['parent'];
+  $entity->weight->value = isset($values['weight']) ? $values['weight'] : 0;
+  $entity->save();
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_predelete() for entity gallery entities.
+ */
+function menu_ui_entity_gallery_predelete(EntityInterface $entity_gallery) {
+  // Delete all MenuLinkContent links that point to this entity gallery.
+  /** @var \Drupal\Core\Menu\MenuLinkManagerInterface $menu_link_manager */
+  $menu_link_manager = \Drupal::service('plugin.manager.menu.link');
+  $result = $menu_link_manager->loadLinksByRoute('entity.entity_gallery.canonical', ['entity_gallery' => $entity_gallery->id()]);
+
+  if (!empty($result)) {
+    foreach ($result as $id => $instance) {
+      if ($instance->isDeletable() && strpos($id, 'menu_link_content:') === 0) {
+        $instance->deleteLink();
+      }
+    }
+  }
+}
+
+/**
+ * Returns the definition for a menu link for the given entity gallery.
+ *
+ * @param \Drupal\entity_gallery\EntityGalleryInterface $entity_gallery
+ *   The entity gallery entity.
+ *
+ * @return array
+ *   An array that contains default values for the menu link form.
+ */
+function menu_ui_get_entity_gallery_menu_link_defaults(EntityGalleryInterface $entity_gallery) {
+  // Prepare the definition for the edit form.
+  /** @var \Drupal\entity_gallery\EntityGalleryTypeInterface $entity_gallery_type */
+  $entity_gallery_type = $entity_gallery->type->entity;
+  $menu_name = strtok($entity_gallery_type->getThirdPartySetting('menu_ui', 'parent', 'main:'), ':');
+  $defaults = FALSE;
+  if ($entity_gallery->id()) {
+    $id = FALSE;
+    // Give priority to the default menu
+    $type_menus = $entity_gallery_type->getThirdPartySetting('menu_ui', 'available_menus', ['main']);
+    if (in_array($menu_name, $type_menus)) {
+      $query = \Drupal::entityQuery('menu_link_content')
+        ->condition('link.uri', 'gallery/' . $entity_gallery->id())
+        ->condition('menu_name', $menu_name)
+        ->sort('id', 'ASC')
+        ->range(0, 1);
+      $result = $query->execute();
+
+      $id = (!empty($result)) ? reset($result) : FALSE;
+    }
+    // Check all allowed menus if a link does not exist in the default menu.
+    if (!$id && !empty($type_menus)) {
+      $query = \Drupal::entityQuery('menu_link_content')
+        ->condition('link.uri', 'entity:entity_gallery/' . $entity_gallery->id())
+        ->condition('menu_name', array_values($type_menus), 'IN')
+        ->sort('id', 'ASC')
+        ->range(0, 1);
+      $result = $query->execute();
+
+      $id = (!empty($result)) ? reset($result) : FALSE;
+    }
+    if ($id) {
+      $menu_link = MenuLinkContent::load($id);
+      $menu_link = \Drupal::service('entity.repository')->getTranslationFromContext($menu_link);
+      $defaults = [
+        'entity_id' => $menu_link->id(),
+        'id' => $menu_link->getPluginId(),
+        'title' => $menu_link->getTitle(),
+        'title_max_length' => $menu_link->getFieldDefinitions()['title']->getSetting('max_length'),
+        'description' => $menu_link->getDescription(),
+        'menu_name' => $menu_link->getMenuName(),
+        'parent' => $menu_link->getParentId(),
+        'weight' => $menu_link->getWeight(),
+      ];
+    }
+  }
+
+  if (!$defaults) {
+    // Get the default max_length of a menu link title from the base field
+    // definition.
+    $field_definitions = \Drupal::entityManager()->getBaseFieldDefinitions('menu_link_content');
+    $max_length = $field_definitions['title']->getSetting('max_length');
+    $defaults = [
+      'entity_id' => 0,
+      'id' => '',
+      'title' => '',
+      'title_max_length' => $max_length,
+      'description' => '',
+      'menu_name' => $menu_name,
+      'parent' => '',
+      'weight' => 0,
+    ];
+  }
+  return $defaults;
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter() for \Drupal\entity_gallery\EntityGalleryForm.
+ *
+ * Adds menu item fields to the entity gallery form.
+ *
+ * @see menu_ui_form_entity_gallery_form_submit()
+ */
+function menu_ui_form_entity_gallery_form_alter(&$form, FormStateInterface $form_state) {
+  // Generate a list of possible parents (not including this link or descendants).
+  // @todo This must be handled in a #process handler.
+  $entity_gallery = $form_state->getFormObject()->getEntity();
+  $defaults = menu_ui_get_entity_gallery_menu_link_defaults($entity_gallery);
+  /** @var \Drupal\entity_gallery\EntityGalleryTypeInterface $entity_gallery_type */
+  $entity_gallery_type = $entity_gallery->type->entity;
+  /** @var \Drupal\Core\Menu\MenuParentFormSelectorInterface $menu_parent_selector */
+  $menu_parent_selector = \Drupal::service('menu.parent_form_selector');
+  $menu_names = menu_ui_get_menus();
+  $type_menus = $entity_gallery_type->getThirdPartySetting('menu_ui', 'available_menus', ['main']);
+  $available_menus = [];
+  foreach ($type_menus as $menu) {
+    $available_menus[$menu] = $menu_names[$menu];
+  }
+  if ($defaults['id']) {
+    $default = $defaults['menu_name'] . ':' . $defaults['parent'];
+  }
+  else {
+    $default = $entity_gallery_type->getThirdPartySetting('menu_ui', 'parent', 'main:');
+  }
+  $parent_element = $menu_parent_selector->parentSelectElement($default, $defaults['id'], $available_menus);
+  // If no possible parent menu items were found, there is nothing to display.
+  if (empty($parent_element)) {
+    return;
+  }
+
+  $form['menu'] = [
+    '#type' => 'details',
+    '#title' => t('Menu settings'),
+    '#access' => \Drupal::currentUser()->hasPermission('administer menu'),
+    '#open' => (bool) $defaults['id'],
+    '#group' => 'advanced',
+    '#attached' => [
+      'library' => ['menu_ui/drupal.menu_ui'],
+    ],
+    '#tree' => TRUE,
+    '#weight' => -2,
+    '#attributes' => ['class' => ['menu-link-form']],
+  ];
+  $form['menu']['enabled'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Provide a menu link'),
+    '#default_value' => (int) (bool) $defaults['id'],
+  ];
+  $form['menu']['link'] = [
+    '#type' => 'container',
+    '#parents' => ['menu'],
+    '#states' => [
+      'invisible' => [
+        'input[name="menu[enabled]"]' => ['checked' => FALSE],
+      ],
+    ],
+  ];
+
+  // Populate the element with the link data.
+  foreach (['id', 'entity_id'] as $key) {
+    $form['menu']['link'][$key] = ['#type' => 'value', '#value' => $defaults[$key]];
+  }
+
+  $form['menu']['link']['title'] = [
+    '#type' => 'textfield',
+    '#title' => t('Menu link title'),
+    '#default_value' => $defaults['title'],
+    '#maxlength' => $defaults['title_max_length'],
+  ];
+
+  $form['menu']['link']['description'] = [
+    '#type' => 'textarea',
+    '#title' => t('Description'),
+    '#default_value' => $defaults['description'],
+    '#rows' => 1,
+    '#description' => t('Shown when hovering over the menu link.'),
+  ];
+
+  $form['menu']['link']['menu_parent'] = $parent_element;
+  $form['menu']['link']['menu_parent']['#title'] = t('Parent item');
+  $form['menu']['link']['menu_parent']['#attributes']['class'][] = 'menu-parent-select';
+
+  $form['menu']['link']['weight'] = [
+    '#type' => 'number',
+    '#title' => t('Weight'),
+    '#default_value' => $defaults['weight'],
+    '#description' => t('Menu links with lower weights are displayed before links with higher weights.'),
+  ];
+
+  foreach (array_keys($form['actions']) as $action) {
+    if ($action != 'preview' && isset($form['actions'][$action]['#type']) && $form['actions'][$action]['#type'] === 'submit') {
+      $form['actions'][$action]['#submit'][] = 'menu_ui_form_entity_gallery_form_submit';
+    }
+  }
+}
+
+/**
+ * Form submission handler for menu item field on the entity gallery form.
+ *
+ * @see menu_ui_form_entity_gallery_form_alter()
+ */
+function menu_ui_form_entity_gallery_form_submit($form, FormStateInterface $form_state) {
+  $entity_gallery = $form_state->getFormObject()->getEntity();
+  if (!$form_state->isValueEmpty('menu')) {
+    $values = $form_state->getValue('menu');
+    if (empty($values['enabled'])) {
+      if ($values['entity_id']) {
+        $entity = MenuLinkContent::load($values['entity_id']);
+        $entity->delete();
+      }
+    }
+    elseif (trim($values['title'])) {
+      // Decompose the selected menu parent option into 'menu_name' and 'parent',
+      // if the form used the default parent selection widget.
+      if (!empty($values['menu_parent'])) {
+        list($menu_name, $parent) = explode(':', $values['menu_parent'], 2);
+        $values['menu_name'] = $menu_name;
+        $values['parent'] = $parent;
+      }
+      _menu_ui_entity_gallery_save($entity_gallery, $values);
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for \Drupal\entity_gallery\EntityGalleryTypeForm.
+ *
+ * Adds menu options to the entity gallery type form.
+ *
+ * @see EntityGalleryTypeForm::form()
+ * @see menu_ui_form_entity_gallery_type_form_submit()
+ */
+function menu_ui_form_entity_gallery_type_form_alter(&$form, FormStateInterface $form_state) {
+  /** @var \Drupal\Core\Menu\MenuParentFormSelectorInterface $menu_parent_selector */
+  $menu_parent_selector = \Drupal::service('menu.parent_form_selector');
+  $menu_options = menu_ui_get_menus();
+  /** @var \Drupal\entity_gallery\EntityGalleryTypeInterface $type */
+  $type = $form_state->getFormObject()->getEntity();
+  $form['menu'] = [
+    '#type' => 'details',
+    '#title' => t('Menu settings'),
+    '#attached' => [
+      'library' => ['menu_ui/drupal.menu_ui.admin'],
+    ],
+    '#group' => 'additional_settings',
+  ];
+  $form['menu']['menu_options'] = [
+    '#type' => 'checkboxes',
+    '#title' => t('Available menus'),
+    '#default_value' => $type->getThirdPartySetting('menu_ui', 'available_menus', ['main']),
+    '#options' => $menu_options,
+    '#description' => t('The menus available to place links in for this content type.'),
+  ];
+  // @todo See if we can avoid pre-loading all options by changing the form or
+  //   using a #process callback. https://www.drupal.org/node/2310319
+  //   To avoid an 'illegal option' error after saving the form we have to load
+  //   all available menu parents. Otherwise, it is not possible to dynamically
+  //   add options to the list using ajax.
+  $options_cacheability = new CacheableMetadata();
+  $options = $menu_parent_selector->getParentSelectOptions('', NULL, $options_cacheability);
+  $form['menu']['menu_parent'] = [
+    '#type' => 'select',
+    '#title' => t('Default parent item'),
+    '#default_value' => $type->getThirdPartySetting('menu_ui', 'parent', 'main:'),
+    '#options' => $options,
+    '#description' => t('Choose the menu item to be the default parent for a new link in the content authoring form.'),
+    '#attributes' => ['class' => ['menu-title-select']],
+  ];
+  $options_cacheability->applyTo($form['menu']['menu_parent']);
+
+  $form['#validate'][] = 'menu_ui_form_entity_gallery_type_form_validate';
+  $form['#entity_builders'][] = 'menu_ui_form_entity_gallery_type_form_builder';
+}
+
+/**
+ * Validate handler for forms with menu options.
+ *
+ * @see menu_ui_form_entity_gallery_type_form_alter()
+ */
+function menu_ui_form_entity_gallery_type_form_validate(&$form, FormStateInterface $form_state) {
+  $available_menus = array_filter($form_state->getValue('menu_options'));
+  // If there is at least one menu allowed, the selected item should be in
+  // one of them.
+  if (count($available_menus)) {
+    $menu_item_id_parts = explode(':', $form_state->getValue('menu_parent'));
+    if (!in_array($menu_item_id_parts[0], $available_menus)) {
+      $form_state->setErrorByName('menu_parent', t('The selected menu item is not under one of the selected menus.'));
+    }
+  }
+  else {
+    $form_state->setValue('menu_parent', '');
+  }
+}
+
+/**
+ * Entity builder for the entity gallery type form with menu options.
+ *
+ * @see menu_ui_form_entity_gallery_type_form_alter()
+ */
+function menu_ui_form_entity_gallery_type_form_builder($entity_type, EntityGalleryTypeInterface $type, &$form, FormStateInterface $form_state) {
+  $type->setThirdPartySetting('menu_ui', 'available_menus', array_values(array_filter($form_state->getValue('menu_options'))));
+  $type->setThirdPartySetting('menu_ui', 'parent', $form_state->getValue('menu_parent'));
+}
