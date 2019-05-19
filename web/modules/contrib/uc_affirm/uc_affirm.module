@@ -1,0 +1,254 @@
+<?php
+
+/**
+ * @file
+ * Defines the credit card payment method and hooks in payment gateways.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Url;
+use Symfony\Component\HttpFoundation\RedirectResponse;
+use Drupal\uc_order\Entity\Order;
+use Drupal\uc_order\OrderInterface;
+use Drupal\Component\Utility\Unicode;
+
+// Affirm live.
+define('UC_AFFIRM_TXN_MODE_LIVE', 'live');
+
+// Affirm sandbox.
+define('UC_AFFIRM_TXN_MODE_TEST', 'sandbox');
+
+// Just authorize a buyer details.
+define('UC_AFFIRM_AUTH_ONLY', 'Authorization');
+
+// Just Capture the amount.
+define('UC_AFFIRM_CAPTURE_ONLY', 'Capture');
+
+// Authorize the buyer and Capture the amount.
+define('UC_AFFIRM_AUTH_CAPTURE', 'Authorization and Capture');
+
+// Void/Cancel the transaction.
+define('UC_AFFIRM_VOID', 'void');
+
+// Refund the transaction amount.
+define('UC_AFFIRM_REFUND', 'refund');
+
+// Refund ubercart status.
+define('UC_AFFIRM_REFUND_STATUS', 'chargeback');
+
+// Payment received status.
+define('UC_AFFIRM_ORDER_STATUS_PAYMENT_RECEIVED', 'payment_received');
+
+// Transaction authorized status.
+define('UC_AFFIRM_ORDER_STATUS_AUTHORIZED', 'order_under_review');
+
+/**
+ * Implements hook for attaching the js script.
+ *
+ * Attaching the affirm javascript file in to review order page.
+ */
+function uc_affirm_page_attachments(array &$page) {
+  if (\Drupal::routeMatch()->getRouteName() == 'uc_cart.checkout_review') {
+    $session = \Drupal::service('session');
+    $order = Order::load($session->get('cart_order'));
+    $payment = \Drupal::service('plugin.manager.uc_payment.method')->createFromOrder($order)->cartReviewTitle();
+    $payment = (array)$payment;
+    $payment = array_values($payment);
+    if ($payment[1] == 'Affirm') {
+      $page['#attached']['library'][] = 'uc_affirm/uc_affirm.scripts';
+    }
+  }
+}
+
+/**
+ * Implements hook for override the review form.
+ *
+ * Order details pass to javascript variable.
+ */
+function uc_affirm_form_alter(&$form, &$form_state, $form_id) {
+  if ($form_id == 'uc_cart_checkout_review_form') {
+    $session = \Drupal::service('session');
+    $order = Order::load($session->get('cart_order'));
+    $data  = _uc_affirm_cart_review_data($order);
+    $form['#attached']['drupalSettings']['uc_affirm'] = $data;
+  }
+}
+
+/**
+ * Custom function for include the js file in the cart page.
+ *
+ * @param object $order
+ *
+ *   Fetches the order details and make an array for
+ *   affirm javascript required values.
+ */
+function _uc_affirm_cart_review_data($order) {
+  $config = \Drupal::config('uc_affirm.settings');
+  $country = \Drupal::service('country_manager')->getCountry($order->getAddress('billing')->country);
+  $shipping = 0;
+  if (is_array($order->line_items)) {
+    foreach ($order->line_items as $item) {
+      if ($item['type'] == 'shipping') {
+        $shipping += $item['amount'];
+      }
+    }
+  }
+  $tax = 0;
+  if (\Drupal::moduleHandler()->moduleExists('uc_tax')) {
+    foreach (uc_tax_calculate($order) as $tax_item) {
+      $tax += $tax_item->amount;
+    }
+  }
+  $subtotal = $order->getTotal() - $tax - $shipping;
+  $affirm_module_info = system_get_info('module', 'uc_affirm');
+  // Creates a data array to be passed onto the request.
+  $data = array(
+  // General settings.
+    'ApiMode' => empty($config->get('uc_affirm_server')) ? 'sandbox' : $config->get('uc_affirm_server'),
+    'PublicKey' => empty($config->get('uc_affirm_public_key')) ? '' : $config->get('uc_affirm_public_key'),
+    'FinancialProductKey' => empty($config->get('uc_affirm_fpkey')) ? '' : $config->get('uc_affirm_fpkey'),
+    'OrderId' => $order->id(),
+    'Email' => Unicode::substr($order->getEmail(), 0, 64),
+    'CancelUrl' => Url::fromRoute('uc_cart.checkout_review', [], ['absolute' => TRUE])->toString(),
+    'ConfirmUrl' => Url::fromRoute('uc_affirm.authentication', [], ['absolute' => TRUE])->toString(),
+    'items' => array(),
+    'metadata' => array(
+      'platform_type' => 'Drupal',
+      'platform_version' => 'Drupal 8.2 ; Drupal UC Affirm ' . $affirm_module_info['version'],
+      'platform_affirm' => $affirm_module_info['version'],
+      'shipping_type' => '',
+    ),
+    'ShippingTotal' => $shipping * 100,
+    'TaxAmount' => $tax * 100,
+    'ProductsTotal' => number_format((float) $subtotal, 2, '.', '') * 100,
+  );
+
+  // Adds information about the billing profile.
+  $data += array(
+    'BillingFullName' => Unicode::substr($order->getAddress('billing')->first_name . ' ' . $order->getAddress('billing')->last_name, 0, 128),
+    'BillingFirstName' => Unicode::substr($order->getAddress('billing')->first_name, 0, 128),
+    'BillingLastName' => Unicode::substr($order->getAddress('billing')->last_name, 0, 128),
+    'BillingAddressLn1' => Unicode::substr($order->getAddress('billing')->street1, 0, 64),
+    'BillingAddressLn2' => Unicode::substr($order->getAddress('billing')->street2, 0, 64),
+    'BillingAddressPostCode' => Unicode::substr($order->getAddress('billing')->postal_code, 0, 16),
+    'BillingAddressState' => get_zone_code_by_id($order->getAddress('billing')->zone),
+    'BillingAddressCity' => Unicode::substr($order->getAddress('billing')->city, 0, 64),
+    'BillingAddressCountry' => $country ? $country->getAlpha3() : 'USA',
+    'BillingTelephone' => Unicode::substr($order->getAddress('billing')->phone, 0, 16),
+  );
+
+  // Adds information about the Shipping profile.
+  $data += array(
+    'ShippingFullName' => Unicode::substr($order->getAddress('delivery')->first_name . ' ' . $order->getAddress('delivery')->last_name, 0, 128),
+    'ShippingFirstName' => Unicode::substr($order->getAddress('delivery')->first_name, 0, 128),
+    'ShippingLastName' => Unicode::substr($order->getAddress('delivery')->last_name, 0, 128),
+    'ShippingAddressLn1' => Unicode::substr($order->getAddress('delivery')->street1, 0, 64),
+    'ShippingAddressLn2' => Unicode::substr($order->getAddress('delivery')->street2, 0, 64),
+    'ShippingAddressCountry' => $country ? $country->getAlpha3() : 'USA',
+    'ShippingAddressPostCode' => Unicode::substr($order->getAddress('delivery')->postal_code, 0, 16),
+    'ShippingAddressState' => get_zone_code_by_id($order->getAddress('delivery')->zone),
+    'ShippingAddressCity' => Unicode::substr($order->getAddress('delivery')->city, 0, 64),
+    'ShippingTelephone' => Unicode::substr($order->getAddress('delivery')->phone, 0, 16),
+  );
+
+  // Adds information about the product items.
+  foreach ($order->products as $products) {
+    $data['items'][] = array(
+      'sku' => $products->model->value,
+      'qty' => $products->qty->value,
+      'display_name' => $products->title->value,
+      'item_url' => '',
+      'item_image_url' => '',
+      'unit_price' => $products->price->value * 100,
+    );
+  }
+  $data['discounts'][] = array(
+    "discount_amount" => '',
+    "discount_display_name" => "test discount",
+  );
+  return $data;
+}
+
+/**
+ * Function for getting the state code.
+ *
+ * @param int $id
+ *
+ *   The state id selected from drop box.
+ *
+ * @return string
+ *   State code against the state id.
+ */
+function get_zone_code_by_id($id) {
+  $zone_id = $id;
+  if ($zone_id == 'AF') {
+    $zone_id = 'AE';
+    return $zone_id;
+  }
+  elseif ($zone_id == 'AC') {
+    $zone_id = 'AE';
+    return $zone_id;
+  }
+  elseif ($zone_id == 'AM') {
+    $zone_id = 'AE';
+    return $zone_id;
+  }
+  else {
+    return $zone_id;
+  }
+}
+
+/**
+ * Implements hook_uc_order_actions().
+ */
+function uc_affirm_uc_order_actions(OrderInterface $order) {
+  $actions = array();
+  $payment = \Drupal::service('plugin.manager.uc_payment.method')->createFromOrder($order)->cartReviewTitle();
+  $payment = (array)$payment;
+  $payment = array_values($payment);
+  if ($payment[0] == 'Affirm') {
+    $status = $order->getStatus()->getName();
+    if ($status == 'Payment received' || $status == 'Charge Back') {
+      $actions['refund'] = array(
+        'title' => t('Refund'),
+        'url' => Url::fromRoute('uc_affirm.refund', ['uc_order' => $order->id()]),
+        'weight' => 4,
+      );
+    }
+    if ($status == 'Order Under Review') {
+      $actions['void'] = array(
+        'title' => t('Void'),
+        'url' => Url::fromRoute('uc_affirm.void', ['uc_order' => $order->id()]),
+        'weight' => 3,
+      );
+      $actions['capture'] = array(
+        'title' => t('Capture Charge'),
+        'url' => Url::fromRoute('uc_affirm.capture', ['uc_order' => $order->id()]),
+        'weight' => 2,
+      );
+    }
+    
+  }
+  
+  
+  return $actions;
+}
+
+/**
+ * Function for getting charge id against the order id.
+ *
+ * @param integer $order_id
+ * The unique id for an order.
+ *
+ * @return string
+ *  Returns the charg id against the given order id.
+ */
+function _get_uc_affirm_charge_id($order_id) {
+  $result = db_select('uc_affirm', 'n')
+      ->fields('n', array('charge_id'))
+      ->condition('order_id', $order_id, '=')
+      ->execute()
+      ->fetchAssoc();
+  return $result['charge_id'];
+}
