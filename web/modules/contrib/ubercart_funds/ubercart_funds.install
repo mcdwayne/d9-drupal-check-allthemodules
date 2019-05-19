@@ -1,0 +1,141 @@
+<?php
+
+/**
+ * @file
+ * Install, update and uninstall functions for the ubercart_funds module.
+ */
+
+use Drupal\ubercart_funds\Entity\Transaction;
+
+/**
+ * Implements hook_schema().
+ */
+function ubercart_funds_schema() {
+  $schema = [];
+
+  $schema['uc_funds_user_funds'] = [
+    'description' => 'User Funds',
+    'fields' => [
+      'uid' => [
+        'description' => 'The user id of the fund.',
+        'type' => 'int',
+        'not null' => TRUE,
+        'unsigned' => TRUE,
+      ],
+      'balance' => [
+        'description' => 'The balance of the user.',
+        'type' => 'int',
+        'size' => 'big',
+        'not null' => TRUE,
+        'unsigned' => TRUE,
+        'default' => 0,
+      ],
+    ],
+    'primary key' => [
+      'uid',
+    ],
+  ];
+
+  return $schema;
+}
+
+/**
+ * Implements hook_install().
+ */
+function ubercart_funds_install() {
+  // Write admin balance.
+  \Drupal::database()->insert('uc_funds_user_funds')
+    ->fields([
+      'uid' => 1,
+      'balance' => 0,
+    ])
+    ->execute();
+
+  // Set a plugin for sending HTML email.
+  $config = \Drupal::configFactory()->getEditable('system.mail');
+  $mail_plugins = $config->get('interface');
+  if (in_array('uc_funds', array_keys($mail_plugins))) {
+    return;
+  }
+
+  $mail_plugins['uc_funds'] = 'ubercart_funds_mail';
+  $config->set('interface', $mail_plugins)->save();
+
+}
+
+/**
+ * Implements hook_uninstall().
+ */
+function ubercart_funds_uninstall() {
+  // Restore default mail config.
+  $config = \Drupal::configFactory()->getEditable('system.mail');
+  $mail_plugins = $config->get('interface');
+  if (!in_array('uc_funds', array_keys($mail_plugins))) {
+    return;
+  }
+
+  unset($mail_plugins['uc_funds']);
+  $config->set('interface', $mail_plugins)->save();
+
+}
+
+/**
+ * Implements hook_update_N().
+ *
+ * Change databe schema to respect Transaction
+ * as Entity schema.
+ */
+function ubercart_funds_update_8101() {
+  $transactions = \Drupal::database()->select('uc_funds_transactions', 'uft')->fields('uft')->range(0, 1)->execute()->fetchAll();
+  // No need to change db schema on first installation.
+  if (empty($transactions)) {
+    return;
+  }
+  // Reset configuration.
+  \Drupal::service('config.installer')->installDefaultConfig('module', 'ubercart_funds');
+
+  // Rename old table.
+  \Drupal::database()->schema()->renameTable('uc_funds_transactions', 'uc_funds_transactions_bkp');
+  // Create new schema.
+  $manager = \Drupal::entityDefinitionUpdateManager();
+  $entity_type = $manager->getEntityType('ubercart_funds_transaction');
+  $manager->installEntityType($entity_type);
+
+  $db_tables = ['uc_funds_transactions_bkp', 'uc_funds_withdrawal_requests'];
+  $currency = \Drupal::config('uc_store.settings')->get('currency.code');
+
+  foreach ($db_tables as $table) {
+    // Transfers data into new schema.
+    $old_data = \Drupal::database()->select($table, 'uc')
+      ->fields('uc')
+      ->execute()
+      ->fetchAll();
+    foreach ($old_data as $data) {
+      $method = NULL;
+      $data->type = isset($data->type) ? strtolower($data->type) : 'withdrawal';
+      if ($data->type != 'Deposit') {
+        $method = 'internal';
+      }
+      if ($table == 'uc_funds_withdrawal_requests') {
+        $method = $data->method;
+        $data->recipient = $data->issuer;
+      }
+      Transaction::create([
+        'issuer' => $data->issuer,
+        'recipient' => $data->recipient,
+        'created' => $data->created,
+        'brut_amount' => $data->brut_amount,
+        'net_amount' => $data->net_amount,
+        'fee' => $data->fee,
+        'currency' => $currency,
+        'type' => $data->type,
+        'method' => $method,
+        'status' => $data->status,
+        'notes' => isset($data->notes) ? $data->notes : $data->reason,
+      ])->save();
+    }
+    // Drop old db.
+    \Drupal::database()->schema()->dropTable($table);
+  }
+
+}
