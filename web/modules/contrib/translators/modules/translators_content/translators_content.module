@@ -1,0 +1,218 @@
+<?php
+
+/**
+ * @file
+ * Basic module file.
+ */
+
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Entity\ContentEntityInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\translators_content\Controller\TranslatorsContentLanguageCtrl;
+use Drupal\translators_content\Plugin\views\filter\TranslationLanguageLimitedToTranslationSkills;
+use Drupal\views\Plugin\views\query\QueryPluginBase;
+use Drupal\views\ViewExecutable;
+use Drupal\node\Entity\Node;
+
+/**
+ * Implements hook_views_query_alter().
+ */
+function translators_content_views_query_alter(ViewExecutable $view, QueryPluginBase $query) {
+  if (!empty($view->filter)) {
+    // Prepare available translation skills for the current user.
+    $translatorSkills = \Drupal::service('translators.skills')
+      ->getSkills(NULL, TRUE);
+    // Prevent any operations in case of empty skills list.
+    // Traverse through the view's filters list.
+    foreach ($view->filter as $filter) {
+      // Handle only filters of plugin "translator_skills_filter".
+      // And if the default "All" option has been selected
+      // or non-exposed filter is used.
+      if ($filter instanceof TranslationLanguageLimitedToTranslationSkills
+        && ($filter->options['limit'])) {
+        // Prepare skills list.
+        $skills_list = [];
+        // Filter list of skills by the specified columns option
+        // in the filter's settings form.
+        foreach ($filter->options['column'] as $name => $column) {
+          if (!empty($column)) {
+            foreach ($translatorSkills as $languages) {
+              if (isset($languages["language_$name"])) {
+                $skills_list[] = $languages["language_$name"];
+              }
+            }
+          }
+        }
+        // Prevent possibly duplicated entries.
+        $skills_list = array_unique($skills_list);
+        if (!empty($skills_list)) {
+          $operator = 'in';
+          if (isset($filter->options['remove']) && $filter->options['remove'] == 1) {
+            $operator = 'not in';
+          }
+          // Add condition to the new where group
+          // to prevent harming existing where groups logic.
+          $query->addWhere(
+            $query->setWhereGroup(),
+            "$filter->table.$filter->realField",
+            $skills_list,
+            $operator
+          );
+        }
+        else {
+          // Prevent query being executed at all
+          // if no user skills are exist.
+          $view->executed = TRUE;
+          continue;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_views_plugins_filter_alter().
+ */
+function translators_content_views_plugins_filter_alter(array &$plugins) {
+  // Replace the core's language filter class with our own class,
+  // which extends the original filter functionality.
+  if (isset($plugins['language']) && !empty($plugins['language'])) {
+    $plugins['language']['class'] = TranslationLanguageLimitedToTranslationSkills::class;
+    $plugins['language']['provider'] = 'translators_content';
+  }
+}
+
+/**
+ * Implements hook_theme_registry_alter().
+ */
+function translators_content_theme_registry_alter(&$theme_registry) {
+  // Specify the path for the template of views_ui_expose_filter_form.
+  $path = drupal_get_path('module', 'translators_content') . '/templates';
+  $theme_registry['views_ui_expose_filter_form']['path'] = $path;
+}
+
+/**
+ * Implements hook_entity_access().
+ */
+function translators_content_entity_access(EntityInterface $entity, $operation) {
+  $request_attributes = \Drupal::request()->attributes;
+  $route_name         = $request_attributes->get('_route');
+  $entity_type_id     = $entity->getEntityTypeId();
+  if (!$entity instanceof ContentEntityInterface
+    || $route_name === "entity.$entity_type_id.content_translation_overview"
+  ) {
+    return AccessResult::neutral()->cachePerPermissions();
+  }
+
+  /** @var \Drupal\translators_content\Plugin\TranslatorsAccessRulesPluginManager $manager */
+  $manager = \Drupal::service('plugin_manager.translators_content_access_rules');
+  return $manager->checkAccess($operation, $entity);
+}
+
+/**
+ * Implements hook_entity_create_access().
+ */
+function translators_content_entity_create_access() {
+  /** @var \Drupal\translators_content\Plugin\TranslatorsAccessRulesPluginManager $manager */
+  $manager = \Drupal::service('plugin_manager.translators_content_access_rules');
+  return $manager->checkAccess('create');
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function translators_content_form_node_form_alter(&$form) {
+  $is_enabled = (bool) \Drupal::configFactory()
+    ->get('translators.settings')
+    ->get('enable_translators_content_permissions');
+  if ($is_enabled && isset($form['langcode'])) {
+    $form['langcode']['widget']['#after_build'][] = [TranslatorsContentLanguageCtrl::class, 'nodeFormLangcodeAfterBuild'];
+  }
+}
+
+/**
+ * Implements hook_config_schema_info_alter().
+ */
+function translators_content_config_schema_info_alter(&$definitions) {
+  $definition =& $definitions['views.filter.language'];
+  $definition['mapping']['limit'] = [
+    'type' => 'boolean',
+    'label' => 'Enable limiting languages list using Translator module',
+  ];
+  $definition['mapping']['column'] = [
+    'type' => 'mapping',
+    'label' => 'Column',
+    'mapping' => [
+      'from' => [
+        'type' => 'string',
+        'label' => 'Source language',
+      ],
+      'to' => [
+        'type' => 'string',
+        'label' => 'Target language',
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function translators_content_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $config = \Drupal::configFactory()->get('translators.settings');
+  if (stripos($form_id, 'node_') !== FALSE) {
+    $node = \Drupal::routeMatch()->getParameter('node');
+    if ($node instanceof Node && isset($form['source_langcode']) && !empty($config->get('enable_auto_preset_source_language_by_skills'))) {
+      $source =& $form['source_langcode']['source'];
+      if (isset($source['#options'])) {
+        $operation = \Drupal::routeMatch()
+          ->getRouteObject()
+          ->getRequirement('_access_content_translation_manage');
+        $translatorSourceSkills = \Drupal::service('translators.skills')
+          ->getSourceSkills();
+        if (!empty($translatorSourceSkills)) {
+          $user = \Drupal::currentUser();
+          if (!empty($config->get('enable_access_by_source_skills'))
+            && $user->hasPermission("translators_content $operation content translations")
+            && !$user->hasPermission("$operation content translations")) {
+            // Leave only "from" languages.
+            foreach ($source['#options'] as $langcode => $label) {
+              if (!in_array($langcode, $translatorSourceSkills)) {
+                unset($source['#options'][$langcode]);
+              }
+            }
+          }
+          elseif ($user->hasPermission("$operation content translations")) {
+            // Group different languages into opt groups.
+            $languages = $source['#options'];
+            $source['#options'] = ['Translation skills' => [], 'Others' => []];
+            foreach ($translatorSourceSkills as $langcode) {
+              if (isset($languages[$langcode])) {
+                $source['#options']['Translation skills'][$langcode] = $languages[$langcode];
+              }
+            }
+            foreach ($languages as $langcode => $name) {
+              if (!in_array($langcode, $translatorSourceSkills) && $node->hasTranslation($langcode)) {
+                $source['#options']['Others'][$langcode] = $name;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function translators_content_module_implements_alter(&$implementations, $hook) {
+  if (stripos($hook, 'form_alter') !== FALSE) {
+    if (isset($implementations['translators_content'])) {
+      $temp = $implementations['translators_content'];
+      unset($implementations['translators_content']);
+      $implementations['translators_content'] = $temp;
+    }
+  }
+}
