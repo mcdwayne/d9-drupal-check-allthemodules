@@ -1,0 +1,228 @@
+<?php
+
+/**
+ * @file
+ * Exposes the module to different API's.
+ */
+
+use Drupal\Core\Url;
+use Drupal\Component\Utility\Html;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Component\Utility\Xss;
+
+/**
+ * Implements hook_help().
+ */
+function views_vcards_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.views_vcards':
+      $path = dirname(__FILE__) . '/README.md';
+      if (file_exists($path)) {
+        $readme = file_get_contents($path);
+      }
+      if (!isset($readme)) {
+        return NULL;
+      }
+      $output = '<pre>' . Html::escape($readme) . '</pre>';
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function views_vcards_theme($existing, $type, $theme, $path) {
+  return [
+    'views_vcards_view_vcard' => [
+      'variables' => [
+        'items' => NULL,
+      ],
+    ],
+    'views_vcards_view_row_vcard' => [
+      'variables' => [
+        'first_name' => NULL,
+        'middle_name' => NULL,
+        'last_name' => NULL,
+        'full_name' => NULL,
+        'title' => NULL,
+        'email' => NULL,
+        'email2' => NULL,
+        'email3' => NULL,
+        'photo' => NULL,
+        'home_address' => NULL,
+        'home_city' => NULL,
+        'home_state' => NULL,
+        'home_zip' => NULL,
+        'home_country' => NULL,
+        'home_phone' => NULL,
+        'home_cellphone' => NULL,
+        'home_website' => NULL,
+        'work_title' => NULL,
+        'work_company' => NULL,
+        'work_address' => NULL,
+        'work_city' => NULL,
+        'work_state' => NULL,
+        'work_zip' => NULL,
+        'work_fax' => NULL,
+        'work_website' => NULL,
+      ],
+    ],
+    'views_vcards_vcard_icon' => [
+      'variables' => [
+        'url' => NULL,
+        'title' => NULL
+      ],
+    ],
+  ];
+}
+
+/**
+ * Preprocess a vCards list.
+ */
+function views_vcards_preprocess_views_vcards_view_vcard(&$variables) {
+  $view = $variables['view'];
+  $items = $variables['rows'];
+  $style = $view->style_plugin;
+
+  $config = \Drupal::config('system.site');
+
+  // Figure out which display which has a path we're using for this feed. If
+  // there isn't one, use the global $base_url.
+  $link_display_id = $view->display_handler->getLinkDisplay();
+  if ($link_display_id && $display = $view->displayHandlers->get($link_display_id)) {
+    $url = $view->getUrl(NULL, $link_display_id);
+  }
+
+  /** @var \Drupal\Core\Url $url */
+  if ($url) {
+    $url_options = ['absolute' => TRUE];
+    if (!empty($view->exposed_raw_input)) {
+      $url_options['query'] = $view->exposed_raw_input;
+    }
+
+    // Compare the link to the default home page; if it's the default home page,
+    // just use $base_url.
+    $url_string = $url->setOptions($url_options)->toString();
+    if ($url_string === Url::fromUserInput($config->get('page.front'))->toString()) {
+      $url_string = Url::fromRoute('<front>')->setAbsolute()->toString();
+    }
+
+    $variables['link'] = $url_string;
+  }
+
+  $variables['langcode'] = \Drupal::languageManager()->getCurrentLanguage()->getId();
+  $variables['items'] = $items;
+
+  // During live preview we don't want to output the header since the contents
+  // of the feed are being displayed inside a normal HTML page.
+  if (empty($variables['view']->live_preview)) {
+
+    // Only build the zip if we are not watching the preview.
+    if (count($items) > 1) {
+      $variables['items'] = NULL;
+
+      // Make sure there always is a filename. Sanitize with pathauto if possible.
+      $filename = !empty($view->human_name) ? $view->human_name : 'vcards';
+      if (\Drupal::moduleHandler()->moduleExists('pathauto')) {
+        $filename = \Drupal::service('pathauto.alias_cleaner')->cleanString($filename);
+      }
+      $filename .= '.zip';
+
+      // Try to load the library and check if that worked.
+      if (class_exists('PHPZip\Zip\Stream\ZipStream')) {
+        $phpzip = new PHPZip\Zip\Stream\ZipStream($filename);
+        $xss = new Xss();
+
+        // Store all names in a keyed array for quick lookup of names.
+        $rows = array();
+        foreach ($items as $item) {
+          $desired_name = $suffixed_desired_name = $xss::filter(render($item['#row']->full_name), []);
+
+          // Cleanup the name.
+          if (\Drupal::moduleHandler()->moduleExists('pathauto')) {
+            $desired_name = $suffixed_desired_name = \Drupal::service('pathauto.alias_cleaner')->cleanString($desired_name);
+          }
+
+          $iterator = 1;
+          // Append an iterator to already existing names.
+          while (array_key_exists($suffixed_desired_name, $rows)) {
+            $suffixed_desired_name = $desired_name . $iterator;
+            $iterator++;
+          }
+          $rows[$suffixed_desired_name] = $item;
+        }
+
+        // Add each rendered vCard by its full name as the filename.
+        foreach ($rows as $vcard_name => $item) {
+          $item = render($item);
+          $phpzip->addFile($item, $vcard_name . '.vcf');
+        }
+        $phpzip->finalize();
+
+        $variables['view']->getResponse()->headers->set('Content-Type', 'application/x-zip; charset=utf-8');
+        $variables['view']->getResponse()->headers->set('Content-Disposition', 'attachment; filename=' . $filename);
+        $variables['view']->getResponse()->headers->set('Pragma', 'no-cache');
+        $variables['view']->getResponse()->headers->set('Cache-Control', 'no-cache');
+        $variables['view']->getResponse()->headers->set('Content-Transfer-Encoding', 'binary');
+      }
+      else {
+        drupal_set_message(t("The PHPZip library was not loaded"), 'error');
+      }
+    }
+    else {
+      // Make sure there always is a filename. Sanitize with pathauto if possible.
+      $human_name = render(reset($items)['#row']->full_name);
+      if (\Drupal::moduleHandler()->moduleExists('pathauto')) {
+        $safe_name = \Drupal::service('pathauto.alias_cleaner')->cleanString($human_name);
+      }
+      $filename = (!empty($safe_name) ? $safe_name : 'vcard') . '.vcf';
+
+      // Only one item? Add headers for vCard and output single (first) item.
+      $variables['view']->getResponse()->headers->set('Content-Type', 'text/vcard; charset=utf-8');
+      $variables['view']->getResponse()->headers->set('Content-Disposition', 'attachment; filename=' . $filename);
+    }
+  }
+}
+
+/**
+ * Default theme function for all vCards entries.
+ *
+ * Sanitizes all items on a row.
+ */
+function views_vcards_preprocess_views_vcards_view_row_vcard(&$variables) {
+  $item = $variables['row'];
+
+  $xss = new Xss();
+
+  $variables['first_name']      = htmlspecialchars_decode($xss::filter(render($item->first_name), []), ENT_QUOTES|ENT_HTML5);
+  $variables['middle_name']     = htmlspecialchars_decode($xss::filter(render($item->middle_name), []), ENT_QUOTES|ENT_HTML5);
+  $variables['last_name']       = htmlspecialchars_decode($xss::filter(render($item->last_name), []), ENT_QUOTES|ENT_HTML5);
+  $variables['full_name']       = htmlspecialchars_decode($xss::filter(render($item->full_name), []), ENT_QUOTES|ENT_HTML5);
+  $variables['title']           = htmlspecialchars_decode($xss::filter(render($item->title), []), ENT_QUOTES|ENT_HTML5);
+  $variables['email']           = htmlspecialchars_decode($xss::filter(render($item->email), []), ENT_QUOTES|ENT_HTML5);
+  $variables['email2']          = htmlspecialchars_decode($xss::filter(render($item->email2), []), ENT_QUOTES|ENT_HTML5);
+  $variables['email3']          = htmlspecialchars_decode($xss::filter(render($item->email3), []), ENT_QUOTES|ENT_HTML5);
+  $variables['photo']           = $xss::filter($item->photo, []);
+  $variables['home_address']    = htmlspecialchars_decode($xss::filter(render($item->home_address), []), ENT_QUOTES|ENT_HTML5);
+  $variables['home_city']       = htmlspecialchars_decode($xss::filter(render($item->home_city), []), ENT_QUOTES|ENT_HTML5);
+  $variables['home_state']      = htmlspecialchars_decode($xss::filter(render($item->home_state), []), ENT_QUOTES|ENT_HTML5);
+  $variables['home_zip']        = htmlspecialchars_decode($xss::filter(render($item->home_zip), []), ENT_QUOTES|ENT_HTML5);
+  $variables['home_country']    = htmlspecialchars_decode($xss::filter(render($item->home_country), []), ENT_QUOTES|ENT_HTML5);
+  $variables['home_phone']      = htmlspecialchars_decode($xss::filter(render($item->home_phone), []), ENT_QUOTES|ENT_HTML5);
+  $variables['home_cellphone']  = htmlspecialchars_decode($xss::filter(render($item->home_cellphone), []), ENT_QUOTES|ENT_HTML5);
+  $variables['home_website']    = htmlspecialchars_decode($xss::filter(render($item->home_website), []), ENT_QUOTES|ENT_HTML5);
+  $variables['work_title']      = htmlspecialchars_decode($xss::filter(render($item->work_title), []), ENT_QUOTES|ENT_HTML5);
+  $variables['work_company']    = htmlspecialchars_decode($xss::filter(render($item->work_company), []), ENT_QUOTES|ENT_HTML5);
+  $variables['work_address']    = htmlspecialchars_decode($xss::filter(render($item->work_address), []), ENT_QUOTES|ENT_HTML5);
+  $variables['work_city']       = htmlspecialchars_decode($xss::filter(render($item->work_city), []), ENT_QUOTES|ENT_HTML5);
+  $variables['work_state']      = htmlspecialchars_decode($xss::filter(render($item->work_state), []), ENT_QUOTES|ENT_HTML5);
+  $variables['work_zip']        = htmlspecialchars_decode($xss::filter(render($item->work_zip), []), ENT_QUOTES|ENT_HTML5);
+  $variables['work_country']    = htmlspecialchars_decode($xss::filter(render($item->work_country), []), ENT_QUOTES|ENT_HTML5);
+  $variables['work_phone']      = htmlspecialchars_decode($xss::filter(render($item->work_phone), []), ENT_QUOTES|ENT_HTML5);
+  $variables['work_fax']        = htmlspecialchars_decode($xss::filter(render($item->work_fax), []), ENT_QUOTES|ENT_HTML5);
+  $variables['work_website']    = htmlspecialchars_decode($xss::filter(render($item->work_website), []), ENT_QUOTES|ENT_HTML5);
+}
+
+function views_vcards_preprocess_views_vcards_vcard_icon(&$variables) {
+  //dpm($variables);
+}
