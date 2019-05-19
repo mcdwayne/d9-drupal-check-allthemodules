@@ -1,0 +1,525 @@
+<?php
+
+/**
+ * @file
+ * Provides an entity for users to post generic adverts to each other.
+ *
+ * The module is designed to be ready to go and yet have some useful options
+ * so there is some tight control over some things expecially taxonomy and
+ * views and menu items.
+ * Each ad has a visibility scope and an expiry date. After the expiry date the
+ * ad reverts to private scope where only the owner and permitted users can see
+ * it.
+ */
+
+use Drupal\smallads\Entity\Smallad;
+use Drupal\smallads\Entity\SmalladInterface;
+use Drupal\comment\CommentInterface;
+use Drupal\Core\Url;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Field\BaseFieldDefinition;
+
+/**
+ * Name of vocab created by this module.
+ */
+const SMALLAD_CATEGORIES = 'categories';
+
+/**
+ * Implements hook_help().
+ */
+function hook_help($route_name) {
+  if ($route_name == 'admin.smallad') {
+    $help[] = t('Ads are organised using two vocabularies.');
+    $help[] = t('The first is like categories and subcategories in the yellow pages.');
+    $help[] = t('Create and organise your categories here:');
+    $help[] = '<br /><strong>' . l(t('Edit categories'), Url::fromRoute('entity.taxonomy_vocabulary.overview_form', ['taxonomy_vocabulary' => 'categories'])) . '</strong>';
+    $help[] = '<p>' . t("'The optional second way to find things creates extra tabs on the listings pages.");
+    $help[] = '<br /><strong>' . l(t('Edit types'), 'admin/structure/taxonomy/smallads_types') . '</strong></p>';
+    $help[] = t('A third vocabluary, types, should be treated like a content type e.g. offers, wants, notices.');
+    return implode(' ', $help);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ *
+ * Notify the owner of the ad that a comment has been added and reindex search.
+ *
+ * @todo this notifying should be done with rules module
+ * @todo this should be a rule, preconfigured
+ */
+function smallads_comment_insert($comment) {
+  if ($comment->getCommentedEntityTypeId() == 'smallad') {
+    // On occaision this seems to be empty.
+    if (0 && $smallad = $comment->getCommentedEntity()) {
+      \Drupal::service('plugin.manager.mail')->mail(
+        'smallads',
+        'comment',
+        $smallad->getOwner()->getEmail(),
+        $smallad->getOwner()->getPreferredLangcode(),
+        [
+          'comment' => $comment,
+          'smallad' => $smallad,
+          'user' => $smallad->getOwner(),
+        ]
+      );
+    }
+    smallads_reindex_search($comment);
+  }
+}
+
+/**
+ * Implements hook_comment_update().
+ */
+function smallads_comment_update($comment) {
+  smallads_reindex_search($comment);
+}
+
+/**
+ * Implements hook_comment_delete().
+ */
+function smallads_comment_delete($comment) {
+  smallads_reindex_search($comment);
+}
+
+/**
+ * Marks a node to be re-indexed by the node_search plugin.
+ *
+ * @param CommentInterface $comment
+ *   The comment to reindex.
+ *
+ * @note How does the node module do this?
+ */
+function smallads_reindex_search(CommentInterface $comment) {
+  if ($comment->getCommentedEntityTypeId() == 'smallad') {
+    if (\Drupal::moduleHandler()->moduleExists('search')) {
+      search_mark_for_reindex('smallad_search', 'smallad');
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_view().
+ *
+ * Render the contact extrafield.
+ *
+ * @todo
+ */
+function smallads_smallad_view(array &$build, $smallad, $display, $view_mode) {
+  if ($display->getComponent('links')) {
+    $build['links'] = [
+      '#theme' => 'links',
+      '#links' => [
+        [
+          'title' => t(
+            "Contact %name",
+            ['%name' => $smallad->getOwner()->label()]
+          ),
+          'url' => Url::fromRoute(
+            'entity.user.contact_form',
+            ['user' => $smallad->getOwnerId()],
+            ['query' => ['subject' => $smallad->label()]]
+          ),
+        ],
+        [
+          'title' => t(
+            "See @name's profile",
+            ['@name' => $smallad->getOwner()->label()]
+          ),
+          'url' => Url::fromRoute(
+            'entity.user.canonical',
+            ['user' => $smallad->getOwnerId()]
+          ),
+        ],
+        [
+          'title' => t(
+            "See @name's @types",
+            ['@name' => $smallad->getOwner()->label(), '@type' => $smallad->type->entity->label()]
+          ),
+          'url' => Url::fromRoute(
+            // See config views.view.smallads_user.
+            'view.smallads_user.page_1',
+            ['user' => $smallad->getOwnerId()]
+          ),
+        ]
+      ]
+    ];
+  }
+  if ($display->getComponent('comment_count')) {
+    $count = isset($build['comments']) ? count(Element::children($build['comments'])) : 0;
+    $build['comment_count']['#markup'] = t('@count comments', ['@count' => $count]);
+  }
+  $build['#attributes']['class'][] = 'smallad';
+  $build['#attributes']['class'][] = 'smallad--type-' . $smallad->type->target_id;
+  $build['#attributes']['class'][] = 'smallad--view-mode-' . $view_mode;
+}
+
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Puts masquerade nominees under a checkbox so they only show when the box is
+ * checked.
+ */
+function smallads_form_user_form_alter(&$form, $form_state) {
+  // Bit bizarre way to get the display compared to hook_entity_type_view
+  $formObject = $form_state->getFormObject();
+  $display = $formObject->getFormDisplay($form_state);
+
+  if ($component = $display->getComponent('smallad_visibility')) {
+    $form['smallad_visibility'] = [
+      '#title' => t('Default visibility of your ads.'),
+      '#type' => 'select',
+      '#empty_option' => '- '.t('Ask each time').' -',
+      '#options' =>  smallads_scopes(),
+      '#default_value' => \Drupal::service('user.data')->get('smallads', $formObject->getEntity()->id(), 'defaultscope')?:SmalladInterface::SCOPE_SITE,
+      '#required' => TRUE,
+      '#weight' => $component['weight']
+    ];
+    $form['#submit'][] = 'smallads_save_user_visibility_setting';
+  }
+}
+
+function smallads_save_user_visibility_setting($form, $form_state) {
+  \Drupal::service('user.data')->set(
+    'smallads',
+    $formObject->getEntity()->id(),
+    'defaultscope',
+    $form_state->getValue('smallad_visibility')
+  );
+}
+
+/**
+ * Implements hook_theme().
+ */
+function smallads_theme() {
+  $items['smallad'] = [
+    'render element' => 'elements',
+  ];
+  $items['smallad_listing'] = [
+    'render element' => 'elements',
+  ];
+  $items['smallad_search_index'] = [
+    'render element' => 'elements',
+  ];
+  return $items;
+}
+
+/**
+ * Default theme preprocessor for 'smallad_search_index.
+ */
+//function template_preprocess_smallad_search_index(&$vars) {
+//  $item = $variables['elements'];
+//}
+
+/**
+ * Default theme preprocessor for 'smallad'.
+ */
+function template_preprocess_smallad(&$vars) {
+  $build = &$vars['elements'];
+  // Make all the ad fields separate $vars.
+  foreach (Element::Children($build) as $key) {
+    $element = $build[$key];
+    $vars[$key] = $element;
+  }
+}
+
+/**
+ * Default theme preprocessor for 'smallad_listing'.
+ */
+function template_preprocess_smallad_listing(&$vars) {
+  // Only show the first image.
+  foreach (Element::children($vars['elements']['image']) as $delta) {
+    if ($delta) {
+      unset($vars['elements']['image'][$delta]);
+    }
+  }
+  template_preprocess_smallad($vars, FALSE);
+  $vars['more'] = $vars['elements']['#smallad']->link(t('More...'));
+  $vars['title'] = $vars['elements']['#smallad']->title->value;
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Manage proposition expiry and notifications by checking for ads past their
+ * expiry date. The act of unpublishing is queued because it involves sending an
+ * email.
+ *
+ * @todo explore core for better ways of advance warnings of expiries
+ */
+function smallads_cron() {
+  // Automatic expiry of nodes, notifies the owner.
+  // Find out how to filter by relative dates.
+  $smids = \Drupal::service('entity.query')
+    ->get('smallad')
+    // Actually the date is stored as dd-mm-yyyy.
+    ->condition('expires', gmdate(DATETIME_DATETIME_STORAGE_FORMAT, REQUEST_TIME), '<')
+    ->condition('scope', 0, '>')
+    ->execute();
+
+  $queue = \Drupal::queue('smallads_expired_mail');
+  foreach (Smallad::loadMultiple($smids) as $ad) {
+    $queue->createItem($ad->id());
+  }
+}
+
+/**
+ * Implements hook_mail().
+ */
+function smallads_mail($key, &$message, $params) {
+  if ($key == 'expired') {
+    $mail_template = \Drupal::Config('smallads.settings')->get('expiry_mail');
+    $message['subject'] = \Drupal::Token()->replace($mail_template['subject'], $params);
+    $message['body'][] = \Drupal::Token()->replace($mail_template['body'], $params);
+  }
+}
+
+/**
+ * Sometimes need to know whether the context indicates an ad-type on a route.
+ */
+function smallad_type_from_route_match() {
+  $route_params = \Drupal::service('current_route_match')->getParameters();
+  if ($route_params->has('smallad')) {
+    return $route_params->get('smallad')->id();
+  }
+  // Doesn't seem very likely.
+  elseif ($route_params->has('view_id')) {
+    return $route_params->get('arg_0');
+  }
+  elseif ($route_params->has('smallad_type')) {
+    // Or could find it in the raw parameters.
+    return $route_params->get('smallad_type')->id();
+  }
+}
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function smallads_entity_extra_field_info() {
+  $fields = ['user' => ['user' => ['form' => ['smallad_visibility' => [
+    'label' => t('Smallad visibility setting'),
+    'description' => t('Private, local, network or public'),
+    'weight' => 8
+  ]]]]];
+  foreach (\Drupal::entityManager()->getStorage('smallad_type')->loadMultiple() as $bundle_name => $type) {
+    $fields['smallad'][$bundle_name] = [
+      'display' => [
+        'links' => [
+          'label' => t('Links'),
+          'description' => t("Links to related ads, duplicates categories field"),
+          'weight' => 6,
+        ],
+        'comment_count' => [
+          'label' => t('Comment count'),
+          'description' => t("The number of comments on the article"),
+          'weight' => 8,
+        ],
+      ],
+    ];
+  }
+  return $fields;
+}
+
+/**
+ * Implements hook_views_pre_render().
+ */
+function smallads_views_pre_render($view) {
+  $view->element['#attached']['library'][] = 'smallads/css';
+}
+
+/**
+ * Implements hook_migration_plugins_alter().
+ *
+ * Change the default Field API migration process
+ */
+function smallads_migration_plugins_alter(array &$definitions) {
+  // Map permissions
+  $definitions['d7_user_role']['process']['permissions'][0]['map'] += [
+    'post smallad' => 'post proposition',
+    'edit all smallads'  => 'edit propositions',
+  ];
+  //Don't migrate the node type config entity.
+  unset($definitions['d7_node:proposition']);
+
+  //in 8.4-rc2 menu items are failing validation because their routes haven't been migrated yet
+  $definitions['d7_menu_links']['migration_dependencies']['required'][] = 'd7_smallad';
+
+  // This is temp until shs module upgrade is done
+  $definitions['d7_field_instance_widget_settings']['process']['options/type']['type']['map']['taxonomy_shs'] = \Drupal::moduleHandler()->moduleExists('shs') ? 'options_shs' : 'options_buttons';
+
+}
+
+/**
+ * Implements hook_migrate_prepare_row().
+ *
+ * Prevent the old field definitions from creating new fields
+ */
+function smallads_migrate_prepare_row($row, $source, $migration) {
+  switch ($source->getPluginId()) {
+    case 'd7_field':
+    case 'd7_field_instance':
+      if ($row->getSourceProperty('entity_type') == 'smallad') {
+        $existing_fields = ['offers_wants_categories', 'offers_wants_types', 'comment_node_proposition', 'comment_body'];
+        if (in_array($row->getSourceProperty('field_name'), $existing_fields)) {
+          return FALSE;
+        }
+      }
+      if ($row->getSourceProperty('bundle') == 'comment_node_proposition') {
+        return FALSE;
+      }
+      if ($row->getSourceProperty('entity_type') == 'comment' and $row->getSourceProperty('field_name') == 'comment_body') {
+        return FALSE;
+      }
+      break;
+    case 'd7_taxonomy_vocabulary':
+      if ($row->getSourceProperty('machine_name') == 'offers_wants_types') {
+        return FALSE;
+      }
+      break;
+    case 'd7_taxonomy_term':
+      if ($row->getSourceProperty('machine_name') == 'offers_wants_types') {
+        return FALSE;
+      }
+      break;
+    case 'd7_node_type':
+      // don't migrate old node type
+      if ($row->getSourceProperty('type') == 'proposition') {
+        return FALSE;
+      }
+      break;
+    case 'd7_comment_entity_display':
+      if ($row->getSourceProperty('bundle') == 'proposition') {
+        return FALSE;
+      }
+      break;
+    case 'd7_comment_field':
+      if ($row->getSourceproperty('node_type') == 'proposition') {
+        return FALSE;
+      }
+      break;
+    case 'menu_link':
+      if ($row->getSourceProperty('link_path') == 'node/add') {
+        return FALSE;
+      }
+      if ($row->getSourceProperty('link_path') == 'node/add/offer') {
+    drupal_set_message('migrating link_path ad/add/offer');
+        $row->setSourceProperty('link_path', 'ad/add/offer');
+      }
+      if ($row->getSourceProperty('link_path') == 'node/add/want') {
+        $row->setSourceProperty('link_path', 'ad/add/want');
+      }
+
+  }
+  if ($source->getPluginId()== 'd7_view_mode' and $row->getSourceProperty('bundle') == 'proposition') {
+    // Doesn't seem to be necessary
+    return FALSE;
+  }
+
+  // Horrible but necessary if we change the entity name
+  if ($migration->getDestinationConfiguration()['plugin'] == 'component_entity_display') {
+    if ($row->getSourceProperty('bundle') == 'proposition') {
+      return FALSE;
+    }
+  }
+
+}
+/**
+ * Implements hook_config_translation_info().
+ */
+function smallads_config_translation_info(&$info) {
+  $info['smallad_type'] = [
+    'class' => '\Drupal\config_translation\ConfigEntityMapper',
+    'base_route_name' => 'entity.smallad_type.edit_form',
+    'title' => t('Smallad type'),
+    'entity_type' => 'smallad_type',
+  ];
+}
+
+/*
+ * Implements hook_form_alter().
+ *
+ * Tells the exposed category filter to use the chosen widget instead of a
+ * textfield
+ */
+function smallads_form_views_exposed_form_alter(&$form, $form_state) {
+  if (isset($form['adcats']) and $form['adcats']['#type'] == 'textfield') {
+    $form['adcats'] = [
+      '#type' => 'select',
+      '#empty_value' => '',
+      '#multiple' =>  FALSE,
+      '#options' => [NULL => t('- Any -')],
+      '#chosen' => 1
+    ];
+    $entityRepository= \Drupal::service('entity.repository');
+    $terms = \Drupal::entityTypeManager()
+      ->getStorage('taxonomy_term')
+      ->loadTree('categories', 0, 1, TRUE);
+    foreach ($terms as $term) {
+      $form['adcats']['#options'][$term->id()] = $entityRepository->getTranslationFromContext($term)->label();
+    }
+  }
+}
+
+function smallads_scopes() {
+  $scopes = [
+    SmalladInterface::SCOPE_PRIVATE => t('Just you'),
+    SmalladInterface::SCOPE_SITE => t('Members of this site'),
+    SmalladInterface::SCOPE_PUBLIC => t('Public'),
+  ];
+  if (\Drupal::moduleHandler()->moduleExists('group')) {
+    // This isn't supported in this module yet.
+    $scopes[SmalladInterface::SCOPE_SITE] = t('Your groups');
+  }
+  if (\Drupal::moduleHandler()->moduleExists('cforge_index')) {
+    $scopes[SmalladInterface::SCOPE_NETWORK] = t('The Solsearch network');
+  }
+  sort($scopes);
+  return $scopes;
+}
+
+/**
+ * Entity field default callback for scope field.
+ * Get the user settings.
+ */
+function smalladsDefaultScope(SmalladInterface $smallad, BaseFieldDefinition $definition) {
+  return \Drupal::service('user.data')
+    ->get('smallads', $smallad->getOwnerId(), 'defaultscope') ?: SmalladInterface::SCOPE_SITE;
+}
+
+/**
+ * Implements entity_bundle_info_alter().
+ * @unused
+ */
+function smallads_entity_bundle_info_alter(&$bundles) {
+  // This doesn't work because EntityReferenceLabelFormatter in D8.6 for both
+  // EntityViewDisplay and Views fields only references the canonical link. So
+  // instead see function smallads_entity_display_build_alter().
+  $bundles['taxonomy_term']['categories']['uri_callback'] = 'smallad_category_uri';
+}
+/**
+ * Entity Type uri callback
+ * @unused
+ */
+function smallad_category_uri() {
+  trigger_error('smallad_category_uri custom uri callback called with args ' .mdump(func_get_args()), E_USER_WARNING);
+}
+
+/**
+ * Implements hook__entity_display_build_alter().
+ *
+ * Rewrite the any links to show taxonomy term listings in categories vocab.
+ */
+function smallads_entity_display_build_alter(&$build, $context) {
+  // Context = entity, view_mode, displaly
+  if ($context['entity']->getEntityTypeId() == 'smallad') {
+    $path = '/'.$context['entity']->bundle() .'s';
+    foreach (Element::children($build['categories']) as $key) {
+      $renderable = &$build['categories'][$key];
+      if (isset($renderable['#type']) and $renderable['#type'] == 'link') {
+        $tid  = $renderable['#options']['entity']->id();
+        $renderable['#url'] =  Url::fromUserInput($path, ['query' => ['adcats' => $tid]]);
+      }
+    }
+  }
+}

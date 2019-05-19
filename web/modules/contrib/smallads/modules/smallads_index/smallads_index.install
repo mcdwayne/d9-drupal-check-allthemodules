@@ -1,0 +1,164 @@
+<?php
+
+use Drupal\smallads\Entity\Smallad;
+use Drupal\user\Entity\Role;
+use Drupal\Core\Url;
+use Drupal\Core\Link;
+use Drupal\smallads\Entity\SmalladInterface;
+use Drupal\Core\Batch\BatchBuilder;
+
+
+/**
+ * Implements hook_requirements().
+ *
+ * Check the site has coordinates before installing.
+ */
+function smallads_index_requirements($phase) {
+  $results = [];
+  if ($phase == 'runtime') {
+    $apikey = \Drupal::config('smallads_index.settings')->get('apikey');
+    $results['solsearch'] = [
+      'title' => t('SolSearch API key'),
+      'severity' => $apikey ? REQUIREMENT_OK : REQUIREMENT_WARNING,
+      'description' => $apikey ? t('Present') :
+        smallads_index_apikey_missing()
+    ];
+  }
+  return $results;
+}
+
+/**
+ * Implements hook_install().
+ *
+ * Allow anon users to use the contact forms. Register with solsearch service
+ */
+function smallads_index_install() {
+  Role::load('anonymous')
+    ->grantPermission('access user contact forms')
+    ->save();
+  db_update('smallad_field_data')
+    ->fields(['scope' => SmalladInterface::SCOPE_NETWORK])
+    ->condition('scope', SmalladInterface::SCOPE_SITE)
+    ->execute();
+  if ($apikey = @file_get_contents(DRUPAL_ROOT .'/../solsearch_apikey.txt')) {
+    solsearch_register($apikey);
+  }
+  else {
+    \Drupal::messenger()->addWarning(smallads_index_apikey_missing());
+  }
+
+
+}
+
+function smallads_index_apikey_missing() {
+   $uri = 'admin/structure/smallads/settings';
+   return t(
+     'Contact Community Forge with your domain name to get a API key: info@communityforge.net and enter it on @link',
+     ['@link' => Link::fromTextAndUrl($uri, Url::fromRoute('smallads.settings'))->toString()]
+   );
+}
+
+function solsearch_register($admin_key) {
+  $config_factory = \Drupal::configFactory();
+  $settings = $config_factory->getEditable('smallads_index.settings');
+  $settings->set('apikey', trim($admin_key))->save();
+  $result = smallads_index_http_request(
+    'post',
+    'groups',
+    ['name' => $config_factory->get('system.site')->get('name'), 'url' => $_SERVER['HTTP_HOST']]
+  );
+  if ($result->getStatusCode() == 200 or $result->getStatusCode() == 201) {
+    $contents = $result->getBody()->getContents();
+    if($apikey = json_decode($contents)->apikey) {
+      $settings->set('apikey', $apikey)->save();
+      \Drupal::messenger()->addStatus(t('Successfully registered with Solsearch service. New key is '.$apikey));
+      smallads_index_upsert_all();
+    }
+    else  {
+      throw new \Exception('Bad result from solsearch service: '.$contents);
+    }
+  }
+  else {
+    \Drupal::messenger()
+      ->addError(t('Failed to register with SolSearch: @message', ['@message' => print_r($result, 1)]));
+    \Drupal::service('logger.channel.smallads')
+      ->error('Failed to register with SolSearch: @message', ['@message' => $result->getReason()]);
+  }
+}
+
+/**
+ * Helper
+ *
+ * (Re)register all the ads en mass.
+ */
+function smallads_index_upsert_all() {
+  if ($ad_ids = smallad_index_all()) {
+    $batch_builder = (new BatchBuilder())
+     ->setTitle(t('Submitting existing smallads to @site', ['@site' => SMALLAD_INDEX_URL]))
+     ->setFile(drupal_get_path('module', 'smallads_index').'/smallads_index.install');
+    foreach ($ad_ids as $type => $smids) {
+      foreach (array_chunk($smids, 100) as $chunk) {
+        $batch_builder->addOperation('smallads_index_put_100', [$chunk]);
+      }
+    }
+    batch_set($batch_builder->toArray());
+  }
+}
+
+
+/**
+ * Implements hook_module_preuninstall().
+ *
+ * Tell Solsearch to delist everything.
+ */
+function smallads_index_module_preuninstall($module) {
+  if ($module == 'smallads_index') {
+    $result = smallads_index_http_request('delete', 'groups');
+    //do something with the result
+    if ($result->getStatusCode() == 200) {
+      \Drupal::service('logger.channel.smallads')->notice('Sucesssfully de-indexed @count ads', ['@count' => count($lines)]);
+    }
+    else {
+      \Drupal::messenger()->addWarning('Problem de-indexing ads. More details may be in the log.');
+      \Drupal::service('logger.channel.smallads')->error('@message', ['@message' => $result->getReasonPhrase()]);
+    }
+  }
+}
+
+/**
+ * batch callback
+ *
+ * @note all the $smids are the same bundle
+ */
+function smallads_index_put_100(array $smids) {
+  module_load_include('module', 'smallads_index');
+  $lines = [];
+  foreach (Smallad::loadMultiple($smids) as $smallad) {
+    $lines[] = smallads_index_to_solItem($smallad, TRUE);
+  }
+  $result = smallads_index_http_request('put', 'bulk', $lines);
+  //do something with the result
+  if ($result->getStatusCode() == 200 or $result->getStatusCode() == 201) {
+    \Drupal::service('logger.channel.smallads')->notice('Sucesssfully indexed @count ads', ['@count' => count($smids)]);
+  }
+  else {
+    trigger_error('Failed to index 100 ads: @message', E_RECOVERABLE_ERROR);
+    \Drupal::service('logger.channel.smallads')->error('Failed to index 100 ads: @message', ['@message' => $result->getReasonPhrase()]);
+  }
+}
+
+
+/**
+ * Get all the smallads to be indexed, according to the scope of each ad
+ *
+ * @return int[]
+ */
+function smallad_index_all() {
+  foreach (\Drupal::entityTypeManager()->getStorage('smallad_type')->loadMultiple() as $smalladType) {
+    $ad_ids[$smalladType->id()] = \Drupal::entityQuery('smallad')
+      ->condition('scope', [SmalladInterface::SCOPE_NETWORK, SmalladInterface::SCOPE_PUBLIC], 'IN')
+      ->condition('type', $smalladType->id())
+      ->execute();
+  }
+  return $ad_ids;
+}

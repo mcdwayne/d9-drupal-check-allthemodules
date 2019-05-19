@@ -1,0 +1,257 @@
+<?php
+
+use Drupal\smallads\Entity\Smallad;
+use Drupal\smallads\Entity\SmalladInterface;
+
+/**
+ * Make this a setting
+ */
+define('SMALLAD_INDEX_URL', 'http://solsearch.communityforge.net/');
+define('SOLSEARCH_RESULTS_PER_PAGE', 10);//make this a setting
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ *
+ * @param SmalladInterface $smallad
+ */
+function smallads_index_smallad_insert(SmalladInterface $smallad) {
+  if ($smallad->scope->value > SmalladInterface::SCOPE_SITE) {
+    smallads_index_upsert($smallad);
+  }
+}
+/**
+ * Implements hook_ENTITY_TYPE_update().
+ *
+ * @param SmalladInterface $smallad
+ */
+function smallads_index_smallad_update(SmalladInterface $smallad) {
+  if ($smallad->scope->value > SmalladInterface::SCOPE_SITE) {
+    smallads_index_upsert($smallad);
+  }
+  else {
+    smallads_index_deindex($smallad);
+  }
+}
+
+/**
+ *
+ * @param SmalladInterface $smallad
+ */
+function smallads_index_upsert(SmalladInterface $smallad) {
+  $response = smallads_index_http_request('put', 'ads', smallads_index_to_solItem($smallad));
+
+  if ($smallad->isNew()&& $response->getStatusCode() != 201) {
+    trigger_error('Failed to create index:'. $response->getReasonPhrase(), E_USER_ERROR);
+  }
+  elseif($smallad->id() && $response->getStatusCode() != 200) {
+    trigger_error('Failed to update index:'. $response->getReasonPhrase(), E_USER_ERROR);
+  }
+}
+
+/**
+ * Implements hook_entity_TYPE_delete().
+ *
+ * Remove an ad from the solsearch index.
+ */
+function smallads_index_deindex(SmalladInterface $smallad) {
+  $result = smallads_index_http_request('delete', 'ads/'.$smallad->id());
+  if ($response->getStatusCode() != 204) {
+    trigger_error($response->getStatusCode() .' Failed to delete from index:'. $response->getReasonPhrase(), E_USER_ERROR);
+  }
+}
+
+/**
+ * Utility. Convert a smallad entity to an object for index to index.
+ *
+ * @param Smallad $smallad
+ *
+ * @return array
+ *
+ * @todo Ensure that every smallad on import or module installation has a location
+ */
+function smallads_index_to_solItem(SmalladInterface $smallad) {
+  $obj = [
+    'id' => $smallad->id(),
+    'type' => $smallad->bundle(),
+    'title' => $smallad->title->value,
+    'body' => str_replace("\n", '', strip_tags($smallad->body->value)),
+    'keywords' => taxonomy_implode_tags($smallad->categories->referencedEntities()),
+    'created' => $smallad->getCreatedTime(),
+    'expires' => $smallad->expires->value,
+    'image' => ($smallad->image && $smallad->image->entity) ? substr(file_url_transform_relative(file_create_url($smallad->image->entity->getFileUri())), 1) : '',
+    'scope' => $smallad->scope->value,
+    'location' => 'POINT ('.$point['lng'].' '.$point['lat'].')',
+    'directexchange' => (int)$smallad->directexchange->value,
+    'indirectexchange' => (int)$smallad->directexchange->value,
+    'money' => (int)$smallad->money->value,
+    'path' => substr($smallad->toUrl('canonical')->toString(), 1),
+    'lang' => $smallad->language()->getId(),
+  ];
+  return $obj;
+}
+
+/**
+ * Submit to the search engine and parse the results a bit
+ *
+ * @param array $values
+ *   with any of keys string type (required), string text, float radius, bool directexchange, bool indirectexchange, bool money, lat/lon from
+ *
+ * @return array
+ *   with keys 'total' an integer, and 'items',
+ */
+function smallads_index_execute(array $values) {
+  $url = 'ads?';
+  $values['limit'] = SOLSEARCH_RESULTS_PER_PAGE;
+  if (isset($values['page'])) {
+    $values['offset'] = $values['limit'] * $values['page'];
+    unset($values['page']);
+  }
+  $url .= http_build_query($values);
+  $result = smallads_index_http_request('GET', $url);
+
+  if ($result->getStatusCode() != 200) {
+    echo $result->getReasonPhrase();
+    exit;
+  }
+  return json_decode($result->getBody()->getContents());
+}
+
+/**
+ * Get the search service
+ *
+ * @note unused
+ */
+function smalladIndex($type) {
+  return \Drupal::service('smallads.solsearch')->init($type);
+}
+
+/**
+ *
+ * @param string $method
+ * @param string $url
+ * @param string $body
+ *
+ * @return Psr\Http\Message\ResponseInterface
+ */
+function smallads_index_http_request($method, $url, $body = '') {
+  if ($key = \Drupal::config('smallads_index.settings')->get('apikey')) {
+    $options['body'] = GuzzleHttp\json_encode($body);
+    $options['headers'] = [
+      'Content-Type' => 'application/json',
+      'apikey' => $key
+    ];
+    if (substr($url, 0, 1) == '/') {
+      $url = substr($url, 1);
+    }
+    try {
+      $response = \Drupal::service('http_client')->{$method}(SMALLAD_INDEX_URL. $url, $options);
+    }
+    catch(\Exception $e)  {
+      $message = 'No response from '.SMALLAD_INDEX_URL;
+      trigger_error($message, E_USER_ERROR);
+      $response = new \GuzzleHttp\Psr7\Response(404, [], NULL, NULL, $message);
+    }
+  }
+  else {
+    module_load_install('smallads_index');
+    \Drupal::messenger()->addStatus(strtoupper($method) ." to /$url cannot run without APIkey");
+    $response = new \GuzzleHttp\Psr7\Response(403, [], NULL, NULL, 'No apikey given');
+  }
+  return $response;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function smallads_index_form_smallads_config_form_alter(&$form, $form_state) {
+  $form['solsearch'] = [
+    '#title' => 'Solsearch',
+    '#description' => t('Web service for global offers & wants'),
+    '#type' => 'details',
+    '#open' => TRUE
+  ];
+  $config = \Drupal::config('smallads_index.settings');
+  $form['solsearch']['apikey'] = [
+    '#title' => t('Solsearch API key'),
+    '#description' => t('Not yet decided how you can get one of these.'),
+    '#type' => 'textfield',
+    '#default_value' => $config->get('apikey'),
+    '#weight' => 1
+  ];
+
+  if (!$config->get('apikey')) {
+    $form['solsearch']['solsearch_secret'] = [
+      '#title' => t('OR Register with SolSearch'),
+      '#description' => t('Enter the Solsearch secret'),
+      '#type' => 'textfield',
+      '#weight' => 0,
+    ];
+    $form['#submit'][] = 'smallads_index_solsearch_secret_submit';
+  }
+//  $form['solsearch']['explicit'] = [
+//    '#type' => 'checkbox',
+//    '#title' => t('Publish all ads to the public.'),
+//    '#description' => t('Checking this could violate your privacy policy'),
+//    '#default_value' => $config->get('explicit'),
+//    '#weight' => 2,
+//  ];
+
+  $lat = $lon = 0;
+  if ($point = $config->get('fallback_point')) {
+    // Yields variables $lat and $lon
+    extract(smallads_geo_convert_point($point));
+  }
+  $form['solsearch']['fallback_location'] = [
+    '#title' => t('Fallback location'),
+    '#description' => t('Location for ads in the global index, from members who are not geolocated.'),
+    '#type' => 'details',
+    '#open' => TRUE,
+    '#weight' => 3,
+    'fallback_lat' => [
+      '#title' => t('Latitude'),
+      '#type' => 'textfield',
+      '#default_value' => $lat,
+      '#placeholder' => '0.0',
+      '#required' => TRUE,
+      '#weight' => 1,
+    ],
+    'fallback_lon' => [
+      '#title' => t('Longitude'),
+      '#type' => 'textfield',
+      '#default_value' => $lon,
+      '#placeholder' => '0.0',
+      '#required' => TRUE,
+      '#weight' => 2,
+    ]
+  ];
+  $form['#submit'][] = 'smallads_index_form_smallads_config_form_submit';
+}
+
+/**
+ * Form submit callback
+ */
+function smallads_index_solsearch_secret_submit($form, $form_state) {
+  if ($secret = $form_state->getValue('solsearch_secret')) {
+    module_load_install('smallads_index');
+    solsearch_register($secret);
+  }
+}
+
+/**
+ * Form submit callback
+ */
+function smallads_index_form_smallads_config_form_submit($form, $form_state) {
+  $settings = \Drupal::configFactory()->getEditable('smallads_index.settings');
+  if ($point = smallads_geo_convert_latlon($form_state->getValue('fallback_lat'), $form_state->getValue('fallback_lon'))) {
+    $settings->set('fallback_point', $point);
+  }
+  $old  = $settings->get('apikey');
+  $new = $form_state->getValue('apikey');
+  //only set the new key and upload ads if the
+  if ($new && !$form_state->getValue('solsearch_secret') and $old != $new) {
+    $settings->set('apikey', $new);
+    module_load_install('smallads_index');
+    smallads_index_upsert_all();
+  }
+  $settings->save();
+}
