@@ -1,0 +1,130 @@
+<?php
+
+/**
+ * @file
+ * Main functions and hook implementations.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\yandexdisk\YandexDiskException;
+
+/**
+ * Implements hook_file_download().
+ */
+function yandexdisk_file_download($uri) {
+  if (\Drupal::service('file_system')->uriScheme($uri) == 'yandexdisk' && yandexdisk_access('get', $uri) && yandexdisk_access('propfind', $uri)) {
+    try {
+      /** @var \Drupal\yandexdisk\StreamWrapper\YandexDiskStreamWrapper $wrapper */
+      $wrapper = \Drupal::service('stream_wrapper_manager')->getViaUri($uri);
+      if ($disk = $wrapper->disk()) {
+        if ($type = $disk->getMimeType($wrapper->path)) {
+          return [
+            'Content-Type' => $type,
+            'Content-Length' => filesize($uri),
+          ];
+        }
+      }
+    }
+    catch (YandexDiskException $e) {
+      watchdog_exception('yandexdisk', $e);
+    }
+
+    return -1;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for user_admin_permissions().
+ */
+function yandexdisk_form_user_admin_permissions_alter(&$form, FormStateInterface $form_state) {
+  // Disable permissions that don't make sense for anonymous users.
+  $form['permissions']['view own yandexdisk resources'][AccountInterface::ANONYMOUS_ROLE]['#disabled'] = TRUE;
+  $form['permissions']['edit own yandexdisk resources'][AccountInterface::ANONYMOUS_ROLE]['#disabled'] = TRUE;
+}
+
+/**
+ * Determines whether a user may perform the operation on the uri.
+ *
+ * @param string $op
+ *   The operation to be performed on the uri. Possible values are:
+ *   - 'get'.
+ *   - 'put'.
+ *   - 'mkcol'.
+ *   - 'copy'.
+ *   - 'move'.
+ *   - 'delete'.
+ *   - 'propfind'.
+ *   - 'proppatch'.
+ * @param string $uri
+ *   The Yandex.Disk uri (yandexdisk://yandex_username/path) on which the
+ *   operation is to be performed.
+ * @param \Drupal\Core\Session\AccountInterface $account
+ *   (optional) A user object representing the user for whom the operation is to
+ *   be performed. Determines access for a user other than the current user.
+ *
+ * @return bool
+ *   TRUE if the operation may be performed, FALSE otherwise.
+ */
+function yandexdisk_access($op, $uri, AccountInterface $account = NULL) {
+  $rights = &drupal_static(__FUNCTION__, []);
+
+  // If no user object is supplied, the access check is for the current user.
+  if (empty($account)) {
+    $account = \Drupal::currentUser();
+  }
+
+  // If we've already checked access for this uri, user and op, return from
+  // cache.
+  if (!isset($rights[$account->id()][$uri][$op])) {
+    // We grant access to the uri if both of the following conditions are met:
+    // - No modules say to deny access.
+    // - At least one module says to grant access.
+    // If no module specified either allow or deny, we fall back to the FALSE.
+    $access = \Drupal::moduleHandler()
+      ->invokeAll('yandexdisk_access', [$op, $uri, $account]);
+    if (in_array(TRUE, $access, TRUE) && !in_array(FALSE, $access, TRUE)) {
+      $rights[$account->id()][$uri][$op] = TRUE;
+    }
+    else {
+      $rights[$account->id()][$uri][$op] = FALSE;
+    }
+  }
+
+  return $rights[$account->id()][$uri][$op];
+}
+
+/**
+ * Implements hook_yandexdisk_access().
+ */
+function yandexdisk_yandexdisk_access($op, $uri, AccountInterface $account) {
+  $wrapper = \Drupal::service('stream_wrapper_manager')->getViaUri($uri);
+  if (isset($wrapper->user)) {
+    $token = \Drupal::service('yandex_oauth')->get($wrapper->user, FALSE);
+  }
+
+  // Not all Yandex accounts belong to authenticated users. For this case we
+  // don't give anonymous users access to 'own' Yandex.Disks (accounts
+  // associated with uid 0).
+  $own_account = !empty($token) && $account->id() && $account->id() == $token->uid;
+
+  switch ($op) {
+    case 'get':
+    case 'propfind':
+      if ($account->hasPermission('view any yandexdisk resources') || $own_account && $account->hasPermission('view own yandexdisk resources')) {
+        return TRUE;
+      }
+      break;
+
+    case 'put':
+    case 'mkcol':
+    case 'copy':
+    case 'move':
+    case 'delete':
+    case 'proppatch':
+      if ($account->hasPermission('edit any yandexdisk resources') || $own_account && $account->hasPermission('edit own yandexdisk resources')) {
+        return TRUE;
+      }
+      break;
+  }
+}
