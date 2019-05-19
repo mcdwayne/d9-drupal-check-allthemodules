@@ -1,0 +1,266 @@
+<?php
+
+/**
+ * @file
+ * The Termcase module gives you the option to specify specific
+ * case-formatting on terms.
+ *
+ * This module prevents users to use different cases on terms.
+ * Site-admins now can make sure all terms in a vocabulary begin with an
+ * uppercase or that they are all formatted to uppercase / lowercase.
+ */
+
+use Drupal\taxonomy\VocabularyInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Component\Utility\Unicode;
+
+define('TERMCASE_NONE', 0);
+define('TERMCASE_UCFIRST', 1);
+define('TERMCASE_LOWERCASE', 2);
+define('TERMCASE_UPPERCASE', 3);
+define('TERMCASE_PROPERCASE', 4);
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function termcase_form_taxonomy_form_term_alter(&$form, FormStateInterface $form_state) {
+  $edit_link = t('You can change this setting on the <a href="@vocabulary_edit_link">vocabulary settings page</a>.', array(
+    '@vocabulary_edit_link' => url('admin/structure/taxonomy/' . $form['#vocabulary']->machine_name . '/edit'),
+  ));
+  $termcase = _termcase_vocabulary_termcase($form['#vocabulary']->machine_name);
+
+  switch ($termcase) {
+    case TERMCASE_UCFIRST:
+      $form['name']['#description'] = t('Please note: the first letter of this term will be converted to <em>Uppercase</em>.') . ' ' . $edit_link;
+      break;
+
+    case TERMCASE_LOWERCASE:
+      $form['name']['#description'] = t('Please note: the term will be converted to <em>lowercase</em>.') . ' ' . $edit_link;
+      break;
+
+    case TERMCASE_UPPERCASE:
+      $form['name']['#description'] = t('Please note: the term will be converted to <em>UPPERCASE</em>.') . ' ' . $edit_link;
+      break;
+
+    case TERMCASE_PROPERCASE:
+      $form['name']['#description'] = t('Please note: the term will be converted to <em>Proper Case</em>.') . ' ' . $edit_link;
+      break;
+
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Adds the termcase selection dropdown to the vocabulary form.
+ */
+function termcase_form_taxonomy_vocabulary_form_alter(&$form, FormStateInterface $form_state) {
+  $config = \Drupal::config('termcase.settings');
+  $vocab_machine_name = $form['vid']['#default_value'];
+  $form['termcase']['termcase_settings'] = array(
+    '#title' => t('Term case settings'),
+    '#type' => 'fieldset',
+    '#collapsible' => TRUE,
+    '#weight' => 2,
+    'termcase_options' => array(
+      '#title' => t('Convert terms to this case'),
+      '#type' => 'select',
+      '#options' => array(
+        TERMCASE_NONE => t('No conversion'),
+        TERMCASE_UCFIRST => t('Convert the first character to uppercase'),
+        TERMCASE_LOWERCASE => t('Convert all characters to lowercase'),
+        TERMCASE_UPPERCASE => t('Convert ALL CHARACTERS TO UPPERCASE'),
+        TERMCASE_PROPERCASE => t('Convert the first character of each word to uppercase'),
+      ),
+      '#default_value' => $config->get('termcase_options_' . $vocab_machine_name),
+      '#description' => t('This applies to all terms that are added to this vocabulary.'),
+    ),
+  );
+
+  $form['submit']['#weight'] = 4;
+
+  // These settings only apply on existing vocabularies.
+  if (isset($form['vid'])) {
+    $form['delete']['#weight'] = 5;
+
+    $form['termcase']['termcase_settings']['termcase_options']['#description'] = t('Note: existing terms will not be changed.');
+
+    $form['termcase']['termcase_settings']['termcase_update_terms'] = array(
+      '#title' => t('Convert the existing terms in this vocabulary immediately'),
+      '#type' => 'checkbox',
+      '#default_value' => $config->get('termcase_update_terms_' . $vocab_machine_name),
+    );
+  }
+
+  // Defining custom submit handler.
+  $form['actions']['submit']['#submit'][] = 'termcase_custom_form_submit';
+}
+
+/**
+ * Submit callback to save Termcase settings with the Vocabulary.
+ */
+function termcase_custom_form_submit($form, FormStateInterface $form_state) {
+  $vocab_machine_name = $form_state->getValue('vid');
+  $config = \Drupal::configFactory()->getEditable('termcase.settings');
+  $config->set('termcase_options_' . $vocab_machine_name, $form_state->getValue('termcase_options'))
+         ->set('termcase_update_terms_' . $vocab_machine_name, $form_state->getValue('termcase_update_terms'))
+         ->save();
+
+  if ($form_state->getValue('termcase_update_terms')) {
+    // Call batch process.
+    $terms = \Drupal::entityTypeManager()->getStorage('taxonomy_term')->loadTree($vocab_machine_name);
+    termcase_batch_update($terms, $form_state->getValue('termcase_options'));
+  }
+}
+
+/**
+ * Function to define batch process.
+ * @param array $terms
+ * List of terms.
+ * @param string $case
+ * Case of the vocabulary, the term belongs to.
+ */
+function termcase_batch_update($terms, $case) {
+  $batch = array(
+      'title' => t('Updating terms...'),
+      'operations' => array(
+        array(
+          '\Drupal\termcase\UpdateTerms::updateAllTerms',
+          array($terms, $case)
+        ),
+      ),
+      'finished' => '\Drupal\termcase\UpdateTerms::updateAllTermsFinishedCallback',
+    );
+  batch_set($batch);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ * Remove Termcase settings when vocabularies are deleted.
+ * @param EntityInterface $entity
+ */
+function termcase_taxonomy_vocabulary_delete(EntityInterface $entity) {
+  Drupal::configFactory()->getEditable('termcase.settings')->clear('termcase_update_terms_' . $entity->id())->save();
+  Drupal::configFactory()->getEditable('termcase.settings')->clear('termcase_options_' . $entity->id())->save();
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_presave() for taxonomy_term entities.
+ */
+function termcase_taxonomy_term_presave(\Drupal\Core\Entity\EntityInterface $entity) {
+  $vocab_machine_name = $entity->getVocabularyId();
+
+  $config = \Drupal::config('termcase.settings');
+  $termcase_mode = $config->get('termcase_options_' . $vocab_machine_name);
+
+  $term_name = $entity->getName();
+
+  if ($termcase_mode) {
+    $term_name = _termcase_convert_string_to_case($term_name, $termcase_mode);
+  }
+
+  $entity->setName($term_name);
+}
+
+/**
+ * Helper function to convert the current string to the specified case.
+ * @param string $original_string
+ * The original term to be converted.
+ * @param string $case
+ * Case of the vocabulary, the term belongs to.
+ *
+ * @return string
+ * The term converted in proper case.
+ */
+function _termcase_convert_string_to_case($original_string, $case = TERMCASE_NONE) {
+  switch ($case) {
+    case TERMCASE_UCFIRST:
+      $converted_string = UNICODE::ucfirst($original_string);
+      break;
+
+    case TERMCASE_LOWERCASE:
+      $converted_string = UNICODE::strtolower($original_string);
+      break;
+
+    case TERMCASE_UPPERCASE:
+      $converted_string = UNICODE::strtoupper($original_string);
+      break;
+
+    case TERMCASE_PROPERCASE:
+      $words = explode(' ', $original_string);
+      foreach ($words as $key => $word) {
+        $words[$key] = UNICODE::ucfirst($word);
+      }
+      $converted_string = implode(' ', $words);
+      break;
+
+    default:
+      $converted_string = $original_string;
+      break;
+  }
+
+  // Allow modules to change the string before saving it.
+  \Drupal::moduleHandler()->alter('termcase_convert_string', $converted_string, $original_string, $case);
+
+  return $converted_string;
+}
+
+/**
+ * Function to update terms.
+ * @param string $term
+ * The converted term.
+ * @param string $tid
+ * Id of the term.
+ * @param string $vid
+ * Id of the vocabulary.
+ */
+function termcase_update_term($term, $tid, $vid) {
+  \Drupal::database()->update('taxonomy_term_field_data')
+      ->fields(array('name' => $term))
+      ->condition('vid', $vid)
+      ->condition('tid', $tid)
+      ->execute();
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_alter().
+ */
+function termcase_entity_type_alter(array &$entity_types) {
+  /** @var $entity_types \Drupal\Core\Entity\EntityTypeInterface[] */
+  $entity_types['taxonomy_vocabulary']->setListBuilderClass('Drupal\termcase\VocabularyListBuilder');
+}
+
+/**
+ * Function to fetch termcase mode.
+ * @param string $mode_id
+ * Id of the mode.
+ *
+ * @return string
+ * Short description of the mode.
+ */
+function termcase_get_mode($mode_id) {
+  switch ($mode_id) {
+    case TERMCASE_UCFIRST:
+      $termcase_mode = t('First character uppercase');
+      break;
+
+    case TERMCASE_LOWERCASE:
+      $termcase_mode = t('All characters lowercase');
+      break;
+
+    case TERMCASE_UPPERCASE:
+      $termcase_mode = t('All characters uppercase');
+      break;
+
+    case TERMCASE_PROPERCASE:
+      $termcase_mode = t('First character of each word uppercase');
+      break;
+
+    default:
+      $termcase_mode = t('None');
+  }
+
+  return $termcase_mode;
+}
