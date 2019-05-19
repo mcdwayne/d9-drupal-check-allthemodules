@@ -1,0 +1,350 @@
+<?php
+
+/**
+ * @file
+ * Post image and status on Twitter.
+ */
+
+/**
+ * Implements hook_help().
+ */
+function tweet_poster_help($path, $arg) {
+  $output = '';
+  switch ($path) {
+    case "admin/help#tweet_poster":
+      $output = '<p>' . t("This module is used to post the Tweet status with Image on http://twitter.com from our website.") . '</p>';
+      $output .= '<h3>' . t("Configuration") . '</h3>';
+      $output .= '<dl>';
+      $output .= '<dt>' . t("2. Download the module. (https://dev.twitter.com/)") . '</dt>';
+      $output .= '<dt>' . t("3. Enable it and go to admin > Twitter API Credential Settings");
+      $output .= t("-Put Twitter App Consumer Key(Get the consumer key from https://dev.twitter.com/)") . '<br />';
+      $output .= t("-Twitter App Consumer Secret") . '<br />';
+      $output .= t("-Callback URL (http://yourwebsite.com/twittercallback)") . '<br />';
+      $output .= t("-TweetPic API (Get it from http://dev.twitpic.com/)") . '<br />';
+      $output .= t("(Note: Please set the Access Level Read & Write while creating API keys on https://dev.twitter.com/)") . '</dt>';
+      $output .= '<dt>' . t("4. Save the configuration.") . '</dt>';
+      $output .= '<dt>' . t("5. For posting to twitter using Modules custom form go to Admin -> Structure -> Blocks -> Configure(Tweet Poster) block.") . '</dt>';
+      break;
+  }
+  return $output;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function tweet_poster_menu() {
+  $items = array();
+  $items['admin/config/services/tweet_poster'] = array(
+    'title' => 'Twitter API Credential Settings',
+    'description' => 'Twitter Credential Settings for connecting twitter.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('tweet_poster_admin'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'tweet_poster.admin.inc',
+  );
+  $items['twitterpost'] = array(
+    'title' => 'Twitter Post',
+    'description' => 'Twitter page',
+    'type' => MENU_CALLBACK,
+    'page callback' => 'tweet_poster_twitterpage',
+    'access callback' => TRUE,
+  );
+  // Twitter callback for getting response from twitter website.
+  $items['twittercallback'] = array(
+    'title' => 'Twitter Post',
+    'description' => 'Twitter Callback',
+    'type' => MENU_CALLBACK,
+    'page callback' => 'tweet_poster_callback',
+    'access callback' => TRUE,
+  );
+  return $items;
+}
+
+/**
+ * @FIXME
+ * hook_block_info is gone in Drupal 8.
+ * 
+ * It has been left here by the Drupal Module Upgrader so that you can move its
+ * logic into the appropriate block plugins, which should be in the
+ * src/Plugin/Block directory. Once all logic is moved into the plugins, delete
+ * this hook.
+ * 
+ * @see https://www.drupal.org/node/1880620
+ */
+function tweet_poster_block_info() {
+  $block['tweet_poster']['info'] = t('Tweet Poster');
+  return $block;
+}
+
+/**
+ * @FIXME
+ * hook_block_view is gone in Drupal 8.
+ * 
+ * It has been left here by the Drupal Module Upgrader so that you can move its
+ * logic into the appropriate block plugins, which should be in the
+ * src/Plugin/Block directory. Once all logic is moved into the plugins, delete
+ * this hook.
+ * 
+ * @see https://www.drupal.org/node/1880620
+ */
+function tweet_poster_block_view($delta = '') {
+  $user = \Drupal::currentUser();
+  $block = array();
+  if ($user->uid) {
+    switch ($delta) {
+      case 'tweet_poster':
+        $block['subject'] = t('Tweet Poster');
+        $block['content'] = \Drupal::formBuilder()->getForm('tweet_poster_form');
+        break;
+    }
+  }
+  return $block;
+}
+
+/**
+ * Form for posting status and image on twitter.
+ */
+function tweet_poster_form($form, &$form_state) {
+  $form['tweet']['tweet_status'] = array(
+    '#type' => 'textarea',
+    '#cols' => 10,
+    '#rows' => 5,
+    '#resizable' => FALSE,
+    '#title' => t('Status Message'),
+    '#title_display' => 'invisible',
+    '#maxlength' => 128,
+    '#attributes' => array('title' => t('Enter Your Comment to Post on Social Website.')),
+    '#required' => TRUE,
+  );
+  $form['tweet']['tweet_pic'] = array(
+    '#title' => t('Image'),
+    '#type' => 'managed_file',
+    '#title_display' => 'invisible',
+    '#default_value' => \Drupal::config('tweet_poster.settings')->get('tweet_poster_tweet_pic_fid'),
+    '#upload_validators' => array("file_validate_extensions" => array("png gif jpg jpeg bmp")),
+    '#upload_location' => 'public://',
+  );
+  $form['tweet']['post'] = array(
+    '#type' => 'submit',
+    '#value' => t('Post'),
+  );
+  return $form;
+}
+
+/**
+ * Form Submit for posting status and image on twitter.
+ */
+function tweet_poster_form_submit($form, &$form_state) {
+  $tweet_poster_image_fid = $form_state['values']['tweet_pic'];
+  $tweet_poster_status = $form_state['values']['tweet_status'];
+  // We can call the function for node submit or any other submit hooks.
+  return tweet_poster_get_arguments($tweet_poster_status, $tweet_poster_image_fid);
+}
+
+/**
+ * Prepare agruments for posting status and image on twitter.
+ */
+function tweet_poster_get_arguments($tweet_poster_status, $tweet_poster_image_fid) {
+  // Image_fid - to load which image by using file_load().
+  $tweet_poster_imgpath = file_load($tweet_poster_image_fid);
+  $tweet_poster_imgpath = explode('://', $tweet_poster_imgpath->uri);
+  $_SESSION['tweet_poster_status'] = $tweet_poster_status;
+  $_SESSION['tweet_poster_imgpath'] = $tweet_poster_imgpath[1];
+  $_SESSION['tweet_poster_url_redirector'] = $_SERVER['HTTP_REFERER'];
+  return tweet_poster_twitterpage();
+}
+
+/**
+ * Authorized and posts the content on twitter.
+ */
+function tweet_poster_twitterpage() {
+  require_once drupal_get_path('module', 'tweet_poster') . '/tweet_poster_config.php';
+  require_once libraries_get_path('twitteroauth') . '/twitteroauth/twitteroauth.php';
+  require_once libraries_get_path('tmhOAuth') . '/tmhOAuth.php';
+  if (empty($_SESSION['access_token']) || empty($_SESSION['access_token']['oauth_token']) || empty($_SESSION['access_token']['oauth_token_secret'])) {
+    return tweet_poster_redirect();
+  }
+  $filename = NULL;
+  $mime = NULL;
+  if (!empty($_SESSION['tweet_poster_imgpath'])) {
+    $filename = drupal_realpath(\Drupal::service("stream_wrapper_manager")->getViaUri('public://')->getDirectoryPath() . '/' . $_SESSION['tweet_poster_imgpath'] . '');
+    $handle = fopen($filename, "rb");
+    $image = fread($handle, filesize($filename));
+    $ext = explode('.', $_SESSION['tweet_poster_imgpath']);
+    $mime = 'image/' . $ext[1];
+  }
+  // If access tokens are not available redirect to connect page.
+  // Get user access tokens out of the session.
+  $access_token = isset($_SESSION['access_token']) ? $_SESSION['access_token'] : NULL;
+  // Create a TwitterOauth object with consumer/user tokens.
+  $connection = new TwitterOAuth(TWEET_POSTER_CONSUMER_KEY, TWEET_POSTER_CONSUMER_SECRET, $access_token['oauth_token'], $access_token['oauth_token_secret']);
+  // If method is set change API call made. Test is called by default.
+  $content = $connection->get('account/verify_credentials');
+  $tmh_oauth = new tmhOAuth(array(
+        'consumer_key' => TWEET_POSTER_CONSUMER_KEY,
+        'consumer_secret' => TWEET_POSTER_CONSUMER_SECRET,
+        'token' => $access_token['oauth_token'],
+        'secret' => $access_token['oauth_token_secret'],
+      ));
+  $delegator = 'http://api.twitpic.com/2/upload.json';
+  $x_auth_service_provider = 'https://api.twitter.com/1.1/account/verify_credentials.json';
+  tweet_poster_generate_verify_header($tmh_oauth, $x_auth_service_provider);
+  // Sometime notices may come so used(@) to avoid.
+  $params = @tweet_poster_generate_prepare_request($tmh_oauth, $x_auth_service_provider, TWEET_POSTER_TWEETPIC_KEY, $filename, $mime);
+  // Post to OAuth Echo provider.
+  $code = tweet_poster_make_request($tmh_oauth, $delegator, $params, FALSE, TRUE);
+  $resp = @json_decode($tmh_oauth->response['response']);
+  @$srtlen_respurl = strlen($resp->url) + 1;
+  $post_status = substr($_SESSION['tweet_poster_status'], 0, 140 - $srtlen_respurl);
+  @$params = array('status' => $post_status . ' ' . $resp->url);
+  @$code = tweet_poster_make_request($tmh_oauth, $tmh_oauth->url('1.1/statuses/update'), $params, TRUE, FALSE);
+  if ($code == 200) {
+    unset($_SESSION['tweet_poster_status']);
+    unset($_SESSION['tweet_poster_imgpath']);
+    drupal_set_message(t('Twitter Post successfully'));
+    if (!isset($_SESSION['tweet_poster_url_redirector'])) {
+      drupal_goto('twitterpost');
+    }
+    else {
+      drupal_goto($_SESSION['tweet_poster_url_redirector']);
+    }
+  }
+  else {
+	unset($_SESSION['tweet_poster_status']);
+    unset($_SESSION['tweet_poster_imgpath']);
+    drupal_set_message(t('Their is some issue while posting in twitter.'), 'error');
+    if (!isset($_SESSION['tweet_poster_url_redirector'])) {
+      drupal_goto('twitterpost');
+    }
+    else {
+      drupal_goto($_SESSION['tweet_poster_url_redirector']);
+    }
+  }
+  drupal_exit();
+}
+
+/**
+ * Twitter callback for checking the token is exist or new token.
+ */
+function tweet_poster_callback() {
+  global $base_url;
+  require_once drupal_get_path('module', 'tweet_poster') . '/tweet_poster_config.php';
+  require_once libraries_get_path('twitteroauth') . '/twitteroauth/twitteroauth.php';
+
+  // If the oauth_token is old redirect to the connect page.
+  if (isset($_REQUEST['oauth_token']) && $_SESSION['oauth_token'] !== $_REQUEST['oauth_token']) {
+    $_SESSION['oauth_status'] = 'oldtoken';
+    drupal_set_message(t('No longer available', 'error'));
+    if (!isset($_SESSION['tweet_poster_url_redirector'])) {
+      drupal_goto('twitterpost');
+    }
+    else {
+      drupal_goto($_SESSION['tweet_poster_url_redirector']);
+    }
+    drupal_exit();
+  }
+  // Create TwitteroAuth object from default phase configuration.
+  $connection = new TwitterOAuth(TWEET_POSTER_CONSUMER_KEY, TWEET_POSTER_CONSUMER_SECRET, $_SESSION['oauth_token'], $_SESSION['oauth_token_secret']);
+
+  // Request access tokens from twitter.
+  $access_token = $connection->getAccessToken($_REQUEST['oauth_verifier']);
+
+  // Save the access tokens these would be saved in a session for future use.
+  $_SESSION['access_token'] = $access_token;
+
+  // Remove no longer needed request tokens.
+  unset($_SESSION['oauth_token']);
+  unset($_SESSION['oauth_token_secret']);
+
+  // If HTTP response is 200 continue otherwise send to connect page to retry.
+  if (200 == $connection->http_code) {
+    // User has been verified and the access tokens saved for future use.
+    $_SESSION['status'] = 'verified';
+    header("Location: " . $base_url . '/twitterpost');
+  }
+  else {
+    // Save HTTP status for error dialog on connnect page.
+    drupal_set_message(t('Could not connect to Twitter. Refresh the page or try again later.', 'error'));
+    if (!isset($_SESSION['tweet_poster_url_redirector'])) {
+      drupal_goto('twitterpost');
+    }
+    else {
+      drupal_goto($_SESSION['tweet_poster_url_redirector']);
+    }
+  }
+}
+
+/**
+ * Twitter redirection for posting on twitter site.
+ */
+function tweet_poster_redirect() {
+  require_once drupal_get_path('module', 'tweet_poster') . '/tweet_poster_config.php';
+  require_once libraries_get_path('twitteroauth') . '/twitteroauth/twitteroauth.php';
+  $connection = new TwitterOAuth(TWEET_POSTER_CONSUMER_KEY, TWEET_POSTER_CONSUMER_SECRET);
+  // Get temporary credentials.
+  $request_token = $connection->getRequestToken(TWEET_POSTER_OAUTH_CALLBACK);
+  // Save temporary credentials to session.
+
+  $_SESSION['oauth_token'] = $token = $request_token['oauth_token'];
+  $_SESSION['oauth_token_secret'] = $request_token['oauth_token_secret'];
+  // If last connection failed don't display authorization link.
+  switch ($connection->http_code) {
+    case 200:
+      // Build authorize URL and redirect user to Twitter.
+      $url = $connection->getAuthorizeURL($token);
+	  //echo $url; die;
+      drupal_goto($url);
+	  //@header('location: ' . $url);
+      break;
+
+    default:
+      // Show notification if something went wrong.
+      drupal_set_message(t('Could not connect to Twitter. Refresh the page or try again later.', 'error'));
+      if (!isset($_SESSION['url_redirector'])) {
+        drupal_goto('twitterpost');
+      }
+      else {
+        drupal_goto($_SESSION['url_redirector']);
+      }
+  }
+}
+
+/**
+ * Headers varification for service authentication.
+ */
+function tweet_poster_generate_verify_header($tmh_oauth, $x_auth_service_provider) {
+  // Generate the verify crendentials header -- BUT DON'T SEND.
+  // Prevent request ones sending the verify_credentials request.
+  $tmh_oauth->config['prevent_request'] = TRUE;
+  $tmh_oauth->request('GET', $x_auth_service_provider);
+  $tmh_oauth->config['prevent_request'] = FALSE;
+}
+
+/**
+ * Initialize and prepare the request for Twitter.
+ */
+function tweet_poster_generate_prepare_request($tmh_oauth, $x_auth_service_provider, $key, $media, $media_type = 'image/jpeg') {
+  // Create the headers for the echo.
+  $headers = array(
+    'X-Auth-Service-Provider' => $x_auth_service_provider,
+    'X-Verify-Credentials-Authorization' => $tmh_oauth->auth_header,
+  );
+  // Load the headers for the request.
+  $tmh_oauth->headers = $headers;
+  // Prepare the request to the delegator.
+  $params = array(
+    'key' => $key,
+    'media' => "@{$media};type={$media_type};filename={$media}",
+    'message' => 'trying something out',
+  );
+  return $params;
+}
+
+/**
+ * Share Request fired after varification. 
+ */
+function tweet_poster_make_request($tmh_oauth, $url, $params, $auth, $multipart) {
+  // Make the request, no auth, multipart, custom headers.
+  $code = $tmh_oauth->request('POST', $url, $params, $auth, $multipart);
+  return $code;
+}
