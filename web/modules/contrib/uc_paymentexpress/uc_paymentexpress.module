@@ -1,0 +1,144 @@
+<?php
+
+/**
+ * @file
+ * Integrates dps payment services with Ubercart.
+ */
+
+use Drupal\uc_paymentexpress\DPSApi\MifMessage;
+use Drupal\uc_paymentexpress\DPSApi\PxPayRequest;
+use Drupal\uc_paymentexpress\DPSApi\PxPay_Curl;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Url;
+use Drupal\uc_order\Entity\Order;
+use Drupal\uc_payment\Entity\PaymentMethod;
+
+
+use Symfony\Component\HttpFoundation\RedirectResponse;
+
+/**
+ * Implements hook_form_FORM_ID_alter() for uc_cart_checkout_form().
+ */
+function uc_paymentexpress_form_uc_cart_checkout_review_form_alter(&$form, &$form_state, $form_id) {
+  $methods = PaymentMethod::loadMultiple();
+  uasort($methods, 'Drupal\uc_payment\Entity\PaymentMethod::sort');
+  foreach ($methods as $method) {
+    $temp_plugin_entity_config = $method->getPlugin();
+    if ($temp_plugin_entity_config && $temp_plugin_entity_config->getPluginId() == 'dps') {
+      // We found dps payment instance and should check further
+      // Client selected it for further payemnt after form submit.
+      $form['#submit'][] = 'uc_paymentexpress_pay_form_submit';
+      break;
+    }
+  }
+}
+
+/**
+ * Redirects if a customer selects PayPal Express Checkout as a payment method.
+ */
+function uc_paymentexpress_pay_form_submit($form, FormStateInterface $form_state) {
+  $session = \Drupal::service('session');
+  $order = Order::load($session->get('cart_order'));
+  $payment_id = $order->getPaymentMethodId();
+  $selected_payment_entity = PaymentMethod::load($payment_id);
+  if ($selected_payment_entity) {
+    $selected_payment_entity = $selected_payment_entity->getPlugin();
+    if ($selected_payment_entity && $selected_payment_entity->getPluginId() == 'dps') {
+      // Client chosen dps payment from the checkout form
+      // carry out the dps payment based order payment method.
+      uc_paymentexpress_goto($order, $selected_payment_entity);
+      exit;
+    }
+  }
+}
+
+/**
+ * Go to dps interface for permission to the checkout host page.
+ */
+function uc_paymentexpress_goto($order, $selected_payment_entity) {
+  $dps_settings = $selected_payment_entity->getConfiguration();
+  if (is_array($dps_settings)) {
+    $pxpay = FALSE;
+    if ($dps_settings['dps_test_mod']) {
+      $pxpay = new PxPay_Curl($dps_settings['px_access_test_url'], $dps_settings['px_access_test_uid'], $dps_settings['px_access_test_key']);
+    }
+    else {
+      $pxpay = new PxPay_Curl($dps_settings['px_access_url'], $dps_settings['px_access_uid'], $dps_settings['px_access_key']);
+    }
+
+    $request = new PxPayRequest();
+    $current_user = \Drupal::currentUser();
+    $temp_site_config = \Drupal::config('system.site');
+
+    $item_name_args = array(
+      '%site_name' => $temp_site_config->get('name'),
+      '%order_id'  => $order->id(),
+      '%user_name' => $current_user->getDisplayName(),
+    );
+
+    $item_name = ($current_user->id()) ? t("%site_name order #%order_id for %user_name", $item_name_args) : t("%site_name order #%order_id", $item_name_args);
+    $item_name = strip_tags($item_name);
+
+    $name = ucfirst($order->delivery_first_name->getString()) . ' ' . ucfirst($order->delivery_last_name->getString());
+
+    if ($order->billing_company->getString()) {
+      $address = $order->billing_company->getString() . ', ';
+    }
+    $address .= $order->billing_street1->getString();
+    if ($order->billing_street2->getString()) {
+      $address .= ', ' . $order->billing_street2->getString();
+    }
+    $address .= ', ' . $order->billing_city->getString();
+    $address .= ', ' . $order->billing_country->getString();
+
+    // Generate a unique identifier for the transaction.
+    $txnId = uniqid("ID");
+
+    // Set PxPay properties.
+    $request->setEnableAddBillCard(1);
+    $request->setMerchantReference($order->id());
+    $request->setAmountInput($order->getTotal());
+    $request->setTxnData1($item_name);
+    $request->setTxnData2($name);
+    $request->setTxnData3($address);
+    $request->setTxnType("Purchase");
+    $request->setCurrencyInput($order->getCurrency());
+    $request->setEmailAddress($order->getEmail());
+
+    $process_path = Url::fromRoute('uc_paymentexpress.dps_complete', [], array('absolute' => TRUE))->toString();
+    $process_failed_path = Url::fromRoute('uc_paymentexpress.dps_failed', [], array('absolute' => TRUE))->toString();
+    // Can be a dedicated failure page.
+    $request->setUrlFail($process_failed_path);
+    // Can be a dedicated success page.
+    $request->setUrlSuccess($process_path);
+
+    $request->setTxnId($txnId);
+
+    // The following properties are not used in this case
+    // $request->setBillingId($BillingId);
+    // $request->setOpt($Opt);
+    // Call makeRequest function to obtain input XML.
+    $request_string = $pxpay->makeRequest($request);
+
+    // Obtain output XML.
+    $response = new MifMessage($request_string);
+
+    // Parse output XML.
+    $url = $response->get_element_text("URI");
+    $valid = $response->get_attribute("valid");
+
+    if ($valid && strlen(trim($url))) {
+      $response = new RedirectResponse($url);
+      $response->send();
+    }
+    else {
+      $error = $response->get_attribute("responsetext");
+      drupal_set_message(t('While processing your order a DPS payment error occurred, please contact the site administrator or try again later.'), 'error');
+      \Drupal::logger('uc_paymentexpress')->error('DPS gateway failed: @error', ['@error' => $error]);
+      $response = new RedirectResponse(Url::fromRoute('uc_cart.checkout')->toString());
+      $response->send();
+    }
+
+    return;
+  }
+}
