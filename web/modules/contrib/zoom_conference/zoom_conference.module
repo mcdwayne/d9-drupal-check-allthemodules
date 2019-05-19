@@ -1,0 +1,588 @@
+<?php
+/**
+ * @file
+ *  Contains zoom_conference.module
+ */
+module_load_include('php', 'zoom_conference', 'src/ZoomApi');
+module_load_include('php', 'zoom_conference', 'src/ZoomMeetingApi');
+module_load_include('php', 'zoom_conference', 'src/ZoomRecordingApi');
+
+use Drupal\zoom_conference\Api\ZoomAPI;
+use Drupal\zoom_conference\Api\ZoomAPIMeeting;
+use Drupal\zoom_conference\Api\ZoomAPIRecording;
+
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
+
+define('ZOOMAPI_USER_TYPE_BASIC', 1);
+define('ZOOMAPI_USER_TYPE_PRO', 2);
+define('ZOOMAPI_USER_TYPE_CORP', 3);
+define('ZOOMAPI_USER_TYPE_DEFAULT', ZOOMAPI_USER_TYPE_BASIC);
+
+define('ZOOMAPI_MEETING_TYPE_INSTANT', 1);
+define('ZOOMAPI_MEETING_TYPE_NORMAL', 2);
+define('ZOOMAPI_MEETING_TYPE_RECURRING_NO_FIXED_TIME', 3);
+define('ZOOMAPI_MEETING_TYPE_RECURRING_FIXED_TIME', 8);
+define('ZOOMAPI_MEETING_TYPE_DEFAULT', ZOOMAPI_MEETING_TYPE_NORMAL);
+
+/**
+ * Implements hook_theme().
+ */
+function zoom_conference_theme() {
+  return [
+    'node__zoom_meeting' => [
+      'template' => 'node--zoom-meeting',
+      'base hook' => 'node',
+    ],
+    'node__zoom_registrant' => [
+      'template' => 'node--zoom-registrant',
+      'base hook' => 'node',
+    ],
+  ];
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function zoom_conference_form_node_zoom_meeting_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+
+  // Get current user.
+  $user = \Drupal::currentUser();
+  $user_email = $user->getEmail();
+
+  // Hide fields that are set by Zoom.
+  $form['field_uuid']['widget'][0]['value']['#type'] = 'hidden';
+  $form['field_meeting_id']['widget'][0]['value']['#type'] = 'hidden';
+  $form['field_meeting_start_url']['widget'][0]['value']['#type'] = 'hidden';
+  $form['field_meeting_start_url']['#type'] = 'hidden';
+  $form['field_meeting_join_url']['widget'][0]['value']['#type'] = 'hidden';
+  $form['field_meeting_join_url']['#type'] = 'hidden';
+  $form['field_meeting_data']['widget'][0]['value']['#type'] = 'hidden';
+  $form['field_meeting_expiry']['widget'][0]['value']['#type'] = 'hidden';
+  $form['field_meeting_expiry']['#type'] = 'hidden';
+  $form['field_meeting_timezone']['widget'][0]['value']['#type'] = 'hidden';
+  $form['field_meeting_timezone']['widget'][0]['value']['#default_value'] = drupal_get_user_timezone();
+
+  // Make fields required.
+  $form['field_host_zoom_user_id']['widget'][0]['value']['#required'] = TRUE;
+  $form['field_meeting_duration']['widget'][0]['value']['#required'] = TRUE;
+
+  // Default duration.
+  $form['field_meeting_duration']['widget'][0]['value']['#default_value'] = 60;
+
+  // Attempt to get a list of actual users for the current api key.
+  $user_list = [];
+  $default_user = null;
+  $temp_meeting = new ZoomAPIMeeting;
+  $temp_users = $temp_meeting->get_users();
+  if (!empty($temp_users) && !empty($temp_users['users'])) {
+    foreach ($temp_users['users'] as $temp_user) {
+      $key = $temp_user['id'];
+      $val = $temp_user['email'];
+
+      // Add to the list for the select widget.
+      $user_list[$key] = $val;
+
+      // Try to get a default for the select widget.
+      if ($val == $user_email) {
+        $default_user = $key;
+      }
+    }
+  }
+
+  // Swap the host user widget to a select list if possible.
+  if (!empty($user_list)) {
+    $form['field_host_zoom_user_id']['widget'][0]['value']['#type'] = 'select';
+    $form['field_host_zoom_user_id']['widget'][0]['value']['#options'] = $user_list;
+    $form['field_host_zoom_user_id']['widget'][0]['value']['#default_value'] = $default_user;
+    unset($form['field_host_zoom_user_id']['widget'][0]['value']['#size']);
+  }
+  else {
+    // Fill in the zoom user id value with the user's email address by default.
+    $form['field_host_zoom_user_id']['widget'][0]['value']['#default_value'] = $user_email;
+  }
+
+  // Set up and hide the meeting type.
+  // TODO: add support for recurring meetings
+  $meeting_types = [
+    1 =>  t('Instant Meeting'),
+    2 => t('Scheduled Meeting'),
+    //3 => t('Recurring Meeting with no fixed time'),
+    //8 => t('Recurring Meeting with fixed time'),
+  ];
+  $form['field_meeting_type']['widget'][0]['value']['#options'] = $meeting_types;
+  $form['field_meeting_type']['widget'][0]['value']['#type'] = 'select';
+  $form['field_meeting_type']['widget'][0]['value']['#default_value'] = 2;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * TODO: options to hide various questions / have a simplified flow.
+ */
+function zoom_conference_form_node_zoom_registrant_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  // Get the request.
+  $request = Request::createFromGlobals();
+  $params = $request->query->all();
+
+  // Get the meeting id, if passed in.
+  if (array_key_exists('meeting_id', $params)) {
+    // Get the meeting. Note this is the nid of the meeting node, not the Zoom meeting id.
+    $meeting_nid = (int) $params['meeting_id'];
+    $meeting = node_load($meeting_nid);
+
+    // Sanity test.
+    if ($meeting === FALSE ||
+      $meeting->getType() != 'zoom_meeting' ||
+      !$meeting->isPublished()) {
+      throw new NotFoundHttpException();
+    }
+
+    // Check that meeting is still in the future.
+    $start_date = $meeting->get('field_meeting_start_date')->getValue();
+    $start_date = array_pop($start_date);
+    $start_date = $start_date['value'];
+    $start_date = new DateTime($start_date);
+    $current_date = new DateTime();
+
+    if ($start_date < $current_date) {
+      drupal_set_message(t('The meeting has already passed.'), 'status');
+      throw new NotFoundHttpException();
+    }
+
+    // Check meeting type to ensure it takes registrations.
+    $type = $meeting->get('field_meeting_type')->getValue();
+    $type = array_pop($type);
+    $type = $type['value'];
+    if ($type == 1) {
+      drupal_set_message(t('You cannot register for instant meetings.'), 'status');
+      throw new NotFoundHttpException();
+    }
+  }
+  else {
+    throw new NotFoundHttpException();
+  }
+
+  // Current user (session, not full record).
+  $current_user = \Drupal::currentUser();
+
+  // Make username fields required
+  // TODO: later on we may default them instead.
+  $form['field_meeting_first_name']['widget'][0]['value']['#required'] = TRUE;
+  $form['field_meeting_last_name']['widget'][0]['value']['#required'] = TRUE;
+
+  // We don't need to check specifically if anon is allowed, as that is
+  // a function of permissions for the content type.
+  if ($current_user->isAnonymous()) {
+    // Hide the user field
+    $form['field_meeting_user']['widget'][0]['target_id']['#type'] = 'hidden';
+
+    // Make email field required.
+    $form['field_zoom_email']['widget'][0]['value']['#required'] = TRUE;
+  }
+  else {
+    $uid = $current_user->id();
+    $user = \Drupal\user\Entity\User::load($uid);
+
+    // Default and hide the user field.
+    $form['field_meeting_user']['widget'][0]['target_id']['#default_value'] = $user;
+    $form['field_meeting_user']['widget'][0]['#disabled'] = TRUE;
+
+    // Default the email field.
+    $mail = $user->get('mail')->getValue();
+    $mail = array_pop($mail);
+    $mail = $mail['value'];
+    $form['field_zoom_email']['widget'][0]['value']['#default_value'] = $mail;
+    //$form['field_zoom_email']['widget'][0]['#disabled'] = TRUE;
+  }
+
+  // Hide / set title based on the meeting name
+  $title = $meeting->getTitle();
+  $title .= ' - Registration';
+  $form['title']['widget'][0]['value']['#default_value'] = $title;
+  $form['title']['widget'][0]['value']['#type'] = 'hidden';
+
+  // Default the meeting.
+  $form['field_meeting']['widget'][0]['target_id']['#default_value'] = $meeting;
+  $form['field_meeting']['widget'][0]['#disabled'] = TRUE;
+
+  // Hide the custom questions field.
+  // TODO: implement and set up config for this.
+  $form['field_custom_questions']['widget'][0]['value']['#type'] = 'hidden';
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ * Block editing of Zoom Registrants (they can only be added or deleted).
+ */
+function zoom_conference_form_node_zoom_registrant_edit_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  drupal_set_message(t('You cannot alter a Zoom Registration once it has been created. To cancel it, delete instead.'), 'status');
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_presave().
+ * Handle calls to Zoom API.
+ */
+function zoom_conference_node_presave(Drupal\Core\Entity\EntityInterface $entity) {
+  $type = $entity->getType();
+
+  //=================
+  // Zoom Meetings.
+  //=================
+  if ($type == 'zoom_meeting') {
+
+    //=================
+    // Add mode.
+    //=================
+    if (!isset($entity->original)) {
+      // Get the data together to send to Zoom.
+
+      // Topic.
+      $topic = $entity->getTitle();
+
+      // Zoom User ID.
+      $host_zoom_user_id = $entity->get('field_host_zoom_user_id')->getValue();
+      $host_zoom_user_id = array_pop($host_zoom_user_id);
+      $host_zoom_user_id = $host_zoom_user_id['value'];
+
+      // Meeting Type.
+      $type = $entity->get('field_meeting_type')->getValue();
+      $type = array_pop($type);
+      $type = $type['value'];
+
+      // Start Date.
+      $start_time = $entity->get('field_meeting_start_date')->getValue();
+      $start_time = array_pop($start_time);
+      $start_time = $start_time['value'];
+
+      // Timezone.
+      $timezone = $entity->get('field_meeting_timezone')->getValue();
+      $timezone = array_pop($timezone);
+      $timezone = $timezone['value'];
+
+      // Duration.
+      $duration = $entity->get('field_meeting_duration')->getValue();
+      $duration = array_pop($duration);
+      $duration = $duration['value'];
+
+      // Agenda.
+      $agenda = $entity->get('body')->getValue();
+      if (!empty($agenda)) {
+        $agenda = array_pop($agenda);
+        $agenda = $agenda['value'];
+      }
+      else {
+        $agenda = '';
+      }
+
+      // Settings
+      // TODO: should probably make these (and other) options available to users.
+      $settings = [
+        'approval_type' => 0, // Automatically Approve
+        'registration_type' => 1, // Attendees register once and can attend any of the occurrences
+        'auto_recording' => 'cloud', // Record to cloud
+      ];
+
+      $options = [
+        'start_time' => $start_time,
+        'duration' => $duration,
+        'timezone' => $timezone,
+        'agenda' => $agenda,
+        'settings' => $settings,
+      ];
+
+      $meeting_api = new ZoomAPIMeeting;
+      $data = $meeting_api->create($host_zoom_user_id, $topic, $type, $options);
+
+      if (!empty($data)) {
+        // Update the meeting with Zoom data before saving.
+        $entity->set('field_meeting_data', json_encode($data));
+        $entity->set('field_uuid', $data['uuid']);
+        $entity->set('field_meeting_id', $data['id']);
+        $entity->set('field_meeting_start_url', $data['start_url']);
+        $entity->set('field_meeting_join_url', $data['join_url']);
+
+        // Let the user know everything worked properly.
+        drupal_set_message(t('Your meeting has been created at Zoom.'), 'status');
+      }
+      else {
+        drupal_set_message(t('An error occurred while adding the meeting to Zoom.'), 'warning');
+      }
+    }
+    //=============
+    // Edit mode.
+    //=============
+    else {
+      // Meeting ID.
+      $meeting_id = $entity->get('field_meeting_id')->getValue();
+      $meeting_id = array_pop($meeting_id);
+      $meeting_id = $meeting_id['value'];
+
+      // Topic.
+      $topic = $entity->getTitle();
+
+      // Meeting Type.
+      $type = $entity->get('field_meeting_type')->getValue();
+      $type = array_pop($type);
+      $type = $type['value'];
+
+      // Start Date.
+      $start_time = $entity->get('field_meeting_start_date')->getValue();
+      $start_time = array_pop($start_time);
+      $start_time = $start_time['value'] . 'Z';
+
+      // Timezone.
+      $timezone = $entity->get('field_meeting_timezone')->getValue();
+      $timezone = array_pop($timezone);
+      $timezone = $timezone['value'];
+
+      // Duration.
+      $duration = $entity->get('field_meeting_duration')->getValue();
+      $duration = array_pop($duration);
+      $duration = $duration['value'];
+
+      // Agenda.
+      $agenda = $entity->get('body')->getValue();
+      if (!empty($agenda)) {
+        $agenda = array_pop($agenda);
+        $agenda = $agenda['value'];
+      }
+      else {
+        $agenda = '';
+      }
+
+      $options = [
+        'start_time' => $start_time,
+        'duration' => $duration,
+        'timezone' => $timezone,
+        'type' => $type,
+        'topic' => $topic,
+        'agenda' => $agenda,
+      ];
+
+      $meeting_api = new ZoomAPIMeeting;
+      $data = $meeting_api->update($meeting_id, $options);
+
+      // Let the user know everything worked properly.
+      drupal_set_message(t('Your meeting has been updated at Zoom.'), 'status');
+    }
+
+  }
+  //=================
+  // Registrations.
+  //=================
+  else if ($type == 'zoom_registrant') {
+
+    //============
+    // Add mode.
+    //============
+    if (!isset($entity->original)) {
+
+      // Gather data to sent to Zoom.
+
+      // Meeting ID.
+      $meeting_id = $entity->get('field_meeting')->getValue();
+      $meeting_id = array_pop($meeting_id);
+      $meeting_id = $meeting_id['target_id'];
+      // Load the meeting.
+      $meeting = node_load($meeting_id);
+      $zoom_meeting_id = $meeting->get('field_meeting_id')->getValue();
+      $zoom_meeting_id = array_pop($zoom_meeting_id);
+      $zoom_meeting_id = $zoom_meeting_id['value'];
+
+      // Get email.
+      $email = $entity->get('field_zoom_email')->getValue();
+      $email = array_pop($email);
+      $email = $email['value'];
+
+      // Get first name.
+      $first_name = $entity->get('field_meeting_first_name')->getValue();
+      $first_name = array_pop($first_name);
+      $first_name = $first_name['value'];
+
+      // Get last name.
+      $last_name = $entity->get('field_meeting_last_name')->getValue();
+      $last_name = array_pop($last_name);
+      $last_name = $last_name['value'];
+
+      // Optional values.
+      $options = [];
+
+      // Address.
+      $address = $entity->get('field_meeting_user_address')->getValue();
+      if (!empty($address)) {
+        $address = array_pop($address);
+        if (isset($address['address_line1'])) {
+          $options['address'] = $address['address_line1'];
+        }
+        if (isset($address['locality'])) {
+          $options['city'] = $address['locality'];
+        }
+        if (isset($address['country_code'])) {
+          $options['country'] = $address['country_code'];
+        }
+        if (isset($address['administrative_area'])) {
+          $options['state'] = $address['administrative_area'];
+        }
+        if (isset($address['postal_code'])) {
+          $options['zip'] = $address['postal_code'];
+        }
+      }
+
+      // Phone.
+      $phone = $entity->get('field_meeting_user_phone')->getValue();
+      if (!empty($phone)) {
+        $phone = array_pop($phone);
+        $options['phone'] = $phone['value'];
+      }
+
+      // Industry.
+      $industry = $entity->get('field_user_industry')->getValue();
+      if (!empty($industry)) {
+        $industry = array_pop($industry);
+        $options['industry'] = $industry['value'];
+      }
+
+      // Org.
+      $org = $entity->get('field_user_organization')->getValue();
+      if (!empty($org)) {
+        $org = array_pop($org);
+        $options['org'] = $org['value'];
+      }
+
+      // Job title.
+      $job_title = $entity->get('field_user_job_title')->getValue();
+      if (!empty($job_title)) {
+        $job_title = array_pop($job_title);
+        $options['job_title'] = $job_title['value'];
+      }
+
+      // Purchasing timeframe
+      $timeframe = $entity->get('field_purchasing_time_frame')->getValue();
+      if (!empty($timeframe)) {
+        $timeframe = array_pop($timeframe);
+        $options['purchasing_time_frame'] = $timeframe['value'];
+      }
+
+      // Role.
+      $role = $entity->get('field_role_in_purchase_process')->getValue();
+      if (!empty($role)) {
+        $role = array_pop($role);
+        $options['role_in_purchase_process'] = $role['value'];
+      }
+
+      // # Employeers.
+      $employees = $entity->get('field_number_of_employees')->getValue();
+      if (!empty($employees)) {
+        $employees = array_pop($employees);
+        $options['no_of_employees'] = $employees['value'];
+      }
+
+      // Comments.
+      $comments = $entity->get('field_questions_comments')->getValue();
+      if (!empty($comments)) {
+        $comments = array_pop($comments);
+        $options['comments'] = $comments['value'];
+      }
+
+      $meeting_api = new ZoomAPIMeeting;
+      $data = $meeting_api->add_registrant($zoom_meeting_id, $email, $first_name, $last_name, $options);
+
+      // Update the object with the returned values.
+      // @todo: Check response message for better handling.
+      // i.e. {"code":200,"message":"Only available for Paid user: ..."}
+      if (!empty($data)) {
+        // Update the meeting with Zoom data before saving.
+        $entity->set('field_zoom_data', json_encode($data));
+        if (!empty($data['registrant_id'])) {
+          $entity->set('field_registrant_id', $data['registrant_id']);
+        }
+        if (!empty($data['registrant_id'])) {
+          $entity->set('field_join_url', $data['join_url']);
+        }
+
+        // Let the user know everything worked properly.
+        drupal_set_message(t('Your registration has been created at Zoom.'), 'status');
+      }
+      else {
+        drupal_set_message(t('An error occurred while creating the registration.'), 'warning');
+      }
+
+      // TODO: send an email to the user?
+
+      // Let the user know everything worked properly.
+      drupal_set_message(t('You have registered for this meeting. The details on how to join the meeting will be sent to your email address.'), 'status');
+    }
+    else {
+      // "Block" edits of registrations.
+      drupal_set_message(t('You cannot edit a registration at Zoom after it has been created. To remove your registration, delete the record.'), 'status');
+    }
+
+  }
+
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_predelete().
+ * Handle deletion of Zoom Meetings and Registrants.
+ */
+function zoom_conference_node_predelete(Drupal\Core\Entity\EntityInterface $entity) {
+  $type = $entity->getType();
+
+  //=================
+  // Zoom Meetings.
+  //=================
+  if ($type == 'zoom_meeting') {
+    #TODO: handle occurrence ID as well, once that feature exists.
+
+    // Get meeting ID.
+    $meeting_id = $entity->get('field_meeting_id')->getValue();
+    $meeting_id = array_pop($meeting_id);
+    $meeting_id = $meeting_id['value'];
+
+    $meeting_api = new ZoomAPIMeeting;
+    $meeting_api->delete($meeting_id);
+
+    // Let the user know everything worked properly.
+    drupal_set_message(t('Your meeting has been canceled.'), 'status');
+  }
+  //=================
+  // Registrations.
+  //=================
+  else if ($type == 'zoom_registrant') {
+    $action = 'cancel';
+
+    // Meeting ID.
+    $meeting_id = $entity->get('field_meeting')->getValue();
+    $meeting_id = array_pop($meeting_id);
+    $meeting_id = $meeting_id['target_id'];
+    // Load the meeting.
+    $meeting = node_load($meeting_id);
+    $zoom_meeting_id = $meeting->get('field_meeting_id')->getValue();
+    $zoom_meeting_id = array_pop($zoom_meeting_id);
+    $zoom_meeting_id = $zoom_meeting_id['value'];
+
+    // Registrant id.
+    $registrant_id = $entity->get('field_registrant_id')->getValue();
+    $registrant_id = array_pop($registrant_id);
+    $registrant_id = $registrant_id['value'];
+
+    // Email.
+    $email = $entity->get('field_zoom_email')->getValue();
+    $email = array_pop($email);
+    $email = $email['value'];
+
+    $registrants = [];
+    $registrants[] = [
+      'id' => $registrant_id,
+      'email' => $email,
+    ];
+
+    $meeting_api = new ZoomAPIMeeting;
+    $meeting_api->update_registrant_status($zoom_meeting_id, $action, $registrants, []);
+
+    // Let the user know everything worked properly.
+    drupal_set_message(t('Your registration has been canceled.'), 'status');
+  }
+
+}
