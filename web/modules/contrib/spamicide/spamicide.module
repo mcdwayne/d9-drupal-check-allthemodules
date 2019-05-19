@@ -1,0 +1,153 @@
+<?php
+
+/**
+ * @file
+ * Spamicide.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Url;
+use Symfony\Component\HttpFoundation\RedirectResponse;
+
+/**
+ * Implements hook_help().
+ */
+function spamicide_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.spamicide':
+      $text = file_get_contents(dirname(__FILE__) . '/README.txt');
+      if (!\Drupal::moduleHandler()->moduleExists('markdown')) {
+        return '<pre>' . $text . '</pre>';
+      }
+      else {
+        // Use the Markdown filter to render the README.
+        $filter_manager = \Drupal::service('plugin.manager.filter');
+        $settings = \Drupal::configFactory()
+          ->get('markdown.settings')
+          ->getRawData();
+        $config = ['settings' => $settings];
+        $filter = $filter_manager->createInstance('markdown', $config);
+        return $filter->process($text, 'en');
+      }
+  }
+  return NULL;
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function spamicide_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+
+  $spamicide = \Drupal::entityTypeManager()
+    ->getStorage('spamicide')
+    ->loadByProperties([
+      'id' => $form_id,
+      'status' => TRUE,
+    ]);
+
+  $spamicide = reset($spamicide);
+
+  if (spamicide_add_button_to_form($spamicide, $form_id)) {
+    $form['spamicide_group'] = [
+      '#type' => 'details',
+      '#open' => FALSE,
+      '#title' => t('Spamicide'),
+    ];
+
+    $form['spamicide_group']['spamicide_url'] = [
+      '#type' => 'link',
+      '#title' => t('Add spamicide to this form to prevent spam'),
+      '#url' => Url::fromRoute('entity.spamicide.add_form', [], [
+        'attributes' => [
+          'class' => [
+            'button',
+          ],
+        ],
+        'query' => [
+          'form_id' => $form_id,
+        ],
+      ]),
+    ];
+  }
+
+  if ($spamicide) {
+    $form['feed_me'] = [
+      '#type' => 'textfield',
+      '#title' => 'Feed me',
+      '#weight' => 999,
+      '#attributes' => [
+        'class' => [
+          'feed_me_textfield',
+        ],
+      ],
+    ];
+    $form['actions']['#weight'] = 1000;
+    $form['#attached']['library'][] = 'spamicide/spamicide';
+    $form['#validate'][] = 'spamicide_validate';
+  }
+}
+
+/**
+ * Implements hook_validate().
+ */
+function spamicide_validate(array $form, FormStateInterface &$form_state) {
+  $spamicide = $form_state->getValue('feed_me');
+  $spamicide_settings = \Drupal::configFactory()->getEditable('spamicide.settings');
+
+  if (empty($spamicide)) {
+    return;
+  }
+
+  $form_state->setError($form, 'Spamicide prevent form submit');
+
+  // Log to watchdog if needed.
+  if ($spamicide_settings->get('spamicide_log_attempts')) {
+    $counter = $spamicide_settings->get('spamicide_counter') + 1;
+    $spamicide_settings->set('spamicide_counter', $counter);
+    $spamicide_settings->save();
+    \Drupal::logger('spamicide')->notice(
+      t('%form_id post blocked by Spamicide module: their IP address is "%ipaddress".',
+        [
+          '%form_id' => $form['form_id'],
+          '%ipaddress' => Drupal::request()->getClientIp(),
+        ])
+    );
+  }
+
+  $response = new RedirectResponse(Url::fromRoute('<current>')->toString());
+  $response->send();
+}
+
+/**
+ * Helper function to check permissions and requirements to form.
+ *
+ * @param bool $spamicide
+ *   Spamicide.
+ * @param string $form_id
+ *   Form id.
+ *
+ * @return bool
+ *   True or false.
+ */
+function spamicide_add_button_to_form($spamicide, $form_id) {
+  $current_path = \Drupal::service('path.current');
+  $spamicide_settings = \Drupal::configFactory()->get('spamicide.settings');
+  $currentUser = \Drupal::currentUser();
+  $exclude_forms = [
+    'spamicide_add_form',
+    'spamicide_edit_form',
+    'spamicide_delete_form',
+    'search_block_form',
+    'search_form',
+  ];
+
+  if ($spamicide_settings->get('spamicide_admin_mode') &&
+    $currentUser->hasPermission('administer spamicide') &&
+    !$spamicide && !in_array($form_id, $exclude_forms) &&
+    strpos($current_path->getPath(), '/admin/structure') === FALSE) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
