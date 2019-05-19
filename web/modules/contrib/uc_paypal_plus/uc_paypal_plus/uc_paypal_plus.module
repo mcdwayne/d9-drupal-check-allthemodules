@@ -1,0 +1,213 @@
+<?php
+
+/**
+ * @file
+ * Integrates various PayPal payment services and IPN with Ubercart.
+ *
+ * You should turn on Instant Payment Notifications in your PayPal profile and
+ * set the IPN URL to http://{yoursite.com}/uc_paypal_plus/ipn. See
+ * https://drupal.org/node/1311198 for further information.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Component\Utility\Html;
+use Drupal\Core\Template\Attribute;
+use \Drupal\user\Entity\User;
+use \Drupal\node\Entity\Node;
+use Drupal\block\Entity\Block;
+use \Drupal\file\Entity\File;
+use \Drupal\Core\Entity\EntityManagerInterface;
+use \Drupal\Core\Entity\EntityInterface;
+use Symfony\Component\HttpFoundation\Response;
+use \Drupal\Core\Session\AccountProxyInterface;
+use \Drupal\user\UserInterface;
+use Drupal\Core\Image\ImageFactory;
+use Drupal\Core\Controller\ControllerBase;
+use Symfony\Component\HttpFoundation\Request;
+use Drupal\node\NodeInterface;
+use Drupal\image\Entity\ImageStyle;
+use Drupal\Core\Url;
+use Drupal\uc_cart\CartInterface;
+use Drupal\Core\Config\Entity\ConfigEntityBase;
+/**
+ * Implements hook_help().
+ */
+function uc_paypal_plus_help($route_name, RouteMatchInterface $route_match) {
+  // @todo: write better help!
+  // Provide information and instructions on the payment method add form.
+  if ($route_name == 'entity.uc_payment_method.add_form') {
+    if ($route_match->getRawParameter('plugin_id') == 'paypalplus_ec') {
+      return '<p>' . t('PayPal Plus settings help.') . '</p>';
+    }
+  }
+  // Provide information and instructions on the payment method edit form.
+  elseif ($route_name == 'entity.uc_payment_method.edit_form') {
+    if ($route_match->getParameter('uc_payment_method')->getPlugin()->getPluginId() == 'paypalplus_ec') {
+      return '<p>' . t('PayPal Plus settings help.') . '</p>';
+    }
+  } 
+}
+
+
+function uc_paypal_plus_preprocess_page(&$variables) {
+
+  // to-do refactor to use /Drupal::request();
+  if($_SERVER["REQUEST_URI"] == '/cart/checkout/review'){
+
+    $session = \Drupal::service('session');
+    $order_id = $session->get('cart_order');
+    $cart = \Drupal::service('uc_cart.manager')->get();
+    $product_count = count($cart->getContents());
+
+    if($product_count > 0){
+      $total = 0;
+      foreach ($cart->getContents() as $item) {
+        $display_item = \Drupal::moduleHandler()->invoke($item->data->module, 'uc_cart_display', array($item));
+
+        $total += $display_item['#total'];
+      }
+	  
+	  //to-do refactor to use \Drupal::config();
+      $config = db_query("SELECT data FROM {config} WHERE name = 'uc_payment.method.paypal_plus'")->fetchAssoc();
+      $paypal_plus_config = unserialize($config['data']);
+
+      $type_of_payment = $paypal_plus_config['settings']['wppplus_server'];
+      $username_ppp = $paypal_plus_config['settings']['apiplus']['apiplus_username'];
+      $password_ppp = $paypal_plus_config['settings']['apiplus']['apiplus_password'];
+      $signature_ppp = $paypal_plus_config['settings']['apiplus']['apiplus_signature'];
+
+      $base_url_check = false;
+      if($type_of_payment == "" || $type_of_payment == null){
+        $base_url_check = false;
+      }elseif(strpos($type_of_payment, 'sandbox') !== false){
+        $base_url_check = true;
+		//to-do can we get this from a configuration value, rather than hardcoded so that they are saved in only one plance
+        $baseurl = 'https://api-3t.sandbox.paypal.com/nvp'; //sandbox
+      }else{
+        $base_url_check = true;
+		//to-do can we get this from a configuration value, rather than hardcoded so that they are saved in only one plance
+        $baseurl = 'https://api-3t.paypal.com/nvp'; //live
+      }
+
+      $username = urlencode($username_ppp);
+      $password = urlencode($password_ppp);
+      $signature = urlencode($signature_ppp);
+      
+	  
+	  //to-do refactor to use Drupal\uc_order\Entity->getPaymentMethodId()
+	  
+      $order_data = db_query("SELECT * FROM {uc_orders} WHERE order_id = {$order_id}")->fetchAssoc();
+  
+      if($order_data["payment_method"] == 'paypal_plus' && $base_url_check == true){
+
+
+        $returnurl = urlencode(Url::fromRoute('uc_paypal_plus.ec_complete', [], ['absolute' => TRUE])->toString());
+        $cancelurl = urlencode($GLOBALS['base_url']);
+
+        $post[] = "USER=$username";
+        $post[] = "PWD=$password";
+        $post[] = "SIGNATURE=$signature";
+        $post['method'] = "METHOD=SetExpressCheckout";
+        $post['returnurl'] = "RETURNURL=$returnurl";
+        $post['cancelurl'] = "CANCELURL=$cancelurl";
+        $post[] = "PAYMENTREQUEST_0_AMT=$total";
+        $post[] = "PAYMENTREQUEST_0_CURRENCYCODE=EUR";
+        $post[] = "PAYMENTREQUEST_0_PAYMENTACTION=Sale";
+        $post[] = "PAYMENTREQUEST_0_DESC=Order Place"; 
+        $post[] = "PAYMENTREQUEST_0_INVNUM=".$order_id . '-' . REQUEST_TIME;
+
+        //shipping
+		//to-do refactor to use Drupal\uc_order\Entity->getAddress('delivery')
+        $post[] = "PAYMENTREQUEST_0_SHIPTONAME=".$order_data["delivery_first_name"]." ".$order_data["delivery_last_name"];
+        $post[] = "PAYMENTREQUEST_0_SHIPTOSTREET=".$order_data["delivery_street1"];
+        $post[] = "PAYMENTREQUEST_0_SHIPTOCITY=".$order_data["delivery_city"];
+        $post[] = "PAYMENTREQUEST_0_SHIPTOSTATE=".$order_data["delivery_city"];
+        $post[] = "PAYMENTREQUEST_0_SHIPTOCOUNTRYCODE=".$order_data["delivery_country"];
+        $post[] = "PAYMENTREQUEST_0_SHIPTOZIP=".$order_data["delivery_postal_code"];
+
+        $post[] = "VERSION=93";
+        $post[] = "PAYMENTREQUEST_0_ITEMAMT=$total";
+        $post[] = "L_PAYMENTREQUEST_0_NAME0=Products";
+        $post[] = "L_PAYMENTREQUEST_0_QTY0=1";
+        $post[] = "L_PAYMENTREQUEST_0_AMT0=$total";
+        //billing
+		//to-do refactor to use Drupal\uc_order\Entity->getAddress('billing')
+        $post[] = "PAYMENTREQUEST_0_FIRSTNAME=".$order_data["delivery_first_name"];
+        $post[] = "PAYMENTREQUEST_0_LASTNAME=".$order_data["delivery_last_name"];
+        $post[] = "PAYMENTREQUEST_0_STREET=".$order_data["delivery_street1"];
+        $post[] = "PAYMENTREQUEST_0_CITY=".$order_data["delivery_city"];
+        $post[] = "PAYMENTREQUEST_0_STATE=".$order_data["delivery_city"];
+        $post[] = "PAYMENTREQUEST_0_COUNTRYCODE=".$order_data["delivery_country"];
+        $post[] = "PAYMENTREQUEST_0_ZIP=".$order_data["delivery_postal_code"];
+        $post[] = "PAYMENTREQUEST_0_EMAIL=".$order_data["primary_email"];
+
+        $post_str = implode('&',$post);
+
+        $ch = curl_init();
+        curl_setopt ($ch, CURLOPT_URL, $baseurl);
+        curl_setopt ($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt ($ch, CURLOPT_POST, 1);
+        curl_setopt ($ch, CURLOPT_POSTFIELDS, $post_str); 
+        curl_setopt ($ch, CURLOPT_RETURNTRANSFER, 1);
+        curl_setopt ($ch, CURLOPT_CONNECTTIMEOUT, 3); // 3 seconds to connect
+        curl_setopt ($ch, CURLOPT_TIMEOUT, 10); // 10 seconds to complete
+        $output = curl_exec($ch);
+        curl_close($ch);
+
+        if(strpos($output, "TOKEN") !== false){
+          $explode = explode('&', $output);
+          $explode = explode("=", $explode[0]);
+          $explode = str_replace("%2d", '-', $explode[1]);    
+          $variables['token_paypal_plus'] = urldecode($explode);
+
+          $variables['scriptforppp'] = '<script src="https://www.paypalobjects.com/webstatic/ppplus/ppplus.min.js" type="text/javascript"></script>';
+          $variables['htmlforiframe'] = '<div id="ppplus" style="display: block; float:left; width: 100%;"></div>';
+
+          if(strpos($type_of_payment, 'sandbox') !== false){
+            $variables['paypal_type'] = 'sandbox';
+            $variables['scriptforpppsandbox'] = '<script type="application/javascript">
+                              var ppp = PAYPAL.apps.PPP({
+                                "approvalUrl": "https://www.sandbox.paypal.com/cgi-bin/webscr?cmd=_express-checkout&useraction=commit&token='.urldecode($explode).'",
+                                "placeholder": "ppplus",
+                                "mode": "sandbox",
+                                "language": "de_DE",
+                                "country": "DE"
+                              });
+                            </script>';
+          }else{
+            $variables['paypal_type'] = 'live';
+            $variables['scriptforppplive'] = '<script type="application/javascript">
+                              var ppp = PAYPAL.apps.PPP({
+                                "approvalUrl": "https://www.paypal.com/cgi-bin/webscr?cmd=_express-checkout&useraction=commit&token='.urldecode($explode).'",
+                                "placeholder": "ppplus",
+                                "mode": "live",
+                                "language": "de_DE",
+                                "country": "DE"
+                              });
+                            </script>';
+          }
+
+        }else{
+          $variables['token_paypal_plus'] = 'false';
+          $variables['scriptforppp'] = '';
+          $variables['htmlforiframe'] = '';
+          $variables['scriptforppplive'] = '';
+          $variables['scriptforpppsandbox'] = '';
+        }
+      }else{
+        $variables['token_paypal_plus'] = 'false';
+        $variables['scriptforppp'] = '';
+        $variables['htmlforiframe'] = '';
+        $variables['scriptforppplive'] = '';
+        $variables['scriptforpppsandbox'] = '';
+      }
+
+      if($order_data["payment_method"] == 'free_order'){
+          $variables['free_order_data'] = 'free_order_data';
+      }else{
+          $variables['free_order_data'] = '';
+      }
+    }
+  }
+
+}
