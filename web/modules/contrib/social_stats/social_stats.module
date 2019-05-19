@@ -1,0 +1,208 @@
+<?php
+/**
+ * @file
+ * File containing implemented hooks.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\node\Entity\NodeType;
+use Drupal\Core\Database\Database;
+
+/**
+ * Implements hook_help().
+ */
+function social_stats_help($route_name, RouteMatchInterface $route_match) {
+  $help_text = '';
+  switch ($route_name) {
+    case 'help.page.social_stats':
+      $help_text = '<p>' . t('This module provides an API to get the social statistics of the nodes of the selected content types. The data includes number of shares of a particular node on Facebook, Twitter, LinkedIn, Google Plus. This module does a collection of data on cron run. Using modules like Elysia Cron this can be set to some convinient time (for e.g. once or twice a day).') . '</p><p>' . t('Use Social Stats Views module for integration of this data in the Views module : like sorting according to the number of shares, using the number of shares as a field, having a filter criteria with this data, etc.') . '</p>';
+      return $help_text;
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function social_stats_cron() {
+  $cron_settings = \Drupal::configFactory()->getEditable('social_stats.cron_settings');
+  $interval = $cron_settings->get('cron_interval');
+  if (REQUEST_TIME >= $cron_settings->get('next_execution')) {
+
+    $cron_settings->set('next_execution', REQUEST_TIME + $interval)->save();
+
+    // Get list of content types in the site.
+    $node_types = NodeType::loadMultiple();
+    $content_types = array();
+    $settings = \Drupal::config('social_stats.settings');
+    $content_type_settings = $settings->get('content_types');
+
+    foreach ($node_types as $type) {
+      $type_id = $type->id();
+      if (($content_type_settings[$type_id])
+      ) {
+        $content_types[] = $type_id;
+      }
+    }
+
+    // Exit if there there is no content type configured.
+    if (empty($content_types)) {
+      return;
+    }
+
+    $start_date = '01/01/1970';
+    $social_stats_options = $cron_settings->get('date_options');
+    if ($social_stats_options == 0) {
+      $start_date = $cron_settings->get('start_date');
+    }
+    elseif ($social_stats_options == 1) {
+      $start_date = $cron_settings->get('date_offset');
+    }
+
+    $start_date = strtotime($start_date);
+    // Fetch node id and type for the content types,
+    // which has at least one social media selected and
+    // which are created after the date mentioned in module's configuration.
+    $connection = Database::getConnection();
+    $query = $connection->select('node_field_data', 'n')
+      ->fields('n', array('nid', 'type'))
+      ->condition('n.type', (empty($content_types) ? '0' : $content_types), 'in')
+      ->condition('n.created', $start_date, '>=')
+      ->execute();
+
+    $queue = Drupal::queue('social_stats_updater');
+    while ($result = $query->fetchObject()) {
+      if (!empty($result)) {
+        $queue->createItem($result);
+      }
+    }
+ }
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function social_stats_node_delete($node) {
+  // Delete all the social data on node deletion.
+  $connection = Database::getConnection();
+  $connection->delete('social_stats_facebook')
+    ->condition('nid', $node->nid)
+    ->execute();
+  $connection->delete('social_stats_twitter')
+    ->condition('nid', $node->nid)
+    ->execute();
+  $connection->delete('social_stats_linkedin')
+    ->condition('nid', $node->nid)
+    ->execute();
+  $connection->delete('social_stats_gplus')
+    ->condition('nid', $node->nid)
+    ->execute();
+  $connection->delete('social_stats_total')
+    ->condition('nid', $node->nid)
+    ->execute();
+}
+
+/**
+ * Fetch the data from Google+ and save it to local table.
+ *
+ * @param array $node
+ *   Contains $node->nid.
+ * @param string $node_path
+ *   The URL alias.
+ */
+function _social_stats_googleplus($node, $node_path = '') {
+  $gplus_like_count = _social_stats_googleplus_plusone($node_path);
+  $gplus_share_count = _social_stats_googleplus_share($node_path);
+  $gplus_count = $gplus_like_count + $gplus_share_count;
+
+  // Only update table if counter > 0
+  if ($gplus_count) {
+    $connection = Database::getConnection();
+    $connection->merge('social_stats_gplus')
+      ->key(array('nid' => $node->nid))
+      ->fields(
+        array(
+          'plusone' => $gplus_like_count,
+          'share' => $gplus_share_count,
+          'total' => $gplus_count,
+        )
+      )
+      ->execute();
+  }
+  return $gplus_count;
+}
+
+/**
+ * Function returning the number of times the node was +1ed.
+ */
+function _social_stats_googleplus_plusone($node_path) {
+  $gplus_like_count = 0;
+
+  // Build the JSON data for the API request.
+  $data['method'] = 'pos.plusones.get';
+  $data['id'] = 'p';
+  $data['params']['nolog'] = TRUE;
+  $data['params']['id'] = $node_path;
+  $data['params']['source'] = 'widget';
+  $data['params']['userId'] = '@viewer';
+  $data['params']['groupId'] = '@self';
+  $data['jsonrpc'] = '2.0';
+  $data['key'] = 'p';
+  $data['apiVersion'] = 'v1';
+
+  $url = 'https://clients6.google.com/rpc?key=AIzaSyCKSbrvQasunBoV16zDH9R33D88CeLr9gQ';
+  $options['data'] = json_encode($data);
+  $options['method'] = 'POST';
+  $options['headers']['Content-Type'] = 'application/json';
+
+  $request = Drupal::httpClient()->post($url, $options);
+
+  try {
+    $gplus_plusone_response = $request->json();
+  }
+  catch (RequestException $e) {
+    watchdog_exception('my_module', $e);
+  }
+
+  if (!empty($gplus_plusone_response['error']) || empty($gplus_plusone_response['data'])) {
+    \Drupal::logger('social_stats')->info('Problem updating data from Google+ for %node_path. Error: %err',
+      array('%node_path' => $node_path, '%err' => $gplus_plusone_response['error']));
+  }
+  else {
+    if (isset($request['data']['result']['metadata']['globalCounts']['count'])) {
+      $gplus_like_count = intval($request['data']['result']['metadata']['globalCounts']['count']);
+    }
+  }
+  return $gplus_like_count;
+}
+
+/**
+ * Function returning the number of times the node was shared.
+ */
+function _social_stats_googleplus_share($node_path) {
+  $gplus_share_count = 0;
+
+  $data = "f.req=%5B%22" . $node_path . "%22%2Cnull%5D&";
+  $url = "https://plus.google.com/u/0/ripple/update";
+
+  $options = array(
+    'headers' => array('Content-Type' => 'application/x-www-form-urlencoded'),
+    'data' => $data,
+    'method' => 'POST',
+  );
+  $request = Drupal::httpClient()->post($url, $options);
+
+  try {
+    $gplus_plusone_response = $request->json();
+  }
+  catch (RequestException $e) {
+    watchdog_exception('social_stats', $e);
+  }
+
+  $gplus_plusone_response['data'] = substr($gplus_plusone_response['data'], 6);
+  $gplus_plusone_response['data'] = str_replace(",,", ",null,", $gplus_plusone_response['data']);
+  $gplus_plusone_response['data'] = str_replace(",,", ",null,", $gplus_plusone_response['data']);
+  $result = $gplus_plusone_response['data'];
+
+  $gplus_share_count = $result[0][1][4];
+  return $gplus_share_count;
+}
