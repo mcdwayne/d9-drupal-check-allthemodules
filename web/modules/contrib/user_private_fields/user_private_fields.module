@@ -1,0 +1,251 @@
+<?php
+
+/**
+ * @file
+ * Contains user_private_fields.module..
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Config\Entity;
+use Drupal\Core\Field;
+use Drupal\Core\Database;
+use Drupal\Core\Access;
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Field\FieldDefinitionInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\Field\FieldItemListInterface;
+
+/**
+ * Implements hook_help().
+ *
+ * @param $route_name
+ * @param \Drupal\Core\Routing\RouteMatchInterface $route_match
+ * @return string
+ */
+
+function user_private_fields_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the user_private_fields module.
+    case 'help.page.user_private_fields':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Provides options for users to override visibility of their own fields.') . '</p>';
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * @param $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+
+function user_private_fields_form_field_config_edit_form_alter(&$form, FormStateInterface $form_state) {
+  $field = $form_state->getFormObject()->getEntity();
+  if ($field->getTargetEntityTypeId() != 'user') {
+    return;
+  }
+
+  $form['private_field'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Allow the user to hide this field\'s value by making it private.'),
+    '#default_value' => $field->getThirdPartySetting('user_private_fields', 'private_field', FALSE),
+  ];
+  $form['actions']['submit']['#submit'][] = 'user_private_fields_form_field_config_edit_form_submit';
+}
+
+/**
+ * Form submission handler for user_private_fields_form_field_config_edit_form_alter.
+ *
+ * @param array $form
+ *   The form array.
+ * @param FormStateInterface $form_state
+ *   The form state.
+ */
+
+function user_private_fields_form_field_config_edit_form_submit(&$form, FormStateInterface $form_state) {
+  $field = $form_state->getFormObject()->getEntity();
+  $form_fields = &$form_state->getValues();
+
+  // If the private option is checked, update settings.
+  if ($form_fields['private_field']) {
+    $field->setThirdPartySetting('user_private_fields', 'private_field', TRUE);
+    $field->save();
+  }
+  else {
+    if ($field->getThirdPartySetting('user_private_fields', 'private_field', FALSE)) {
+      user_private_fields_settings_update($field->toArray()['field_name']);
+    }
+    $field->unsetThirdPartySetting('user_private_fields', 'private_field');
+    $field->save();
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * @param $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+
+function user_private_fields_form_user_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $entity_field_definitions = \Drupal::entityManager()
+    ->getFieldDefinitions('user', 'user');
+  foreach ($entity_field_definitions as $field_key => $field_value) {
+    $selected_field = strpos($field_key, 'field');
+    if (!empty($field_value->isDisplayConfigurable('form'))) {
+      if ($selected_field === FALSE) {
+        continue;
+      }
+      else {
+        if ($field_value->getThirdPartySetting('user_private_fields', 'private_field', FALSE) && !empty($form[$field_key])) {
+          $user_id = user_private_fields_get_uid();
+          $query_default_value = \Drupal::database()
+            ->select('user_private_fields_value', 'upfv');
+          $query_default_value->fields('upfv');
+          $query_default_value->condition('upfv.uid', $user_id);
+          $query_default_value->condition('upfv.private_field_key', 'private_' . $field_key);
+          $default_value = $query_default_value->execute()->fetchField(3);
+
+          $form[$field_key]['private_' . $field_key] = [
+            '#type' => 'checkbox',
+            '#title' => t('Private'),
+            '#default_value' => $default_value,
+          ];
+        }
+      }
+    }
+  }
+  $form['actions']['submit']['#validate'][] = 'user_private_fields_form_user_form_validate';
+  $form['actions']['submit']['#submit'][] = 'user_private_fields_form_user_form_submit';
+}
+
+/**
+ * @param $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+function user_private_fields_form_user_form_validate(&$form, FormStateInterface $form_state) {
+  foreach ($form_state->getValues() as $field_key => $field_value) {
+    $selected_field = strpos($field_key, 'private_field');
+    if ($selected_field === FALSE) {
+      continue;
+    }
+    else {
+      $is_private = $form_state->getValue($field_key);
+      $field = explode('private_', $field_key);
+      if (empty($form_state->getValue($field)) && $is_private) {
+        $form_state->setErrorByName($field[1], $field[1] . ' is empty, Empty field is not allowed to make Private');
+      }
+    }
+  }
+
+}
+
+/**
+ * @param $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+
+function user_private_fields_form_user_form_submit(&$form, FormStateInterface $form_state) {
+  foreach ($form_state->getValues() as $field_key => $field_value) {
+    $selected_field = strpos($field_key, 'private_field');
+    if ($selected_field === FALSE) {
+      continue;
+    }
+    else {
+      $user_id = user_private_fields_get_uid();
+      $is_private = $form_state->getValue($field_key);
+      $values = [
+        'uid' => $user_id,
+        'private_field_key' => $field_key,
+        'private' => $is_private
+      ];
+      $query = \Drupal::database()->select('user_private_fields_value', 'upfv');
+      $query->fields('upfv');
+      $query->condition('upfv.private_field_key', $field_key);
+      $query->condition('upfv.uid', $user_id);
+      $result = $query->execute()->fetchAssoc();
+      if ((empty($result) && $is_private == 1)) {
+        $query_insert = \Drupal::database()
+          ->insert('user_private_fields_value')
+          ->fields($values);
+        $query_insert->execute();
+      }
+      elseif (!empty($result) && $is_private == 0) {
+        $query = \Drupal::database()->delete('user_private_fields_value');
+        $query->condition('private_field_key', $field_key);
+        $query->condition('uid', $user_id);
+        $query->execute();
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_field_access().
+ *
+ * @param $operation
+ * @param \Drupal\Core\Field\FieldDefinitionInterface $field_definition
+ * @param \Drupal\Core\Session\AccountInterface $account
+ * @param \Drupal\Core\Field\FieldItemListInterface|NULL $items
+ * @return bool
+ */
+
+function user_private_fields_entity_field_access($operation, FieldDefinitionInterface $field_definition, AccountInterface $account, FieldItemListInterface $items = NULL) {
+  $current_user_id = \Drupal::currentUser()->id();
+  $account = \Drupal::currentUser();
+  $private = _user_private_fields();
+  foreach ($private as $field_name) {
+    $field_name_explode = explode('private_', $field_name->private_field_key);
+    $uid_from_url = \Drupal::routeMatch()->getParameter('user');
+    if (!$account->hasPermission('access private fields') && !empty($uid_from_url)) {
+      $uid = $uid_from_url->get('uid')->value;
+      if ($operation == 'view' && $field_definition->getName() == $field_name_explode[1] && $uid != $current_user_id) {
+        return AccessResult::forbidden();
+      }
+    }
+  }
+  return AccessResult::allowed();
+}
+
+/**
+ * Helper function getting the private field settings.
+ */
+function _user_private_fields() {
+  $user_id = user_private_fields_get_uid();
+  $query = \Drupal::database()->select('user_private_fields_value', 'upfv');
+  $query->fields('upfv');
+  $query->condition('upfv.private', TRUE);
+  $query->condition('upfv.uid', $user_id);
+  $result = $query->execute()->fetchAll();
+  return $result;
+}
+
+/**
+ * Helper function to remove setting.
+ */
+function user_private_fields_settings_update($field_name) {
+  $query = \Drupal::database()->delete('user_private_fields_value');
+  $query->condition('private_field_key', 'private_' . $field_name);
+  $result = $query->execute();
+  return $result;
+}
+
+/**
+ * Helper function to get user id
+ */
+function user_private_fields_get_uid() {
+  $user_from_url = \Drupal::routeMatch()->getParameter('user');
+  if (!empty($user_from_url)) {
+    $uid_from_url = $user_from_url->get('uid')->value;
+  }
+  $current_user_id = \Drupal::currentUser()->id();
+  if ($current_user_id != $uid_from_url) {
+    return $uid_from_url;
+  }
+  else {
+    return $current_user_id;
+  }
+}
