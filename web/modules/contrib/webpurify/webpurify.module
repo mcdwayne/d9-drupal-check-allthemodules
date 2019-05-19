@@ -1,0 +1,537 @@
+<?php
+/**
+ * @file
+ * WebPurify integration for Drupal
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Language\Language;
+
+define('WEBPURIFY_VALIDATION_MODE', 'validation');
+define('WEBPURIFY_REWRITE_MODE', 'rewrite');
+define('WEBPURIFY_CREATE_FAILURE_MODE_NOTHING', 'nothing');
+define('WEBPURIFY_CREATE_FAILURE_MODE_BLOCK', 'block');
+define('WEBPURIFY_FILTER_CONFIG_TABLE_NAME', 'webpurify_fields');
+define('WEBPURIFY_FILTER_DISABLED', 0);
+define('WEBPURIFY_FILTER_ENABLED', 1);
+
+/**
+ * Implements hook_help().
+ */
+function webpurify_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.webpurify':
+      $output = '<p>The WebPurify module allows you to filter words or phrases in site content and replace the filtered words with the specified replacement symbol.</p>';
+      $output .= t('In order for filtering to work on the body text of a node or comment, you must activate the WebPurify filter in your input filters. Check your filter settings at !filter.', ['!filter' => '<a href="admin/settings/filters" target="_blank">Input Formats</a>']);
+
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_permission().
+ */
+function webpurify_permission() {
+  return [
+    'webpurify settings' => [
+      'title' => t('Manage WebPurify settings'),
+    ],
+  ];
+}
+
+/**
+ * Get list of filter modes.
+ */
+function webpurify_modes_list() {
+  return [
+    WEBPURIFY_REWRITE_MODE => t('Rewrite'),
+    WEBPURIFY_VALIDATION_MODE => t('Validation'),
+  ];
+}
+
+/**
+ * Get list of create failure modes.
+ */
+function webpurify_create_failure_modes_list() {
+  return [
+    WEBPURIFY_CREATE_FAILURE_MODE_NOTHING => t('Allow during failure'),
+    WEBPURIFY_CREATE_FAILURE_MODE_BLOCK => t('Block during failure'),
+  ];
+}
+
+/**
+ * Get current status of failure mode.
+ */
+function webpurify_failure_mode_status() {
+  return \Drupal::config('webpurify.settings')->get('webpurify_create_failure_mode');
+}
+
+/**
+ * Implements hook_entity_bundle_field_info_alter().
+ */
+function webpurify_entity_bundle_field_info_alter(&$fields, EntityTypeInterface $entity_type, $bundle) {
+  foreach ($fields as $field) {
+    if (in_array($field->getType(), ['text', 'text_long', 'text_with_summary', 'string', 'string_long'])) {
+      $fields[$field->getName()]->addConstraint('WebPurifyValidation', []);
+    }
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function webpurify_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+	$form_ids = [
+		'field_config_edit_form',
+		'node_type_edit_form',
+		'comment_type_edit_form',
+		'taxonomy_vocabulary_form',
+		'user_admin_settings',
+		'user_register_form',
+	];
+  if (in_array($form_id, $form_ids)) {
+    // Prepare common form of filter settings.
+    $filter_settings_form = [
+      'webpurify' => [
+        '#parents' => [],
+        '#type' => 'fieldset',
+        '#title' => t('WebPurify profanity filter'),
+        '#attributes' => [],
+        'webpurify_status' => [
+          '#title' => t('Enable WebPurify filter for this field'),
+          '#type' => 'checkbox',
+        ],
+        'webpurify_mode' => [
+          '#title' => t('Mode'),
+          '#type' => 'select',
+          '#options' => webpurify_modes_list(),
+          '#description' => t('Select how you want WebPurify to handle fields.'),
+        ],
+        'webpurify_validation_message' => [
+          '#title' => t('Validation message'),
+          '#type' => 'textfield',
+          '#description' => t('This is the text that will be appearing if node creation will be blocked via WebPurify.'),
+        ],
+      ],
+    ];
+
+    // Prepare states.
+    $filter_settings_form['webpurify']['webpurify_mode']['#states'] = [
+      'visible' => [
+        ':input[name="webpurify_status"]' => ['checked' => TRUE],
+      ],
+    ];
+    $filter_settings_form['webpurify']['webpurify_replacement_char']['#states'] = [
+      'visible' => [
+        ':input[name="webpurify_status"]' => [
+          'checked' => TRUE
+        ],
+        'select[name="webpurify_mode"]' => [
+          'value' => WEBPURIFY_REWRITE_MODE,
+        ],
+      ],
+    ];
+    $filter_settings_form['webpurify']['webpurify_validation_message']['#states'] = [
+      'visible' => [
+        'select[name="webpurify_mode"]' => [
+          'value' => WEBPURIFY_VALIDATION_MODE
+        ],
+        ':input[name="webpurify_status"]' => [
+          'checked' => TRUE
+        ],
+      ],
+    ];
+    $entity_info = $form_state->getFormObject();
+    switch ($form_id) {
+      case 'user_admin_settings':
+	      $field_id = webpurify_build_field_id('user', '', 'name');
+        $filter_info = webpurify_field_config_get($field_id);
+	      $filter_settings_form = webpurify_set_settings_form_default_values($filter_settings_form, $filter_info);
+	      $filter_settings_form['webpurify']['webpurify_status']['#title'] = t('Enable WebPurify filter for name field');
+        unset($filter_settings_form['webpurify']['webpurify_mode']['#options']['rewrite']);
+        $form = array_merge($form, $filter_settings_form);
+        $form['actions']['submit']['#submit'][] = 'webpurify_user_admin_settings_form_submit';
+        break;
+      case 'taxonomy_vocabulary_form':
+	      $field_id = webpurify_build_field_id(
+		      $entity_info->getEntity()->get('entityTypeId'),
+		      $entity_info->getEntity()->get('vid'),
+		      'name'
+	      );
+        $filter_info = webpurify_field_config_get($field_id);
+	      $filter_settings_form = webpurify_set_settings_form_default_values($filter_settings_form, $filter_info);
+        $filter_settings_form['webpurify']['webpurify_status']['#title'] = t('Enable WebPurify filter for subject field');
+        $form['third_party_settings'] = $filter_settings_form;
+        $form['actions']['submit']['#submit'][] = 'webpurify_taxonomy_vocabulary_form_submit';
+        break;
+      case 'comment_type_edit_form':
+	      $field_id = webpurify_build_field_id($entity_info->getEntity()->get('id'), '', 'subject');
+        $filter_info = webpurify_field_config_get($field_id);
+	      $filter_settings_form = webpurify_set_settings_form_default_values($filter_settings_form, $filter_info);
+	      $filter_settings_form['webpurify']['webpurify_status']['#title'] = t('Enable WebPurify filter for subject field');
+        $form['third_party_settings'] = $filter_settings_form;
+        $form['actions']['submit']['#submit'][] = 'webpurify_comment_type_edit_form_submit';
+        break;
+      case 'field_config_edit_form':
+        if (in_array($entity_info->getEntity()->getType(), ['string', 'string_long'])) {
+          // Get field config default values.
+	        $field_id = webpurify_build_field_id($entity_info->getEntity()->id());
+          $filter_info = webpurify_field_config_get($field_id);
+	        $filter_settings_form = webpurify_set_settings_form_default_values($filter_settings_form, $filter_info);
+	        $form['third_party_settings'] = array_merge($form['third_party_settings'], $filter_settings_form);
+          $form['actions']['submit']['#submit'][] = 'webpurify_field_config_edit_form_submit';
+        }
+        break;
+      case 'node_type_edit_form':
+	      $field_id = webpurify_build_field_id('node', $entity_info->getEntity()->get('type'), 'title');
+        $filter_info = webpurify_field_config_get($field_id);
+	      $filter_settings_form = webpurify_set_settings_form_default_values($filter_settings_form, $filter_info);
+        $filter_settings_form['webpurify']['webpurify_status']['#title'] = t('Enable WebPurify filter for title field');
+        $filter_settings_form['webpurify']['#group'] = 'additional_settings';
+        $filter_settings_form['webpurify']['#type'] = 'details';
+        $form['webpurify'] = reset($filter_settings_form);
+        $form['actions']['submit']['#submit'][] = 'webpurify_field_config_edit_form_submit';
+        break;
+    }
+  }
+
+  if (method_exists($form_state, 'getFormObject')) {
+    $form_state_object = $form_state->getFormObject();
+    if (method_exists($form_state_object, 'getEntity')) {
+      $entity = $form_state_object->getEntity();
+      // Alter node title validation.
+      if ($entity instanceof \Drupal\node\Entity\Node) {
+        $form['#validate'][] = 'webpurify_node_edit_form_validate';
+      }
+      elseif ($entity instanceof \Drupal\comment\Entity\Comment) {
+        $form['#validate'][] = 'webpurify_comment_edit_form_validate';
+      }
+      elseif ($entity instanceof \Drupal\taxonomy\Entity\Term) {
+        $form['#validate'][] = 'webpurify_taxonomy_term_edit_form_validate';
+      }
+      elseif ($entity instanceof \Drupal\user\Entity\User) {
+        $form['#validate'][] = 'webpurify_user_register_form_validate';
+      }
+    }
+  }
+}
+
+/**
+ * Provide default values for WebPurify settings form.
+ */
+function webpurify_set_settings_form_default_values(array $filter_settings_form, array $filter_info = []) {
+	$filter_settings_form['webpurify']['webpurify_status']['#default_value'] = !empty($filter_info['data']['mode'])
+		? $filter_info['data']['status']
+		: NULL;
+	$filter_settings_form['webpurify']['webpurify_mode']['#default_value'] = !empty($filter_info['data']['mode'])
+		? $filter_info['data']['mode']
+		: NULL;
+	$filter_settings_form['webpurify']['webpurify_validation_message']['#default_value'] = !empty($filter_info['data']['validation_message'])
+		? $filter_info['data']['validation_message']
+		: '';
+
+	return $filter_settings_form;
+}
+
+/**
+ * Validation handler for the user_register entity form.
+ */
+function webpurify_user_register_form_validate($form, FormStateInterface $form_state) {
+	$field_id = webpurify_build_field_id('user', '', 'name');
+  $filter_info = webpurify_field_config_get($field_id);
+  if (isset($filter_info['data']['status'])
+    && $filter_info['data']['status']
+    && !empty($filter_info['data']['mode'])
+    && $filter_info['data']['mode'] == WEBPURIFY_VALIDATION_MODE
+  ) {
+    $user_name = $form_state->getValue('name');
+    if (!empty($user_name)) {
+      $webpurify_api = \Drupal::service('webpurify.api');
+      $count = (bool) $webpurify_api->count($user_name);
+      if ($count) {
+        $form_state->setErrorByName('name', $filter_info['data']['validation_message']);
+      }
+    }
+  }
+}
+
+/**
+ * Submit handler for the user settings form.
+ */
+function webpurify_user_admin_settings_form_submit(array &$form, FormStateInterface $form_state) {
+  $filter_config = [
+    'mode' => $form_state->getValue('webpurify_mode'),
+    'validation_message' => $form_state->getValue('webpurify_validation_message'),
+    'status' => $form_state->getValue('webpurify_status'),
+  ];
+  // Prepare field id.
+	$field_id = webpurify_build_field_id('user', '', 'name');
+  webpurify_field_config_set($field_id, 'user', 'user', 'name', $filter_config);
+}
+
+/**
+ * Validation handler for the taxonomy term edit form.
+ */
+function webpurify_taxonomy_term_edit_form_validate($form, FormStateInterface $form_state) {
+  $vid = $form_state->getValue('vid');
+  $vocabulary = \Drupal\taxonomy\Entity\Vocabulary::load($vid);
+	$field_id = webpurify_build_field_id($vocabulary->get('entityTypeId'), $vocabulary->get('vid'), 'name');
+  $filter_info = webpurify_field_config_get($field_id);
+  if (isset($filter_info['data']['status'])
+    && $filter_info['data']['status']
+    && !empty($filter_info['data']['mode'])
+    && $filter_info['data']['mode'] == WEBPURIFY_VALIDATION_MODE
+  ) {
+    $taxonomy_term_name = $form_state->getValue('name');
+    if (!empty($taxonomy_term_name[0]['value'])) {
+      $webpurify_api = \Drupal::service('webpurify.api');
+      $count = (bool) $webpurify_api->count($taxonomy_term_name[0]['value']);
+      if ($count) {
+        $form_state->setErrorByName('name', $filter_info['data']['validation_message']);
+      }
+    }
+  }
+}
+
+/**
+ * Submit handler for the taxonomy vocabulary edit form.
+ */
+function webpurify_taxonomy_vocabulary_form_submit(array &$form, FormStateInterface $form_state) {
+  $entity = $form_state->getFormObject()->getEntity();
+  $filter_config = [
+    'mode' => $form_state->getValue('webpurify_mode'),
+    'validation_message' => $form_state->getValue('webpurify_validation_message'),
+    'status' => $form_state->getValue('webpurify_status'),
+  ];
+  // Prepare field id.
+	$field_id = webpurify_build_field_id($entity->get('entityTypeId'), $entity->get('vid'), 'name');
+  webpurify_field_config_set($field_id, $entity->get('entityTypeId'), $entity->get('vid'), 'name', $filter_config);
+}
+
+/**
+ * Validation handler for the comment edit form.
+ */
+function webpurify_comment_edit_form_validate($form, FormStateInterface $form_state) {
+	$field_id = webpurify_build_field_id('comment', '', 'subject');
+  $filter_info = webpurify_field_config_get($field_id);
+  if (isset($filter_info['data']['status'])
+    && $filter_info['data']['status']
+    && !empty($filter_info['data']['mode'])
+    && $filter_info['data']['mode'] == WEBPURIFY_VALIDATION_MODE
+  ) {
+    $comment_subject = $form_state->getValue('subject');
+    if (!empty($comment_subject[0]['value'])) {
+      $webpurify_api = \Drupal::service('webpurify.api');
+      $count = (bool) $webpurify_api->count($comment_subject[0]['value']);
+      if ($count) {
+        $form_state->setErrorByName('title', $filter_info['data']['validation_message']);
+      }
+    }
+  }
+}
+
+/**
+ * Submit handler for the comment type edit form.
+ */
+function webpurify_comment_type_edit_form_submit(array &$form, FormStateInterface $form_state) {
+  $entity = $form_state->getFormObject()->getEntity();
+  $filter_config = [
+    'mode' => $form_state->getValue('webpurify_mode'),
+    'validation_message' => $form_state->getValue('webpurify_validation_message'),
+    'status' => $form_state->getValue('webpurify_status'),
+  ];
+  // Prepare field id.
+  $field_id = $entity->get('id') . '.subject';
+  webpurify_field_config_set($field_id, 'comment', $entity->get('target_entity_type_id'), 'subject', $filter_config);
+}
+
+/**
+ * Validation handler for the node edit form.
+ */
+function webpurify_node_edit_form_validate($form, FormStateInterface $form_state) {
+  $node_type = $form_state->getFormObject()->getEntity()->getType();
+	$field_id = webpurify_build_field_id('node', $node_type, 'title');
+  $filter_info = webpurify_field_config_get($field_id);
+  if (isset($filter_info['data']['status'])
+    && $filter_info['data']['status']
+    && !empty($filter_info['data']['mode'])
+    && $filter_info['data']['mode'] == WEBPURIFY_VALIDATION_MODE
+  ) {
+    $node_title = $form_state->getValue('title');
+    if (!empty($node_title[0]['value'])) {
+      $webpurify_api = \Drupal::service('webpurify.api');
+      $count = (bool) $webpurify_api->count($node_title[0]['value']);
+      if ($count) {
+        $form_state->setErrorByName('subject', $filter_info['data']['validation_message']);
+      }
+    }
+  }
+}
+
+/**
+ * Submit handler for the field config edit form.
+ */
+function webpurify_field_config_edit_form_submit(array &$form, FormStateInterface $form_state) {
+  $entity = $form_state->getFormObject()->getEntity();
+  $filter_config = [
+    'mode' => $form_state->getValue('webpurify_mode'),
+    'validation_message' => $form_state->getValue('webpurify_validation_message'),
+    'status' => $form_state->getValue('webpurify_status'),
+  ];
+
+  // Prepare entity info.
+  $type = method_exists($entity, 'getType') ? $entity->getType() : NULL;
+  $type = !empty($type) ?  $type : $entity->get('type');
+  $field_name = method_exists($entity, 'getName') ? $entity->getName() : NULL;
+  $field_name = !empty($field_name) ? $field_name : $entity->get('name');
+
+  // Prepare field id.
+  if ($entity instanceof \Drupal\node\Entity\NodeType) {
+    $field_id = 'node.' . $type . '.title';
+    $field_name = 'title';
+  }
+  else {
+    $field_id = $entity->id();
+  }
+
+  webpurify_field_config_set($field_id, $type, $entity->bundle(), $field_name, $filter_config);
+}
+
+/**
+ * Set filter config for field instance.
+ */
+function webpurify_field_config_set($id, $entity_type, $bundle, $field_name, array $data = []) {
+  \Drupal::database()->merge(WEBPURIFY_FILTER_CONFIG_TABLE_NAME)
+    ->key('id', $id)
+    ->fields([
+      'entity_type' => $entity_type,
+      'bundle' => $bundle,
+      'field_name' => $field_name,
+      'data' => json_encode($data),
+    ])
+    ->execute();
+
+  return TRUE;
+}
+
+/**
+ * Get filter config for field instance.
+ */
+function webpurify_field_config_get($id, $entity_type = NULL, $bundle = NULL, $field_name = NULL, array $default = []) {
+  $conditions = [
+    'entity_type' => $entity_type,
+    'bundle' => $bundle,
+    'field_name' => $field_name,
+  ];
+
+  $query = \Drupal::database()->select(WEBPURIFY_FILTER_CONFIG_TABLE_NAME);
+  $query->fields(WEBPURIFY_FILTER_CONFIG_TABLE_NAME, []);
+  $query->condition('id', $id, '=');
+  foreach ($conditions as $field_name => $field_value) {
+    if (isset($field_value)) {
+      $query->condition($field_name, $field_value, '=');
+    }
+  }
+  $result = $query->execute()->fetchAssoc();
+  if (!empty($result['data'])) {
+    $result['data'] = (array) json_decode($result['data']);
+  }
+
+  return !empty($result) ? $result : $default;
+}
+
+/**
+ * Preprocess variables for comment.tpl.php.
+ */
+function webpurify_preprocess_comment(&$variables) {
+  $comment = $variables['elements']['#comment'];
+	$field_id = webpurify_build_field_id('comment', '', 'subject');
+  $filter_info = webpurify_field_config_get($field_id);
+	$subject = $comment->getSubject();
+	$subject = webpurify_replace_text($subject);
+  if (isset($filter_info['data']['status'])
+    && $filter_info['data']['status']
+    && !empty($filter_info['data']['mode'])
+    && $filter_info['data']['mode'] == WEBPURIFY_REWRITE_MODE
+  ) {
+    if (isset($comment->in_preview)) {
+      $variables['title'] = \Drupal::l($subject, new Url('<front>'));
+      $variables['permalink'] = \Drupal::l(t('Permalink'), new Url('<front>'));
+    }
+    else {
+      $uri = $comment->urlInfo();
+      $attributes = $uri->getOption('attributes') ?: [];
+      $attributes += ['class' => ['permalink'], 'rel' => 'bookmark'];
+      $uri->setOption('attributes', $attributes);
+      $variables['title'] = \Drupal::l($subject, $uri);
+      $variables['permalink'] = \Drupal::l(t('Permalink'), $comment->permalink());
+    }
+  }
+}
+
+/**
+ * Preprocess variables for field.tpl.php.
+ */
+function webpurify_preprocess_field(&$variables, $hook) {
+  $element = $variables['element'];
+  if (!empty($element['#field_type']) && in_array($element['#field_type'], ['string', 'string_long'])) {
+	  $field_id = webpurify_build_field_id($element['#entity_type'], $element['#bundle'], $element['#field_name']);
+    if ($filter_info = webpurify_field_config_get($field_id)) {
+      if (isset($filter_info['data']['status'])
+        && $filter_info['data']['status']
+        && !empty($filter_info['data']['mode'])
+        && $filter_info['data']['mode'] == WEBPURIFY_REWRITE_MODE
+      ) {
+        $text = $variables['items'][0]['content']['#context']['value'];
+        $variables['items'][0]['content']['#context']['value'] = webpurify_replace_text($text);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_load().
+ */
+function webpurify_entity_load(array $entities, $entity_type_id) {
+  foreach ($entities as $entity) {
+    if ($entity instanceof Drupal\taxonomy\Entity\Term && method_exists($entity, 'getName')) {
+      $vid = $entity->get('vid')->getValue();
+      if (!empty($vid[0]['target_id'])) {
+        $vocabulary = \Drupal\taxonomy\Entity\Vocabulary::load($vid[0]['target_id']);
+        $field_id = webpurify_build_field_id($vocabulary->get('entityTypeId'), $vocabulary->get('vid'), 'name');
+        $filter_info = webpurify_field_config_get($field_id);
+
+        if (isset($filter_info['data']['status'])
+          && $filter_info['data']['status']
+          && !empty($filter_info['data']['mode'])
+          && $filter_info['data']['mode'] == WEBPURIFY_REWRITE_MODE
+        ) {
+          $name = $entity->getName();
+					$filtered_name = webpurify_replace_text($name);
+          $entity->setName($filtered_name);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Build field id value.
+ */
+function webpurify_build_field_id($entity_type = '', $entity_bundle = '', $field_name = '') {
+	return implode('.', array_filter([$entity_type, $entity_bundle, $field_name], 'strlen'));
+}
+
+/**
+ * Replace all profanity words.
+ */
+function webpurify_replace_text($text = '') {
+	$config = \Drupal::config('webpurify.settings');
+	$replacement_char = $config->get('replacement_char');
+	$web_purify = \Drupal::service('webpurify.api');
+	return $web_purify->replace($text, $replacement_char);
+}
