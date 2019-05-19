@@ -1,0 +1,692 @@
+<?php
+
+/**
+ * @file
+ * Contains controlled_fields.module.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\Entity\EntityFormDisplay;
+use Drupal\Core\Field\FieldConfigInterface;
+use Drupal\Core\Form\FormState;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Component\Utility\UrlHelper;
+
+const CONTROLLED_FIELDS_DELIM = '___';
+
+/**
+ * Implements hook_help().
+ */
+function controlled_fields_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.controlled_fields':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Enable fields to be visible or not dependent on their controlling field.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Fetch the field definitions.
+ */
+function controlled_fields_fetch_field_definitions($entity_type, $bundle, $field_definitions = NULL) {
+  if ($field_definitions === NULL) {
+    $field_definitions = \Drupal::service('entity_field.manager')->getFieldDefinitions($entity_type, $bundle);
+  }
+
+  $field_definitions = array_filter($field_definitions, function ($field_definition) {
+    return $field_definition instanceof FieldConfigInterface;
+  });
+
+  uasort($field_definitions, ['\Drupal\Core\Config\Entity\ConfigEntityBase', 'sort']);
+
+  return $field_definitions;
+}
+
+/**
+ * Implements hook_field_widget_third_party_settings_form().
+ */
+function controlled_fields_field_widget_third_party_settings_form($plugin, $field_definition, $form_mode, $form, $form_state) {
+  $plugin_parent_conditional = $plugin->getThirdPartySetting('controlled_fields', 'parent_conditional');
+  $plugin_parent_conditional_value = $plugin->getThirdPartySetting('controlled_fields', 'parent_conditional_value');
+
+  $element['parent_conditional'] = [
+    '#type' => 'textfield',
+    '#title' => t('Parent conditional controlling field'),
+    '#description' => t('Machine name of the parent conditional controlling field.'),
+    '#default_value' => isset($plugin_parent_conditional) ? $plugin_parent_conditional : NULL,
+  ];
+
+  $element['parent_conditional_value'] = [
+    '#type' => 'textfield',
+    '#title' => t('Parent conditional controlling field value'),
+    '#description' => t('The value that the parent must be set to for this field to show.'),
+    '#default_value' => isset($plugin_parent_conditional_value) ? $plugin_parent_conditional_value : NULL,
+  ];
+
+  return $element;
+}
+
+/**
+ * Check to see if entity + bundle is controlled.
+ */
+function controlled_fields_check_controlled($entity_type_id, $bundle) {
+  $config = \Drupal::configFactory()->get('controlled_fields.forms');
+  $data = $config->get();
+  $form_id = controlled_fields_config_id($entity_type_id, $bundle);
+  return isset($data['forms'][$form_id]);
+}
+
+/**
+ * Generate config friendly form id.
+ */
+function controlled_fields_config_id($entity_type, $bundle) {
+  return $entity_type . CONTROLLED_FIELDS_DELIM . $bundle;
+}
+
+/**
+ * Convert config id to form id.
+ */
+function controlled_fields_config_form_id($id) {
+  return str_replace(CONTROLLED_FIELDS_DELIM, '.', $id);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_prepare_form().
+ */
+function controlled_fields_field_config_prepare_form(EntityInterface $entity, $operation, FormStateInterface $form_state) {
+  $is_required = $entity->getThirdPartySetting('controlled_fields', 'required', 0);
+  if ($is_required === 1) {
+    $entity->setRequired(TRUE);
+  }
+}
+
+/**
+ * Implements hook_filter_form_values_filter_functions().
+ */
+function controlled_fields_filter_form_values_filter_functions($form, $form_state) {
+  $storage = $form_state->getStorage();
+  if (!isset($storage['form_display'])) {
+    return;
+  }
+
+  $form_display = $storage['form_display'];
+  $entity = $form_state->getFormObject()->getEntity();
+  $bundle = $form_display->getTargetBundle();
+  $entity_type_id = $form_display->getTargetEntityTypeId();
+
+  if (controlled_fields_check_controlled($entity_type_id, $bundle)) {
+    return 'controlled_fields_filter_form_value';
+  }
+
+  return NULL;
+}
+
+/**
+ * Determine whether a form value should be filtered out.
+ */
+function controlled_fields_filter_form_value($form, $form_display, $form_state_values, $entity, $field_name, $field_definition) {
+  // Workflow fields can't be filtered.
+  if ($field_definition->getType() == 'workflow') {
+    return FALSE;
+  }
+
+  $module_handler = \Drupal::moduleHandler();
+  $is_accessible = controlled_fields_check_access($form_display, $form_state_values, $field_name, 'edit');
+
+  $check_other_accessible = $module_handler->invokeAll('check_form_field_access', [
+    $form_display, $form_state_values, $field_name, $form, 'edit',
+  ]);
+
+  foreach ($check_other_accessible as $other_accessible) {
+    $is_accessible = $is_accessible && $other_accessible;
+  }
+
+  return ($is_accessible === FALSE);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_presave().
+ */
+function controlled_fields_field_config_presave(EntityInterface $entity) {
+  $is_controlled = controlled_fields_check_controlled($entity->getTargetEntityTypeId(), $entity->getTargetBundle());
+  if ($is_controlled) {
+    if ($entity->isRequired()) {
+      $entity->setRequired(FALSE)
+        ->setThirdPartySetting('controlled_fields', 'required', 1);
+    }
+  }
+}
+
+/**
+ * Implements hook_FORM_ID_alter().
+ */
+function controlled_fields_form_field_config_edit_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $entity = $form_state->getFormObject()->getEntity();
+  $is_controlled = controlled_fields_check_controlled($entity->getTargetEntityTypeId(), $entity->getTargetBundle());
+  if ($is_controlled) {
+    $form['actions']['submit']['#submit'][] = 'controlled_fields_form_field_config_edit_form_submit';
+  }
+}
+
+/**
+ * Custom field_config_edit_form submit.
+ */
+function controlled_fields_form_field_config_edit_form_submit(&$form, FormStateInterface $form_state) {
+  // Field config is controlled if we are inside this function.
+  $entity = $form_state->getFormObject()->getEntity();
+  $form_state_values = $form_state->getValues();
+  if (isset($form_state_values['required'])) {
+    $entity->setThirdPartySetting('controlled_fields', 'required', $form_state_values['required'])->save();
+  }
+}
+
+/**
+ * Store/restore the required field config setting into third party settings.
+ */
+function controlled_fields_field_config_change_required($field_definitions, $has_controlled) {
+  foreach ($field_definitions as $field_name => $field_definition) {
+    if ($has_controlled) {
+      if ($field_definition->isRequired()) {
+        // Store.
+        $field_definition->setRequired(FALSE)
+          ->setThirdPartySetting('controlled_fields', 'required', 1)
+          ->save();
+      }
+    }
+    else {
+      if ($field_definition->getThirdPartySetting('controlled_fields', 'required', 0) === 1) {
+        // Restore.
+        $field_definition->setRequired(TRUE)
+          ->unsetThirdPartySetting('controlled_fields', 'required')
+          ->save();
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_field_widget_settings_summary_alter().
+ */
+function controlled_fields_field_widget_settings_summary_alter(&$summary, $context) {
+  $plugin_parent_conditional = $context['widget']->getThirdPartySetting('controlled_fields', 'parent_conditional');
+  $plugin_parent_conditional_value = $context['widget']->getThirdPartySetting('controlled_fields', 'parent_conditional_value');
+
+  if ($plugin_parent_conditional) {
+    $summary[] = [
+      '#theme' => 'controlled_fields_settings_summary',
+      '#parent_name' => $plugin_parent_conditional,
+      '#parent_value' => $plugin_parent_conditional_value,
+    ];
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function controlled_fields_form_entity_form_display_edit_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $form['#attached']['library'][] = 'controlled_fields/controlled_fields_field_ui';
+  $form['actions']['submit']['#submit'][] = 'controlled_fields_form_entity_form_display_edit_form_submit';
+}
+
+/**
+ * Custom entity_form_display_edit_form submit handler.
+ */
+function controlled_fields_form_entity_form_display_edit_form_submit(array &$form, FormStateInterface $form_state) {
+  // Check if any fields are conditional, if so, add this form to the list.
+  $entity_type = $form['#entity_type'];
+  $bundle = $form['#bundle'];
+  $form_display = $form['#context'];
+  $form_mode = $form_display->getMode();
+
+  $field_definitions = controlled_fields_fetch_field_definitions($entity_type, $bundle);
+  $field_names = $form['#fields'];
+
+  $has_controlled = FALSE;
+  foreach ($field_names as $field_name) {
+    $widget = $form_display->getRenderer($field_name);
+    if ($widget) {
+      $plugin_parent_conditional = $widget->getThirdPartySetting('controlled_fields', 'parent_conditional');
+      if ($plugin_parent_conditional) {
+        controlled_fields_enable_form_display($entity_type, $bundle, $form_mode, TRUE);
+        $has_controlled = TRUE;
+        break;
+      }
+    }
+  }
+
+  if (!$has_controlled) {
+    controlled_fields_enable_form_display($entity_type, $bundle, $form_mode, FALSE);
+  }
+
+  // Store/restore required settings.
+  controlled_fields_field_config_change_required($field_definitions, $has_controlled);
+}
+
+/**
+ * Add a form display mode to enabled list.
+ */
+function controlled_fields_enable_form_display($entity_type, $bundle, $form_mode, $enabled = TRUE) {
+  if ($enabled) {
+    $config = \Drupal::configFactory()->getEditable('controlled_fields.forms');
+    $data = $config->get();
+    $form_id = controlled_fields_config_id($entity_type, $bundle);
+
+    if (!isset($data['forms'][$form_id])) {
+      $data['forms'][$form_id] = [];
+    }
+
+    $data['forms'][$form_id][$form_mode] = TRUE;
+    $config->setData($data)->save();
+  }
+  else {
+    $config = \Drupal::configFactory()->getEditable('controlled_fields.forms');
+    $data = $config->get();
+    $form_id = controlled_fields_config_id($entity_type, $bundle);
+
+    unset($data['forms'][$form_id][$form_mode]);
+
+    if (isset($data['forms'][$form_id]) && count($data['forms'][$form_id]) === 0) {
+      unset($data['forms'][$form_id]);
+    }
+
+    $config->setData($data)->save();
+  }
+}
+
+/**
+ * Add controlled required class to form array field.
+ */
+function controlled_fields_add_required_class(&$form_field) {
+  $form_field['#attributes']['class'][] = 'controlled-required';
+}
+
+/**
+ * Implements hook_inline_entity_form_entity_form_alter().
+ */
+function controlled_fields_inline_entity_form_entity_form_alter(&$entity_form, &$form_state) {
+  controlled_fields_entity_form_alter($entity_form, $form_state);
+}
+
+/**
+ * Alter an entity form.
+ */
+function controlled_fields_entity_form_alter(&$form, &$form_state, $bundle = NULL) {
+  $storage = $form_state->getStorage();
+  $form_display = $storage['form_display'];
+  $form_mode = $form_display->getMode();
+  $enabled_forms = \Drupal::configFactory()->get('controlled_fields.forms')->get('forms');
+
+  if (isset($form['#entity'])) {
+    $entity = $form['#entity'];
+    $entity_type = $entity->getEntityTypeId();
+    $bundle = $entity->bundle();
+    $form_display = EntityFormDisplay::collectRenderDisplay($entity, $form_mode);
+  }
+  else {
+    $entity_type = $form_display->getTargetEntityTypeId();
+    $bundle = $form_display->getTargetBundle();
+  }
+
+  foreach ($enabled_forms as $config_id => $display_modes) {
+    // Check form id.
+    if (controlled_fields_config_form_id($config_id) != ($entity_type . '.' . $bundle)) {
+      continue;
+    }
+
+    // Check form mode.
+    if (!array_key_exists($form_mode, $display_modes)) {
+      continue;
+    }
+
+    $has_required = FALSE;
+
+    $field_definitions = controlled_fields_fetch_field_definitions($form_display->getTargetEntityTypeId(), $form_display->getTargetBundle());
+    foreach ($field_definitions as $field_name => $field_definition) {
+      $widget = $form_display->getRenderer($field_name);
+      if ($widget === NULL) {
+        continue;
+      }
+
+      $plugin_parent_conditional = $widget->getThirdPartySetting('controlled_fields', 'parent_conditional', NULL);
+      $plugin_parent_conditional_value = $widget->getThirdPartySetting('controlled_fields', 'parent_conditional_value');
+
+      if (!empty($plugin_parent_conditional)) {
+        // Add in conditional classes.
+        $form[$plugin_parent_conditional]['#attributes']['class'][] = 'controlled-master controlled-master-' . str_replace('_', '-', $plugin_parent_conditional);
+        $form[$field_name]['#attributes']['class'][] = 'controlled-dependent controlled-dependent-value-' . $plugin_parent_conditional_value . ' controlled-dependent-field-' . str_replace('_', '-', $plugin_parent_conditional);
+      }
+
+      // Required handling.
+      if ($field_definition->getThirdPartySetting('controlled_fields', 'required', 0) === 1) {
+        controlled_fields_add_required_class($form[$field_name]);
+        $has_required = TRUE;
+      }
+
+      // Check field collections for required fields.
+      // @TODO finish this or create some kind of hook / plugin solution.
+      if ($field_definition->getType() == 'field_collection') {
+        $fc_definitions = controlled_fields_fetch_field_definitions('field_collection_item', $field_name);
+
+        foreach ($fc_definitions as $fc_name => $fc_definition) {
+          if ($fc_definition->getThirdPartySetting('controlled_fields', 'required', 0) === 1) {
+            foreach (Element::children($form[$field_name]['widget']) as $widget_key) {
+              if ($widget_key !== 'add_more') {
+                $form[$field_name]['widget'][$widget_key][$fc_name]['#attributes']['class'][] = 'controlled-required';
+              }
+            }
+
+            $has_required = TRUE;
+          }
+        }
+      }
+
+      $form[$field_name]['#attributes']['class'][] = 'controlled-field';
+    }
+
+    $form['#attached']['library'][] = 'controlled_fields/controlled_fields_form';
+
+    if ($has_required) {
+      $form['actions']['submit']['#validate'][] = 'controlled_fields_form_validate';
+    }
+  }
+
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function controlled_fields_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // Check for an entity form.
+  if (isset($form['#entity_builders'])) {
+    $storage = $form_state->getStorage();
+    if (!isset($storage['form_display'])) {
+      return;
+    }
+
+    controlled_fields_entity_form_alter($form, $form_state);
+    return;
+  }
+}
+
+/**
+ * Check if form state value is valid, which is like isEmpty on field widgets.
+ */
+function controlled_fields_form_value_valid($widget, $form_state_value_field, $field_definition) {
+  $valid = NULL;
+
+  // @TODO Can this be done easier... extractFormValues?
+  if (method_exists($widget, 'isValueValid') && isset($form_state_value_field)) {
+    $valid = $widget->isValueValid($form_state_value_field);
+  }
+  else {
+    if ($field_definition->getType() == 'file') {
+      $valid = isset($form_state_value_field[0]['fids'][0]);
+    }
+    elseif ($field_definition->getType() == 'boolean') {
+      $valid = !empty($form_state_value_field['value']);
+    }
+    elseif ($field_definition->getType() == 'link') {
+      $valid = ($form_state_value_field[0]['uri'] !== '' && UrlHelper::isValid($form_state_value_field[0]['uri'], TRUE));
+    }
+    elseif (is_array($form_state_value_field) &&
+      array_key_exists(0, $form_state_value_field) &&
+      is_array($form_state_value_field[0]) &&
+      array_key_exists('value', $form_state_value_field[0])) {
+
+      $valid = !(empty($form_state_value_field[0]['value']) &&
+        $form_state_value_field[0]['value'] !== '0');
+    }
+    elseif (is_array($form_state_value_field) &&
+      array_key_exists('value', $form_state_value_field)) {
+
+      $valid = !(empty($form_state_value_field['value']) &&
+        $form_state_value_field['value'] !== '0');
+    }
+    elseif (empty($form_state_value_field) ||
+      is_array($form_state_value_field) &&
+      array_key_exists('0', $form_state_value_field) &&
+      is_array($form_state_value_field[0]) &&
+      array_key_exists('value', $form_state_value_field[0]) &&
+      $form_state_value_field[0]['value'] === NULL) {
+
+      $valid = FALSE;
+    }
+  }
+
+  return $valid;
+}
+
+/**
+ * Custom form validation handling.
+ */
+function controlled_fields_form_validate(&$form, FormStateInterface $form_state) {
+  // Fire original entity form validation.
+  $form_state->getFormObject()->validateForm($form, $form_state);
+
+  $form_display = $form_state->getStorage()['form_display'];
+  $field_definitions = controlled_fields_fetch_field_definitions($form_display->getTargetEntityTypeId(), $form_display->getTargetBundle());
+  $form_state_values = $form_state->getValues();
+  $entity = $form_state->getFormObject()->getEntity();
+
+  $entity_type_manager = \Drupal::entityTypeManager();
+  $module_handler = \Drupal::moduleHandler();
+
+  // @TODO cardinality handling. Probably requires a 'how many required' field.
+  foreach ($field_definitions as $field_name => $field_definition) {
+    $is_accessible = controlled_fields_check_access($form_display, $form_state_values, $field_name);
+
+    $check_other_accessible = $module_handler->invokeAll('check_form_field_access', [
+      $form_display, $form_state_values, $field_name, $form, 'edit',
+    ]);
+
+    foreach ($check_other_accessible as $other_accessible) {
+      $is_accessible = $is_accessible && $other_accessible;
+    }
+
+    if ($is_accessible && array_key_exists($field_name, $form_state_values)) {
+      if ($field_definition->getType() == 'field_collection') {
+
+        $fc_field_definitions = controlled_fields_fetch_field_definitions('field_collection_item', $field_name);
+
+        $fc_form_display = $entity_type_manager->getStorage('entity_form_display')->load('field_collection_item.' . $field_name . '.default');
+
+        foreach ($fc_field_definitions as $fc_field_name => $fc_field_definition) {
+          $fc_field_widget = $fc_form_display->getRenderer($fc_field_name);
+
+          // Check for access limiting.
+          $access_limited = FALSE;
+          foreach (Element::children($form[$field_name]['widget']) as $fc_widget_key) {
+            if ($fc_widget_key !== 'add_more') {
+              if (isset($form[$field_name]['widget'][$fc_widget_key]['#access'])) {
+                $access_limited = TRUE;
+              }
+            }
+          }
+
+          if ($access_limited) {
+            foreach (Element::children($form[$field_name]['widget']) as $fc_widget_key) {
+              if ($fc_widget_key !== 'add_more') {
+                if (!(isset($form[$field_name]['widget'][$fc_widget_key]['#access']) &&
+                  $form[$field_name]['widget'][$fc_widget_key]['#access'] === FALSE)) {
+                  $is_valid = controlled_fields_form_value_valid($fc_field_widget, $form_state_values[$field_name][$fc_widget_key][$fc_field_name], $fc_field_definition);
+                  $is_required = $fc_field_definition->getThirdPartySetting('controlled_fields', 'required', 0);
+
+                  if ($is_required === 1 && $is_valid === FALSE) {
+                    drupal_set_message(t('Please complete the highlighted field(s) below.'), 'error');
+
+                    $form_state->setErrorByName($field_name . '][' . $fc_widget_key . '][' . $fc_field_name);
+                  }
+                }
+              }
+            }
+          }
+          else {
+            // @todo fix this cardinality issue.
+            // Just check the first lot.
+            $is_valid = controlled_fields_form_value_valid($fc_field_widget, $form_state_values[$field_name][0][$fc_field_name], $fc_field_definition);
+            $is_required = $fc_field_definition->getThirdPartySetting('controlled_fields', 'required', 0);
+
+            if ($is_required === 1 && $is_valid === FALSE) {
+              drupal_set_message(t('Please complete the highlighted field(s) below.'), 'error');
+
+              $form_state->setErrorByName($field_name . '][0][' . $fc_field_name);
+            }
+          }
+        }
+      }
+      // Not field collection.
+      else {
+
+        $widget = $form_display->getRenderer($field_name);
+
+        $is_valid = NULL;
+        if (isset($form_state_values[$field_name])) {
+          $is_valid = controlled_fields_form_value_valid($widget, $form_state_values[$field_name], $field_definition);
+        }
+
+        $check_other_valid = $module_handler->invokeAll('check_form_field_valid', [
+          $form_display, $form_state_values, $field_definition, $field_name,
+        ]);
+
+        foreach ($check_other_valid as $other_valid) {
+          $is_valid = $is_valid && $other_valid;
+        }
+
+        $is_required = $field_definition->getThirdPartySetting('controlled_fields', 'required', 0);
+
+        $check_other_required = $module_handler->invokeAll('check_form_field_required', [
+          $form_display, $form_state_values, $field_definition, $field_name,
+        ]);
+
+        foreach ($check_other_required as $other_required) {
+          $is_required = $is_required && $other_required;
+        }
+
+        if ($is_required === 1 && $is_valid === FALSE) {
+          drupal_set_message(t('Please complete the highlighted field(s) below.'), 'error');
+
+          $form_state->setErrorByName($field_name);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Recursively check if fields are accessible.
+ */
+function controlled_fields_check_access(&$form_display, &$values, $field_name, $access_type = 'edit', $conditional_value = NULL) {
+  $accessible = TRUE;
+
+  $widget = $form_display->getRenderer($field_name);
+  if ($widget === NULL) {
+    return FALSE;
+  }
+
+  $plugin_definition = $widget->getPluginDefinition();
+
+  $plugin_parent_conditional = $widget->getThirdPartySetting('controlled_fields', 'parent_conditional');
+  $plugin_parent_conditional_value = $widget->getThirdPartySetting('controlled_fields', 'parent_conditional_value');
+
+  if (!empty($plugin_parent_conditional)) {
+    $parent_accessible = controlled_fields_check_access($form_display, $values, $plugin_parent_conditional, $access_type, $plugin_parent_conditional_value);
+    $accessible = $accessible && $parent_accessible;
+  }
+
+  if ($conditional_value !== NULL) {
+    if (!array_key_exists($field_name, $values)) {
+      return FALSE;
+    }
+    elseif ($plugin_definition['multiple_values'] === TRUE && count($values[$field_name]) > 1) {
+      foreach ($values[$field_name] as $multiple_value) {
+        if (is_array($multiple_value) && array_key_exists('value', $multiple_value) && $multiple_value['value'] == $conditional_value) {
+          return $accessible;
+        }
+        elseif ($multiple_value === $conditional_value) {
+          return $accessible;
+        }
+      }
+      return FALSE;
+    }
+    elseif (!is_array($values[$field_name])) {
+      $accessible = $accessible && ($values[$field_name] == $conditional_value);
+    }
+    else {
+      $accessible = $accessible &&
+        (is_array($values[$field_name][0]) && array_key_exists('value', $values[$field_name][0]) &&
+        $values[$field_name][0]['value'] == $conditional_value);
+    }
+  }
+
+  return $accessible;
+}
+
+/**
+ * Implements hook_field_group_pre_render_alter().
+ */
+function controlled_fields_field_group_pre_render_alter(&$element, &$group, &$rendering_object) {
+  // Add in a class to field groups so that we can more easily identify them.
+  $element['#attributes']['class'][] = 'controlled-fields-field-group';
+}
+
+/**
+ * Implements hook_theme().
+ */
+function controlled_fields_theme($existing, $type, $theme, $path) {
+  return [
+    'controlled_fields_settings_summary' => [
+      'variables' => [
+        'parent_name' => '',
+        'parent_value' => '',
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_entity_print_form_content_alter().
+ */
+function controlled_fields_entity_print_form_content_alter(&$form, $context) {
+  $entity = $context['entity'];
+  $form_display = $context['form_display'];
+
+  $bundle = $form_display->getTargetBundle();
+  $entity_type_id = $form_display->getTargetEntityTypeId();
+  $entity_type_manager = \Drupal::entityTypeManager();
+
+  $module_handler = \Drupal::moduleHandler();
+
+  $form_object = $entity_type_manager->getFormObject($entity->getEntityTypeId(), $form_display->getMode());
+  $form_object->setEntity($entity);
+
+  // Populate values in FormState.
+  $form_state = new FormState();
+  $rebuilt_form = \Drupal::formBuilder()->buildForm($form_object, $form_state);
+  $form_state_values = $form_state->getValues();
+
+  $field_definitions = controlled_fields_fetch_field_definitions($form_display->getTargetEntityTypeId(), $form_display->getTargetBundle());
+
+  foreach ($field_definitions as $field_name => $field_definition) {
+    $is_accessible = controlled_fields_check_access($form_display, $form_state_values, $field_name);
+
+    // Note that when printing we are checking for 'view'.
+    $check_other_accessible = $module_handler->invokeAll('check_form_field_access', [
+      $form_display, $form_state_values, $field_name, $rebuilt_form, 'view',
+    ]);
+
+    foreach ($check_other_accessible as $other_accessible) {
+      $is_accessible = $is_accessible && $other_accessible;
+    }
+
+    if (!$is_accessible) {
+      $form[$field_name]['#access'] = FALSE;
+    }
+  }
+
+}
