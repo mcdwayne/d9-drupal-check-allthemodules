@@ -1,0 +1,297 @@
+<?php
+
+/**
+ * @file
+ * Provides a volume (bulk) pricing option for Ubercart Products
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\node\NodeInterface;
+use Drupal\Core\Render\Element;
+
+/**
+ * Implements hook_node_load().
+ */
+function uc_volume_pricing_node_load($nodes, $types) {
+
+  $product_types = array_intersect(uc_product_types(), $types);
+
+  if (empty($product_types)) {
+    return;
+  }
+
+  foreach ($nodes as $node) {
+    if (uc_product_is_product($node->type)) {
+      $node->volume_pricing = array();
+      $results = db_query("SELECT * FROM {uc_volume_pricing} WHERE nid=:nid AND vid=:vid ORDER BY min ASC", array(':nid' => $node->nid, ':vid' => $node->vid));
+      $i = 0;
+      foreach ($results as $volume_set) {
+        $node->volume_pricing[$i]['min'] = $volume_set->min;
+        $node->volume_pricing[$i]['price'] = $volume_set->price;
+        $i++;
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function uc_volume_pricing_node_insert($node) {
+  uc_volume_pricing_node_update($node);
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function uc_volume_pricing_node_update($node) {
+  $nodeBundle = $node->bundle();
+  if (uc_product_is_product($nodeBundle)) {
+    if (empty($node->revision)) {
+      \Drupal::database()
+        ->delete('uc_volume_pricing')
+        ->condition('vid', $node->vid->value)
+        ->execute();
+    }
+    foreach ($node->volume_pricing as $volume_set) {
+      if (isset($volume_set['min']) && $volume_set['min'] > 0) {
+        \Drupal::database()->insert('uc_volume_pricing')
+          ->fields(array(
+            'nid' => intval($node->id()),
+            'vid' => intval($node->vid->value),
+            'min' => $volume_set['min'],
+            'price' => $volume_set['price'],
+          ))
+          ->execute();
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function uc_volume_pricing_node_delete($node) {
+  \Drupal::database()
+    ->delete('uc_volume_pricing')
+    ->condition('nid', $node->id())
+    ->execute();
+}
+
+/**
+ * Implements hook_node_revision_delete().
+ */
+function uc_volume_pricing_node_revision_delete($node) {
+  \Drupal::database()
+    ->delete('uc_volume_pricing')
+    ->condition('vid', $node->vid())
+    ->execute();
+}
+
+/**
+ * Implements hook_form_uc_cart_view_form_alter().
+ */
+function uc_volume_pricing_form_uc_cart_view_form_alter(&$form, FormStateInterface $form_state) {
+  if (\Drupal::config('uc_volume_pricing.settings')->get('show_in_cart')) {
+    $form['#attached']['library'][] = 'uc_volume_pricing/uc_volume_pricing.styles';
+    $num_rows = 0;
+    
+    foreach (Element::children($form['items']) as $i) {
+      if (!empty($form['data'][$i]['nid'])) {
+        $defaultQty = $form['items'][$i]['qty']['#default_value'];
+        $product = uc_product_load_variant($form['data'][$i]['nid']['#value']);
+        $volume_set = db_query("SELECT price,min FROM {uc_volume_pricing} WHERE nid=:nid AND vid=:vid AND min>:min ORDER BY min ASC", array(':nid' => $form['data'][$i]['nid']['#value'], ':vid' => $product->vid->value, ':min' => $defaultQty))->fetchObject();
+        if (!empty($volume_set)) {
+          if ($defaultQty < $volume_set->min) {
+            $remaining = ($volume_set->min - $defaultQty);
+            $savings = uc_currency_format($product->display_price - $volume_set->price);
+            $message = \Drupal::config('uc_volume_pricing.settings')->get('cart_message');
+            // If quantity is not in the custom message, don't bother with format_plural
+            if(strpos($message, '[remaining]') !== FALSE) {
+              $message_singular = str_replace(array('[remaining]', '[product_title]', '[savings]'), array('1', ':title', ':savings'), $message);
+              $message_plural = str_replace(array('[remaining]', '[product_title]', '[savings]'), array('@count', ':titles', ':savings'), $message);
+              $alert[] = \Drupal::translation()->formatPlural($remaining, $message_singular, $message_plural, array(':title' => $product->title->value, ':savings' => $savings));
+            }
+            else {
+              $message = str_replace(array('[product_title]', '[savings]'), array('!titles', '!savings'), $message);
+              $alert[] = t($message, array('!title' => $product->title, '!savings' => $savings));
+            }
+          }
+        }
+        else {
+          $volume_price = db_query("SELECT price FROM {uc_volume_pricing} WHERE nid=:nid AND vid=:vid AND min <= :min ORDER BY price ASC LIMIT 1", array(':nid' => $form['data'][$i]['nid']['#value'], ':vid' => $product->vid->value, ':min' => $defaultQty))->fetchField();
+          if ($volume_price > 0) {
+            $newPrice = $defaultQty*$volume_price;
+            $form['items']['#footer'][0][3]['data']['#price'] += (($newPrice) - $form['items'][$i]['total']['#price']);
+            $form['items'][$i]['total']['#price'] = $newPrice;
+          }
+          
+        }
+      }
+      $num_rows++;
+    }
+    
+    // Add in the cart alert.
+    if (!empty($alert)) {
+      $working_row = $num_rows - 1;
+      $subtotal_row = $form['data'][$working_row];
+
+      $html = '<div class="volume-alert">' . implode("<br/>", $alert) . '</div>';
+      $form['data'][$working_row]['total'] = array(
+        '#cell_attributes' => array(
+          'colspan' => 'full',
+          'class' => array('total'),
+        ),
+        '#markup' => $html,
+      );
+      $working_row++;
+      // Add the subtotal line back in.
+      $form['data'][$working_row] = $subtotal_row;
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function uc_volume_pricing_form_node_form_alter(&$form, FormStateInterface $form_state) {
+  $node = $form_state->getFormObject()->getEntity();
+  $nodeBundle = $node->bundle();
+  if (uc_product_is_product($nodeBundle)) {
+    $form['volume_pricing'] = [
+      '#type' => 'fieldset',
+      '#tree' => TRUE,
+      '#title' => t('Volume Pricing'),
+      '#prefix' => '<div id="volume-pricing-wrapper">',
+      '#suffix' => '</div>',
+      '#weight' => 99,
+    ];
+    $vid = $node->vid->value;
+    $nid = $node->id();
+    
+    $count = 0;
+    $result = db_query("SELECT * FROM {uc_volume_pricing} WHERE nid=:nid AND vid=:vid ORDER BY min ASC", array(':nid' => $nid, ':vid' => $vid))->fetchAll();
+    foreach ($result as $volume_set) {
+      $form['volume_pricing']['volume-set' . $count] = [
+        '#type' => 'fieldset',
+        '#title' => 'Option ' . ($count + 1),
+        '#tree' => TRUE,
+      ];
+      $form['volume_pricing']['volume-set' . $count]['min'] = [
+        '#type' => 'textfield',
+        '#title' => 'Min Quantity',
+        '#default_value' => $volume_set->min,
+      ];
+      $form['volume_pricing']['volume-set' . $count]['price'] = [
+        '#type' => 'textfield',
+        '#title' => 'Price Each',
+        '#default_value' => $volume_set->price,
+      ];
+      $count++;
+    }
+    $volumeFields = $form_state->get('volume_fields');
+    if (empty($volumeFields)) {
+      $volumeFields = ($count > 0) ? $count : 1;
+      $form_state->set('volume_fields', $volumeFields);
+    }
+
+    for ($i = $count; $i < $volumeFields; $i++) {
+      $form['volume_pricing']['volume-set' . $i] = [
+        '#type' => 'fieldset',
+        '#title' => 'Option ' . ($i + 1),
+        '#tree' => TRUE,
+      ];
+      $form['volume_pricing']['volume-set' . $i]['min'] = [
+        '#type' => 'textfield',
+        '#title' => 'Min Quantity',
+      ];
+      $form['volume_pricing']['volume-set' . $i]['price'] = [
+        '#type' => 'textfield',
+        '#title' => 'Price Each',
+      ];
+    }
+
+    $form['volume_pricing']['add_item'] = [
+      '#type' => 'submit',
+      '#value' => t('Add Another Item'),
+      '#submit' => ['uc_volume_pricing_add_item'],
+      '#ajax' => [
+        'callback' => 'uc_volume_pricing_ajax_callback',
+        'wrapper' => 'volume-pricing-wrapper',
+      ],
+    ];
+    $form['#entity_builders'][] = 'uc_volume_pricing_node_builder';
+  }
+}
+
+/**
+ * Entity form builder to add the uc volume pricing information to the node.
+ */
+function uc_volume_pricing_node_builder($entity_type, NodeInterface $entity, &$form, FormStateInterface $form_state) {
+  $node = $form_state->getFormObject()->getEntity();
+  $nodeBundle = $node->bundle();
+  if (uc_product_is_product($nodeBundle)) {
+    $volumePricing = $form_state->getValue('volume_pricing');
+    
+    $node->volume_pricing = array();
+    $i = 0;
+    while (!empty($volumePricing['volume-set' . $i])) {
+      $entity->volume_pricing[$i]['min'] = $volumePricing['volume-set' . $i]['min'];
+      $entity->volume_pricing[$i]['price'] = $volumePricing['volume-set' . $i]['price'];
+      $i++;
+    }
+  }
+}
+
+/**
+ * Ajax Callback for the form.
+ *
+ * @param array $form
+ *   The form being passed in
+ * @param array $form_state
+ *   The form state
+ * 
+ * @return array
+ *   The form element we are changing via ajax
+ */
+function uc_volume_pricing_ajax_callback(&$form, FormStateInterface $form_state) {
+  return $form['volume_pricing'];
+}
+
+/**
+ * Functionality for our ajax callback.
+ *
+ * @param array $form
+ *   The form being passed in
+ * @param array $form_state
+ *   The form state, passed by reference so we can modify
+ */
+function uc_volume_pricing_add_item(&$form, FormStateInterface $form_state) {
+  $volumeFields = $form_state->get('volume_fields');
+  $form_state->set('volume_fields', ($volumeFields+1));
+  $form_state->setRebuild();
+}
+
+/**
+ * Implements hook_uc_cart_checkout_start.
+ */
+function uc_volume_pricing_uc_cart_checkout_start($order) {
+  $updated = FALSE;
+  $productArray = $order->products;
+  foreach ($productArray as $key => $product) {
+    $node = $product->nid->entity;
+    $nid = $node->nid->value;
+    $vid = $node->vid->value;
+    $volume_price = db_query("SELECT price FROM {uc_volume_pricing} WHERE nid=:nid AND vid=:vid AND min <= :min ORDER BY price ASC LIMIT 1", array(':nid' => $nid, ':vid' => $vid, ':min' => $order->products[$key]->qty->value))->fetchField();
+    if ($volume_price > 0) {
+      $order->products[$key]->price->value = $volume_price;
+      $updated = TRUE;
+    }
+  }
+  // Updating Order for affecting variable price.
+  if ($updated) {
+    $order->save();
+  }
+}
+
+ 
