@@ -1,0 +1,162 @@
+<?php
+
+/**
+ * @file
+ * Contains sitecommander.module
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\sitecommander\Controller\BackupController;
+use Drupal\sitecommander\SiteCommanderUtils;
+
+/**
+   * {@inheritdoc}
+   */
+function defaultConfiguration() {
+	$default_config = \Drupal::config('sitecommander.settings');
+	return array(
+		'includeBootstrapCSS' => $default_config('includeBootstrapCSS'),
+		'includejQuery' => $default_config('includejQuery'),
+		'refreshRate' => $default_config('refreshRate'),
+		'anonymousUserTrackingMode' => $default_config('anonymousUserTrackingMode'),
+		'visitorIpAddressTTL' => $default_config('visitorIpAddressTTL'),
+		'backupMaxAgeInDays' => $default_config('backupMaxAgeInDays'),
+		'enableScheduledBackups' => $default_config('enableScheduledBackups'),
+		'minHoursBetweenBackups' => $default_config('minHoursBetweenBackups'),
+		'enableMirroring' => $default_config('enableMirroring'),
+		'mirrorMode' => $default_config('mirrorMode'),
+		'tagCloudVocabulary' => $default_config('tagCloudVocabulary'),
+		'tagCloudLimit' => $default_config('tagCloudLimit'),
+		'tagCloudBackgroundColor' => $default_config('tagCloudBackgroundColor'),
+		'tagCloudStartingColor' => $default_config('tagCloudStartingColor'),
+		'tagCloudEndingColor' => $default_config('tagCloudEndingColor')
+	);
+}
+
+/**
+ * Theme hook
+ */
+
+function sitecommander_theme($existing, $type, $theme, $path) {
+
+	$variables = array(
+		'sitecommander' => array(
+			'variables' => array(
+				'drupalInfo' => null
+			),
+			'title' => 'SiteCommander',
+			'template' => 'block--sitecommander',
+		),
+	);
+
+	return $variables;
+}
+
+/**
+ * page_attachments hook
+ *
+ * Ensure Bootstrap .js is only loaded once, otherwise modals won't work right.
+ *
+ * NOTE: This is a theme hook, probably won't work here.
+ */
+
+function sitecommander_page_attachments(&$page)
+{
+	// Include Pusher
+	$config = \Drupal::config('sitecommander.settings');
+	$pusherAppKey = $config->get('pusherAppKey');
+	$enableBroadcastManager = $config->get('enableBroadcastManager');
+
+	$page['#attached']['library'][] = 'sitecommander/sitecommander.Broadcast';
+	$page['#attached']['drupalSettings']['sitecommander']['enableBroadcastManager'] = $enableBroadcastManager;
+	$page['#attached']['drupalSettings']['sitecommander']['pusherAppKey'] = $pusherAppKey;
+
+	if (!$config->get('includeBootstrapCSS')) {
+		return;
+	}
+
+	$page['#attached']['library'][] = 'sitecommander/sitecommander.BootstrapCSS';
+}
+
+/**
+ * Called after cache has been cleared so we can store the timestamp for reporting purposes in SiteCommander
+ */
+
+function sitecommander_rebuild() {
+	// Store the current timestamp in state variables
+	\Drupal::state()->set('sitecommander.timestamp_cache_last_rebuild', time());
+	\Drupal::state()->set('sitecommander.timestamp_cssjs_last_rebuild', time());
+}
+
+/**
+ * Cron hook
+ */
+
+function sitecommander_cron() {
+
+	// Handle Backup Manager archive retention strategy
+	$config = \Drupal::config('sitecommander.settings');
+	$backupDirectory = $config->get('backupDirectory');
+	$maxAge = $config->get('backupMaxAgeInDays');
+
+	if($backupDirectory && $maxAge)
+	{
+		$cutOff = strtotime($maxAge . ' days ago');
+
+		$fileList = BackupController::scScanDir($backupDirectory, 'ctime', 1);
+
+		if(isset($fileList) && count($fileList) > 0)
+		{
+			foreach($fileList as $fileName => $fileInfo)
+			{
+				if($cutOff > $fileInfo['ctime'])
+				{
+					@unlink($backupDirectory . '/' . $fileName);
+				}
+			}
+		}
+	}
+
+	// Make a new backup in the background if we meet the requirements
+	if(\Drupal::config('sitecommander.settings')->get('enableScheduledBackups') && \Drupal::config('sitecommander.settings')->get('backupDirectory'))
+	{
+		// Make sure no backup is currently running
+		if(!SiteCommanderUtils::isProcessRunning("drush archive-dump"))
+		{
+			// Get the timestamp of when we made the last backup
+			$now = time();
+			$lastBackupTimestamp = \Drupal::state()->get('sitecommander.timestamp_last_backup', 0);
+
+			// Compare to current timestamp. If >= to minHoursBetweenBackups, we need to make a new one
+			$minHoursBetweenBackups = \Drupal::config('sitecommander.settings')->get('minHoursBetweenBackups');
+			if($now >= $lastBackupTimestamp + ($minHoursBetweenBackups * 60 * 60))
+			{
+				// Update the time stamp
+				\Drupal::state()->set('sitecommander.timestamp_last_backup', $now);
+
+				// Get the config options we need
+				$backupDirectory = \Drupal::config('sitecommander.settings')->get('backupDirectory');
+				$drushPath = \Drupal::config('sitecommander.settings')->get('drushPath');
+				$backupMaxAgeInDays = \Drupal::config('sitecommander.settings')->get('backupMaxAgeInDays');
+	
+				// Build the drush command line
+				$archiveFileName = 'sitecommander-scheduled-backup.' . time() . '.tar.gz';
+				$backupCmd = $drushPath . ' archive-dump --destination=' . $backupDirectory . '/' . $archiveFileName;
+				$syncCmd = $drushPath . ' sitecommander-backup-copy ' . $backupDirectory . '/' . $archiveFileName;
+
+				// Optional mirroring of backups
+				$mirrorEnabled = \Drupal::config('sitecommander.settings')->get('enableMirroring');
+				if($mirrorEnabled)
+				{
+					shell_exec('(/usr/bin/nohup ' . $backupCmd . '; ' . $syncCmd .') 2>/dev/null >/dev/null &');
+				}
+				else
+				{
+					shell_exec('/usr/bin/nohup ' . $backupCmd . ' 2>/dev/null >/dev/null &');
+				}
+	
+			}
+		}
+	}
+}
+
