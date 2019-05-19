@@ -1,0 +1,267 @@
+<?php
+
+/**
+ * @file
+ * Update function for the tmgmt_extension_suit module.
+ */
+
+use Drupal\Core\Config\FileStorage;
+use Drupal\Core\Config\InstallStorage;
+use Drupal\Core\Utility\UpdateException;
+use Drupal\tmgmt\Entity\JobItem;
+use \Drupal\tmgmt\JobInterface;
+use Drupal\tmgmt\JobItemInterface;
+
+/**
+ * Creates action plugin.
+ *
+ * @param $plugin_id
+ * @param $plugin_name
+ */
+function tmgmt_extension_suit_create_action_plugin($plugin_id, $plugin_name) {
+  $entity_type_manager = \Drupal::entityTypeManager();
+  $module_handler = \Drupal::moduleHandler();
+  $config_install_path = $module_handler->getModule('tmgmt_extension_suit')
+      ->getPath() . '/' . InstallStorage::CONFIG_INSTALL_DIRECTORY;
+  $action_storage = $entity_type_manager->getStorage('action');
+  $action = $action_storage->load($plugin_id);
+
+  // Create action if it doesn't exist.
+  if (!$action) {
+    $storage = new FileStorage($config_install_path);
+    $read_file = $storage->read($plugin_name);
+
+    if ($read_file) {
+      $entity_type_manager
+        ->getStorage('action')
+        ->create($read_file)
+        ->save();
+    }
+  }
+}
+
+/**
+ * Add missing job item hashes.
+ */
+function tmgmt_extension_suit_update_8001() {
+  // Apply field to an entity. Field is defined in
+  // tmgmt_extension_suit_entity_base_field_info() hook.
+  \Drupal::service('entity.definition_update_manager')->applyUpdates();
+
+  $query = db_select('tmgmt_job_item', 'tji');
+  $result = $query->condition('tji.plugin', 'content')
+      ->condition('tji.item_type', 'node')
+      ->fields('tji', ['tjiid'])
+      ->orderBy('tji.changed', 'DESC')
+      ->groupBy('tji.tjiid')
+      ->groupBy('tji.changed')
+      ->execute();
+
+
+  if ($items = $result->fetchCol()) {
+    $job_items = JobItem::loadMultiple($items);
+
+    foreach ($job_items as $job_item) {
+      $hash = _tmgmt_extension_suit_get_job_item_hash($job_item);
+      $job_item->set('tes_source_content_hash', $hash);
+      $job_item->save();
+    }
+  }
+}
+
+/**
+ * Transform all existing continuous jobs into regular jobs.
+ */
+function tmgmt_extension_suit_update_8002() {
+  // Add active continuous jobs into upload queue.
+  $select = \Drupal::database()->select('tmgmt_job', 'tj');
+  $select->distinct();
+  $select->fields('tj', [
+    'tjid',
+  ]);
+  $select->condition('job_type', JobInterface::TYPE_CONTINUOUS);
+  $select->condition('continuous_settings', serialize([]));
+  $select->condition('tj.state', [JobInterface::STATE_CONTINUOUS], 'IN');
+  $select->join('tmgmt_job_item', 'tji', 'tji.tjid = tj.tjid');
+  $select->condition('tji.state', [JobItemInterface::STATE_INACTIVE, JobItemInterface::STATE_ACTIVE], 'IN');
+
+  $ids = $select->execute()->fetchCol();
+
+  foreach ($ids as $id) {
+    \Drupal::queue('tmgmt_extension_suit_upload')->createItem(['id' => $id]);
+  }
+
+  // Drupal::database()->update() doesn't have join method so here we are using
+  // Drupal::database()->query() method.
+  $query = 'UPDATE tmgmt_job as tj
+    INNER JOIN tmgmt_job_item as tji
+      ON tj.tjid = tji.tjid
+    SET tj.job_type = :job_to_type, tj.state = :job_to_state
+    WHERE tj.job_type = :job_from_type
+      AND tj.state = :job_from_state
+      AND tj.continuous_settings = :job_continuous_settings
+      AND tji.state IN (:job_item_states[])';
+
+  $mapping = [
+    // Migrate active continuous jobs to active state.
+    [
+      'job_to_state' => JobInterface::STATE_ACTIVE,
+      'job_item_states' => [
+        JobItemInterface::STATE_INACTIVE,
+        JobItemInterface::STATE_ACTIVE,
+        JobItemInterface::STATE_REVIEW,
+      ],
+    ],
+    // Migrate finished continuous jobs to finished state.
+    [
+      'job_to_state' => JobInterface::STATE_FINISHED,
+      'job_item_states' => [
+        JobItemInterface::STATE_ACCEPTED,
+      ],
+    ],
+  ];
+
+  foreach ($mapping as $item) {
+    Drupal::database()->query($query, [
+      ':job_to_type' => JobInterface::TYPE_NORMAL,
+      ':job_to_state' => $item['job_to_state'],
+      ':job_from_type' => JobInterface::TYPE_CONTINUOUS,
+      ':job_from_state' => JobInterface::STATE_CONTINUOUS,
+      ':job_continuous_settings' => serialize([]),
+      ':job_item_states[]' => $item['job_item_states'],
+    ]);
+  }
+
+  // Migrate continuous inactive jobs to aborted state.
+  Drupal::database()->update('tmgmt_job')
+    ->condition('job_type', JobInterface::TYPE_CONTINUOUS)
+    ->condition('continuous_settings', serialize([]))
+    ->condition('state', JobInterface::STATE_CONTINUOUS_INACTIVE)
+    ->fields([
+      'job_type' => JobInterface::TYPE_NORMAL,
+      'state' => JobInterface::STATE_ABORTED,
+    ])
+    ->execute();
+}
+
+/**
+ * Add file name into job entries.
+ */
+function tmgmt_extension_suit_update_8003() {
+  drupal_flush_all_caches();
+
+  // Apply new field to a job entity.
+  Drupal::service('entity.definition_update_manager')->applyUpdates();
+}
+
+/**
+ * Create action configuration entity.
+ */
+function tmgmt_extension_suit_update_8004() {
+  try {
+    tmgmt_extension_suit_create_action_plugin(
+      'tmgmt_extension_suit_clear_job_items_data_action',
+      'system.action.tmgmt_extension_suit_clear_job_items_data_action'
+    );
+  }
+  catch (Exception $e) {
+    throw new UpdateException('Unable to create "tmgmt_extension_suit_clear_job_items_data_action" action.');
+  }
+}
+
+
+/**
+ * Delete action configuration entity.
+ */
+function tmgmt_extension_suit_update_8005() {
+  try {
+    Drupal::configFactory()->getEditable('system.action.tmgmt_extension_suit_upload_job_action_id')->delete();
+  }
+  catch (Exception $e) {
+    throw new UpdateException('Unable to delete "tmgmt_extension_suit_upload_job_action" action.');
+  }
+}
+
+/**
+ * Restore "tmgmt_extension_suit_upload_job_action" action.
+ */
+function tmgmt_extension_suit_update_8006() {
+  try {
+    tmgmt_extension_suit_create_action_plugin(
+      'tmgmt_extension_suit_upload_job_action_id',
+      'system.action.tmgmt_extension_suit_upload_job_action'
+    );
+  }
+  catch (Exception $e) {
+    throw new UpdateException('Unable to create "tmgmt_extension_suit_upload_job_action" action.');
+  }
+}
+
+/**
+ * Delete action configuration entity.
+ */
+function tmgmt_extension_suit_update_8007() {
+  try {
+    $entity_type_manager = \Drupal::entityTypeManager();
+    $action_storage = $entity_type_manager->getStorage('action');
+    $action = $action_storage->load('tmgmt_extension_suit_upload_job_action_id');
+
+    if (!empty($action)) {
+      $action->delete();
+    }
+  }
+  catch (Exception $e) {
+    throw new UpdateException('Unable to delete "tmgmt_extension_suit_upload_job_action" action.');
+  }
+}
+
+/**
+ * Delete old action configuration entities and create new ones.
+ */
+function tmgmt_extension_suit_update_8008() {
+  $action_plugins = [
+    'tmgmt_extension_suit_cancel_job_action',
+    'tmgmt_extension_suit_delete_job_action',
+    'tmgmt_extension_suit_download_job_action',
+  ];
+
+  try {
+    $entity_type_manager = \Drupal::entityTypeManager();
+    $action_storage = $entity_type_manager->getStorage('action');
+
+    foreach ($action_plugins as $action_plugin) {
+      // Create new actions with proper ids.
+      tmgmt_extension_suit_create_action_plugin(
+        $action_plugin,
+        "system.action.{$action_plugin}"
+      );
+
+      // Delete old actions with wrong ids.
+      $action = $action_storage->load("{$action_plugin}_id");
+
+      if (!empty($action)) {
+        $action->delete();
+      }
+    }
+  }
+  catch (Exception $e) {
+    throw new UpdateException("Error during update: {$e->getMessage()}, {$e->getTraceAsString()}.");
+  }
+}
+
+/**
+ * Create tmgmt_extension_suit_request_translation_job_action job action.
+ */
+function tmgmt_extension_suit_update_8009() {
+  drupal_flush_all_caches();
+
+  try {
+    tmgmt_extension_suit_create_action_plugin(
+      "tmgmt_extension_suit_request_translation_job_action",
+      "system.action.tmgmt_extension_suit_request_translation_job_action"
+    );
+  }
+  catch (Exception $e) {
+    throw new UpdateException("Can't create tmgmt_extension_suit_request_translation_job_action action: {$e->getMessage()}, {$e->getTraceAsString()}.");
+  }
+}

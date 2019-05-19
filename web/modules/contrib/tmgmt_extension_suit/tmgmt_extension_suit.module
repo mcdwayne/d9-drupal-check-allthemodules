@@ -1,0 +1,240 @@
+<?php
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\ContentEntityInterface;
+use Drupal\tmgmt\Entity\Job;
+use Drupal\tmgmt\TMGMTException;
+use Drupal\tmgmt_extension_suit\ExtendedTranslatorPluginInterface;
+use Drupal\views\ViewExecutable;
+use Drupal\tmgmt\JobInterface;
+use Drupal\tmgmt\JobItemInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+
+/**
+ * Implements hook_views_pre_view().
+ */
+function tmgmt_extension_suit_views_pre_view(ViewExecutable $view, $display_id, array &$args) {
+  if ($view->id() != 'tmgmt_job_overview') {
+    return;
+  }
+
+  $handlers = $view->getHandlers('field');
+
+  foreach ($handlers as $name => $value) {
+    $view->removeHandler($view->current_display, 'field', $name);
+  }
+
+  $view->addHandler($view->current_display, 'field', 'tmgmt_job', 'tmgmt_job_bulk_form', [
+    'id' => 'tmgmt_job_bulk_form',
+    'table' => 'tmgmt_job',
+    'field' => 'tmgmt_job_bulk_form',
+    'group_type' => 'group',
+    'label' => 'Bulk update',
+    'hide_alter_empty' => 1,
+    'action_title' => 'With selection',
+    'include_exclude' => 'exclude',
+    'selected_actions' => [],
+    'entity_type' => 'tmgmt_job',
+    'plugin_id' => 'bulk_form',
+    'weight' => -10
+  ]);
+
+  foreach ($handlers as $name => $value) {
+    $view->addHandler($view->current_display, 'field', 'tmgmt_job', $name, $value);
+  }
+}
+
+/**
+ * Calculates hash for a given job item depends on source data.
+ *
+ * @param \Drupal\tmgmt\JobItemInterface $job_item
+ *
+ * @return string
+ */
+function _tmgmt_extension_suit_get_job_item_hash(JobItemInterface $job_item) {
+  // Check if job exists at this moment. If we save job item into
+  // cart it means that job doesn't exist for now and we can't get
+  // source data for hash calculating.
+  if ($job_item->getJobId() == 0) {
+    return '';
+  }
+
+  // Try to load the entity. If we deal with non-content types like strings,
+  // we'll get an \Exception here and skip it for now.
+  // @todo: Add support for strings
+  try {
+    $entity = Drupal::entityTypeManager()->getStorage($job_item->getItemType())->load($job_item->getItemId());
+  } catch (\Exception $e) {
+    return '';
+  }
+
+
+  if (!($entity instanceof ContentEntityInterface && $entity->isTranslatable())) {
+    return '';
+  }
+
+  $hash_data = Drupal::service('tmgmt.data')->filterTranslatable($job_item->getSourceData());
+
+  return md5(json_encode($hash_data));
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function tmgmt_extension_suit_entity_update(EntityInterface $entity) {
+  if ($entity instanceof ContentEntityInterface &&
+    $entity->isTranslatable() &&
+    Drupal::config('tmgmt_extension_suit.settings')->get('do_track_changes')
+  ) {
+    $entity = $entity->getUntranslated();
+
+    // Get job ids that contains current entity.
+    $select = Drupal::database()->select('tmgmt_job', 'tj');
+    $select->join('tmgmt_job_item', 'tji', 'tji.tjid = tj.tjid');
+    $select->addField('tj', 'tjid');
+    $select->condition('tj.state', [
+      JobInterface::STATE_ACTIVE,
+      JobInterface::STATE_REJECTED,
+      JobInterface::STATE_FINISHED,
+    ], 'IN');
+    $select->condition('tji.state', [JobItemInterface::STATE_ABORTED], 'NOT IN');
+    $select->condition('tji.item_type', $entity->getEntityTypeId());
+    $select->condition('tji.item_id', $entity->id());
+    $job_ids = $select->execute()->fetchCol();
+
+    // Set job state as active. Set all child job items state as active.
+    // Reset all child data. Also we need to update job item hash because
+    // source entity is updated.
+    $upload_entities = [];
+
+    foreach ($job_ids as $job_id) {
+      if ($job = Job::load($job_id)) {
+        $is_reopen_needed = FALSE;
+
+        foreach ($job->getItems() as $item) {
+          $old_hash = $item->get('tes_source_content_hash')->getValue();
+          $old_hash = isset($old_hash[0]['value']) ? $old_hash[0]['value'] : '';
+          $hash = _tmgmt_extension_suit_get_job_item_hash($item);
+
+          // Source entity is updated. Mark job item as active.
+          if ($old_hash !== $hash) {
+            // Reset an old data array with old entity field values.
+            $item->resetData();
+
+            // Update current job item hash.
+            $item->set('tes_source_content_hash', $hash);
+
+            // We don't use JobItem::setState() because it doesn't always call
+            // JobItem::save(), and so the behaviour might be inconsistent.
+            $item->set('state', JobItemInterface::STATE_ACTIVE);
+            $item->save();
+
+            $is_reopen_needed = TRUE;
+          }
+        }
+
+        // Reopen parent job.
+        if ($is_reopen_needed) {
+          // Job::save() method invokes inside of Job::setState()
+          // method. So there is no need to call save() directly.
+          $job->setState(JobInterface::STATE_ACTIVE);
+
+          // Put job into upload queue.
+          $upload_entities[] = $job->id();
+        }
+      }
+    }
+
+    if (!empty($upload_entities)) {
+      $data = \Drupal::moduleHandler()->invokeAll('tmgmt_extension_suit_updated_entity_jobs', [$upload_entities]);
+
+      foreach ($upload_entities as $upload_entity) {
+        Drupal::service('tmgmt_extension_suit.utils.queue_unique_item')
+          ->addItem(
+            'tmgmt_extension_suit_upload', [
+              'id' => (int) $upload_entity,
+            ] + $data,
+            TRUE
+          );
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_base_field_info().
+ */
+function tmgmt_extension_suit_entity_base_field_info(EntityTypeInterface $entity_type) {
+  if ($entity_type->id() === 'tmgmt_job_item') {
+    $fields['tes_source_content_hash'] = BaseFieldDefinition::create('string')
+      ->setLabel(t('Source content hash (md5)'))
+      ->setSetting('max_length', 32)
+      ->setTranslatable(FALSE);
+
+    return $fields;
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_presave().
+ */
+function tmgmt_extension_suit_tmgmt_job_item_presave(EntityInterface $job_item) {
+  // Create hash for job item while creation process. We only need to update
+  // job item hash in case source entity was updated in Drupal.
+  // @see tmgmt_extension_suit_entity_update().
+  $old_hash = $job_item->get('tes_source_content_hash')->getValue();
+  $old_hash = isset($old_hash[0]['value']) ? $old_hash[0]['value'] : '';
+  if ('' != $old_hash) {
+    return;
+  }
+
+  $hash = _tmgmt_extension_suit_get_job_item_hash($job_item);
+
+  if ($hash !== '') {
+    $job_item->set('tes_source_content_hash', $hash);
+  }
+}
+
+/**
+ * Implements hook_translatable_fields_alter.
+ */
+function tmgmt_extension_suit_tmgmt_translatable_fields_alter(ContentEntityInterface $entity, array &$translatable_fields) {
+  unset($translatable_fields['moderation_state']);
+}
+
+/**
+ * Implements hook_entity_base_field_info_alter().
+ */
+function tmgmt_extension_suit_entity_base_field_info_alter(array &$fields, EntityTypeInterface $entity_type) {
+  if ($entity_type->id() === 'tmgmt_job' && empty($fields['job_file_name'])) {
+    $fields['job_file_name'] = BaseFieldDefinition::create('string')
+      ->setLabel(t('Generated file name'))
+      ->setSetting('max_length', 1024)
+      ->setTranslatable(FALSE)
+      ->setProvider('tmgmt_extension_suit')
+      ->setName('job_file_name')
+      ->setTargetEntityTypeId($entity_type->id())
+      ->setTargetBundle(NULL);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update().
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ */
+function tmgmt_extension_suit_tmgmt_job_presave(Drupal\Core\Entity\EntityInterface $entity) {
+  try {
+    if ($entity->hasTranslator()) {
+      $plugin = $entity->getTranslatorPlugin();
+
+      if ($plugin instanceof ExtendedTranslatorPluginInterface) {
+        $entity->set('job_file_name', $plugin->getFileName($entity));
+      }
+    }
+  }
+  catch (TMGMTException $e) {
+    watchdog_exception('tmgmt_smartling', $e);
+  }
+}
