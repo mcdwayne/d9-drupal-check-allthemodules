@@ -1,0 +1,260 @@
+<?php
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\workflow\Entity\WorkflowScheduledTransition;
+use Drupal\workflow\Entity\WorkflowTransitionInterface;
+use Drupal\workflow_notifications\Entity\WorkflowNotification;
+
+/**
+ * Implements hook_entity_update().
+ * sending on state change mail.
+ */
+function workflow_notifications_entity_update(EntityInterface $entity) {
+  // Avoid this hook on workflow objects.
+    $data = _workflow_notifications_get_transition_details($entity);
+    // $todo: use $transitions as parameter, and derive $trigger from that.
+    foreach($data as $key => $value) {
+      $notifications = WorkflowNotification::loadMultipleByProperties($value['from_sid'], $value['to_sid'], $value['wid'], $value['trigger'], $value['days']);
+      if (!empty($notifications)) {
+        _workflow_notifications_mail_trigger($value['trigger'], $notifications, $entity, $value['transition']);
+      } 
+    }
+}
+/**
+ * get transition details.
+ **/
+ function _workflow_notifications_get_transition_details(EntityInterface $entity) {
+  if (\Drupal\workflow\Entity\WorkflowManager::isWorkflowEntityType($entity->getEntityTypeId())) {
+    return;
+  }
+  $i = 0;
+  $data = [];
+  foreach (_workflow_info_fields($entity) as $field_info) {
+    $field_name = $field_info->getName();
+    /** @var $transition WorkflowTransitionInterface */
+    $transition = $entity->$field_name->__get('workflow_transition');
+    if (empty($transition)) {
+      continue;
+    }
+    // @todo: hide below code in WorkflowNotification::loadMultiple()?
+    $data[$i]['from_sid'] = $transition->getFromSid();
+    $data[$i]['to_sid'] = $transition->getToSid();
+    $data[$i]['wid'] = $transition->getWorkflowId();
+    $data[$i]['days'] = 0;
+    $data[$i]['transition'] = $transition;
+    $state_changed = ($data[$i]['from_sid'] != $data[$i]['to_sid']);
+    if (!$state_changed) {
+      continue;
+    }
+
+    // Default select parameters for non-scheduled transitions.
+    $data[$i]['trigger'] = 'on_state_change';
+    if ($transition->isScheduled()) {
+      $data[$i]['trigger'] = 'before_state_change';
+
+      $timestamp = $transition->getTimestamp();
+      if (!empty($timestamp)) {
+        $date = date('y-m-d', $timestamp);
+        $current_date = date('y-m-d', \Drupal::time()->getRequestTime());
+        $date1=date_create($date);
+        $date2=date_create($current_date);
+        $diff=date_diff($date1,$date2);
+        $data[$i]['days'] = $diff->days;
+      }
+    }
+    $i++;
+  }
+  return $data;
+ }
+/**
+ * Implements hook_cron().
+ *
+ * sending remainder mail.
+ **/
+function workflow_notifications_cron() {
+  workflow_debug('', __FUNCTION__, __LINE__);
+
+  $last_run = \Drupal::state()->get('workflow_notifications.last_run') ?: 0;
+  if(date('d', $last_run) != date('d')) {
+    // queue to send mail.
+    // @todo: use $notifications[] = WorkflowNotification::LoadByProperties()
+    $result = Drupal::entityQuery("workflow_notify")->condition('when_to_trigger', 'before_state_change', '=')->execute();
+    foreach ($result as $key => $value) {
+      $entity = WorkflowNotification::load($key);
+      $data['entity'] = $entity;
+      $data['notify'] = "mail";
+      $queue = \Drupal::queue('workflow_scheduled_entity_mail');
+      $queue->createItem($data);
+    }
+    \Drupal::state()->set('workflow_notifications.last_run', \Drupal::time()->getRequestTime());
+  }
+}
+
+/**
+ * Implements hook_mail_alter().
+ */
+function workflow_notifications_mail_alter(&$message) {
+  workflow_debug('', __FUNCTION__, __LINE__);
+}
+
+/**
+ * Implements hook_mail().
+ */
+function workflow_notifications_mail($key, &$message, $params) {
+  workflow_debug('', __FUNCTION__, __LINE__);
+
+  $options = [
+    'langcode' => $message['langcode'],
+  ];
+  $from = Drupal::config('system.site')->get('mail');
+  $message['from'] = $from;
+  $message['subject'] = $params['subject'];
+  $message['body'][] = $params['message'];
+  $message['headers']['Content-Type'] = 'text/html; charset=UTF-8; format=flowed; delsp=yes';
+}
+
+/**
+ * Internal helper function. No hook.
+ */
+function _workflow_notifications_mail_trigger($trigger, $notifications, $entity, $transition) {
+  if (empty($notifications)) {
+    return;
+  }
+
+  foreach ($notifications as $id => $notification) {
+    /** @var WorkflowNotification $notifications */
+    $roles = $notification->roles;
+    $tkn_rpl_val = _workflow_notifications_token_replace($notification->mail_ids, $notification->message['value'], $notification->subject, $entity, $transition);
+    $mail_ids = _workflow_notifications_get_value_as_array($tkn_rpl_val['ids']);
+    if(isset($roles['workflow_author']) && $roles['workflow_author'] == 'workflow_author'){
+      $mail_ids[] = $entity->getOwner()->getEmail();
+    }
+    unset($roles['workflow_author']);
+    $to = _workflow_notifications_collect_mail_ids($roles, $mail_ids);
+    $params['subject'] = $tkn_rpl_val['subject'];
+    $params['message'] = $tkn_rpl_val['message'];
+    _workflow_notifications_mail_send($to, $params, $trigger);
+  }
+}
+
+/**
+ * send mail to all users.
+ * @param $start_time
+ * @param $end_time
+ * @param $notification
+ */
+function _workflow_notifications_send_mail_to_all($start_time, $end_time, $notification) {
+  workflow_debug('', __FUNCTION__, __LINE__);
+
+  // @todo: use WorkflowScheduledTransition::loadBetween();
+  $query_publish = \Drupal::database()->select('workflow_transition_schedule', 'ws')->fields('ws');
+  $query_publish->condition('ws.timestamp', [$start_time, $end_time], 'BETWEEN');
+  $query_publish->condition('ws.from_sid', $notification->from_sid, '=');
+  $query_publish->condition('ws.to_sid', $notification->to_sid, '=');
+  $result_publish = $query_publish->execute()->fetchAll();
+
+  $key = 'workflow_notification_before_mail_trigger';
+  foreach ($result_publish as $row => $val) {
+    $entity = entity_load($val->entity_type, $val->entity_id);
+    $field = _workflow_info_fields($entity, $val->entity_type);
+    $fieldName = $field[key($field)]->getName();
+    // @todo: next line has no effect.
+    $transition = WorkflowScheduledTransition::loadByProperties($val->entity_type, $val->entity_id, [], $fieldName);
+    $roles = $notification->roles;
+    $tkn_rpl_val = _workflow_notifications_token_replace($notification->mail_ids, $notification->message['value'], $notification->subject, $entity, $transition);
+    $mail_ids = _workflow_notifications_get_value_as_array($tkn_rpl_val['ids']);
+    if(isset($roles['workflow_author']) && $roles['workflow_author'] == 'workflow_author'){
+      $mail_ids[] = $entity->getOwner()->getEmail();
+    }
+    unset($roles['workflow_author']);
+    $to = _workflow_notifications_collect_mail_ids($roles, $mail_ids);
+    $params['subject'] = $tkn_rpl_val['subject'];
+    $params['message'] = $tkn_rpl_val['message'];
+    _workflow_notifications_mail_send($to, $params, $key);
+  }
+}
+
+/**
+ * returns array from string.
+ * @param $value
+ * @return array
+ */
+function _workflow_notifications_get_value_as_array($value) {
+  $values = "\r\n" . $value;
+  $result = array_filter(preg_split('/\r\n|[\r\n]/', $values));
+  return $result;
+}
+
+/**
+ * Implements token replace.
+ */
+function _workflow_notifications_token_replace($ids, $message, $subject, $entity, $transition) {
+  $token_service = \Drupal::token();
+  $tkn_rpl_val = [];
+  $tkn_rpl_val['ids'] = $token_service->replace($ids, ['comment' => $entity, 'node' => $entity, 'term' => $entity, 'media' => $entity, 'paragraph' => $entity, 'workflow_transition' => $transition, 'workflow_scheduled_transition' => $transition]);
+  $tkn_rpl_val['message'] = $token_service->replace($message, ['comment' => $entity, 'node' => $entity, 'term' => $entity, 'media' => $entity, 'paragraph' => $entity, 'workflow_transition' => $transition, 'workflow_scheduled_transition' => $transition]);
+  $tkn_rpl_val['subject'] = $token_service->replace($subject, ['comment' => $entity, 'node' => $entity, 'term' => $entity, 'media' => $entity, 'paragraph' => $entity, 'workflow_transition' => $transition, 'workflow_scheduled_transition' => $transition]);
+  return $tkn_rpl_val;
+}
+
+/**
+ * Get all mail adresses.
+ *
+ * Add the role-defined adresses t the user-specified adresses.
+ */
+function _workflow_notifications_collect_mail_ids($roles, $mail_ids) {
+
+  if ($roles) {
+    foreach ($roles as $role_id => $role) {
+      if ($role == '0') {
+        continue;
+      }
+
+      // @todo: the selection upon role is not working.
+      $ids = \Drupal::entityQuery('user')
+        ->condition('status', 1)
+        ->condition('roles', $role)
+        ->execute();
+//      $group = $query->orConditionGroup()
+//        ->condition('roles', 'managers')
+//        ->condition('roles', 'administrator');
+//      $ids = $query->condition($group)->execute();
+
+      $user_storage = \Drupal::service('entity_type.manager')->getStorage('user');
+      $ids = $user_storage->getQuery()
+        ->condition('status', 1)
+ // @todo       ->condition('roles', $role, 'IN')
+        ->execute();
+
+      $users = $user_storage->loadMultiple($ids);
+//      $users = \Drupal\user\Entity\User::loadMultiple($ids);
+
+      foreach ($users as $key => $user) {
+        $mail_ids[] = $user->getEmail();
+      }
+    }
+  }
+
+  $mail_ids = array_unique($mail_ids);
+  return $mail_ids;
+}
+
+/**
+ * send mail.
+ */
+function _workflow_notifications_mail_send($to, $params, $key) {
+  $mailManager = \Drupal::service('plugin.manager.mail');
+  $langcode = \Drupal::currentUser()->getPreferredLangcode();
+  $send = true;
+  $module_name = basename(__FILE__, '.module');
+  $to = implode(', ', $to);
+  $result = $mailManager->mail($module_name, $key, $to, $langcode, $params, NULL, $send);
+  if ($result['result'] !== true) {
+    \Drupal::logger('workflow-mail-log')->error("There was a problem sending your message and it was not sent.");
+    drupal_set_message(t('There was a problem sending your message and it was not sent.'), 'error');
+  }
+  else {
+    \Drupal::logger('workflow-mail-log')->notice("Email sent successfully to " . $to);
+    drupal_set_message(t('Email sent successfully.'));
+  }
+}

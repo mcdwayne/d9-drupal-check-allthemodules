@@ -1,0 +1,158 @@
+<?php
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\workflow\Entity\WorkflowScheduledTransition;
+use Drupal\workflow\Entity\WorkflowTransitionInterface;
+use Drupal\workflow_sms_notify\Entity\WorkflowSmsNotify;
+use Drupal\sms\Entity\SmsMessage;
+use Drupal\sms\Direction;
+use Drupal\sms\Entity\SmsGateway;
+
+/**
+ * Implements hook_entity_update().
+ * sending on state change mail.
+ */
+function workflow_sms_notify_entity_update(EntityInterface $entity) {
+  // Avoid this hook on workflow objects.
+    $data = _workflow_notifications_get_transition_details($entity);
+    // $todo: use $transitions as parameter, and derive $trigger from that.
+    foreach($data as $key => $value) {
+      $smsnotifications = WorkflowSmsNotify::loadMultipleByProperties($value['from_sid'], $value['to_sid'], $value['wid'], $value['trigger'], $value['days']);
+      if (!empty($smsnotifications)) {
+          _workflow_sms_notify_sms_trigger($value['trigger'], $smsnotifications, $entity, $value['transition']);
+      }
+    }
+}
+
+/**
+ * Internal helper function. no hook.
+ **/
+ function _workflow_sms_notify_sms_trigger($trigger, $smsnotifications, $entity, $transition) {
+    if (empty($smsnotifications)) {
+        return;
+    }
+    foreach ($smsnotifications as $id => $smsnotification) {
+        /** @var WorkflowNotification $notifications */
+        $roles = $smsnotification->roles;
+        $tkn_rpl_val = _workflow_notifications_token_replace($smsnotification->phone_num, $smsnotification->message['value'],$smsnotification->subject, $entity, $transition);
+        $phone_num = _workflow_notifications_get_value_as_array($tkn_rpl_val['ids']);
+        $to = _workflow_sms_notify_collect_phone_num($roles, $phone_num);
+        $params['subject'] = $tkn_rpl_val['subject'];
+        $params['message'] = $tkn_rpl_val['message'];
+        if(array_values($to)) {
+            _workflow_sms_notify_sms_send($to, $params, $trigger);
+        }        
+    }
+ }
+
+ /**
+  * get all phone number
+  **/
+  function _workflow_sms_notify_collect_phone_num($roles, $phone_nums) {
+       if ($roles) {
+        foreach ($roles as $role_id => $role) {
+            if ($role == '0') {
+                continue;
+            }
+            $ids = \Drupal::entityQuery('user')
+                ->condition('status', 1)
+                ->condition('roles', $role)
+                ->execute();
+            $user_storage = \Drupal::service('entity_type.manager')->getStorage('user');
+            $ids = $user_storage->getQuery()
+                ->condition('status', 1)
+                ->execute();
+
+            $users = $user_storage->loadMultiple($ids);
+            foreach ($users as $key => $user) {
+                 $phone_number_service = \Drupal::service('sms.phone_number');
+                 if(!empty($phone_number_service->getPhoneNumbers($user))) {
+                    $phone_nums[] = $phone_number_service->getPhoneNumbers($user);
+                 }
+            }
+        }
+    }
+    return array_unique($phone_nums);
+  }
+
+  /**
+   * send sms to all users.
+   **/
+
+   function _workflow_sms_notify_sms_send($to, $params, $trigger) {
+        if(!empty($to)) {
+            try {
+                $smsProvider = \Drupal::service('sms.provider');
+                $sms_message = SmsMessage::create()
+                ->setMessage($params['message']);
+                // $gateway = SmsGateway::load("sms_gateway");
+                $sms_message = SmsMessage::convertFromSmsMessage($sms_message)
+                                ->addRecipients($to)
+                                // ->setGateway($gateway)
+                                ->setDirection(Direction::OUTGOING);
+                $phone_number_service = \Drupal::service('sms.provider.default')->queue($sms_message);
+                drupal_set_message(t('SMS sent successfully'), 'status', FALSE);
+            }
+            catch (Exception $e) {
+                drupal_set_message(t('SMS not sent, please contact site administrator'), 'error', FALSE);
+            }
+        }
+   }
+
+/**
+ * Implements hook_cron().
+ *
+ * sending remainder mail.
+ **/
+ 
+function workflow_sms_notify_cron() {
+    workflow_debug('', __FUNCTION__, __LINE__);
+  
+    $config = \Drupal::service('config.factory')->getEditable('workflow_sms_notify.settings');
+    if (date('d', $config->get('last_sms_run_date')) != date('d')) {
+      // queue to send mail.
+      // @todo: use $notifications[] = WorkflowNotification::LoadByProperties()
+      $result = Drupal::entityQuery("workflow_sms_notify")->condition('when_to_trigger', 'before_state_change', '=')->execute();
+      foreach ($result as $key => $value) {
+        $entity = WorkflowSmsNotify::load($key);
+        $data['entity'] = $entity;
+        $data['notify'] = "sms";
+        $queue = \Drupal::queue('workflow_scheduled_entity_mail');
+        $queue->createItem($data);
+      }
+      $config->set('last_sms_run_date', \Drupal::time()->getRequestTime())->save();
+    }
+  }
+
+ /**
+ * send sms to all users.
+ * @param $start_time
+ * @param $end_time
+ * @param $notification
+ */
+  function _workflow_sms_notify_send_sms_to_all($start_time, $end_time, $notification) {
+    workflow_debug('', __FUNCTION__, __LINE__);
+  
+    // @todo: use WorkflowScheduledTransition::loadBetween();
+    $query_publish = \Drupal::database()->select('workflow_transition_schedule', 'ws')->fields('ws');
+    $query_publish->condition('ws.timestamp', [$start_time, $end_time], 'BETWEEN');
+    $query_publish->condition('ws.from_sid', $notification->from_sid, '=');
+    if ($notification->to_sid != 'any') {
+      $query_publish->condition('ws.to_sid', $notification->to_sid, '=');
+    }
+    $result_publish = $query_publish->execute()->fetchAll();  
+    foreach ($result_publish as $row => $val) {
+        $entity = entity_load($val->entity_type, $val->entity_id);
+        $field = _workflow_info_fields($entity, $val->entity_type);
+        $fieldName = $field[key($field)]->getName();
+        // @todo: next line has no effect.
+        $transition = WorkflowScheduledTransition::loadByProperties($val->entity_type, $val->entity_id, [], $fieldName);
+        $roles = $notification->roles;
+        $tkn_rpl_val = _workflow_notifications_token_replace($notification->phone_num, $notification->message['value'],$notification->subject, $entity, $transition);
+        $phone_num = _workflow_notifications_get_value_as_array($tkn_rpl_val['ids']);
+        $to = _workflow_sms_notify_collect_phone_num($roles, $phone_num);
+        $params['subject'] = $tkn_rpl_val['subject'];
+        $params['message'] = $tkn_rpl_val['message'];
+        _workflow_sms_notify_sms_send($to, $params, $trigger);
+    }
+  }
