@@ -1,0 +1,156 @@
+<?php
+
+/**
+ * @file
+ * Preprocesses AsciiDoc text.
+ *
+ * Use with care -- things in the output directory will be overwritten!
+ *
+ * Command-line arguments: Source directory, output directory, steps
+ * where steps is a character string like fi
+ *
+ * Depending on the characters in steps, the following processing can happen,
+ * after which the resulting files are written to the output directory with
+ * the same names. Possible processing steps -- if steps contains:
+ * - f: Adds filenames. Specifically, adds:
+ *   @code
+ *   pass:[<remark>Source file: (filename)</remark>]
+ *   @endcode
+ *   after each 2nd-level and 3rd-level header found in the file.
+ * - i: Fixes extra whitespace from index entries, by moving them to the
+ *   first regular paragraph in each topic (except glossary files).
+ */
+
+if (count($argv) < 4) {
+  exit("Usage: php (scriptname) source output steps, where steps is some combination of characters fi");
+}
+
+$source = $argv[1];
+$output = $argv[2];
+$steps = $argv[3];
+
+if (!is_dir($source) || !is_dir($output)) {
+  exit("Source or output directories are missing");
+}
+if ($source == $output) {
+  exit("Source and output directories are the same");
+}
+
+// Find all *.txt files in the source directory and process them.
+if ($dh = opendir($source)) {
+  while (($file = readdir($dh)) !== FALSE) {
+    if (preg_match('|^[a-zA-Z_.\-]+\.txt$|', $file)) {
+      $text = file_get_contents($source . '/' . $file);
+      $text = mb_convert_encoding($text, 'UTF-8',
+        mb_detect_encoding($text, 'UTF-8, ISO-8859-1', TRUE));
+      if ($text && strpos($steps, 'i') !== FALSE) {
+        $text = move_index_entries($text, $file);
+      }
+      if ($text && strpos($steps, 'f') !== FALSE) {
+        $text = add_filenames($text, $file);
+      }
+      if ($text) {
+        $count = file_put_contents($output . '/' . $file, $text);
+      }
+      if (!$text || !$count) {
+        exit("Empty file or could not write to output for $file");
+      }
+    }
+  }
+  closedir($dh);
+}
+
+/**
+ * Adds filenames to the text of a file.
+ *
+ * @param string $text
+ *   Text of the file.
+ * @param string $filename
+ *   Name of the file being processed, without the directory.
+ * @param int[] depths
+ *   (optional) Header depths to add file name to.
+ *
+ * @return string
+ *   Processed text of the file.
+ */
+function add_filenames($text, $filename, $depths = array(2,3)) {
+  $addition = "pass:[<remark>Source file: $filename</remark>]\n";
+
+  // Make a regular expression to match level-N headers, which are '==' or
+  // '===' or whatever at the start of a line.
+  $match = array();
+  foreach ($depths as $depth) {
+    $match[] = preg_quote(str_repeat('=', $depth));
+  }
+  $match = array_filter($match);
+  if (!count($match)) {
+    exit ("No headers in $filename");
+  }
+  $match = '/^(' . implode('|', $match) . ')[^\=].*$/mu';
+
+  // Split the text at code block indicator lines: ----.
+  // Only process the odd results, which will skip processing the code blocks.
+  $codes = preg_split('/^----$/m', $text);
+  for ($i = 0; $i < count($codes); $i += 2) {
+    $codes[$i] = preg_replace($match, '$0' . "\n" . $addition, $codes[$i]);
+  }
+  $text = implode("----\n", $codes);
+  return $text;
+}
+
+/**
+ * Fixes index entries in the text of a file.
+ *
+ * Except in files containing glossary entries, moves all index entries to
+ * the next regular paragraph (not a header or special paragraph).
+ *
+ * @param string $text
+ *   Text of the file.
+ * @praam string $filename
+ *   Name of the file (only used for error message).
+ *
+ * @return string
+ *   Processed text of the file.
+ */
+function move_index_entries($text, $filename) {
+  // See if this is a glossary file. If so, do not disturb it.
+  if (strpos($text, '[glossary]') !== FALSE) {
+    return $text;
+  }
+
+  // Split the text into paragraphs (on two or more line breaks).
+  $paragraphs = preg_split('|\R{2,}|u', $text);
+
+  // Put it back together, moving index-entry-only paragraphs to the front of
+  // the next regular paragraph.
+  $output = '';
+  $saved_indexes = '';
+  foreach ($paragraphs as $paragraph) {
+    // If the first character is a "letter" character, it's a "regular"
+    // paragraph. Output any saved indexes and the paragraph.
+    $first_char = mb_substr($paragraph, 0, 1, 'utf-8');
+    if (preg_match('|\pL|u', $first_char)) {
+      $output .= "\n\n" . $saved_indexes . $paragraph;
+      $saved_indexes = '';
+      continue;
+    }
+
+    // See if the paragraph consists entirely of index entries and
+    // whitespace. If so, save and continue.
+    if (preg_match('|^(\s*\(\(\([^\(]+\)\)\))+|u', $paragraph)) {
+      $saved_indexes = $paragraph;
+      continue;
+    }
+
+    // It's some kind of a header or other special paragraph. Output and
+    // continue.
+    $output .= "\n\n" . $paragraph;
+  }
+
+  // If there were index entries left over, we failed.
+  if ($saved_indexes) {
+    exit("Could not fix indexes in $filename");
+  }
+
+  return trim($output);
+}
