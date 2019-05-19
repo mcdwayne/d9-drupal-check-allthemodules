@@ -1,0 +1,860 @@
+<?php
+
+/**
+ * @file
+ * Front-end form pre-processor.
+ */
+
+use Drupal\Component\Serialization\Json;
+use Drupal\Component\Utility\Html;
+use Drupal\Component\Utility\NestedArray;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Link;
+use Drupal\Core\Render\Markup;
+use Drupal\Core\Url;
+use Drupal\webform\Plugin\WebformHandlerInterface;
+
+class wf_crm_webform_preprocess extends wf_crm_webform_base {
+  private $form;
+  private $form_state;
+  private $info = array();
+  private $all_fields;
+  private $all_sets;
+  private $handler;
+
+  function __construct(&$form, FormStateInterface $form_state, WebformHandlerInterface $handler) {
+    $this->handler = $handler;
+    $this->form = &$form;
+    $this->form_state = $form_state;
+    $this->node = $handler->getWebform();
+    $this->settings = $handler->getConfiguration()['settings'];
+    $this->data = $this->settings['data'];
+    $this->ent['contact'] = [];
+    $this->all_fields = wf_crm_get_fields();
+    $this->all_sets = wf_crm_get_fields('sets');
+    $this->enabled = wf_crm_enabled_fields($handler->getWebform());
+    $this->line_items = $form_state->get(['civicrm', 'line_items']) ?: [];
+  }
+
+  /**
+   * Alter front-end of webforms: Called by hook_form_alter() when rendering a civicrm-enabled webform
+   * Add custom prefix.
+   * Display messages.
+   * Block users who should not have access.
+   * Set webform default values.
+   */
+  public function alterForm() {
+    // Add css & js
+    $this->addResources();
+    // Add validation handler
+    // $this->form['#validate'][] = 'wf_crm_validate';
+    // If this form is already in-process, IDs will be stored
+    if (!empty($this->form_state->get('civicrm'))) {
+      $this->ent = $this->form_state->get(['civicrm', 'ent']);
+    }
+    $submitted_contacts = array();
+    // Keep track of cids across multipage forms
+    if (!empty($this->form_state->getValue('submitted')) && $this->form_state->get(['webform','page_count']) > 1) {
+      foreach ($this->enabled as $k => $v) {
+        if (substr($k, -8) == 'existing' && $this->form_state->getValue(['submitted', $v])) {
+          list(, $c) = explode('_', $k);
+          $val = $this->form_state->getValue(['submitted', $v]);
+          $cid_data["cid$c"] = $this->ent['contact'][$c]['id'] = (int) (is_array($val) ? $val[0] : $val);
+          $submitted_contacts[$c] = TRUE;
+        }
+      }
+      if (!empty($cid_data)) {
+        $this->form['#attributes']['data-civicrm-ids'] = Json::encode($cid_data);
+      }
+    }
+    // Early return if the form (or page) was already submitted
+    /*
+    $triggering_element = $this->form_state->getTriggeringElement();
+    if ($triggering_element && $triggering_element['#id'] == 'edit-previous'
+      || (empty($this->form_state->isRebuilding()) && empty($this->form['#submission']->is_draft))
+      // When resuming from a draft
+      || (!empty($this->form['#submission']->is_draft) && empty($this->form_state->getUserInput()))
+    ) {
+      $this->fillForm($this->form['submitted']);
+      return;
+    }
+    // If this is an edit op, use the original IDs and return
+    if (isset($this->form['#submission']->sid) && $this->form['#submission']->is_draft != '1') {
+      if (isset($this->form['#submission']->civicrm)) {
+        $this->form_state['civicrm']['ent'] = $this->form['#submission']->civicrm;
+        foreach ($this->form_state['civicrm']['ent']['contact'] as $c => $contact) {
+          $this->info['contact'][$c]['contact'][1]['existing'] = wf_crm_aval($contact, 'id', 0);
+        }
+      }
+      $this->fillForm($this->form['submitted']);
+      return;
+    }
+    */
+    // Search for existing contacts
+    $elements = $this->handler->getWebform()->getElementsDecoded();
+    for ($c = 1; $c <= count($this->data['contact']); ++$c) {
+      $this->ent['contact'][$c] = wf_crm_aval($this->ent, "contact:$c", array());
+      $existing_component = $elements["civicrm_{$c}_contact_1_contact_existing"];
+      // Search for contact if the user hasn't already chosen one
+      if ($existing_component && empty($submitted_contacts[$c])) {
+        $this->findContact($existing_component);
+      }
+      // Fill cid with '0' if unknown
+      $this->ent['contact'][$c] += array('id' => 0);
+    }
+    // Search for other existing entities
+    if (empty($this->form_state->get('civicrm'))) {
+      if (!empty($this->data['case']['number_of_case'])) {
+        $this->findExistingCases();
+      }
+      if (!empty($this->data['activity']['number_of_activity'])) {
+        $this->findExistingActivities();
+      }
+      if (isset($this->data['grant']['number_of_grant'])) {
+        $this->findExistingGrants();
+      }
+    }
+    // Form alterations for unknown contacts
+    if (empty($this->ent['contact'][1]['id'])) {
+      if ($this->settings['prefix_unknown']) {
+        $this->form['#prefix'] = wf_crm_aval($this->form, '#prefix', '') . '<div class="webform-civicrm-prefix contact-unknown">' . nl2br($this->settings['prefix_unknown']) . '</div>';
+      }
+      if ($this->settings['block_unknown_users']) {
+        $this->form['submitted']['#access'] = $this->form['actions']['#access'] = FALSE;
+        $this->setMessage(t('Sorry, you do not have permission to access this form.'), 'warning');
+        return;
+      }
+    }
+    if (!empty($this->data['participant_reg_type'])) {
+      $this->populateEvents();
+    }
+    // Form alterations for known contacts
+    foreach ($this->ent['contact'] as $c => $contact) {
+      if (!empty($contact['id'])) {
+        // Retrieve contact data
+        $this->info['contact'][$c] = $this->loadContact($c);
+        $this->info['contact'][$c]['contact'][1]['existing'] = $contact['id'];
+        // Retrieve participant data
+        if ($this->events && ($c == 1 || $this->data['participant_reg_type'] == 'separate')) {
+          $this->loadParticipants($c);
+        }
+        // Membership
+        if (!empty($this->data['membership'][$c]['number_of_membership'])) {
+          $this->loadMemberships($c, $contact['id']);
+        }
+      }
+      // Load events from url if enabled, this will override loadParticipants
+      if (!empty($this->data['reg_options']['allow_url_load'])) {
+        $this->loadURLEvents($c);
+      }
+    }
+    // Prefill other existing entities
+    foreach (array('case', 'activity', 'grant') as $entity) {
+      if (!empty($this->ent[$entity])) {
+        $this->populateExistingEntity($entity);
+      }
+    }
+    if (!empty($this->ent['contact'][1]['id'])) {
+      if ($this->settings['prefix_known']) {
+        $this->form['#prefix'] = wf_crm_aval($this->form, '#prefix', '') . '<div class="webform-civicrm-prefix contact-known">' . nl2br($this->replaceTokens($this->settings['prefix_known'], $this->info['contact'][1]['contact'][1])) . '</div>';
+      }
+      if ($this->settings['message']) {
+        $this->showNotYouMessage($this->settings['message'], $this->info['contact'][1]['contact'][1]);
+      }
+    }
+    // Store ids
+    $this->form_state->set(['civicrm', 'ent'], $this->ent);
+    // Set default values and other attributes for CiviCRM form elements
+    // Passing $submitted helps avoid overwriting values that have been entered on a multi-step form
+    $submitted = $this->form_state->getValue('submitted', []);
+    $this->fillForm($this->form, $submitted);
+  }
+
+  /**
+   * Add necessary js & css to the form
+   */
+  private function addResources() {
+    $this->form['#attached']['library'][] = 'webform_civicrm/forms';
+
+    $config = CRM_Core_Config::singleton();
+    // Variables to push to the client-side
+    $js_vars = array();
+    // JS Cache eliminates the need for most ajax state/province callbacks
+    foreach ($this->data['contact'] as $c) {
+      if (!empty($c['number_of_address'])) {
+        $js_vars += [
+          'defaultCountry' => $config->defaultContactCountry,
+          'defaultStates' => wf_crm_get_states($config->defaultContactCountry),
+          'noCountry' => t('- First Choose a Country -'),
+          'callbackPath' => Url::fromUserInput('/webform-civicrm/js', ['alias' => TRUE]),
+        ];
+        break;
+      }
+    }
+    // Preprocess contribution page
+    if (!empty($this->data['contribution'])) {
+      $this->addPaymentJs();
+      $this->form['#attached']['js'][] = array(
+        'data' => drupal_get_path('module', 'webform_civicrm') . '/js/webform_civicrm_payment.js',
+        'scope' => 'footer',
+      );
+      $page_id = $this->data['contribution'][1]['contribution'][1]['contribution_page_id'];
+      if (version_compare($this->civicrm_version, '4.7', '>=')) {
+        $currency = $this->contribution_page['currency'];
+        $contributionCallbackQuery = array('currency' => $currency, 'snippet' => 4);
+        $contributionCallbackUrl = 'civicrm/payment/form';
+        $js_vars['processor_id_key'] = 'processor_id';
+      }
+      else {
+        $contributionCallbackQuery = array('reset' => 1, 'id' => $page_id, 'qfKey' => $this->getQfKey(), 'snippet' => 4);
+        $contributionCallbackUrl = '/civicrm/contribute/transact';
+        $js_vars['processor_id_key'] = 'type';
+      }
+      if (!empty($this->data['contribution'][1]['contribution'][1]['is_test'])) {
+        // RM: This is needed in order for CiviCRM to know that this is a 'test' (i.e. 'preview' action in CiviCRM) transaction - otherwise, CiviCRM defaults to 'live' and returns the payment form with public key for the live payment processor!
+        $contributionCallbackQuery['action'] = CRM_Core_Action::description(CRM_Core_Action::PREVIEW);
+      }
+      $js_vars['contributionCallback'] = Url::fromUserInput($contributionCallbackUrl, ['query' => $contributionCallbackQuery, 'alias' => TRUE]);
+      // Add payment processor - note we have to search in 2 places because $this->loadMultipageData hasn't been run. Maybe it should be?
+      $fid = 'civicrm_1_contribution_1_contribution_payment_processor_id';
+      if (!empty($this->enabled[$fid])) {
+        $js_vars['paymentProcessor'] = wf_crm_aval($this->form_state, 'storage:submitted:' . $this->enabled[$fid]);
+      }
+      else {
+        $js_vars['paymentProcessor'] = $this->getData($fid);
+      }
+    }
+
+    $this->form['#attached']['drupalSettings']['webform_civicrm'] = $js_vars;
+  }
+
+  /**
+   * Check if events are open to registration and take appropriate action
+   */
+  private function populateEvents() {
+    $reg = wf_crm_aval($this->data, 'reg_options', array());
+    // Fetch events set in back-end
+    $this->data += array('participant' => array());
+    foreach ($this->data['participant'] as $e => $par) {
+      if (!empty($par['participant'])) {
+        foreach ($par['participant'] as $n => $p) {
+          if (!empty($p['event_id'])) {
+            // Handle multi-valued event selection
+            foreach ((array) $p['event_id'] as $eid) {
+              if ($eid = (int) $eid) {
+                $this->events[$eid]['ended'] = TRUE;
+                $this->events[$eid]['title'] = t('this event');
+                $this->events[$eid]['count'] = wf_crm_aval($this->events, "$eid:count", 0) + 1;
+                $status_fid = "civicrm_{$e}_participant_{$n}_participant_status_id";
+                $this->events[$eid]['form'][] = array(
+                  'contact' => $e,
+                  'num' => $n,
+                  'eid' => NULL,
+                  'status_id' => (array) $this->getData($status_fid, array_keys($this->getExposedOptions($status_fid))),
+                );
+              }
+            }
+          }
+        }
+      }
+    }
+    // Add events exposed to the form
+    foreach ($this->enabled as $field => $fid) {
+      if (strpos($field, 'participant_event_id')) {
+        foreach ($this->getExposedOptions($field) as $p => $label) {
+          list($eid) = explode('-', $p);
+          $this->events[$eid]['ended'] = TRUE;
+          $this->events[$eid]['title'] = $label;
+          list(, $e, , $n) = explode('_', $field);
+          $status_fid = "civicrm_{$e}_participant_{$n}_participant_status_id";
+          $this->events[$eid]['form'][] = array(
+            'contact' => $e,
+            'num' => $n,
+            'eid' => $p,
+            'status_id' => (array) $this->getData($status_fid, array_keys($this->getExposedOptions($status_fid))),
+          );
+        }
+      }
+    }
+    if ($this->events && (!empty($reg['show_remaining']) || !empty($reg['block_form']))) {
+      $this->loadEvents();
+      foreach ($this->events as $eid => $event) {
+        if ($event['ended']) {
+          if (!empty($reg['show_remaining'])) {
+            $this->setMessage(t('Sorry, %event has ended.', array('%event' => $event['title'])), 'warning');
+          }
+        }
+        elseif ($event['full']) {
+          if (!empty($reg['show_remaining'])) {
+            $this->setMessage('<em>' . check_plain($event['title']) . '</em>: ' . check_plain($event['full_message']), 'warning');
+          }
+        }
+        else {
+          $reg['block_form'] = FALSE;
+          if ($event['max_participants'] && ($reg['show_remaining'] == 'always' || intval($reg['show_remaining']) >= $event['remaining'])) {
+            $this->setMessage(format_plural($event['remaining'],
+              '%event has 1 remaining space.',
+              '%event has @count remaining spaces.',
+              array('%event' => $event['title'])));
+          }
+        }
+      }
+      if ($reg['block_form']) {
+        $this->form['submitted']['#access'] = $this->form['actions']['#access'] = FALSE;
+        return;
+      }
+    }
+  }
+
+  /**
+   * Load participant data for a contact
+   * @param int $c
+   */
+  private function loadParticipants($c) {
+    $select = array('id', 'event_id', 'role_id', 'status_id');
+    if (array_key_exists('participant_campaign_id', $this->all_fields)) {
+      $select[] = 'campaign_id';
+    }
+    $status_types = wf_crm_apivalues('participant_status_type', 'get');
+    $dao = CRM_Core_DAO::executeQuery('SELECT ' . implode(',', $select) . '
+      FROM civicrm_participant
+      WHERE contact_id = ' . $this->ent['contact'][$c]['id'] . ' AND event_id IN (' . implode(',', array_keys($this->events)) . ")"
+    );
+    while ($dao->fetch()) {
+      $par = array();
+      foreach ($select as $sel) {
+        $par['participant'][1][$sel] = $dao->$sel;
+      }
+      $par += $this->getCustomData($dao->id, 'Participant');
+      $status = $status_types[$dao->status_id];
+      foreach ($this->events[$dao->event_id]['form'] as $event) {
+        if ($event['contact'] == $c) {
+          // If status has been set by admin or exposed to the form, use it as a filter
+          if (in_array($status['id'], $event['status_id']) ||
+            // If status is "Automatic" (empty) then make sure the participant is registered
+            (empty($event['status_id']) && $status['class'] != 'Negative')
+          ) {
+            $n = $event['contact'];
+            $i = $event['num'];
+            // Support multi-valued form elements as best we can
+            $event_ids = wf_crm_aval($this->info, "participant:$n:participant:$i:event_id", array());
+            if ($event['eid']) {
+              $event_ids[] = $event['eid'];
+            }
+            foreach ($par as $k => $v) {
+              $this->info['participant'][$n][$k][$i] = $v[1];
+            }
+            $this->info['participant'][$n]['participant'][$i]['event_id'] = $event_ids;
+          }
+        }
+      }
+    }
+    $dao->free();
+  }
+
+  /**
+   * Load event data for the url
+   * @param int $c
+   */
+  private function loadURLEvents($c) {
+    $n = $this->data['participant_reg_type'] == 'separate' ? $c : 1;
+    $p = wf_crm_aval($this->data, "participant:$n:participant");
+    if ($p) {
+      foreach ($p as $e => $value) {
+        $event_ids = array();
+        // Get the available event list from the component
+        $fid = "civicrm_{$c}_participant_{$e}_participant_event_id";
+        $eids = array();
+        foreach ($this->getExposedOptions($fid) as $eid => $title) {
+          $id = explode('-', $eid);
+          $eids[$id[0]] = $eid;
+        }
+        if ($this->data['participant_reg_type'] == 'all') {
+          $urlParam = "event$e";
+        }
+        else {
+          $urlParam = "c{$c}event{$e}";
+        }
+        foreach (explode(',', wf_crm_aval($_GET, $urlParam)) as $value) {
+          if (isset($eids[$value])){
+            $event_ids[] = $eids[$value];
+          }
+        }
+        $this->info['participant'][$c]['participant'][$e]['event_id'] = $event_ids;
+      }
+    }
+  }
+
+  /**
+   * Load existing membership information and display a message to members.
+   * @param int $c
+   * @param int $cid
+   */
+  private function loadMemberships($c, $cid) {
+    $today = date('Y-m-d');
+    foreach ($this->findMemberships($cid) as $num => $membership) {
+      // Only show 1 expired membership, and only if there are no active ones
+      if (!$membership['is_active'] && $num) {
+        break;
+      }
+      $type = $membership['membership_type_id'];
+      $msg = t('@type membership for @contact has a status of "@status".', array(
+        '@type' => $this->getMembershipTypeField($type, 'name'),
+        '@contact' => $this->info['contact'][$c]['contact'][1]['display_name'],
+        '@status' => $membership['status'],
+      ));
+      if (!empty($membership['end_date'])) {
+        $end = array('@date' => CRM_Utils_Date::customFormat($membership['end_date']));
+        $msg .= ' ' . ($membership['end_date'] > $today ? t('Expires @date.', $end) : t('Expired @date.', $end));
+      }
+      $this->setMessage($msg);
+      for ($n = 1; $n <= $this->data['membership'][$c]['number_of_membership']; ++$n) {
+        $fid = "civicrm_{$c}_membership_{$n}_membership_membership_type_id";
+        if (empty($info['membership'][$c]['membership'][$n]) && ($this->getData($fid) == $type ||
+            array_key_exists($type, $this->getExposedOptions($fid)))
+        ) {
+          $this->info['membership'][$c]['membership'][$n] = $membership;
+          break;
+        }
+      }
+    }
+  }
+
+  /**
+   * Recursively walk through form array and set properties of CiviCRM fields
+   *
+   * @param array $elements (reference)
+   *   FAPI form array
+   * @param array $submitted
+   *   Existing submission (optional)
+   */
+  private function fillForm(&$elements, $submitted = array()) {
+    foreach ($elements as $eid => &$element) {
+      if ($eid[0] == '#' || !is_array($element)) {
+        continue;
+      }
+      // Recurse through nested elements
+      $this->fillForm($element, $submitted);
+      if (empty($element['#type']) || $element['#type'] == 'fieldset') {
+        continue;
+      }
+      if (!empty($element['#webform']) && $pieces = wf_crm_explode_key($eid)) {
+        list( , $c, $ent, $n, $table, $name) = $pieces;
+        // Separate out time fields
+        if (substr($name, -8) === 'timepart') {
+          $name = str_replace('_timepart', '', $name);
+        }
+        if ($field = wf_crm_aval($this->all_fields, $table . '_' . $name)) {
+          $component = [
+            'cid' => '@todo what is the CID?'
+          ];
+          $element['#attributes']['class'][] = 'civicrm-enabled';
+          $dt = NULL;
+          if (!empty($field['data_type'])) {
+            $dt = $element['#civicrm_data_type'] = $field['data_type'];
+          }
+          $element['#attributes']['data-civicrm-field-key'] = $eid;
+          // For contribution line-items
+          if ($table == 'contribution' && in_array($name, array('line_total', 'total_amount'))) {
+            $element['#attributes']['class'][] = 'contribution-line-item';
+          }
+          // Provide live options from the Civi DB
+          if (!empty($element['#civicrm_live_options']) && isset($element['#options'])) {
+            $params = [
+              'extra' => wf_crm_aval($field, 'extra', []) + $element['#extra'],
+              'form_key' => $element['#webform_key'],
+            ];
+            $new = wf_crm_field_options($params, 'live_options', $this->data);
+            $old = $element['#options'];
+            $resave = FALSE;
+            // If an item doesn't exist, we add it. If it's changed, we update it.
+            // But we don't subtract items that have been removed in civi - this prevents
+            // breaking the display of old submissions.
+            foreach ($new as $k => $v) {
+              if (!isset($old[$k]) || $old[$k] != $v) {
+                $old[$k] = $v;
+                $resave = TRUE;
+              }
+            }
+            if ($resave) {
+              $element['#extra']['extra']['items'] = wf_crm_array2str($old);
+              //webform_component_update($component);
+            }
+            $element['#options'] = $new;
+          }
+          // If the user has already entered a value for this field, don't change it
+          if (isset($this->info[$ent][$c][$table][$n][$name])
+            && !(isset($component['cid']) && isset($submitted[$component['cid']]))) {
+            $val = $this->info[$ent][$c][$table][$n][$name];
+
+            if ($ent === 'contact') {
+              $createModeKey = 'civicrm_' . $c . '_contact_' . $n . '_' . $table . '_createmode';
+              $multivaluesCreateMode = isset($this->data['config']['create_mode'][$createModeKey]) ? (int) $this->data['config']['create_mode'][$createModeKey] : NULL;
+
+              // Set empty value for field with 'Create only' mode.
+              if ($multivaluesCreateMode === self::MULTIVALUE_FIELDSET_MODE_CREATE_ONLY) {
+                $val = wf_crm_aval($element, '#default_value', '');
+              }
+            }
+            if (($element['#type'] == 'checkboxes' || !empty($element['#multiple'])) && !is_array($val)) {
+              $val = wf_crm_explode_multivalue_str($val);
+            }
+            if ($element['#type'] != 'checkboxes' && $element['#type'] != 'date'
+              && empty($element['#multiple']) && is_array($val)) {
+              // If there's more than one value for a non-multi field, pick the most appropriate
+              if (!empty($element['#options'])) {
+                foreach ($element['#options'] as $k => $v) {
+                  if (in_array($k, $val)) {
+                    $val = $k;
+                    break;
+                  }
+                }
+              }
+              else {
+                $val = array_pop($val);
+              }
+            }
+            if ($element['#type'] == 'autocomplete' && is_string($val) && strlen($val)) {
+              $options = wf_crm_field_options($component, '', $this->data);
+              $val = wf_crm_aval($options, $val);
+            }
+            // Contact image & custom file fields
+            if ($dt == 'File') {
+              $fileInfo = $this->getFileInfo($name, $val, $ent, $n);
+              if ($fileInfo && in_array($element['#type'], array('file', 'managed_file'))) {
+                $fileInfo = json_encode($fileInfo);
+                $js = "jQuery(function() {wfCivi.initFileField('$eid', $fileInfo)});";
+                $element['#attached']['js'][$js] = array('type' => 'inline');
+              }
+            }
+            // Set value for "secure value" elements
+            elseif ($element['#type'] == 'value') {
+              $element['#value'] = $val;
+            }
+            // Set default value
+            else {
+              $element['#default_value'] = $val;
+            }
+          }
+          if ($name == 'existing') {
+            wf_crm_fill_contact_value($this->node, $component, $element, $this->ent);
+          }
+          if ($name == 'contribution_page_id') {
+            $element['#prefix'] = $this->displayLineItems();
+            $element['#suffix'] = '<div class="crm-container crm-public" id="billing-payment-block"></div>';
+            $element['#value'] = wf_crm_aval($this->data, 'contribution:1:contribution:1:contribution_page_id');
+            unset($element['#default_value']);
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Format line-items to appear on front-end of webform
+   * @return string
+   */
+  private function displayLineItems() {
+    $rows = array();
+    $total = 0;
+    // Support hidden contribution field
+    $fid = 'civicrm_1_contribution_1_contribution_total_amount';
+    if (!$this->line_items && isset($this->enabled[$fid])) {
+      $field = $this->node->webform['components'][$this->enabled[$fid]];
+      if ($field['type'] == 'hidden') {
+        $this->line_items[] = array(
+          'line_total' => $field['value'],
+          'qty' => 1,
+          'element' => 'civicrm_1_contribution_1',
+          'label' => !empty($field['name']) ? $field['name'] : t('Contribution Amount'),
+        );
+      }
+    }
+
+    $taxRates = CRM_Core_PseudoConstant::getTaxRates();
+    foreach ($this->line_items as $item) {
+      $total += $item['line_total'];
+      // Sales Tax integration
+      if (!empty($item['financial_type_id'])) {
+        $itemTaxRate = isset($taxRates[$item['financial_type_id']]) ? $taxRates[$item['financial_type_id']] : NULL;
+      }
+      else {
+        $itemTaxRate = $this->tax_rate;
+      }
+
+      if (!is_null($itemTaxRate)) {
+        // Change the line item label to display the tax rate it contains
+        $taxSettings = CRM_Core_BAO_Setting::getItem(CRM_Core_BAO_Setting::CONTRIBUTE_PREFERENCES_NAME, 'contribution_invoice_settings');
+
+        if (($taxSettings['tax_display_settings'] != 'Do_not_show') && ($itemTaxRate !== 0)) {
+          $item['label'] .= ' (' . t('includes !rate @tax', array('!rate' => (float)$itemTaxRate . '%', '@tax' => $taxSettings['tax_term'])) . ')';
+        }
+
+        // Add calculation for financial type that contains tax
+        $item['tax_amount'] = ($itemTaxRate / 100) * $item['line_total'];
+        $total += $item['tax_amount'];
+        $label = $item['label'] . ($item['qty'] > 1 ? " ({$item['qty']})" : '');
+        $rows[] = array(
+          'data' => array($label, CRM_Utils_Money::format($item['line_total'] + $item['tax_amount'])),
+          'class' => array($item['element'], 'line-item'),
+          'data-amount' => $item['line_total'] + $item['tax_amount'],
+          'data-tax' => (float)$itemTaxRate,
+        );
+      }
+      else {
+        $label = $item['label'] . ($item['qty'] > 1 ? " ({$item['qty']})" : '');
+        $rows[] = array(
+          'data' => array($label, CRM_Utils_Money::format($item['line_total'])),
+          'class' => array($item['element'], 'line-item'),
+          'data-amount' => $item['line_total'],
+        );
+      }
+    }
+    $rows[] = array(
+      'data' => array(t('Total'), CRM_Utils_Money::format($total)),
+      'id' => 'wf-crm-billing-total',
+      'data-amount' => $total,
+    );
+    return theme('table', array(
+      'sticky' => FALSE,
+      'caption' => $this->contribution_page['title'],
+      'header' => array(),
+      'rows' => $rows,
+      'attributes' => array('id' => "wf-crm-billing-items"),
+    ));
+  }
+
+  /**
+   * Find case ids based on url input or "existing case" settings
+   */
+  private function findExistingCases() {
+    // Support legacy url param
+    if (empty($_GET["case1"]) && !empty($_GET["caseid"])) {
+      $_GET["case1"] = $_GET["caseid"];
+    }
+    for ($n = 1; $n <= $this->data['case']['number_of_case']; ++$n) {
+      if (!empty($this->data['case'][$n]['case'][1]['client_id'])) {
+        $clients = array();
+        foreach ((array)$this->data['case'][$n]['case'][1]['client_id'] as $c) {
+          if (!empty($this->ent['contact'][$c]['id'])) {
+            $clients[] = $this->ent['contact'][$c]['id'];
+          }
+        }
+        if ($clients) {
+          // Populate via url argument
+          if (isset($_GET["case$n"]) && wf_crm_is_positive($_GET["case$n"])) {
+            $id = $_GET["case$n"];
+            $item = wf_civicrm_api('case', 'getsingle', array('id' => $id));
+            if (array_intersect((array)wf_crm_aval($item, 'client_id'), $clients)) {
+              $this->ent['case'][$n] = array('id' => $id);
+            }
+          }
+          // Populate via search
+          elseif (!empty($this->data['case'][$n]['existing_case_status'])) {
+            $item = $this->findCaseForContact($clients, array(
+              'case_type_id' => wf_crm_aval($this->data['case'][$n], 'case:1:case_type_id'),
+              'status_id' => $this->data['case'][$n]['existing_case_status']
+            ));
+            if ($item) {
+              $this->ent['case'][$n] = array('id' => $item['id']);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Find activity ids based on url input or "existing activity" settings
+   */
+  private function findExistingActivities() {
+    // Support legacy url param
+    if (empty($_GET["activity1"]) && !empty($_GET["aid"])) {
+      $_GET["activity1"] = $_GET["aid"];
+    }
+    for ($n = 1; $n <= $this->data['activity']['number_of_activity']; ++$n) {
+      if (!empty($this->data['activity'][$n]['activity'][1]['target_contact_id'])) {
+        $targets = array();
+        foreach ($this->data['activity'][$n]['activity'][1]['target_contact_id'] as $c) {
+          if (!empty($this->ent['contact'][$c]['id'])) {
+            $targets[] = $this->ent['contact'][$c]['id'];
+          }
+        }
+        if ($targets) {
+          if (isset($_GET["activity$n"]) && wf_crm_is_positive($_GET["activity$n"])) {
+            $id = $_GET["activity$n"];
+            $item = wf_civicrm_api('activity', 'getsingle', array('id' => $id, 'return' => array('target_contact_id')));
+            if (array_intersect($targets, $item['target_contact_id'])) {
+              $this->ent['activity'][$n] = array('id' => $id);
+            }
+          }
+          elseif (!empty($this->data['activity'][$n]['existing_activity_status'])) {
+            // If the activity type hasn't been set, bail.
+            if (empty($this->data['activity'][$n]['activity'][1]['activity_type_id'])) {
+              watchdog('webform_civicrm', "Activity type to update hasn't been set, so won't try to update activity. location = %1, webform activity number : %2", array('%1' => request_uri(), '%2' => $n), WATCHDOG_ERROR);
+              continue;
+            }
+            // The api doesn't accept an array of target contacts so we'll do it as a loop
+            // If targets has more than one entry, the below could result in the wrong activity getting updated.
+            foreach ($targets as $cid) {
+              $params = array(
+                'sequential' => 1,
+                'target_contact_id' => $cid,
+                'status_id' => array('IN' => (array)$this->data['activity'][$n]['existing_activity_status']),
+                'is_deleted' => '0',
+                'is_current_revision' => '1',
+                'options' => array('limit' => 1),
+              );
+              $params['activity_type_id'] = $this->data['activity'][$n]['activity'][1]['activity_type_id'];
+              $items = wf_crm_apivalues('activity', 'get', $params);
+              if (isset($items[0]['id'])) {
+                $this->ent['activity'][$n] = array('id' => $items[0]['id']);
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Find grant ids based on url input or "existing grant" settings
+   */
+  private function findExistingGrants() {
+    for ($n = 1; $n <= $this->data['grant']['number_of_grant']; ++$n) {
+      if (!empty($this->data['grant'][$n]['grant'][1]['contact_id'])) {
+        $cid = $this->ent['contact'][$this->data['grant'][$n]['grant'][1]['contact_id']]['id'];
+        if ($cid) {
+          if (isset($_GET["grant$n"]) && wf_crm_is_positive($_GET["grant$n"])) {
+            $id = $_GET["grant$n"];
+            $item = wf_civicrm_api('grant', 'getsingle', array('id' => $id));
+            if ($cid == $item['contact_id']) {
+              $this->ent['grant'][$n] = array('id' => $id);
+            }
+          }
+          elseif (!empty($this->data['grant'][$n]['existing_grant_status'])) {
+            $params = array(
+              'sequential' => 1,
+              'contact_id' => $cid,
+              'status_id' => array('IN' => (array)$this->data['grant'][$n]['existing_grant_status']),
+              'options' => array('limit' => 1),
+            );
+            if (!empty($this->data['grant'][$n]['grant'][1]['grant_type_id'])) {
+              $params['grant_type_id'] = $this->data['grant'][$n]['grant'][1]['grant_type_id'];
+            }
+            $items = wf_crm_apivalues('grant', 'get', $params);
+            if (isset($items[0]['id'])) {
+              $this->ent['grant'][$n] = array('id' => $items[0]['id']);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Populate existing entity data
+   * @param string $type entity type (activity, case, grant)
+   */
+  private function populateExistingEntity($type) {
+    $items = array();
+    foreach ($this->ent[$type] as $key => $item) {
+      if (!empty($item['id'])) {
+        $items[$key] = $item['id'];
+      }
+    }
+    if ($items) {
+      // Todo: Remove when we drop support for 4.4 - https://www.drupal.org/node/2832331
+      if (version_compare($this->civicrm_version, '4.6.0', '<')) {
+        $values = array();
+        foreach ($items as $id) {
+          $value = wf_crm_apivalues($type, 'get', array('id' => $id));
+          $values[$id] = $value[$id];
+        }
+      }
+      else {
+        $values = wf_crm_apivalues($type, 'get', array('id' => array('IN' => array_values($items))));
+      }
+      foreach ($items as $n => $id) {
+        if (isset($values[$id])) {
+          // Load core + custom data
+          $this->info[$type][$n] = array($type => array(1 => $values[$id])) + $this->getCustomData($id, $type);
+          // Load file attachments
+          if (!empty($this->all_sets["{$type}upload"])) {
+            foreach ($this->getAttachments($type, $id) as $f => $file) {
+              $this->info[$type][$n]["{$type}upload"][1]["file_$f"] = $file['file_id'];
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Wrapper for drupal_set_message
+   * Ensures we only set the message on the first page of the node display
+   * @param $message
+   * @param string $type
+   */
+  function setMessage($message, $type='status') {
+    if (empty($_POST)) {
+      drupal_set_message($message, $type, FALSE);
+    }
+  }
+
+  /**
+   * Displays the admin-defined message with "not you?" link to known contacts
+   *
+   * @param string $message
+   *   Raw message with tokens
+   * @param array $contact
+   *   CiviCRM contact array
+   */
+  private function showNotYouMessage($message, $contact) {
+    $request = \Drupal::request();
+    $message = $this->replaceTokens($message, $contact);
+    preg_match_all('#\{([^}]+)\}#', $message, $matches);
+    if (!empty($matches[0])) {
+      $q = $request->query->all();
+      unset($q['cs'], $q['cid'], $q['cid1']);
+      if (empty($request->query->get('cid')) && empty($request->query->get('cid1'))) {
+        $q['cid1'] = 0;
+      }
+      foreach ($matches[0] as $pos => $match) {
+        $link = Link::createFromRoute($matches[1][$pos], '<current>', [], [
+          'query' => $q
+        ])->toString();
+        $message = str_replace($match, $link, $message);
+      }
+    }
+    $this->setMessage(Markup::create($message));
+  }
+
+  /**
+   * Token replacement for form messages
+   *
+   * @param $str
+   *   Raw message with tokens
+   * @param $contact
+   *   CiviCRM contact array
+   * @return mixed
+   */
+  private function replaceTokens($str, $contact) {
+    $tokens = wf_crm_get_fields('tokens');
+    $values = array();
+    foreach ($tokens as $k => &$t) {
+      if (empty($contact[$k])) {
+        $contact[$k] = '';
+      }
+      $value = $contact[$k];
+      if (is_array($value)) {
+        $value = implode(', ', $value);
+      }
+      $values[] = implode(' &amp; ', wf_crm_explode_multivalue_str($value));
+      $t = "[$t]";
+    }
+    return str_ireplace($tokens, $values, $str);
+  }
+
+}
