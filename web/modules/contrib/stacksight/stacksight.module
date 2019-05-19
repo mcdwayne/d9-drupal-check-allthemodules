@@ -1,0 +1,664 @@
+<?php
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\user\UserInterface;
+use Drupal\Core\Url;
+use Drupal\user\Entity\User;
+use Drupal\comment\CommentInterface;
+
+require_once('stacksight-php-sdk/SSUtilities.php');
+require_once('stacksight-php-sdk/SSHttpRequest.php');
+require_once('stacksight-php-sdk/SSClientBase.php');
+require_once('stacksight-php-sdk/SSEventsMessageMapping.php');
+require_once('stacksight-php-sdk/platforms/SSDrupalClient.php');
+
+if (defined('STACKSIGHT_DEBUG') && STACKSIGHT_DEBUG === true){
+	define('STACKSIGHT_DEBUG_MODE', true);
+}
+
+function stacksight_cron(){
+	global $ss_client;
+	\Drupal::logger('stacksight')->notice('stacksight invoked by cron');
+	// Default to an hourly interval. Of course, cron has to be running at least
+	// hourly for this to work.
+	$interval = \Drupal::state()->get('stacksight_interval', 60 * 60);
+	// We usually don't want to act every time cron runs (which could be every
+	// minute) so keep a time for the next run in a variable.
+	handshake();
+	if(defined('STACKSIGHT_INCLUDE_INVENTORY') && STACKSIGHT_INCLUDE_INVENTORY == true){
+		$inventory = stacksight_inventory_call();
+		if(!empty($inventory)){
+			$data = array(
+				'data' => $inventory
+			);
+			$ss_client->sendInventory($data);
+		}
+	}
+	if(defined('STACKSIGHT_INCLUDE_UPDATES') && STACKSIGHT_INCLUDE_UPDATES == true){
+		stacksight_updates_publish();
+	}
+
+	if (time() >= \Drupal::state()->get('stacksight_next_execution', 0)) {
+		if (!empty($GLOBALS['stacksight_show_status_message'])) {
+			drupal_set_message(t('stacksight executed at %time', array('%time' => date_iso8601(time(0)))));
+		}
+		\Drupal::state()->set('stacksight_next_execution', time() + $interval);
+	}
+}
+
+function stacksight_updates_publish() {
+	if(defined('STACKSIGHT_INCLUDE_UPDATES') && STACKSIGHT_INCLUDE_UPDATES === true) {
+		global $ss_client;
+		if (empty($ss_client)) return;
+
+		$updates = stacksight_get_availible_updates();
+		$upd = array();
+		foreach ($updates as $key => $uitem) {
+			$upd[] = array(
+				'title' => isset($uitem['info']['name']) ? $uitem['info']['name'] : '',
+				'release_ts' => $uitem['datestamp'],
+				'current_version' => $uitem['existing_version'],
+				'latest_version' => isset($uitem['info']['version']) ? $uitem['info']['version'] : '',
+				'type' => $uitem['project_type'],
+				'status' => $uitem['status'],
+				// 'description' => $uitem['status'],
+				'link' => isset($uitem['link']) ? $uitem['link'] : '',
+				'release_link' => (isset($uitem['latest_version']) && isset($uitem['releases'][$uitem['latest_version']]['release_link'])) ? $uitem['releases'][$uitem['latest_version']]['release_link'] : '',
+				'download_link' => (isset($uitem['latest_version']) && isset($uitem['releases'][$uitem['latest_version']]['download_link'])) ? $uitem['releases'][$uitem['latest_version']]['download_link'] : '',
+				// 'update_link' => '',
+			);
+		}
+		$ss_client->sendUpdates(array('data' => $upd));
+	}
+}
+
+function stacksight_get_availible_updates() {
+	require_once DRUPAL_ROOT . '/core/modules/update/update.module';
+	require_once DRUPAL_ROOT . '/core/modules/update/update.compare.inc';
+	update_refresh();
+	$available = update_get_available(TRUE);
+	$updates = update_calculate_project_data($available);
+	return $updates;
+}
+
+
+
+function _stacksight_user_events($account, $action) {
+	if(defined('STACKSIGHT_INCLUDE_EVENTS') && STACKSIGHT_INCLUDE_EVENTS === true){
+		global $ss_client;
+		if (empty($ss_client) || empty($account) || empty($action)) return;
+		//		\Drupal::currentUser()->id();
+		$user_id = $account->get('uid')->value;
+		if(!$user_id) $user_id = \Drupal::currentUser()->id();
+		$user = User::load($user_id);
+
+		$event = $changed = array(); $event_name = '';
+		if (!empty($user_id)) {
+			$url_options = array('absolute' => true);
+			$url = Url::fromUri("entity:user/$user_id", $url_options);
+			if($url->isRouted()){
+				$event['url'] = $url->toString();
+			}
+
+		}
+		if (!empty($user)) {
+			$event['user'] = array(
+				'name' => $user->get('name')->value,
+			);
+		}
+
+		$event_name = $user->get('name')->value;
+
+		if ($action == 'updated' && !empty($account->original)) {
+			$event_name = 'account';
+			$origin = $account->original;
+
+			// name
+			if ($user->get('name')->value != $origin->get('name')->value){
+				$message = t('name (@str)', array('@str' => $user->get('name')->value));
+				$changed[] = $message->render();
+			}
+			// timezone
+			if ($user->get('timezone')->value != $origin->get('timezone')->value){
+				$message = t('time zone (@str)', array('@str' => $user->get('timezone')->value));
+				$changed[] = $message->render();
+			}
+			// password
+			if ($user->get('pass')->value != $origin->get('pass')->value){
+				$changed[] = 'password';
+			}
+			// email
+			if ($user->get('mail')->value != $origin->get('mail')->value){
+				$message = t('email (@str)', array('@str' => $user->get('mail')->value));
+				$changed[] = $message->render();
+			}
+			//  active/blocked
+			if ($user->get('status')->value != $origin->get('status')->value){
+				if($user->get('status')->value){
+					$message = t('status (acvive)');
+				} else{
+					$message =  t('status (blocked)');
+				}
+				$changed[] = $message->render();
+			}
+
+			$image_url = false;
+			$user=\Drupal\user\Entity\User::load(\Drupal::currentUser()->id());
+			if(isset($user->get('user_picture')->entity) && $user->get('user_picture')->entity->url()) {
+				$image_url = true;
+			}
+
+			$user_origin_array = $origin->toArray();
+			$user_array = $user->toArray();
+
+			// avatar uploaded
+			if (empty($user_origin_array['user_picture']) && !empty($user_array['user_picture'])){
+				$message = t('avatar (new)');
+				$changed[] = $message->render();
+			}
+
+			// avatar deleted
+			if (!empty($user_origin_array['user_picture']) && empty($user_array['user_picture'])){
+				$message = t('avatar (removed)');
+				$changed[] = $message->render();
+			}
+		}
+
+		// general event
+		$res = $ss_client->publishEvent(array(
+				'action' => $action,
+				'type' => 'user',
+				'name' => $event_name
+			) + $event);
+
+		// specific what changed (see case 'updated' for details)
+		if (!empty($changed)) {
+			$add_res = $ss_client->publishEvent(array(
+					'action' => 'changed',
+					'type' => 'user',
+					'name' => implode(', ', $changed)
+				) + $event);
+		}
+	}
+}
+
+function stacksight_user_insert(EntityInterface $entity) {
+	_stacksight_user_events($entity, 'added');
+}
+
+function stacksight_user_update(EntityInterface $entity) {
+	_stacksight_user_events($entity, 'updated');
+}
+
+function stacksight_user_delete(EntityInterface $entity) {
+	_stacksight_user_events($entity, 'deleted');
+}
+
+function _stacksight_user_log_events($account, $action) {
+	if(defined('STACKSIGHT_INCLUDE_EVENTS') && STACKSIGHT_INCLUDE_EVENTS === true) {
+		global $ss_client;
+		if (empty($ss_client) || empty($account) || empty($action)) return;
+
+		$event = array();
+		$url_options = array('absolute' => true);
+		$uid = $account['uid'];
+		$url = Url::fromUri("entity:user/$uid", $url_options);
+		$event['user'] = array('name' => $account['name'], 'url' => $url->toString());
+		$res = $ss_client->publishEvent(array(
+				'action' => $action,
+				'type' => 'user',
+				'name' => '',
+			) + $event);
+	}
+}
+
+function stacksight_user_login(UserInterface $account) {
+	_stacksight_user_log_events(array(
+		'uid' => $account->get('uid')->value,
+		'name' => $account->get('name')->value
+	), 'logged in');
+}
+
+function stacksight_user_logout($account) {
+	_stacksight_user_log_events(array(
+		'uid' => $account->id(),
+		'name' => $account->getUsername()
+	), 'logged out');
+}
+
+function stacksight_node_insert(EntityInterface $node){
+	_stacksight_node_events($node, 'created');
+}
+
+function stacksight_node_update(EntityInterface $node){
+	_stacksight_node_events($node, 'updated');
+}
+
+function stacksight_node_delete(EntityInterface $node){
+	_stacksight_node_events($node, 'deleted');
+}
+
+function _stacksight_node_events($node, $action) {
+	if(defined('STACKSIGHT_INCLUDE_EVENTS') && STACKSIGHT_INCLUDE_EVENTS === true){
+		global $ss_client;
+		if (empty($ss_client) || empty($action) || empty($node)) return;
+
+		$event = $add_actions = array();
+		$url_options = array('absolute' => true);
+		$user_id = \Drupal::currentUser()->id();
+		if (\Drupal::currentUser()->isAuthenticated()) {
+			$user = User::load($user_id);
+			$event['user'] = array(
+				'name' => $user->get('name')->value,
+			);
+			$url = Url::fromUri("entity:user/$user_id", $url_options);
+			if($url->isRouted()){
+				$event['url'] = $url->toString();
+			}
+		}
+		$nid = $node->get('nid')->value;
+		$url = Url::fromUri("entity:node/$nid", $url_options);
+		if($url->isRouted()){
+			$url_nid = $url->toString();
+		}
+
+		$res = $ss_client->publishEvent(array(
+				'action' => $action,
+				'type' => 'content',
+				'subtype' => $node->get('type')->value,
+				'name' => $node->get('title')->value,
+				'url' => $url_nid
+			) + $event);
+
+		switch ($action) {
+			case 'updated':
+				if (!empty($node->original)) {
+					// promoted
+					if ($node->original->get('promote')->value == NODE_NOT_PROMOTED && $node->get('promote')->value == NODE_PROMOTED) $add_actions[] = 'promoted';
+					// unpromoted
+					if ($node->original->get('promote')->value == NODE_PROMOTED && $node->get('promote')->value == NODE_NOT_PROMOTED) $add_actions[] = 'unpromoted';
+
+					// published
+					if ($node->original->get('status')->value == NODE_NOT_PUBLISHED && $node->get('status')->value == NODE_PUBLISHED) $add_actions[] = 'published';
+					// unpublished
+					if ($node->original->get('status')->value == NODE_PUBLISHED && $node->get('status')->value == NODE_NOT_PUBLISHED) $add_actions[] = 'unpublished';
+
+					// sticky
+					if ($node->original->get('sticky')->value == NODE_NOT_STICKY && $node->get('sticky')->value == NODE_STICKY) $add_actions[] = 'sticked';
+					// not sticky
+					if ($node->original->get('sticky')->value == NODE_STICKY && $node->get('sticky')->value == NODE_NOT_STICKY) $add_actions[] = 'unsticked';
+				}
+				break;
+
+			case 'created':
+				// checking only "on" actions, cause opposite state did not exist
+				// promoted
+				if ($node->get('promote')->value == NODE_PROMOTED) $add_actions[] = 'promoted';
+				// published
+				if ($node->get('status')->value == NODE_PUBLISHED) $add_actions[] = 'published';
+				// sticky
+				if ($node->get('sticky')->value == NODE_STICKY) $add_actions[] = 'sticked';
+				break;
+		}
+
+		if (!empty($add_actions)) {
+			$add_res = $ss_client->publishEvent(array(
+					'action' => implode(', ', $add_actions),
+					'type' => 'content',
+					'subtype' => $node->get('type')->value,
+					'name' => $node->get('title')->value,
+					'url' => $url_nid
+				) + $event);
+		}
+	}
+}
+
+function stacksight_comment_insert(EntityInterface $comment) {
+	if(defined('STACKSIGHT_INCLUDE_EVENTS') && STACKSIGHT_INCLUDE_EVENTS === true) {
+		global $ss_client;
+		if (empty($ss_client) || empty($comment)) return;
+		if ($comment->get('status')->value == CommentInterface::NOT_PUBLISHED) return;
+
+		$event = array();
+		$url_options = array('absolute' => true);
+		$user_id = \Drupal::currentUser()->id();
+		if (\Drupal::currentUser()->isAuthenticated()) {
+			$user = User::load($user_id);
+			$event['user'] = array(
+				'name' => $user->get('name')->value,
+			);
+			$url = Url::fromUri("entity:user/$user_id", $url_options);
+			if ($url->isRouted()) {
+				$event['url'] = $url->toString();
+			}
+		}
+
+		$node_id = $comment->get('entity_id')->target_id;
+		$cid = $comment->get('cid')->value;
+		if ($comment->get('subject')->value) {
+			$url_options['fragment'] = "comment-$cid";
+			$event['name'] = $comment->get('subject')->value;
+			$url = Url::fromUri("entity:node/$node_id", $url_options);
+			$event['url'] = $url->toString();
+		}
+
+		$event['data']['body'] = $comment->get('comment_body')->value;
+
+		$res = $ss_client->publishEvent(array(
+				'action' => 'added',
+				'type' => 'comment',
+				'id' => $cid
+			) + $event);
+	}
+}
+
+function stacksight_comment_update($comment) {
+	if(defined('STACKSIGHT_INCLUDE_EVENTS') && STACKSIGHT_INCLUDE_EVENTS === true) {
+		global $ss_client;
+		if (empty($ss_client) || empty($comment)) return;
+
+		$event = array();
+		$url_options = array('absolute' => true);
+		$user_id = \Drupal::currentUser()->id();
+		if (\Drupal::currentUser()->isAuthenticated()) {
+			$user = User::load($user_id);
+			$event['user'] = array(
+				'name' => $user->get('name')->value,
+			);
+			$url = Url::fromUri("entity:user/$user_id", $url_options);
+			if ($url->isRouted()) {
+				$event['url'] = $url->toString();
+			}
+		}
+		// if comment changed
+		$com_changes = _stacksight_array_diff_assoc_recursive(
+			array('subject' => $comment->get('subject')->value, $comment->get('comment_body')->value),
+			array('subject' => $comment->original->get('subject')->value, $comment->original->get('comment_body')->value)
+		);
+		if ($com_changes) {
+
+		}
+
+		if ($comment->original->get('status')->value == CommentInterface::NOT_PUBLISHED && $comment->get('status')->value == CommentInterface::PUBLISHED) {
+			// published
+			$event['action'] = 'published';
+		} elseif ($comment->original->get('status')->value == CommentInterface::PUBLISHED && $comment->get('status')->value == CommentInterface::NOT_PUBLISHED) {
+			// unpublished
+			$event['action'] = 'unpublished';
+		}
+
+		$node_id = $comment->get('entity_id')->target_id;
+		$cid = $comment->get('cid')->value;
+		if ($comment->get('subject')->value) {
+			$url_options['fragment'] = "comment-$cid";
+			$event['name'] = $comment->get('subject')->value;
+			$url = Url::fromUri("entity:node/$node_id", $url_options);
+			$event['url'] = $url->toString();
+		}
+		$res = $ss_client->publishEvent(array(
+				'action' => 'edited',
+				'type' => 'comment',
+				'id' => $cid
+			) + $event);
+	}
+}
+
+function stacksight_comment_delete($comment) {
+	if(defined('STACKSIGHT_INCLUDE_EVENTS') && STACKSIGHT_INCLUDE_EVENTS === true) {
+		global $ss_client;
+		if (empty($ss_client) || empty($comment)) return;
+
+		$event = array();
+		$url_options = array('absolute' => true);
+		$user_id = \Drupal::currentUser()->id();
+		if (\Drupal::currentUser()->isAuthenticated()) {
+			$user = User::load($user_id);
+			$event['user'] = array(
+				'name' => $user->get('name')->value,
+			);
+			$url = Url::fromUri("entity:user/$user_id", $url_options);
+			if ($url->isRouted()) {
+				$event['url'] = $url->toString();
+			}
+		}
+
+		if (!empty($comment->get('subject')->value)) $event['name'] = $comment->get('subject')->value;
+
+		$res = $ss_client->publishEvent(array(
+				'action' => 'deleted',
+				'type' => 'comment'
+			) + $event);
+	}
+}
+
+function stacksight_inventory_call(){
+	$inventory_modules = array();
+	$inventory_themes = array();
+	$modules = system_rebuild_module_data();
+
+	if($modules && is_array($modules)){
+		foreach($modules as $key => $module){
+			$info = $module->info;
+			$dep_modules = array();
+			if(isset($info['dependencies']) && !empty($info['dependencies'])){
+				foreach($info['dependencies'] as $dep_module){
+					if(!empty($dep_module) && isset($modules[$dep_module])){
+						$info_dep_mod = $modules[$dep_module]->info;
+						if(!empty($info_dep_mod) && is_array($info_dep_mod)){
+							$dep_modules[] = array(
+								'type' => SSDrupalClient::TYPE_MODULE,
+								'name' => (isset($dep_module) && !empty($dep_module)) ? $dep_module : $info_dep_mod['name'],
+								'version' => (isset($info_dep_mod['version']) && !empty($info_dep_mod['version'])) ? $info_dep_mod['version'] : false,
+								'label' => (isset($info_dep_mod['name']) && !empty($info_dep_mod['name'])) ? $info_dep_mod['name'] : false,
+								'description' => (isset($info_dep_mod['description']) && !empty($info_dep_mod['description'])) ? $info_dep_mod['description'] : false,
+								'active' => (bool) $modules[$dep_module]->status,
+								'requires' => (array) $info_dep_mod['dependencies']
+							);
+						}
+					}
+				}
+			}
+			$inventory_modules[] = array(
+				'type' => SSDrupalClient::TYPE_MODULE,
+				'name' => (isset($key) && !empty($key)) ? $key : $info['name'],
+				'version' => (isset($info['version']) && !empty($info['version'])) ? $info['version'] : false,
+				'label' => (isset($info['name']) && !empty($info['name'])) ? $info['name'] : false,
+				'description' => (isset($info['description']) && !empty($info['description'])) ? $info['description'] : false,
+				'active' => (bool) $module->status,
+				'requires' => (!empty($dep_modules)) ? $dep_modules : array()
+			);
+
+		}
+	}
+
+
+	// Get all available themes.
+	$themes = \Drupal::service('theme_handler')->rebuildThemeData();
+	if($themes && is_array($themes)){
+		foreach($themes as $key => $theme){
+			$inventory_themes[] = array(
+				'type' => SSDrupalClient::TYPE_THEME,
+				'name' => $theme->info['name'],
+				'version' => $theme->info['version'],
+				'label' => $theme->info['name'],
+				'description' => $theme->info['description'],
+				'active' => (bool) $theme->status,
+				'requires' => array()
+			);
+		}
+	}
+
+	return array_merge($inventory_modules, $inventory_themes);
+}
+
+function handshake(){
+	global $ss_client;
+
+	$total_state = getTotalState();
+	$total_hash_state = md5(serialize($total_state));
+	$old_hash_exist = false;
+	$old_hash_state = false;
+	$date_of_old_hash_state = false;
+	$state_option = false;
+
+	$state_option = \Drupal::state()->get('stacksight_state', false);
+	if($state_option){
+		$tempory = unserialize($state_option);
+		$old_hash_exist = true;
+		$old_hash_state = $tempory['hash_of_state'];
+		$date_of_old_hash_state = $tempory['date_of_set'];
+	}
+
+	// If we have changed state
+	if($total_hash_state != $old_hash_state){
+		$time = time();
+		// Send new state
+		$handshake_event = array(
+			'action' => ($old_hash_exist === true) ? 'updated' : 'registred',
+			'type' => 'stacksight',
+			'name' => 'configuration',
+			'data' => $total_state
+		);
+
+		// Write new state to DB
+		$new_state_to_db = array(
+			'hash_of_state' => $total_hash_state,
+			'date_of_set' => $time
+		);
+
+		\Drupal::state()->set('stacksight_state', serialize($new_state_to_db));
+
+		$ss_client->publishEvent($handshake_event);
+	}
+}
+
+function getTotalState(){
+	global $base_url;
+	$plugin_info = false;
+	$info = system_get_info('module');
+	if(isset($info['stacksight'])){
+		$plugin_info = $info['stacksight'];
+	}
+
+	$plugin_info['space_used'] = trim(str_replace('	.','', shell_exec('du -hs .')));
+	$plugin_info['wpml_lang'] = false;
+
+	$plugin_info['public'] = true;
+	$plugin_info['url'] = $base_url;
+
+	$meta = db_query("SELECT * FROM {users_field_data} ORDER BY login DESC LIMIT 1")->fetchAssoc();
+	if (isset($meta) && !empty($meta)){
+		$plugin_info['last_login'] = array(
+			'user_id' => $meta['uid'],
+			'user_login' => $meta['name'],
+			'user_mail' => $meta['mail'],
+			'user_name' => $meta['name'],
+			'time' => $meta['login']
+		);
+	}
+
+	return array(
+		'app' => $plugin_info,
+		'settings' => array(
+			'app_id' => (defined('STACKSIGHT_APP_ID')) ? STACKSIGHT_APP_ID : false,
+			'app_token' => (defined('STACKSIGHT_TOKEN')) ? STACKSIGHT_TOKEN : false,
+			'debug_mode' => (defined('STACKSIGHT_DEBUG')) ? STACKSIGHT_DEBUG : false
+		),
+		'features' => array(
+			'logs' => (defined('STACKSIGHT_INCLUDE_LOGS')) ? STACKSIGHT_INCLUDE_LOGS : $this->defaultDefines['STACKSIGHT_INCLUDE_LOGS'],
+			'health' => (defined('STACKSIGHT_INCLUDE_HEALTH')) ? STACKSIGHT_INCLUDE_HEALTH : $this->defaultDefines['STACKSIGHT_INCLUDE_HEALTH'],
+			'inventory' => (defined('STACKSIGHT_INCLUDE_INVENTORY')) ? STACKSIGHT_INCLUDE_INVENTORY : $this->defaultDefines['STACKSIGHT_INCLUDE_INVENTORY'],
+			'events' => (defined('STACKSIGHT_INCLUDE_EVENTS')) ? STACKSIGHT_INCLUDE_EVENTS : $this->defaultDefines['STACKSIGHT_INCLUDE_EVENTS'],
+			'updates' => (defined('STACKSIGHT_INCLUDE_UPDATES')) ? STACKSIGHT_INCLUDE_UPDATES : $this->defaultDefines['STACKSIGHT_INCLUDE_UPDATES']
+		)
+	);
+}
+
+function _stacksight_array_diff_assoc_recursive($array1, $array2) {
+	$difference=array();
+	foreach($array1 as $key => $value) {
+		if( is_array($value) ) {
+			if( !isset($array2[$key]) || !is_array($array2[$key]) ) {
+				$difference[$key] = $value;
+			} else {
+				$new_diff = _stacksight_array_diff_assoc_recursive($value, $array2[$key]);
+				if( !empty($new_diff) )
+					$difference[$key] = $new_diff;
+			}
+		} else if( !array_key_exists($key,$array2) || $array2[$key] !== $value ) {
+			$difference[$key] = $value;
+		}
+	}
+	return $difference;
+}
+
+function stacksight_file_presave($file) {
+	_stacksight_file_events($file, 'uploaded');
+}
+
+function stacksight_file_delete($file) {
+	_stacksight_file_events($file, 'deleted');
+}
+
+
+function _stacksight_file_events($file, $action) {
+	if(defined('STACKSIGHT_INCLUDE_EVENTS') && STACKSIGHT_INCLUDE_EVENTS === true) {
+		global $ss_client;
+		$event = array();
+
+		if (empty($ss_client) || empty($file) || empty($action)) return;
+		if ($action == 'uploaded') {
+			// required that condition cause this hook is called 3 times with different parameters
+			if (empty($file->original) || empty($file->get('status')->value)) return;
+			$event['url'] = file_create_url($file->get('uri')->value);
+		}
+
+		$url_options = array('absolute' => true);
+		$user_id = \Drupal::currentUser()->id();
+		if (\Drupal::currentUser()->isAuthenticated()) {
+			$user = User::load($user_id);
+			$event['user'] = array(
+				'name' => $user->get('name')->value,
+			);
+			$url = Url::fromUri("entity:user/$user_id", $url_options);
+			if ($url->isRouted()) {
+				$event['url'] = $url->toString();
+			}
+		}
+
+		$file_ex = explode('/', $file->get('filemime')->value);
+		if (!empty($file_ex[0])) {
+			$event['subtype'] = $file_ex[0];
+		}
+
+		$res = $ss_client->publishEvent(array(
+				'action' => $action,
+				'type' => 'file',
+				'name' => $file->get('filename')->value,
+				'id' => $file->get('fid')->value,
+				'data' => array(
+					'file_name' => $file->get('filename')->value,
+					'type' => $file->get('filemime')->value,
+					'size' => $file->get('filesize')->value,
+					'url' => isset($event['url']) ? $event['url'] : '',
+				)
+			) + $event);
+	}
+}
+
+function stacksight_page_attachments_alter(array &$page) {
+	if (!\Drupal::currentUser()->hasPermission('access contextual links')) {
+		return;
+	}
+	$page['#attached']['library'][] = 'stacksight/global-styling';
+}
+
+function stacksight_theme() {
+	$theme['debug_page'] = [
+		'variables' => [
+			'session' => NULL,
+		],
+		'template' => 'debug',
+	];
+	return $theme;
+}
