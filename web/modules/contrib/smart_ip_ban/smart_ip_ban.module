@@ -1,0 +1,81 @@
+<?php
+use Drupal\Core\Form;
+
+module_set_weight('smart_ip_ban', 3);
+
+/**
+ * Implements hook_form_alter().
+ */
+function smart_ip_ban_form_alter(&$form, &$form_state, $form_id) {
+  if ($form_id == 'user_login_form' || $form_id == 'user_login_block') {
+    $form['#validate'][] = 'smart_ip_ban_login_form_validate';
+  }
+}
+
+/**
+ * Validation handler for login_form
+ *
+ * Getting the inputs from the settings form, and check the conditions.
+ * If more access coming from same_ip then ip is blocked.
+ */
+function smart_ip_ban_login_form_validate(&$form, &$form_state) {
+  $threshold = \Drupal::state()->get('smart_ip_ban_threshold');
+  $interval = \Drupal::state()->get('smart_ip_ban_interval') * 60;
+  $ban_duration = \Drupal::state()->get('smart_ip_ban_duration') * 60;
+  if (($ban_duration == 0) || ($threshold == 0) || ($interval == 0)) {
+    return;
+  }
+  // Check excluded IPs
+  $ip_address = Drupal::request()->getClientIp(); //get client IP address
+  $exclude_ips = explode("\n", \Drupal::state()->get('smart_ip_ban_excluded_ip'));
+  if (in_array($ip_address, $exclude_ips)) {
+    return;
+  }
+  $event = 'user.failed_login_ip';
+  $login_failed = db_query('SELECT COUNT(*) FROM {flood} WHERE identifier = :ip AND event = :event AND timestamp >=  :timestamp', array(':ip' => $ip_address, ':event' => $event, ':timestamp' => REQUEST_TIME - $interval))->fetchField();
+
+  if ($login_failed < $threshold) {
+    return;
+  }
+
+  $already_added = db_query("SELECT iid FROM {ban_ip} WHERE ip = :ip", array(':ip' => $ip_address))->fetchField();
+  if ($already_added) {
+    return;
+  }
+  db_insert('ban_ip')
+    ->fields(array('ip','agent'))
+    ->values(array(
+      'ip' => $ip_address,
+      'agent' => 'smart_ip_ban',
+    ))
+    ->execute();
+  \Drupal::logger('smart_ip_ban')->notice('IP address !ip has been added to blocked IP list',
+    array(
+      '!ip' => $ip_address,
+    ));
+}
+
+
+
+/**
+ * Implements hook_cron()
+ */
+function smart_ip_ban_cron() {
+  // Cleanup the flood.
+  db_delete('flood')
+    ->condition('expiration', REQUEST_TIME, '<')
+    ->execute();
+  $ips = db_query("SELECT ip FROM {ban_ip}
+    WHERE agent = :agent AND ip NOT IN (SELECT identifier FROM {flood} WHERE event = :event)", array(':agent' => 'smart_ip_ban', ':event' => 'user.failed_login_ip')
+  )->fetchCol();
+  if (!empty($ips)) {
+    db_delete('ban_ip')
+      ->condition('ip', $ips, 'IN')
+      ->execute();
+    \Drupal::logger('smart_ip_ban')->notice('Following IPs have been unblocked !ips',
+    array(
+      '!ip' => $ips,
+    ));
+  }
+}
+
