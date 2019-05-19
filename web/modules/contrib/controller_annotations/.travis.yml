@@ -1,0 +1,121 @@
+language: php
+
+sudo: false
+
+php:
+  - 7.1
+  - 7.2
+  - 7.3
+
+env:
+  global:
+    - MODULE_NAME="controller_annotations"
+    - DRUPAL_REPO="https://git.drupal.org/project/drupal.git"
+    - PHPCS_VERSION="^2.7"
+    - CODER_VERSION="^8.2"
+    - DRUSH_VERSION="^9.0"
+  matrix:
+    - DRUPAL_VERSION="8.5.x"
+    - DRUPAL_VERSION="8.6.x"
+    - DRUPAL_VERSION="8.7.x"
+
+cache:
+  bundler: true
+  apt: true
+  directories:
+  - "$HOME/.composer/cache"
+  - "$HOME/.drush/cache"
+
+mysql:
+  database: drupal
+  username: root
+  encoding: utf8
+
+before_install:
+  # Decide if we are going to do a full inspection on this build
+  - if [ "$TRAVIS_PHP_VERSION" == "7.1" ] && [ "$DRUPAL_VERSION" == "8.6.x" ] ; then export INSPECT="true"; else export INSPECT="false"; fi;
+  # Decide if this build is used to push upstream changes to Drupal.org
+  - if [ "$INSPECT" == "true" ] && [ "$TRAVIS_PULL_REQUEST" == "false" ]; then export UPSTREAM="true"; else export UPSTREAM="false"; fi;
+
+  # Disable xdebug when we do not generate coverage files
+  - if [ "$INSPECT" == "0" ]; then phpenv config-rm xdebug.ini; fi;
+
+  # Composer
+  - sed -i '1i export PATH="$HOME/.composer/vendor/bin:$PATH"' $HOME/.bashrc
+  - source $HOME/.bashrc
+  - composer self-update
+  - composer config --global discard-changes true
+
+  # Load global dependencies
+  - composer global require drush/drush:$DRUSH_VERSION
+
+  # Ensure the PHP environment is ready
+  - phpenv rehash
+
+  # Isolate our module into a separate directory
+  - mkdir module
+  - shopt -s extglob dotglob
+  - mv !(module) module
+  - shopt -u dotglob
+  - git clone --branch $DRUPAL_VERSION $DRUPAL_REPO drupal --depth 1
+
+  # Make sure Drupal can access our module by using a symlink
+  - ln -s $PWD/module drupal/modules/$MODULE_NAME
+  - cd drupal
+
+install:
+  # Merge the module requirements with the core requirements
+  # (yes this is ugly but it works very well, let us know if there is a better way to do it please)
+  - sed -i "s|\"core/composer.json\"|\"core/composer.json\",\"modules/$MODULE_NAME/composer.json\"|" composer.json
+  - composer install
+  - composer update
+
+  # This fixes a fail when install Drupal.
+  - echo 'sendmail_path = /bin/true' >> ~/.phpenv/versions/$(phpenv version-name)/etc/conf.d/travis.ini
+
+  # Mysql might time out for long tests, increase the wait timeout.
+  - mysql -e 'SET @@GLOBAL.wait_timeout=1200'
+
+  # Install Drupal and enable the required modules (including this one).
+  - mysql -e 'create database drupal;'
+  - cd $TRAVIS_BUILD_DIR/drupal && drush --yes site-install standard --db-url="mysql://root@127.0.0.1/drupal"
+  - cd $TRAVIS_BUILD_DIR/drupal && drush --yes en $MODULE_NAME
+  - cd $TRAVIS_BUILD_DIR/drupal && drush --yes en simpletest
+
+  # Export simpletest environment variables
+  - export SIMPLETEST_BASE_URL=http://localhost:8080
+  - export SIMPLETEST_DB=mysql://root:@127.0.0.1/drupal
+
+  # Do not break on deprecation warnings
+  - export SYMFONY_DEPRECATIONS_HELPER=disabled
+
+script:
+  # PHPUnit
+  - if [ "$INSPECT" == "true" ]; then export PHPUNIT_FLAGS="--coverage-clover=coverage.clover"; else export PHPUNIT_FLAGS=""; fi;
+  - cd $TRAVIS_BUILD_DIR/drupal
+  - vendor/bin/phpunit -c core/phpunit.xml.dist modules/$MODULE_NAME $PHPUNIT_FLAGS;
+
+after_success:
+  # Push code coverage to Scrutinizer
+  - if [ "$INSPECT" == "true" ]; then
+    cd $TRAVIS_BUILD_DIR/module;
+    mv $TRAVIS_BUILD_DIR/drupal/coverage.clover coverage.clover;
+    wget https://scrutinizer-ci.com/ocular.phar && php ocular.phar code-coverage:upload --format=php-clover coverage.clover;
+    rm coverage.clover;
+    fi
+  # Push code to drupal.org
+  - if [ "$UPSTREAM" == "true" ]; then
+    eval "$(ssh-agent -s)";
+    echo $DRUPAL_ORG_KEY | base64 --decode > drupalorg_key.pem;
+    chmod 600 drupalorg_key.pem;
+    ssh-add drupalorg_key.pem;
+    git fetch --unshallow;
+    git config --global user.name "devmonk";
+    git config --global user.email devmonk@mediamonks.com;
+    git config --global push.default matching;
+    git config --global push.followTags true;
+    echo -e "Host git.drupal.org\n\tStrictHostKeyChecking no\n" >> ~/.ssh/config;
+    git remote add drupalorg git@git.drupal.org:project/$MODULE_NAME.git;
+    git push drupalorg $TRAVIS_BRANCH;
+    eval "$(ssh-agent -k)";
+    fi
