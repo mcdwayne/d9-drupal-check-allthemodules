@@ -1,0 +1,286 @@
+<?php
+
+/**
+ * @file
+ * UpTime Widget module.
+ */
+
+use Drupal\Component\Serialization\Json;
+use Drupal\Core\Render\BubbleableMetadata;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_help().
+ */
+function uptime_widget_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.uptime_widget':
+      // Return a line-break version of the README.txt.
+      return _filter_autop(file_get_contents(dirname(__FILE__) . '/README.txt'));
+  }
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Called every time the Drupal cron runs. Grabs the all-time uptime ratio from
+ * UptimeRobot.com to store in the variable 'ratio' till next cron run.
+ */
+function uptime_widget_cron() {
+  $config = \Drupal::configFactory()->getEditable('uptime_widget.settings');
+  $state = \Drupal::state();
+
+  // Default to a daily interval.
+  $interval = $config->get('refresh_interval');
+
+  // We usually don't want to act every time cron runs (which could be every
+  // minute) so keep a time for the next run in a variable.
+  if (time() >= $state->get('uptime_widget.next_execution', 0)) {
+    // Send request for retrieving monitoring updates only when uptime enabled.
+    $monitor_ids = $config->get('monitor_ids') ?: [$config->get('monitor_id')];
+    $data = \Drupal::service('uptime_widget')->sendPost('getMonitors', [
+      'monitors' => implode('-', $monitor_ids),
+      'all_time_uptime_ratio' => 1,
+      'statuses' => '2-9',
+    ]);
+
+    if ($data['stat'] == 'fail') {
+      // Leave a message in the log when request completed with error.
+      \Drupal::logger('uptime')->error('Uptime ratio could not be updated. Reported error: %err', ['%err' => $data['error']['message']]);
+    }
+    else {
+      $monitors = $state->get('uptime_widget.monitors', []);
+      // Getting all time uptime ratio.
+      foreach ($data['monitors'] as $monitor) {
+        $ratio = (float) $monitor['all_time_uptime_ratio'];
+
+        // The digits to the right of the decimal can be fully zero.
+        // For example 100.000. In this case the digit will be converted
+        // to integer.
+        if ($ratio == 0 || $ratio == 100) {
+          $ratio = intval($ratio);
+        }
+        else {
+          $ratio = number_format($ratio, $config->get('ratio_scale'), $config->get('ratio_decimal_separator'), '');
+        }
+        $monitors[$monitor['id']]['ratio'] = (string) $ratio;
+        $monitors[$monitor['id']]['status'] = 1;
+
+        // Leave a message in the log.
+        \Drupal::logger('uptime')->notice('Uptime ratio updated successfully to %ratio %', ['%ratio' => $ratio]);
+      }
+      $state->set('uptime_widget.monitors', $monitors);
+    }
+
+    // Set the next time this hook_cron should be invoked.
+    $state->set('uptime_widget.next_execution', time() + $interval);
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function uptime_widget_theme(&$existing, &$type, &$theme, &$path) {
+  return [
+    'uptime_widget_block' => [
+      'variables' => [
+        'enabled' => NULL,
+        'nocss' => NULL,
+        'ratio' => NULL,
+        'notice_enabled' => NULL,
+        'host' => NULL,
+        'notice' => NULL,
+        'selected_widget' => NULL,
+        'widget_type' => NULL,
+        'block' => NULL,
+      ],
+    ],
+    'uptime_widget_type' => [
+      'variables' => [
+        'ratio' => NULL,
+        'widget_type' => NULL,
+      ],
+    ],
+    'uptime_range' => [
+      'render element' => 'elements',
+      'template' => 'uptime-widget--input--range',
+      'variables' => [
+        'attributes' => NULL,
+        'name' => NULL,
+        'default_value' => NULL,
+      ],
+    ],
+    'status_report_uptime_widget_info' => [
+      'variables' => [
+        'account' => NULL,
+        'psp' => NULL,
+        'uptime' => NULL,
+      ],
+    ],
+  ];
+}
+
+/**
+ * Process variables for status-report-page.html.twig.
+ *
+ * @see system/templates/status-report-page.html.twig
+ */
+function uptime_widget_preprocess_status_report_page(&$variables) {
+  $config = \Drupal::config('uptime_widget.settings');
+  $button = [
+    '#type' => 'link',
+    '#attributes' => [
+      'class' => [
+        'button',
+        'button--small',
+        'button--primary',
+        'system-status-uptime_widget-info__button',
+      ],
+    ],
+  ];
+
+  if ($config->get('api_key')) {
+    $email = \Drupal::state()->get('uptime_widget.account')['email'];
+    $account['description'] = [
+      '#markup' => t('<p>Email: @email</p>', [
+        '@email' => $email,
+      ]),
+    ];
+  }
+  else {
+    $account['description'] = [
+      '#markup' => t('<p>You need to provide UptimeRobot API keys for loading account information.</p>'),
+    ];
+  }
+  $account['button'] = $button + [
+    '#title' => t('Configure'),
+    '#url' => Url::fromRoute('uptime.admin_page'),
+  ];
+
+  $psp['description'] = [
+    '#markup' => '<p>' . t('The PSP shows the detailed status of the monitor in a graphical way.') . '</p>',
+  ];
+  if ($config->get('psp_url')) {
+    $psp['button'] = $button + [
+        '#title' => t('Open PSP'),
+        '#url' => Url::fromUri($config->get('psp_url'), ['attributes' => ['target' => '_blank']]),
+      ];
+  }
+
+  $uptime['description'] = [
+    '#markup' => t('<p>The current Uptime ratio is <strong>@ratio %</strong></p>', [
+      '@ratio' => \Drupal::state()->get('uptime_widget.ratio', 0)
+    ])
+  ];
+
+  $variables['general_info'] = [
+    'uptime_widget_info' => [
+      '#theme' => 'status_report_uptime_widget_info',
+      '#account' => $account,
+      '#psp' => $psp,
+      '#uptime' => $uptime,
+    ],
+    'general_info' => $variables['general_info'],
+  ];
+}
+
+/**
+ * Implements hook_token_info().
+ */
+function uptime_widget_token_info() {
+  $types['uptime_widget'] = array(
+    'name' => t("Uptime Widget"),
+    'description' => t("Tokens related to Uptime Widget."),
+  );
+  // Site-wide global token.
+  $tokens['ratio'] = array(
+    'name' => t("Uptime Ratio"),
+    'description' => t("Uptime Ratio for your site."),
+  );
+  return array(
+    'types' => $types,
+    'tokens' => array(
+      'uptime_widget' => $tokens,
+    ),
+  );
+}
+
+/**
+ * Implements hook_tokens().
+ */
+function uptime_widget_tokens($type, $tokens, array $data, array $options, BubbleableMetadata $bubbleable_metadata) {
+  $token_service = \Drupal::token();
+
+  $replacements = array();
+
+  if ($type == 'uptime_widget') {
+    foreach ($tokens as $name => $original) {
+      switch ($name) {
+        case 'ratio':
+          $ratio = \Drupal::state()->get('uptime_widget.ratio', 0);
+          $replacements[$original] = $ratio;
+          break;
+      }
+    }
+  }
+  return $replacements;
+}
+
+/**
+ * Implements hook_preprocess_HOOK() for uptime widget block.
+ */
+function uptime_widget_preprocess_uptime_widget_block(&$variables) {
+  $config = \Drupal::configFactory()->getEditable('uptime_widget.settings');
+  $state = \Drupal::state();
+  $configuration = $variables['block']->getConfiguration();
+  $host = $config->get('url_name');
+  if (empty($host)) {
+    $config->set('url_name', \Drupal::request()->getHost())->save();
+  }
+  $year = $config->get('year');
+
+  // If the notice is enabled we want it.
+  if ($configuration['selected_widget']['copyright']) {
+    $notice = ' ' . $config->get('prepend') . ' © ' . (($year != date('Y') && !empty($year)) ? $year . '-' . date('Y') : date('Y'));
+  }
+  else {
+    // ..and leave it empty if disabled.
+    $notice = '';
+    $host = '';
+  }
+
+  $monitors = $state->get('uptime_widget.monitors', []);
+  $monitor_id = $configuration['selected_monitor'] ?: $config->get('monitor_id');
+  $defaults = [
+    'enabled' => $monitors[$monitor_id]['status'],
+    'nocss' => $config->get('nocss'),
+    'ratio' => $monitors[$monitor_id]['ratio'],
+    'notice_enabled' => $config->get('notice_enabled'),
+    'host' => $host,
+    'notice' => $notice,
+  ];
+
+  // Overrides default values.
+  foreach ($variables as $key => &$value) {
+    if (!isset($value)) {
+      $value = $defaults[$key];
+    }
+  }
+
+  $variables['widget'] = [
+    '#theme' => 'uptime_widget_type',
+    '#widget_type' => $variables['widget_type'],
+    '#ratio' => $variables['ratio'],
+  ];
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK().
+ */
+function uptime_widget_theme_suggestions_uptime_widget_type(array $variables) {
+  $suggestions = [];
+
+  $suggestions[] = $variables['theme_hook_original'] . '__' . $variables['widget_type'];
+  return $suggestions;
+}
