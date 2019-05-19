@@ -1,0 +1,221 @@
+<?php
+
+/**
+ * @file
+ * Contains Tupas session install.
+ */
+
+use Drupal\Core\Database\Database;
+
+/**
+ * Implements hook_schema().
+ */
+function tupas_session_schema() {
+  $schema['tupas_session'] = [
+    'description' => 'Stores tupas sessions.',
+    'fields' => [
+      'owner' => [
+        'type' => 'varchar',
+        'not null' => TRUE,
+        'length' => 128,
+        'default' => '',
+      ],
+      'unique_id' => [
+        'description' => 'The unique id',
+        'type' => 'varchar',
+        'not null' => TRUE,
+        'length' => 128,
+        'default' => '',
+      ],
+      'access' => [
+        'description' => 'The last access timestamp',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ],
+      'transaction_id' => [
+        'description' => 'The transaction id',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ],
+      'data' => [
+        'description' => 'Extra (serialized) data to store with the session.',
+        'type' => 'blob',
+        'not null' => FALSE,
+        'size' => 'big',
+      ],
+    ],
+    'indexes' => [
+      'access' => ['access'],
+      'owner' => ['owner'],
+    ],
+    'unique keys' => [
+      'unique_id' => ['unique_id'],
+    ],
+  ];
+
+  return $schema;
+}
+
+/**
+ * Add unique_id and transaction_id fields. Migrate existing sessions.
+ */
+function tupas_session_update_8001() {
+  $schema = Database::getConnection()->schema();
+
+  if (!$schema->fieldExists('tupas_session', 'unique_id')) {
+    $field = [
+      'description' => 'The unique id',
+      'type' => 'varchar',
+      'not null' => TRUE,
+      'length' => 128,
+      'default' => '',
+    ];
+    $schema->addField('tupas_session', 'unique_id', $field);
+  }
+
+  if (!$schema->fieldExists('tupas_session', 'transaction_id')) {
+    $field = [
+      'description' => 'The transaction id',
+      'type' => 'int',
+      'unsigned' => TRUE,
+      'not null' => TRUE,
+      'default' => 0,
+    ];
+    $schema->addField('tupas_session', 'transaction_id', $field);
+    $schema->addUniqueKey('tupas_session', 'unique_id', ['unique_id']);
+  }
+
+  $connection = Database::getConnection();
+  $sessions = $connection->select('tupas_session', 's')
+    ->fields('s')
+    ->execute();
+
+  foreach ($sessions as $session) {
+    $data = unserialize($session->data);
+
+    $connection->merge('tupas_session')
+      ->keys([
+        'owner' => $session->owner,
+      ])
+      ->fields([
+        'expire' => $session->expire,
+        'data' => $session->data,
+        'unique_id' => $data['unique_id'],
+        'transaction_id' => $data['transaction_id'],
+      ])
+      ->execute();
+  }
+}
+
+/**
+ * Convert expire field to last access timestamp.
+ */
+function tupas_session_update_8002() {
+  $connection = Database::getConnection();
+  // Convert the expire field to access.
+  $schema = Database::getConnection()->schema();
+
+  if ($schema->fieldExists('tupas_session', 'expire')) {
+    $sessions = $connection->select('tupas_session', 's')
+      ->fields('s')
+      ->execute();
+
+    // Move expiration timestamp under the 'data'.
+    foreach ($sessions as $session) {
+      $data = unserialize($session->data);
+      $data['expire'] = $session->expire;
+
+      $connection->merge('tupas_session')
+        ->keys([
+          'owner' => $session->owner,
+        ])
+        ->fields([
+          'expire' => $session->expire,
+          'data' => serialize($data),
+        ])
+        ->execute();
+    }
+
+    // Drop expire field.
+    $schema->dropField('tupas_session', 'expire');
+  }
+
+  if (!$schema->fieldExists('tupas_session', 'access')) {
+    $schema->addField('tupas_session', 'access', [
+      'description' => 'The last access timestamp',
+      'type' => 'int',
+      'unsigned' => TRUE,
+      'not null' => TRUE,
+      'default' => 0,
+    ]);
+  }
+
+  if ($schema->indexExists('tupas_session', 'expire')) {
+    $schema->dropIndex('tupas_session', 'expire');
+  }
+
+  if (!$schema->indexExists('tupas_session', 'access')) {
+    $schema->addIndex('tupas_session', 'access', ['access'], tupas_session_schema()['tupas_session']);
+  }
+  // Migrate expire timestamps.
+  $sessions = $connection->select('tupas_session', 's')
+    ->fields('s')
+    ->execute();
+
+  $expire = (int) \Drupal::config('tupas_session.settings')->get('tupas_session_length');
+
+  foreach ($sessions as $session) {
+    $data = unserialize($session->data);
+    $access = $data['expire'];
+
+    // Substract expire from access if session has not expired yet.
+    if ($expire > 0 && ($access - ($expire * 60)) > 0) {
+      $access = $access - ($expire * 60);
+    }
+    $connection->merge('tupas_session')
+      ->keys([
+        'owner' => $session->owner,
+      ])
+      ->fields([
+        'access' => $access,
+        'data' => serialize($data),
+      ])
+      ->execute();
+  }
+}
+
+/**
+ * Add new required bank numbers to bank entities.
+ */
+function tupas_session_update_8003() {
+  $bank_ids = \Drupal::entityQuery('tupas_bank')
+    ->execute();
+  $banks = \Drupal::entityTypeManager()
+    ->getStorage('tupas_bank')
+    ->loadMultiple($bank_ids);
+
+  $map_table = [
+    'aktia' => 410,
+    'alandsbanken' => 600,
+    'danske' => 800,
+    'handelsbanken' => 310,
+    'nordea' => 200,
+    'osuuspankki' => 500,
+    'saastopankki' => 420,
+    'spankki' => 390,
+  ];
+
+  /** @var \Drupal\tupas\Entity\TupasBank $bank */
+  foreach ($banks as $bank) {
+    if (!isset($map_table[$bank->id()])) {
+      drupal_set_message(t('Found bank without known bank number. Please update bank_number to %bank manually.', ['%bank' => $bank->label()]), 'error');
+    }
+    $bank->set('bank_number', $map_table[$bank->id()]);
+    $bank->save();
+  }
+
+}
