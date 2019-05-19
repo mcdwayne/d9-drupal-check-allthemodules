@@ -1,0 +1,771 @@
+<?php
+
+/**
+ * @file
+ * description http://www.youtube.com/watch?v=Qo7qoonzTCE
+ *
+ * @todo
+ *   - click to copy link as a Views field
+ *   - add some watchdog logging
+ *   - remove "http://" from the long URL field when you click in
+ *   - add hook for other modules to create additional/substitute long URL validation
+ *   - add option/permission to reactivate URLs
+ */
+
+use Drupal\Core\Url;
+use Drupal\Core\Link;
+use Drupal\Core\Language\Language;
+use Drupal\Core\Language\LanguageManager;
+use Drupal\Core\Routing\RouteMatchInterface;
+
+/**
+ * Implements hook_page_attachments().
+ */
+function shurly_page_attachments(array &$attachments) {
+  if (\Drupal::routeMatch()->getRouteName() == 'shurly.create') {
+    $attachments['#attached']['library'][] = 'shurly/clipboardjs';
+    $attachments['#attached']['library'][] = 'shurly/shurly';
+  }
+}
+
+/**
+ * Implements hook_help().
+ */
+function shurly_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case "help.page.shurly":
+      return '<div style="white-space:pre-wrap">' . htmlentities(file_get_contents('README.txt', FILE_USE_INCLUDE_PATH)) . '</div>';
+  }
+}
+
+
+/**
+ * Implements hook_theme().
+ */
+function shurly_theme($existing, $type, $theme, $path) {
+  return array(
+    'shurly_create_form' => array(
+      'render element' => 'form',
+    ),
+  );
+}
+
+
+/**
+ * From http://www.php.net/manual/en/function.base-convert.php#52450
+ *
+ * Parameters:
+ * $num - your decimal integer
+ * $base - base to which you wish to convert $num (leave it 0 if you are providing $index or omit if you're using default (62))
+ * $index - if you wish to use the default list of digits (0-1a-zA-Z), omit this option, otherwise provide a string (ex.: "zyxwvu")
+ */
+function shurly_dec2any($num, $base=62, $index=FALSE) {
+    if (! $base ) {
+        $base = strlen( $index );
+    }
+    elseif (! $index ) {
+        // note: we could rearrange this string to get more random looking URLs
+        // another note, to create printable URLs, omit the following characters: 01lIO
+        $index = substr("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", 0, $base );
+    }
+    $out = "";
+    for ( $t = floor( log10( $num ) / log10( $base ) ); $t >= 0; $t-- ) {
+        $a = floor( $num / pow( $base, $t ) );
+        $out = $out . substr( $index, $a, 1 );
+        $num = $num - ( $a * pow( $base, $t ) );
+    }
+    return $out;
+}
+
+
+/* *****************************************************
+ * Flood Control
+ * *****************************************************
+ */
+
+/**
+ * Implements hook_cron().
+ */
+function shurly_cron() {
+  // Cleanup the flood.
+  \Drupal::database()->query('DELETE FROM {shurly_flood} WHERE expiration < :time', array('time' => time()));
+}
+
+/**
+ * Function to store the flood event.
+ */
+function shurly_flood_register_event($name, $window = 3600, $identifier = NULL) {
+  if (!isset($identifier)) {
+    $identifier = \Drupal::request()->getClientIp();
+  }
+
+  $request_time = \Drupal::time()->getRequestTime();
+
+  \Drupal::database()->query("INSERT INTO {shurly_flood} (event, identifier, timestamp, expiration) VALUES (:event, :identifier, :timestamp, :expiration)", array('event' => $name, 'identifier' => \Drupal::request()->getClientIp(), 'timestamp' => $request_time, 'expiration' => time() + $window));
+}
+
+/**
+ * Function to check if the current user
+ * is in the flood table.
+ */
+function shurly_flood_is_allowed($name, $threshold, $window = 3600, $identifier = NULL) {
+  if (!isset($identifier)) {
+    $identifier = \Drupal::request()->getClientIp();
+  }
+
+  $request_time = \Drupal::time()->getRequestTime();
+
+  $number = \Drupal::database()->query("SELECT COUNT(*) FROM {shurly_flood} WHERE event = :event AND identifier = :identifier AND timestamp > :timestamp", array('event' => $name, 'identifier' => $identifier, 'timestamp' => $request_time - $window))->fetchField();
+  return ($number < $threshold);
+}
+
+/* *****************************************************
+ * API functions
+ * *****************************************************
+ */
+
+/**
+ * API function to shorten a URL
+ * @arg $long_url - the long URL to shorten
+ * @arg $custom - optional custom short URL
+ *
+ * @return an array with the following keys
+ *   'success' => TRUE or FALSE
+ *   'error' => reason for for failure
+ *   'long_url' => the long url
+ *   'short_url' => the short url
+ */
+function shurly_shorten($long_url, $custom = NULL, $account = NULL) {
+  global $base_url;
+  $success = FALSE;
+  $account = ($account) ? $account : \Drupal::currentUser();
+  $error = '';
+  $no_save = FALSE;
+  $rate_limit = shurly_rate_limit_allowed($account);
+  if (!$rate_limit['allowed']) {
+    $error = t('Rate limit exceeded. You are limited to @rate requests per @time minute period.', array('@rate' => $rate_limit['rate'], '@time' => $rate_limit['time']));
+  }
+  elseif (!shurly_validate_long($long_url)) {
+    $error = t('Invalid long URL.');
+  }
+  elseif (is_null($custom)) {
+    $latest = shurly_get_latest_short($long_url, $account->uid);
+    if ($latest) {
+      $no_save = TRUE;
+      $success = TRUE;
+      $short = $latest;
+    }
+    else {
+      $short = shurly_next_url();
+    }
+  }
+  else {
+    $short = $custom;
+    if (!shurly_validate_custom($short) || !shurly_path_available($short)) {
+      $error .= $error ? ' ' : '';
+      $error .= t('Invalid short URL.');
+    }
+    elseif (shurly_url_exists($short)) {
+      $error .= $error ? ' ' : '';
+      $error .= t('Existing short URL.');
+    }
+  }
+  if (!$error && !$no_save) {
+    if (shurly_save_url($long_url, $short, $account, $custom)) {
+      $success = TRUE;
+    }
+    else {
+      $error = t('Unknown database error.');
+    }
+  }
+return array(
+    'success' => $success,
+    'error' => $error,
+    'longUrl' => $long_url,
+    'shortUrl' => isset($short) ? _surl($short, array('absolute' => TRUE)) : '',
+  );
+}
+
+/**
+ * Function to get the long url.
+ */
+function shurly_expand($short, $account = NULL) {
+  global $base_url;
+  $error = '';
+  $success = FALSE;
+  $rate_limit = shurly_rate_limit_allowed($account);
+  if (!$rate_limit['allowed']) {
+    $error = t('Rate limit exceeded. You are limited to @rate requests per @time minute period.', array('@rate' => $rate_limit['rate'], '@time' => $rate_limit['time']));
+  }
+  elseif ($redirect = shurly_get_redirect($short, TRUE)) {
+    $success = TRUE;
+    $long_url = $redirect->destination;
+  }
+  else {
+    $error = t('Not found');
+  }
+
+  return array(
+      'success' => $success,
+      'error' => $error,
+      'longUrl' => $long_url,
+      'shortUrl' => _surl($short, array('absolute' => TRUE))
+    );
+}
+
+/**
+ * Check rate limit for this user
+ * return an array in the following format
+ * array(
+ *  'allowed' => TRUE/FALSE
+ *  'rate' => number of requests allowed
+ *  'time' => period of time in minutes
+ * )
+ */
+function shurly_rate_limit_allowed($account = NULL) {
+  if (!isset($account)) {
+    $user = \Drupal::currentUser();
+    $account = $user;
+  }
+
+  // @FIXME
+// Could not extract the default value because it is either indeterminate, or
+// not scalar. You'll need to provide a default value in
+// config/install/shurly.settings.yml and config/schema/shurly.schema.yml.
+$settings = \Drupal::config('shurly.settings')->get('shurly_throttle');
+
+  if (is_array($account->roles)) {
+    $rids = array_keys($account->roles);
+    $use_rid = array_shift($rids);
+    // get list of roles with permission to create short URLs
+    $creating_roles = user_roles(FALSE, 'Create short URLs');
+    foreach ($account->roles as $rid => $name) {
+      // check that this role has permission to create URLs, otherwise discard it
+      if (array_key_exists($rid, $creating_roles)) {
+        // find the lightest role... if roles are the same weight, use the next role
+        $settings[$use_rid]['weight'] = isset($settings[$use_rid]['weight']) ? $settings[$use_rid]['weight'] : 0;
+        $settings[$rid]['weight'] = isset($settings[$rid]['weight']) ? $settings[$rid]['weight'] : 0;
+        $use_rid = $settings[$use_rid]['weight'] < $settings[$rid]['weight'] ? $use_rid : $rid;
+        //Create array index if not exists for rate and time
+        $settings[$use_rid]['rate'] = isset($settings[$use_rid]['rate']) ? $settings[$use_rid]['rate'] : NULL;
+        $settings[$use_rid]['time'] = isset($settings[$use_rid]['time']) ? $settings[$use_rid]['time'] : NULL;
+      }
+    }
+  }
+
+  if (!empty($settings) && is_numeric($settings[$use_rid]['rate']) && is_numeric($settings[$use_rid]['time'])) {
+    // see if it's allowed
+    $allowed = shurly_flood_is_allowed('shurly', $settings[$use_rid]['rate'], $settings[$use_rid]['time'] * 60);
+    // increment the counter
+    shurly_flood_register_event('shurly', $settings[$use_rid]['time'] * 60);
+    $return = array(
+      'allowed' => $allowed,
+      'rate' => $settings[$use_rid]['rate'],
+      'time' => $settings[$use_rid]['time'],
+    );
+  }
+  else {
+    // not set... don't do a flood check
+    $return = array(
+      'allowed' => TRUE,
+    );
+  }
+
+  return $return;
+}
+
+/**
+ * API function to save a URL
+ * @arg $custom is a TRUE/FALSE
+ */
+function shurly_save_url($long_url, $short_path, $account = NULL, $custom = NULL) {
+
+  if (is_null($account)) {
+    $account = new stdClass();
+    $account->id = \Drupal::currentUser()->id();
+  }
+
+  $request_time = \Drupal::time()->getRequestTime();
+
+  $record = array();
+  $record['destination'] = $long_url;
+  $record['hash'] = md5($long_url);
+  $record['custom'] = $custom ? 1 : 0;
+  $record['created'] = $request_time;
+  $record['source'] = $short_path;
+  $record['uid'] = $account->id;
+  $record['count'] = $record['last_used'] = 0;
+  $record['active'] = 1;
+
+  return \Drupal::database()->insert('shurly')->fields($record)->execute();
+
+}
+
+
+/**
+ * Activate or deactivate a link
+ */
+function shurly_set_link_active($rid, $active) {
+  $record = \Drupal::database()->query('SELECT * FROM {shurly} WHERE rid = :rid', ['rid' => $rid])->fetchObject();
+  if ($record) {
+    $rid = $record->rid;
+    $active = $active ? 1 : 0;
+    return \Drupal::database()->merge('shurly')->fields(['rid' => $rid, 'active' => $active ])->key(['rid' => $rid])->execute();
+  }
+  else {
+    return FALSE;
+  }
+}
+
+/**
+ * Validate custom short URL string
+ *
+ * @return TRUE if valid, FALSE if invalid
+ */
+function shurly_validate_custom($custom) {
+
+  // check the length of the string
+  if (strlen($custom) == 0) {
+    return FALSE;
+  }
+
+  // disallow: #%&@*{}\:;<>?/+.,'"$|`^[] and space character
+  return preg_match('/[\/#%&\@\*\{\}\\:\;<>\?\+ \.\,\'\"\$\|`^\[\]]/u', $custom) ? FALSE : TRUE;
+}
+
+/**
+ * Validate a long URL
+ *
+ * Checks for:
+ * - a valid URL
+ * - it's not a link to an existing short URL
+ *
+ * @param
+ * $long url - the long URL entered by user
+ *
+ * @return
+ * BOOLEAN - TRUE if valid, FALSE if invalid
+ */
+function shurly_validate_long(&$long_url) {
+  $return = TRUE;
+  $match = FALSE;
+
+  // if the person didn't remove the original http:// from the field, pull it out
+  $long_url = preg_replace('!^http\://(http\://|https\://)!i', '\\1', $long_url);
+
+  $long_parse = parse_url($long_url);
+  $base_parse = parse_url($GLOBALS['base_url']);
+
+  $check_ip = \Drupal::config('shurly.settings')->get('shurly_forbid_ips');
+  $check_localhost = \Drupal::config('shurly.settings')->get('shurly_forbid_localhost');
+  $check_resolvability = \Drupal::config('shurly.settings')->get('shurly_forbid_unresolvable_hosts');
+  $check_private_ip_ranges = \Drupal::config('shurly.settings')->get('shurly_forbid_private_ips');
+
+  if ($long_parse === FALSE || !isset($long_parse['host'])) {
+    // malformed URL
+    // or no host in the URL
+    $return = FALSE;
+  }
+  elseif ($long_parse['scheme'] != 'http' && $long_parse['scheme'] != 'https') {
+    $return = FALSE;
+  }
+  elseif ($check_ip && preg_match('/^\d/', $long_parse['host'])) {
+    // Host is given as IP address instead of a common hostname.
+    $return = FALSE;
+    // @todo Rework condition with respect to RFC 1123, which allows hostnames
+    //       starting with a digit.
+  }
+  elseif ($check_localhost && shurly_host_is_local($long_parse['host'], TRUE)) {
+    // Host seems to be the local host.
+    $return = FALSE;
+  }
+  elseif ($check_resolvability && !shurly_host_is_resolveable($long_parse['host'], TRUE)) {
+    // Host cannot be resolved (at least not by this server!).
+    $return = FALSE;
+  }
+  elseif ($check_private_ip_ranges && shurly_host_is_private($long_parse['host'], TRUE)) {
+    // Host refers to a private IP address.
+    $return = FALSE;
+  }
+  else {
+    if (\Drupal::config('shurly.settings')->get('shurly_forbid_custom')) {
+      $custom_pattern = \Drupal::config('shurly.settings')->get('shurly_custom_restriction');
+      if (!empty($custom_pattern)) {
+        if (preg_match($custom_pattern, $long_url)) {
+          $return = FALSE;
+        }
+      }
+    }
+
+    $long_domain_parts = explode('.', $long_parse['host']);
+    $base_domain_parts = explode('.', $base_parse['host']);
+
+    $count_long_domain = count($long_domain_parts);
+
+    $last_long_part = isset($long_domain_parts[$count_long_domain - 1]) ? $long_domain_parts[$count_long_domain - 1] : NULL;
+    $last_base_part = isset($base_domain_parts[$count_long_domain - 1]) ? $base_domain_parts[$count_long_domain - 1] : NULL;
+
+    // if last domain part of entered URL matches last part of this domain
+    if ($last_long_part == $last_base_part) {
+      // and (if there's a 2nd to last)
+      if ($count_long_domain >= 2) {
+
+        $last_long_penult = isset($long_domain_parts[$count_long_domain - 2]) ? $long_domain_parts[$count_long_domain - 2] : NULL;
+        $last_base_penult = isset($base_domain_parts[$count_long_domain - 2]) ? $base_domain_parts[$count_long_domain - 2] : NULL;
+
+        // check that 2nd to last matches
+        if ($last_long_penult == $last_base_penult) {
+          // last 2 parts link to this domain
+          $match = TRUE;
+        }
+      }
+      else {
+        // there's only one part, and it links here
+        $match = TRUE;
+      }
+
+      // We only get down here if the long URL links to this domain
+      // by the way, we're ignoring any subdomain...
+      // so http://lbt.me/something and http://www.lbt.me/something are assumed to be the same
+      if ($match) {
+        $queries  = array();
+        if(isset($long_parse['query'])){
+          // let's see if there's a $_GET['q'] in the long URL
+          $query = $long_parse['query'];
+          $query  = html_entity_decode($query);
+          $query_array  = explode('&', $query);
+          foreach ($query_array as $val) {
+            $x = explode('=', $val);
+            $queries[$x[0]] = $x[1];
+          }
+        }
+        if (isset($queries['q'])) {
+          // if there's a 'q' query, Drupal uses this instead of anything in the path
+          $path = $queries['q'];
+        }
+        else {
+          $path = $long_parse['path'];
+        }
+
+        // see if this is a link to an existing shortURL
+        // remove the leading "/" from path, if it exists
+        $path = explode('/', $path, 2);
+        $path = array_pop($path);
+        if ($path) {
+          // get the base path of this Drupal install
+          $base = explode('/', base_path(), 2);
+          $base = array_pop($base);
+          // remove the base from the path
+          if ($base) {
+            $path = preg_replace('!' . preg_quote($base, '!') . '!i', '', $path);
+          }
+          if (shurly_url_exists($path)) {
+            $return = FALSE;
+          }
+        }
+      }
+
+    }
+  }
+  return $return;
+}
+
+/**
+ * Generate a random short URL
+ * Pretty much unused at this point
+ * this method could take a LOOOONG time on a site with lots of URLs
+ */
+function shurly_generate_random($len = NULL) {
+  if ($len == NULL) {
+    $len = \Drupal::config('shurly.settings')->get('shurly_length');
+  }
+  $charset = "abcdefghijklmnopqrstuvwxyz123456789";
+  $charlen = strlen($charset) - 1;
+  do {
+    $str = '';
+    for ($i=0; $i<$len; $i++) {
+      $str .= $charset[mt_rand(0, $charlen)];
+    }
+    // check that this string hasn't been used already
+    // check that the string is a valid (available) path
+  } while (shurly_url_exists($str) || !shurly_path_available($str));
+
+  // allow extra operations
+  \Drupal::moduleHandler()->invokeAll('shurly_shorturl_extra', [$str]);
+
+  return $str;
+}
+
+/**
+ * Return next available short URL
+ */
+function shurly_next_url() {
+
+  $count = \Drupal::config('shurly.settings')->get('shurly_counter'); // starts the URLs with 3 characters
+  do {
+    $count++;
+    // counter is stored as base 10
+    // $index is a-z, A-Z, 0-9, sorted randomly, with confusing characters (01lIO) removed - 57 characters
+    // a custom index can be created as a variable override in settings.php
+    $index = \Drupal::config('shurly.settings')->get('shurly_index');
+    $str = shurly_dec2any($count, NULL, $index);
+
+    // check that this string hasn't been used already
+    // check that the string is a valid (available) path
+  } while (shurly_url_exists($str) !== FALSE || shurly_path_available($str) === FALSE);
+
+  \Drupal::configFactory()->getEditable('shurly.settings')->set('shurly_counter', $count)->save();
+
+  return $str;
+}
+
+/**
+ * Checks to see if there's a menu handler, path alias, or language prefix for a given path
+ *
+ * @return TRUE if there are no conflicts
+ */
+function shurly_path_available($path) {
+
+  // check to see if path represents an enabled language
+  $languages =  \Drupal::LanguageManager()->getLanguages();
+  if (array_key_exists($path, $languages)) {
+    return FALSE;
+  }
+
+  $return = TRUE;
+
+  // see if $path is an alias
+  $source = \Drupal::service('path.alias_manager')->getAliasByPath('/'.$path);
+  if ($source != $path) {
+    // if so, set alias source to $path
+    $path = $source;
+  }
+
+  $url_object = \Drupal::service('path.validator')->getUrlIfValid($path);
+
+  if ($url_object) {
+      $return = FALSE;
+    }
+
+  return $return;
+}
+
+/**
+ * Check to see if this short URL already exists
+ */
+function shurly_url_exists($short, $long = NULL) {
+  $redirect = shurly_get_redirect($short);
+  $return = FALSE;
+  if ($redirect) {
+    $return = 'found';
+  }
+  if ($long && $redirect && $redirect->destination == $long) {
+    $return = 'match';
+  }
+  return $return;
+}
+
+/**
+ * Given the short URL, return the long one
+ *  NOTE: Always check $redirect->active before using the result
+ */
+function shurly_get_redirect($short_url, $check_active = FALSE) {
+  $query = "SELECT * FROM {shurly} WHERE source = :short";
+  if ($check_active) {
+    $query .= ' AND active = 1';
+  }
+  $redirect = \Drupal::database()->query($query, array('short' => $short_url))->fetchObject();
+  return $redirect;
+}
+
+/**
+ * Get the latest generated short URL by a given user for a given long URL
+ */
+function shurly_get_latest_short($long, $uid) {
+  $hash = md5($long);
+  return \Drupal::database()->query("SELECT source FROM {shurly} WHERE hash = :hash AND uid = :uid AND custom = 0 AND active = 1 ORDER BY rid DESC LIMIT 1", array('hash' => $hash, 'uid' => $uid))->fetchField();;
+}
+
+/**
+ * Internal function to format a URL without language prefixing or subdomain rewrites
+ */
+function _surl($path = NULL, $options = array()) {
+  $shurly_base = \Drupal::config('shurly.settings')->get('shurly_base');
+
+  //Set default language object which will avoid redirects and subdomains
+  $options['language'] = Language::$defaultValues;
+
+  return Url::fromUri($shurly_base. '/' . $path, $options)->toString();
+}
+
+/**
+ * Internal function to generate a link without language prefixing or subdomain rewrites
+ */
+function _sl($text, $path, $options = array()) {
+  $shurly_base = \Drupal::config('shurly.settings')->get('shurly_base');
+
+  return Link::fromTextAndUrl($text, Url::fromUri($shurly_base. '/' . $path, $options))->toString();
+}
+
+
+/**
+ * Wrapper function for PHP's `gethostbyname()`.
+ *
+ * This function should be used, when multiple encapsulated code parts need to
+ * resolve a hostname.
+ *
+ * @staticvar array $resolved_hosts
+ *   Array of `gethostbyname()` return values.
+ *
+ * @param string $hostname
+ *   Hostname to resolve.
+ *
+ * @return string
+ *   Resolved host address on success or the input $hostname on failure.
+ */
+function _shurly_gethostbyname($hostname) {
+  static $resolved_hosts = array();
+
+  if (!isset($resolved_hosts[$hostname])) {
+    $resolved_hosts[$hostname] = gethostbyname($hostname);
+  }
+
+  return $resolved_hosts[$hostname];
+}
+
+/**
+ * Check whether the given test string matches the pattern of an IP address.
+ *
+ * @param string $test_string
+ *   Host address or whatever should be tested.
+ *
+ * @return bool
+ *   TRUE if the $test_string matches an IP address pattern; otherwise FALSE.
+ */
+function _shurly_is_ip_address($test_string) {
+  if (!!filter_var($test_string, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+    return TRUE;
+  }
+  if (!!filter_var($test_string, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Check whether the input $hostname can be resolved to a valid IP address.
+ *
+ * @param string $hostname
+ *   Hostname to test.
+ *
+ * @return bool
+ *   TRUE if the $hostname resolves to a valid IP address; otherwise FALSE.
+ */
+function shurly_host_is_resolveable($hostname) {
+  if (_shurly_is_ip_address($hostname)) {
+    return TRUE;
+  }
+  elseif (_shurly_is_ip_address(_shurly_gethostbyname($hostname))) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Check whether the given resolved host is the localhost.
+ *
+ * @param string $hostname
+ *   Return value of a `gethostbyname()` call.
+ *
+ * @return bool
+ *   TRUE if the resolved hostname matches an IPv4 or IPv6 localhost address;
+ *   otherwise FLASE.
+ */
+function shurly_host_is_local($hostname) {
+  $resolved_hostname = _shurly_gethostbyname($hostname);
+  $local_ip_address_pattern = '/^127(?:\.[0-9]+){0,2}\.[0-9]+$|^\[(?:0*\:)*?:?0*1\]$/';
+
+  if (preg_match($local_ip_address_pattern, $resolved_hostname)) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Check whether the given hostname matches a private IP address.
+ *
+ * @param string $hostname
+ *   Hostname to check.
+ *
+ * @return bool
+ *   TRUE if the given $hostname matches a private IP address; otherwise FALSE.
+ */
+function shurly_host_is_private($hostname) {
+  $resolved_hostname = _shurly_gethostbyname($hostname);
+  $private_ip_address_pattern = '/^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)/';
+
+  if (preg_match($private_ip_address_pattern, $resolved_hostname)) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Check the URL against Google Safe browser for phishing, malware of both.
+ *
+ * @param string $url
+ *   URL to check.
+ *
+ * @return bool
+ *   TRUE if the given URL matches; otherwise FALSE.
+ *
+ */
+function shurly_gsb($url){
+  $client = \Drupal::config('shurly.settings')->get('shurly_gsb_config_client');
+  $api_key = \Drupal::config('shurly.settings')->get('shurly_gsb_apikey');
+
+  $gsb_url = "https://safebrowsing.googleapis.com/v4/threatMatches:find?key=".$api_key;
+
+  $rawdata = array(
+    'client' => array("clientId" => "lccx", "clientVersion" => "1.5.2"),
+    'threatInfo' => array(
+      "threatTypes" => array("MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"),
+      "platformTypes" => array("ALL_PLATFORMS"),
+      "threatEntryTypes" => array("URL"),
+      "threatEntries" => array(array("url" => $url))
+    )
+  );
+
+  $data = json_encode($rawdata);
+
+  $client = \Drupal::httpClient();
+  $request = $client->createRequest('POST', $gsb_url, $data);
+  $request->addHeader('Content-Type', 'application/json');
+
+  try {
+    $response = $client->get($gsb_url, [
+      'headers' => [
+        'Content-Type', 'application/json',
+      ],
+    ]);
+    $data = json_decode($response->getBody());
+
+    if ($data->matches) {
+      return True;
+    }
+    else{
+      return False;
+    }
+  }
+  catch (RequestException $e) {
+    watchdog_exception('shurly', $e);
+  }
+}
+
+function shurly_disable_url(&$shurly_item, $context) {
+    shurly_set_link_active($shurly_item->rid, 0);
+}
