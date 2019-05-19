@@ -1,0 +1,344 @@
+<?php
+
+/**
+ * @file
+ * Contains workflow_field_groups.module.
+ */
+
+use Drupal\Core\Config\Entity\ConfigEntityBundleBase;
+use Drupal\Core\Entity\EntityDeleteForm;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\Entity\EntityFormDisplay;
+use Drupal\Core\Field\FieldConfigInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Url;
+use Drupal\workflow\Entity\WorkflowTransition;
+
+/**
+ * Implements hook_help().
+ */
+function workflow_field_groups_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.workflow_field_groups':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Add in workflow support to field groups.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Fetch the field definitions.
+ */
+function workflow_field_groups_fetch_field_definitions($entity_type, $bundle, $field_definitions = NULL) {
+  if ($field_definitions === NULL) {
+    $entity_manager = \Drupal::entityManager();
+    $field_definitions = $entity_manager->getFieldDefinitions($entity_type, $bundle);
+  }
+
+  $field_definitions = array_filter($field_definitions, function ($field_definition) {
+    return $field_definition instanceof FieldConfigInterface;
+  });
+
+  uasort($field_definitions, ['\Drupal\Core\Config\Entity\ConfigEntityBase', 'sort']);
+
+  return $field_definitions;
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function workflow_field_groups_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $form_object = $form_state->getFormObject();
+  if (!method_exists($form_object, 'getEntity')) {
+    return;
+  }
+
+  if ($form_object->getEntity() instanceof ConfigEntityBundleBase &&
+    !$form_object instanceof EntityDeleteForm) {
+
+    $entity = $form_object->getEntity();
+
+    $form['workflow_field_groups'] = [
+      '#type' => 'details',
+      '#title' => t('Workflow field groups'),
+      '#group' => 'additional_settings',
+      '#weight' => 50,
+    ];
+
+    $form['workflow_field_groups']['enable_workflow_field_groups'] = [
+      '#type' => 'checkbox',
+      '#title' => t('Enable workflow field groups'),
+      '#description' => t('Check this to enable management of field groups via workflow states.'),
+      '#default_value' => $entity->getThirdPartySetting('workflow_field_groups', 'enable', 0),
+    ];
+
+    $workflow_options = workflow_get_workflow_names(FALSE);
+
+    $form['workflow_field_groups']['workflow'] = [
+      '#type' => 'select',
+      '#title' => t('Workflow'),
+      '#description' => t('Select the workflow to use.'),
+      '#options' => $workflow_options,
+      '#default_value' => $entity->getThirdPartySetting('workflow_field_groups', 'workflow', ''),
+    ];
+
+    $form['actions']['submit']['#submit'][] = 'workflow_field_groups_entity_type_submit';
+  }
+}
+
+/**
+ * Custom form display submit handling.
+ */
+function workflow_field_groups_entity_type_submit(array &$form, FormStateInterface $form_state) {
+  $enable = $form_state->getValue('enable_workflow_field_groups');
+  $workflow = $form_state->getValue('workflow');
+  $entity = $form_state->getFormObject()->getEntity();
+  $current_setting = $entity->getThirdPartySetting('workflow_field_groups', 'enable', 0);
+  $entity->setThirdPartySetting('workflow_field_groups', 'enable', $enable)
+    ->setThirdPartySetting('workflow_field_groups', 'workflow', $workflow)
+    ->save();
+
+  if ($current_setting !== $enable) {
+    drupal_flush_all_caches();
+  }
+}
+
+/**
+ * Implements hook_filter_form_values_filter_functions().
+ */
+function workflow_field_groups_filter_form_values_filter_functions($form, $form_state) {
+  $storage = $form_state->getStorage();
+  if (!isset($storage['form_display'])) {
+    return;
+  }
+
+  $form_display = $storage['form_display'];
+  $bundle = $form_display->getTargetBundle();
+  $entity_type_id = $form_display->getTargetEntityTypeId();
+  $entity_type_manager = \Drupal::service('entity_type.manager');
+  $bundle_entity_type = $entity_type_manager->getDefinition($entity_type_id)->get('bundle_entity_type');
+  if ($bundle_entity_type === NULL) {
+    return NULL;
+  }
+
+  $config = $entity_type_manager->getStorage($bundle_entity_type)->load($bundle);
+  $current_setting = $config->getThirdPartySetting('workflow_field_groups', 'enable', 0);
+
+  if ($current_setting === 0) {
+    return NULL;
+  }
+
+  return 'workflow_field_groups_filter_form_value';
+}
+
+/**
+ * Determine whether a form value should be filtered out.
+ */
+function workflow_field_groups_filter_form_value($form, $form_display, $form_state_values, $entity, $field_name, $field_definition) {
+  // Workflow fields can't be filtered.
+  if ($field_definition->getType() == 'workflow') {
+    return FALSE;
+  }
+
+  $bundle = $form_display->getTargetBundle();
+  $entity_type_id = $form_display->getTargetEntityTypeId();
+  $form_display_mode_id = $form_display->getMode();
+  $groups = field_group_info_groups($entity_type_id, $bundle, 'form', $form_display_mode_id);
+  $state_field = workflow_get_field_name($entity);
+  $state_id = workflow_node_current_state($entity, $state_field);
+
+  $field_group_id = NULL;
+  $accessible = TRUE;
+
+  foreach ($groups as $group_id => $group) {
+    if (in_array($field_name, $group->children) !== FALSE) {
+      $field_group_id = $group_id;
+    }
+  }
+
+  if ($field_group_id !== NULL) {
+    $accessible = workflow_field_groups_check_group_access($entity_type_id, $bundle, $field_group_id, $form_display_mode_id, $state_id, 'edit');
+  }
+
+  return ($accessible === FALSE);
+}
+
+/**
+ * Implements hook_entity_operation_alter().
+ */
+function workflow_field_groups_entity_operation_alter(array &$operations, EntityInterface $entity) {
+  if (method_exists($entity, 'getThirdPartySetting')) {
+    $enabled = $entity->getThirdPartySetting('workflow_field_groups', 'enable', FALSE);
+    if ($enabled) {
+      $weight = 20;
+      foreach (['view', 'edit'] as $form_operation) {
+        $workflow_url = Url::fromRoute('workflow_field_groups.' . $entity->getEntityType()->getBundleOf() . ".workflow.default.$form_operation", [$entity->getEntityTypeId() => $entity->type]);
+        $operations["workflow_field_groups_$form_operation"] = [
+          'title' => t('Workflow field groups @operation', ['@operation' => $form_operation]),
+          'weight' => $weight++,
+          'url' => $workflow_url,
+        ];
+      }
+    }
+  }
+}
+
+/**
+ * Recursive search an array for matching key and return the values.
+ */
+function workflow_field_groups_array_search_recursive($array, $key) {
+  $values = [];
+
+  if (is_array($array)) {
+    if (isset($array[$key])) {
+      $values[] = $array[$key];
+    }
+
+    foreach ($array as $subarray) {
+      $values = array_merge($values, workflow_field_groups_array_search_recursive($subarray, $key));
+    }
+  }
+
+  return $values;
+}
+
+/**
+ * Get the state_id from the form.
+ */
+function workflow_field_groups_form_state_id($entity_type, $bundle, $form, $form_display_mode) {
+  $function_id = $entity_type . $bundle . $form_display_mode . $form['#form_id'];
+  $state_id = &drupal_static($function_id);
+  if (!isset($state_id)) {
+    $workflow_field_name = '';
+    $workflow_fields = \Drupal::service('entity_field.manager')->getFieldMapByFieldType('workflow');
+    if (isset($workflow_fields[$entity_type])) {
+      foreach ($workflow_fields[$entity_type] as $entity_field_id => $entity_field) {
+        foreach ($entity_field['bundles'] as $entity_field_bundle_id => $entity_field_bundle) {
+          if ($entity_field_bundle_id == $bundle) {
+            $workflow_field_name = $entity_field_id;
+          }
+        }
+      }
+    }
+
+    if (empty($workflow_field_name)) {
+      return NULL;
+    }
+
+    $state_id = NULL;
+
+    // @todo maybe we can do better than this... seems heavy handed.
+    // Why not just get from the entity using the workflow method? huh?!
+    $possible_field_matches = workflow_field_groups_array_search_recursive($form, $workflow_field_name);
+    foreach ($possible_field_matches as $possible_field_match) {
+      if (isset($possible_field_match['widget'][0]['#default_value']) && $possible_field_match['widget'][0]['#default_value'] instanceof WorkflowTransition) {
+        $state_id = $possible_field_match['widget'][0]['#default_value']->getFromSid();
+        break;
+      }
+    }
+
+    if (empty($state_id)) {
+      return NULL;
+    }
+  }
+
+  return $state_id;
+}
+
+/**
+ * Check if group is accessible.
+ */
+function workflow_field_groups_check_group_access($entity_type, $bundle, $group_id, $form_display_mode_id, $state_id, $operation = 'view') {
+
+  $form_display = EntityFormDisplay::load($entity_type . '.' . $bundle . '.' . $form_display_mode_id);
+
+  $settings = $form_display->getThirdPartySetting('workflow_field_groups', $form_display_mode_id, NULL);
+
+  if (isset($settings[$operation][$group_id][$state_id])) {
+    $user = \Drupal::currentUser();
+    $user_roles = $user->getRoles();
+
+    $show_group = FALSE;
+    foreach ($settings[$operation][$group_id][$state_id] as $rid => $enabled) {
+      if ($enabled && in_array($rid, $user_roles)) {
+        $show_group = TRUE;
+        break;
+      }
+    }
+
+    return $show_group;
+  }
+
+  return NULL;
+}
+
+/**
+ * Check if group is accessible on form.
+ */
+function workflow_field_groups_check_form_group_access($entity_type, $bundle, $group_id, $form_display_mode_id, $form, $operation = 'view') {
+
+  // @todo Get this instead from the entity...
+  $state_id = workflow_field_groups_form_state_id($entity_type, $bundle, $form, $form_display_mode_id);
+
+  if ($state_id === NULL) {
+    return NULL;
+  }
+
+  return workflow_field_groups_check_group_access($entity_type, $bundle, $group_id, $form_display_mode_id, $state_id, $operation);
+}
+
+/**
+ * Implements hook_field_group_pre_render_alter().
+ */
+function workflow_field_groups_field_group_pre_render_alter(&$element, &$group, &$rendering_object) {
+  $accessible = workflow_field_groups_check_form_group_access($group->entity_type, $group->bundle, $group->group_name, $group->mode, $rendering_object, 'view');
+
+  if ($accessible === FALSE) {
+    $element['#access'] = FALSE;
+  }
+  else {
+    $editable = workflow_field_groups_check_form_group_access($group->entity_type, $group->bundle, $group->group_name, $group->mode, $rendering_object, 'edit');
+
+    if ($editable === FALSE) {
+      workflow_field_groups_disable_group_editability($element, $rendering_object);
+    }
+  }
+}
+
+/**
+ * Disable editability of a field group.
+ */
+function workflow_field_groups_disable_group_editability(&$element, &$rendering_object) {
+  $element['#attributes']['class'][] = 'field-group-disabled';
+  if (!in_array('workflow_field_groups/workflow_field_groups', $rendering_object['#attached']['library'])) {
+    $rendering_object['#attached']['library'][] = 'workflow_field_groups/workflow_field_groups';
+
+    $settings_config = \Drupal::configFactory()->get('workflow_field_groups.settings');
+    $rendering_object['#attached']['drupalSettings']['workflow_field_groups']['disabled_class'] = $settings_config->get('disabled_class');
+  }
+}
+
+/**
+ * Implements hook_check_form_field_access().
+ */
+function workflow_field_groups_check_form_field_access($form_display, $form_state_values, $field_name, $form, $access_type = 'edit') {
+
+  // Return true if no group.
+  if (!isset($form['#group_children'][$field_name])) {
+    return TRUE;
+  }
+
+  $bundle = $form_display->getTargetBundle();
+  $entity_type_id = $form_display->getTargetEntityTypeId();
+  $group_id = $form['#group_children'][$field_name];
+  $form_display_mode_id = $form_display->getMode();
+
+  $accessible = workflow_field_groups_check_form_group_access($entity_type_id, $bundle, $group_id, $form_display_mode_id, $form, $access_type);
+
+  // Return true on NULL.
+  return $accessible === FALSE ? FALSE : TRUE;
+}
