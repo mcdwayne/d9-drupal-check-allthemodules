@@ -1,0 +1,1336 @@
+<?php
+
+/**
+ * @file
+ * Provides an integration with GoCardless.com for the Ubercart module.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Component\Utility\UrlHelper;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\uc_order\Entity\Order;
+use Drupal\uc_gc_client\Controller\GoCardlessPartner;
+use Drupal\uc_gc_client\Form\CheckoutReviewForm;
+use Drupal\Core\Routing\TrustedRedirectResponse;
+use Drupal\Component\Utility\Html;
+use Drupal\Core\Routing\RouteMatchInterface;
+use GuzzleHttp\Exception\RequestException;
+
+require_once dirname(__FILE__) . '/uc_gc_client.admin.inc';
+
+/**
+ * Implements hook_help().
+ */
+function uc_gc_client_help($route_name, RouteMatchInterface $route_match) {
+
+  switch ($route_name) {
+    case 'help.page.uc_gc_client':
+      $output = '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Ubercart GoCardless Client') . '</p>';
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_uc_add_to_cart_data().
+ *
+ * Adds extra information to a cart item's "data" array.
+ */
+function uc_gc_client_uc_add_to_cart_data($form_values) {
+
+  $nid = $form_values['nid'];
+  $extras = db_select('uc_gc_client_products', 'p')
+    ->fields('p')
+    ->condition('nid', $nid, '=')
+    ->execute()
+    ->fetchAssoc();
+
+  // Set the interval_params length and unit from the Interval attribute.
+  if (isset($form_values['attributes'])) {
+    $attributes = $form_values['attributes'];
+    foreach ($form_values['node']->attributes as $att_value) {
+      if ($att_value->name == 'Interval') {
+        $option_id = $attributes[$att_value->aid];
+        if (isset($option_id)) {
+          $attr_option = $att_value->options[$option_id]->name;
+        }
+      }
+    }
+  }
+  if (isset($attr_option)) {
+    $interval_params = uc_gc_client_interval_params($attr_option);
+  }
+  elseif (isset($extras['interval_length'])) {
+    $interval_params = [
+      'length' => $extras['interval_length'],
+      'unit' => $extras['interval_unit'],
+      'string' => $extras['interval_length'] . ' ' . $extras['interval_unit'],
+      'unit_gc' => $extras['interval_unit'] . 'ly',
+    ];
+  }
+
+  // Add GC type.
+  if (isset($extras['type'])) {
+    $extras['type'] == 'S' ? $gc_type = 'subscription' : $gc_type = 'payment';
+  }
+  else {
+    $gc_type = NULL;
+  }
+
+  $data = [
+    'gc_auth_type' => $gc_type,
+    'price_x' => $extras['price_x'],
+    'interval_params' => isset($interval_params) ? $interval_params : NULL,
+  ];
+  return $data;
+}
+
+/**
+ * Returns an array of interval params.
+ *
+ * @param string $option
+ *   The interval type.
+ *
+ * @return array
+ *   Length and unit interval parameters.
+ */
+function uc_gc_client_interval_params($option) {
+
+  switch ($option) {
+
+    case 'Yearly':
+      $interval_params = [
+        'length' => 1,
+        'unit' => 'yearly',
+        'string' => '1 year',
+        'unit_gc' => 'yearly',
+      ];
+      break;
+
+    case 'Monthly':
+      $interval_params = [
+        'length' => 1,
+        'unit' => 'month',
+        'string' => '1 month',
+        'unit_gc' => 'monthly',
+      ];
+      break;
+
+    case 'Weekly':
+      $interval_params = [
+        'length' => 1,
+        'unit' => 'week',
+        'string' => '1 week',
+        'unit_gc' => 'weekly',
+      ];
+      break;
+
+    case 'Fortnightly':
+      $interval_params = [
+        'length' => 2,
+        'unit' => 'week',
+        'string' => '2 week',
+        'unit_gc' => 'weekly',
+      ];
+      break;
+  }
+  return $interval_params;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function uc_gc_client_form_uc_cart_checkout_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+
+  $session = \Drupal::service('session');
+  $order_id = intval($session->get('cart_order'));
+  if (!isset($order_id) || $order_id == 0) return;
+  
+  $order = Order::load($order_id);
+  $config_id = \Drupal::state()->get('uc_gc_client_config_id');
+  $payment_method_id = explode('.', $config_id)[2];
+
+/*
+  if ((isset($form['panes']['payment']) && count($form['panes']['payment']['payment_method']['#options']) <= 1) || !isset($form['panes']['payment'])) {
+    $order->setPaymentMethodId($payment_method_id);
+    $order->save();
+  }
+*/
+
+  
+  if (is_null($order->getPaymentMethodID()) || $order->getPaymentMethodId() == $payment_method_id) {
+
+    // Change the address fieldsets to a bespoke type that has countries
+    // filtered to only include GC enabled countries.
+    $settings = GoCardlessPartner::getSettings();
+    if ($settings['currencies']) {
+      if (isset($form['panes']['delivery'])) {
+        $form['panes']['delivery']['address']['#type'] = 'uc_gc_client_address';
+      }
+      if (isset($form['panes']['billing'])) {
+        $form['panes']['billing']['address']['#type'] = 'uc_gc_client_address';
+      }
+    }
+
+    // Optional checkout review selected. (This should only be selected
+    // if GC is the only enabled payment method.)
+    if ($settings['checkout_review']) {
+      $form['actions']['continue']['#value'] = $settings['checkout_label'];
+      $form['#submit'][] = 'uc_gc_client_checkout_form_submit';
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function uc_gc_client_form_uc_cart_checkout_review_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+
+  // Optional checkout is not selected.
+  $session = \Drupal::service('session');
+  $order_id = intval($session->get('cart_order'));
+  if (!isset($order_id) || $order_id == 0) {
+    return;
+  }
+
+  $order = Order::load($order_id);
+
+  // This allows you to omit the Payment method pane, and is safe because
+  // you would only do if you had just one payment method enabled.
+  /*
+  if (!isset($order->payment_method) || empty($order->payment_method)) {
+  $order->payment_method = 'gc_client';
+  uc_order_save($order);
+  }
+   */
+
+  $config_id = GoCardlessPartner::getSettings()['config_id'];
+  if ($config_id != $order->getPaymentMethodId()) {
+    return;
+  }
+
+  $checkout_review_form = \Drupal::formBuilder()->getForm(CheckoutReviewForm::class, $order);
+  $form['actions']['submit']['#access'] = FALSE;
+  $form['#prefix'] = '<table style="display: inline; padding-top: 1em;"><tr><td>';
+  $form['gocardless_link'] = [
+    '#type' => 'submit',
+    '#value' => \Drupal::config('uc_gc_client.settings')->get('checkout_label'),
+  ];
+
+  $mandate_details = uc_gc_client_mandate_details($order);
+  $form['mandate_details'] = array(
+    '#type' => 'value',
+    '#value' => $mandate_details,
+  );
+  $form['order_id'] = array(
+    '#type' => 'value',
+    '#value' => $order_id,
+  );
+
+  $form['#submit'][] = 'uc_gc_client_checkout_form_submit';
+  $form['#suffix'] = '</td></tr></table>';
+}
+
+/**
+ * Handles form submission when Optional Checkout Review is selected.
+ */
+function uc_gc_client_checkout_form_submit($form, FormStateInterface $form_state) {
+  uc_gc_client_form_submit($form, $form_state);
+}
+
+/**
+ * Implements hook_form_submit().
+ *
+ * Submit the checkout review form and redirect to Partner site to
+ * begin the Direct Debit setup flow.
+ */
+function uc_gc_client_form_submit($form, FormStateInterface $form_state) {
+
+  $values = $form_state->getValues();
+
+  if (isset($values['mandate_details'])) {
+    $mandate_details = $form_state->getValue(['mandate_details']);
+    $order_id = $form_state->getValue(['order_id']);
+  }
+  else {
+    //$order = $form_state->getStorage('uc_order')['uc_order'];
+    $order = $form_state->getStorage('order')['order'];
+    $order_id = $order->id();
+    $mandate_details = uc_gc_client_mandate_details($order);
+  }
+
+  $partner = new GoCardlessPartner();
+  $result = $partner->api([
+    'endpoint' => 'redirect_flows',
+    'action' => 'create',
+    'mandate_details' => $mandate_details,
+    'order_id' => $order_id,
+  ]);
+  if (UrlHelper::isValid($result->response)) {
+    $form_state->setResponse(new TrustedRedirectResponse($result->response, 302));
+  }
+  else {
+    drupal_set_message(t('We were unable to create your new direct debit mandate, please contact the site administrator for assistance.'), 'error');
+  }
+  // Todo send user somewhere else here to prevent order from completing.
+}
+
+/**
+ * Returns an array of mandate details.
+ *
+ * Mandate details are passed on to GoCardless Redirect Flows endpoint.
+ */
+function uc_gc_client_mandate_details($order) {
+
+  global $base_url;
+
+  // Depending on if Optional Checkout Review is selected.
+  if (is_array($order)) {
+    $order = $order['build_info']['args']['0'];
+  }
+
+  $fields = [
+    'first_name',
+    'last_name',
+    'company',
+    'street1',
+    'street2',
+    'city',
+    'postal_code',
+    'country',
+  ];
+  $billing = $order->getAddress('billing');
+  $delivery = $order->getAddress('delivery');
+
+  foreach ($fields as $field) {
+    !is_null($billing->$field) ? $$field = $billing->$field : $$field = $delivery->$field;
+  }
+
+  $valid_countries = \Drupal::config('uc_gc_client.settings')->get('countries');
+  if (!isset($valid_countries[$country])) {
+    drupal_set_message(t('Sorry, this country is not avaialable to GoCardless right now.'),'warning');
+    drupal_goto($_SERVER['HTTP_REFERER']);
+  }
+
+  // Generate the mandate_details array.
+  $mandate_details = [
+    'name'              => 'Order ' . $order->id(),
+    'user'              => [
+      'first_name'        => $first_name,
+      'last_name'         => $last_name,
+      'email'             => $order->getEmail(),
+      'company_name'      => $company,
+      'billing_address1'  => $street1,
+      'billing_address2'  => $street2,
+      'billing_town'      => $city,
+      'billing_postcode'  => $postal_code,
+      'billing_country'  => $country,
+    ],
+  ];
+
+  $settings = \Drupal::config('uc_gc_client.settings')->get();
+  $sandbox = $settings['sandbox'];
+  $sandbox ? $ext = '_sandbox' : $ext = '_live';
+
+  $mandate_details['redirect_uri'] = $settings['partner_url'] . '/gc_partner/mandate?org_id=' . $settings['org_id' . $ext] . '&order_id=' . $order->id();
+
+  // Provide a hook so that mandate details can be altered by another module.
+  \Drupal::moduleHandler()->alter('gc_client_mandate_details', $mandate_details, $order);
+
+  return $mandate_details;
+}
+
+/**
+ * Implements hook_menu_local_tasks_alter().
+ *
+ * Removes the Payments tab from an order's View pane if the module is
+ * configured to do this on the settings form.
+ */
+function uc_gc_client_menu_local_tasks_alter(&$data, $route_name) {
+
+  $settings = GoCardlessPartner::getSettings();
+  if ($settings['payments_tab']) {
+    $current_path = \Drupal::service('path.current')->getPath(); 
+    if (strpos($current_path, '/admin/store/orders/') !== FALSE) {
+      $args = explode('/', $current_path);
+      if (is_numeric($args[4])) { 
+        $order = Order::load($args[4]);
+        if ($order->getPaymentMethodId() == $settings['config_id']) {
+          if (isset($data['tabs'][0]['uc_payments.order_payments'])) {
+            unset($data['tabs'][0]['uc_payments.order_payments']);
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_date_format_types().
+ */
+function uc_gc_client_date_format_types() {
+  return [
+    'gocardless' => t('GoCardless'),
+  ];
+}
+
+/**
+ * Implements hook_date_formats().
+ */
+function uc_gc_client_date_formats() {
+  return [
+    [
+      'type' => 'gocardless',
+      'format' => 'Y-m-d',
+    ],
+  ];
+}
+
+/**
+ * Implements hook_uc_checkout_complete().
+ *
+ *  For anonymous checkouts update the uid from 0 in the uc_gcsubs table.
+ */
+function uc_gc_client_uc_checkout_complete($order, $account) {
+
+  if (isset($order->data['new_user'])) {
+    $update = db_update('uc_gc_client')
+      ->fields([
+        'uid' => $order->uid,
+      ])
+      ->condition('ucid', $order->order_id, '=')
+      ->execute();
+  }
+}
+
+
+/**
+ * Implements hook_element_info().
+ */
+/*
+function uc_gc_client_element_info() {
+
+  $types = [];
+  $types['uc_gc_client_address'] = [
+    '#input' => TRUE,
+    '#required' => TRUE,
+    '#process' => ['uc_gc_client_process_address_field'],
+    '#attributes' => ['class' => ['uc-store-address-field']],
+    '#theme_wrappers' => ['container'],
+    '#key_prefix' => '',
+    '#hidden' => FALSE,
+  ];
+  return $types;
+}
+*/
+
+/**
+ * Element process hook for address fields.
+ */
+/*
+function uc_gc_client_process_address_field($element, $form_state) {
+
+  $uc_countries = db_select('uc_countries', 'u')
+    ->fields('u')
+    ->condition('version', 0, '>')
+    ->execute()->fetchAllAssoc('country_iso_code_2');
+
+  $countryController = new Drupal\uc_country\Controller\CountryController();
+  $uc_countries = $countryController->countryOptionsCallback();
+  $gc_countries = \Drupal::config('uc_gc_client.settings')->get('countries');
+  
+  $enabled_countries = [];
+  foreach ($gc_countries as $gc_code => $gc_country) {
+    if ($gc_country['enabled'] && isset($uc_countries[$gc_code])) {
+      $enabled_countries[$uc_countries[$gc_code]->country_id] = $uc_countries[$gc_code]->country_name;
+    }
+  }
+
+  $element = uc_store_process_address_field($element, $form_state);
+  $element[$element['#key_prefix'] . '_country']['#options'] = $enabled_countries;
+  return $element;
+}
+*/
+
+/**
+ * Implements hook_uc_order_pane().
+ */
+function uc_gc_client_uc_order_pane() {
+
+  $panes['cancel_button'] = [
+    'callback' => 'uc_gc_client_pane_cancel_button',
+    'title' => t('Cancel mandate button'),
+    'display title' => '',
+    'desc' => t("Button to cancel GoCardless subscription."),
+    'class' => 'abs-left',
+    'weight' => 10,
+    'show' => ['customer', 'view'],
+  ];
+  $panes['gc_client'] = [
+    'callback' => 'uc_gc_client_uc_order_pane_callback',
+    'title' => t('Go Cardless'),
+    'desc' => t('Information on GoCardless order'),
+    'class' => 'pos-left',
+    'weight' => 4,
+    'show' => ['view', 'edit'],
+  ];
+  return $panes;
+}
+
+/**
+ * Provides the "GoCardless" pane in an order's admin view pane.
+ */
+function uc_gc_client_uc_order_pane_callback($op, $order) {
+
+  switch ($op) {
+
+    case 'view':
+      /*
+      // Todo this doesn't work if there is more than one product in order.
+      $query = db_select('uc_gc_client', 'g');
+      $gc = $query
+      ->fields('g')
+      ->condition('ucid', $order->order_id, '=')
+      ->execute()->fetch();
+
+      $build = 'Mandate ID: ' . $gc->gcid . '<br />';
+      $build .= 'Created: ' . format_date($gc->created, 'uc_store') . '<br />';
+      $gc->status == 'completed' ? $status = 'Active' : $status = $gc->status;
+      $build .= 'Status: ' . $status . '<br />';
+      $gc->type == 'P' ? $type = 'Payments' : $type = 'Subscription';
+      $build .= 'Type: ' . $type . '<br />';
+      !is_null($gc->start_date) ? $start = format_date($gc->start_date, 'uc_store') . '<br />' : $start = 'Not set<br />';
+      $build .= 'Start: ' . $start;
+
+      if (isset($order->products[$gc->ucpid]->data['interval_params'])) {
+      $params = $order->products[$gc->ucpid]->data['interval_params'];
+      $interval = $params['length'] . ' ' . $params['unit'];
+      }
+      else {
+      $interval = 'Not set';
+      }
+      $build .= 'Payment Interval: ' . $interval . '<br />';
+
+      if ($gc->status != 'canceled' && $gc->type == 'P') {
+
+      !is_null($gc->next_payment) ? $next_payment = format_date($gc->next_payment) . '<br />' : $next_payment = 'Not set<br />';
+      $build .= 'Next payment creation: ' . $next_payment;
+      }
+
+      return array('#markup' => $build);
+       */
+
+  }
+}
+
+/**
+ * Handles the "Cancel button" order pane.
+ */
+function uc_gc_client_pane_cancel_button($op, $order, &$form = NULL, &$form_state = NULL) {
+
+  switch ($op) {
+    case 'customer':
+      if (\Drupal::currentUser()->hasPermission('view own invoices')) {
+        return \Drupal::formBuilder()->getForm('uc_gc_client_pane_cancel_form', $order);
+      }
+      // Case 'view':
+      // if (user_access('view own invoices')) {
+      // return drupal_get_form('uc_gc_client_pane_cancel_form', $order);
+      // }.
+  }
+}
+
+/**
+ * Adds a form with a cancel button.
+ */
+function uc_gc_client_pane_cancel_form($form, &$form_state, $order) {
+  if ($order->order_status <> 'canceled') {
+    $form['order'] = [
+      '#value' => $order,
+    ];
+    $form['submit'] = [
+      '#type' => 'submit',
+      '#value' => t('Cancel GoCardless mandate'),
+      '#attributes' => ['onclick' => 'if (!confirm("Are you sure you want to cancel the direct debit mandate? This action cannot be undone.")) {return FALSE;}'],
+    ];
+    return $form;
+  }
+}
+
+/**
+ * Implements hook_form_submit().
+ *
+ * Submit function for the cancel button form.
+ */
+function uc_gc_client_pane_cancel_form_submit($form, &$form_state) {
+
+  $order = $form['order']['#value'];
+  uc_order_update_status($order->order_id, 'canceled');
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * If next_payment date is in the past create a new payment and
+ * update next_payment.
+ */
+function uc_gc_client_cron() {
+
+  // Get list of active orders where next_payment is in the past.
+  $payments = db_select('uc_gc_client', 'g')
+    ->fields('g', ['ucid', 'ucpid', 'gcid', 'uid', 'next_payment'])
+    ->condition('type', 'S', '!=')
+    ->condition('status', 'canceled', '!=')
+    ->condition('next_payment', REQUEST_TIME, '<=')
+    ->execute()
+    ->fetchAll();
+
+  if (!empty($payments)) {
+    $partner = new GoCardlessPartner();
+  }
+
+  foreach ($payments as $payment) {
+
+    $result = $partner->api([
+      'endpoint' => 'mandates',
+      'action' => 'get',
+      'mandate' => $payment->gcid,
+    ]);
+    if ($result->response->status_code == 200) {
+      $mandate = $result->response->body->mandates;
+    }
+
+    if (!isset($mandate) || in_array($mandate->status, ['cancelled', 'failed'])) {
+      $log = t('Order #@ucid: Payment creation error.', ['@ucid' => $payment->ucid]);
+      \Drupal::logger('uc_gc_client')->error($log, []);
+      continue;
+    }
+
+    $order = Order::load($payment->ucid);
+    if (!$order instanceof EntityInterface) {
+      continue;
+    }
+
+    // Calculate amount.
+    $next_paymentdate = date('D d M Y', $payment->next_payment);
+    $calculate = uc_gc_client_price_calculate($order, $payment->ucpid, $next_paymentdate, $status = 1);
+    $amount = $calculate['amount'];
+    $store_config = \Drupal::config('uc_store.settings');
+    $currency_code = isset($calculate['currency']) ? $calculate['currency'] : $store_config->get('currency.code');
+    $currency_sign = isset($calculate['sign']) ? $calculate['sign'] : $store_config->get('currency.symbol');
+
+    $uid = $order->getOwnerId();
+    $settings = GoCardlessPartner::getSettings();
+
+    // Make sure daily payment limit hasn't been exceeded.
+    if (!empty($settings['payment_limit']) && $settings['payment_limit'] != 0) {
+
+      $count = 0;
+      $result = $partner->api([
+        'endpoint' => 'payments',
+        'action' => 'list',
+        'mandate' => $payment->gcid,
+        'created_at_on_after' => date('c', strtotime('midnight')),
+      ]);
+      if ($result->response->status_code == 200) {
+        foreach ($result->response->body->payments as $pay) {
+          if (isset($pay->metadata->ucpid)) {
+            if ($pay->metadata->ucpid == $payment->ucpid) {
+              $count++;
+            }
+          }
+        }
+      }
+
+      if ($count > $settings['payment_limit']) {
+
+        $message = t("Payment for @amount has not been raised because the daily payment limit of @payment_limit has been exceeded for the order.", [
+          '@amount' => uc_currency_format($amount, $currency_sign),
+          '@payment_limit' => $settings['payment_limit'],
+        ]);
+
+        uc_order_comment_save($order->id(), $uid, $message, 'order');
+
+        $watchdog_array = [
+          '@amount' => uc_currency_format($amount, $currency_sign),
+          '@order_id' => $order->id(),
+          '@uid' => $uid,
+          '@payment_limit' => $settings['payment_limit'],
+        ];
+        $watchdog = t("Payment for @amount for order #@order_id has not been created on user #@uid's account because the daily payment limit of @payment_limit has been exceeded.", $watchdog_array);
+        \Drupal::logger('uc_gc_client')->warning($watchdog, []);
+
+        // Send a warning email to admin.
+        $mail_recipient = $settings['warnings_email'];
+        $mail_params = [
+          'order_id' => $order->id(),
+          'payment_limit' => $settings['payment_limit'],
+          'amount' => uc_currency_format($amount, $currency_sign),
+        ];
+        $langcode = \Drupal::languageManager()->getCurrentLanguage()->getId();
+        \Drupal::service('plugin.manager.mail')
+          ->mail('uc_gc_client', 'payment-limit-reached', $mail_recipient, $langcode, $mail_params);
+
+        continue;
+      }
+    }
+
+    $payment_details = [
+      'amount' => $amount,
+      'name' => $calculate['name'],
+    ];
+
+    // Provide a hook so that payment details can be altered by another module.
+    \Drupal::moduleHandler()->alter('gc_client_scheduled_payment_details', $payment_details, $order);
+    $amount = $payment_details['amount'];
+    $name = $payment_details['name'];
+
+    // Validate the payment amount before creating.
+    if ($amount < 1 && $amount != 0) {
+      $message = t("Payment for @amount has not been created because it is less than @minimum.", [
+        '@minimum' => uc_currency_format(1, $currency_sign),
+        '@amount' => uc_currency_format($amount, $currency_sign),
+      ]);
+      uc_order_comment_save($order->id(), $uid, $message, 'order');
+
+      $watchdog = t("Payment for @amount for order #@order_id has not been created on user #@uid's account because it is less than @minimum.", [
+        '@minimum' => uc_currency_format(1, $currency_sign),
+        '@amount' => uc_currency_format($amount, $currency_sign),
+        '@order_id' => $order->id(),
+        '@uid' => $uid,
+      ]);
+      \Drupal::logger('uc_gc_client')->warning($watchdog, []);
+
+      // Send a warning email to admin.
+      $mail_recipient = $settings['warnings_email'];
+      $langcode = \Drupal::languageManager()->getCurrentLanguage()->getId();
+      $mail_params = ['order_id' => $order->id()];
+      \Drupal::service('plugin.manager.mail')
+        ->mail('uc_gc_client', 'payment-less-than-one', $mail_recipient, $langcode, $mail_params);
+    }
+
+    elseif ($amount == 0) {
+      $message = t("No payment raised because scheduled amount is @sign0.", ['@sign' => $currency_sign]);
+      uc_order_comment_save($order->id(), $uid, $message, 'order');
+
+      $watchdog = t("No payment raised for order #@order_id on user #@uid's account because the amount is @sign0.", [
+        '@order_id' => $order->id(),
+        '@uid' => $uid,
+        '@sign' => $currency_sign,
+      ]);
+      \Drupal::logger('uc_gc_client')->warning($watchdog, []);
+    }
+
+    else {
+      // Create the payment.
+      $result = $partner->api([
+        'endpoint' => 'payments',
+        'action' => 'create',
+        'mandate' => $payment->gcid,
+        'amount' => $amount,
+        'currency' => $currency_code,
+        'description' => $name,
+        'metadata' => ['ucpid' => $payment->ucpid],
+      ]);
+
+      if ($result->response->status_code == 201) {
+        $payment_created = $result->response->body->payments;
+
+        $comment = t('Payment for @amount has been created with GoCardless and will be made from your account on @charge_date.', [
+          '@amount' => uc_currency_format($amount, $currency_sign),
+          '@charge_date' => format_date(strtotime($payment_created->charge_date), 'uc_store'),
+        ]);
+        uc_order_comment_save($order->id(), $uid, $comment, 'order', 'pending', TRUE);
+
+        $watchdog = "Payment for @amount for order #@order_id has been created with GoCardless and will be taken from user #@uid's account on @charge_date.";
+        \Drupal::logger('uc_gc_client')->info($watchdog, [
+          '@amount' => uc_currency_format($amount, $currency_sign),
+          '@order_id' => $order->id(),
+          '@uid' => $uid,
+          '@charge_date' => format_date(strtotime($payment_created->charge_date, 'uc_store')),
+        ]);
+      }
+      else {
+
+      } //Todo if payment creation fails
+    }
+
+    // Update next_payment field in uc_gc_client table.
+    // TODO should next scheduled payment be adjustded if payment fails? 
+    // Configuration setting perhaps?
+    $product_data = $order->products[$payment->ucpid]->data->getValue()[0];
+    $string = '+' . $product_data['interval_params']['string'];
+    $next_payment = strtotime($string, $payment->next_payment);
+
+    // Provide a hook so that next_payment can be altered by another module.
+    \Drupal::moduleHandler()->alter('gc_client_next_scheduled_payment_date', $next_payment, $order);
+
+    $update = db_update('uc_gc_client')
+      ->fields([
+        'next_payment' => $next_payment,
+        'updated' => REQUEST_TIME,
+      ])
+      ->condition('ucpid', $payment->ucpid)
+      ->execute();
+
+    // Update status field in uc_gc_client_schedules table.
+    $update = db_update('uc_gc_client_schedules')
+      ->fields([
+        'status' => 2,
+      ])
+      ->condition('type', 'adjustment')
+      ->condition('date', $next_paymentdate)
+      ->condition('ucpid', $payment->ucpid)
+      ->execute();
+  }
+}
+
+/**
+ * Returns the price of an order modified by the multiplier and other factors.
+ */
+function uc_gc_client_price_calculate($order, $ucpid, $next_paymentdate = NULL, $status = NULL, $data = FALSE) {
+
+  // Process scheduled adjustments.
+  $query = db_select('uc_gc_client_schedules', 's');
+  $adjustments = $query
+    ->fields('s', ['sid','date','status','data',])
+    ->condition('s.status', $status)
+    ->condition('s.date', $next_paymentdate)
+    ->condition('type', 'adjustment')
+    ->condition('ucpid', $ucpid)
+    ->orderBy('timestamp', 'ASC')
+    ->execute()->fetchAll();
+
+  $calcs_array = [];
+  $adjs_total = 0;
+
+  foreach ($adjustments as $adj) {
+
+    // Todo Ensure this will not break if 2 adjustments on same date have same
+    // title.
+    $data = unserialize($adj->data);
+    $calcs_arr['adjs'][$data['title']] = $data['amount'];
+    $adjs_total = $adjs_total + $data['amount'];
+  }
+
+  // Factor in price multiplier.
+  $product = $order->products[$ucpid];
+  $product_data = $product->data->getValue()[0];
+
+  if (isset($product_data['price_x'])) {
+    !is_null($product_data['price_x']) ? $price_x = $product_data['price_x'] : $price_x = 1;
+  }
+  else {
+    $price_x = 1;
+  }
+
+  // Process line items.
+  $line_items_amount = 0;
+
+  // If there is just one product in the order we can safely add the total
+  // of the line items to the amount.
+  if ($order->getProductCount() == 1) {
+    $line_items = $order->getLineItems();
+    foreach ($line_items as $item) {
+      if ($item['type'] == 'subtotal') {
+        continue;
+      }
+      $line_items_amount = $line_items_amount + $item['amount'];
+    }
+  }
+
+  // Todo add extra rules here for handling line item amounts.
+  $data ? $amount = $data['amount'] : $amount = $product->price->value;
+  $amount = ($amount + $adjs_total + $line_items_amount) * $price_x;
+
+  // Modify payment amount and currency if international customer
+  $settings = GoCardlessPartner::getSettings();
+  if ($settings['currencies']) {
+
+    $default_currency = \Drupal::config('uc_store.settings')->get('currency')['code'];
+    !empty($order->billing_country->value) ? $country_code = $order->billing_country->value : $country_code = $order->delivery_country->value;
+    $currency_arr = uc_gc_client_currency($country_code);
+    $currency = (string) $currency_arr['currency'];
+
+    if ($default_currency != $currency) {
+
+      //Use fixer.io to provide latest exchange rates for currency conversion.
+      if ( isset($settings['fixer']) && !empty($settings['fixer']) ) {
+        $uri = 'http://data.fixer.io/api/latest?access_key=' . $settings['fixer'] . '&symbols=' . $default_currency;
+        try {
+          $result = \Drupal::httpClient()
+            ->get($uri, [
+              'headers' => ['Content-Type' => 'application/json'],
+            ]
+          );
+          if (empty($result)) {
+            //return FALSE;
+          }
+          $data = json_decode($result->getBody());
+          $exchange_rate = $data->rates->$default_currency;
+          if ($default_currency == 'EUR') {
+            $amount = $amount * $exchange_rate;
+          }
+          else $amount = $amount / $exchange_rate;
+
+          drupal_set_message(t('The amount for your purchase has been converted into @sign using current exchange rates at fixer.io', [
+            '@sign' => $currency_arr['sign'],
+          ]));
+        }
+        catch (RequestException $e) {
+          watchdog_exception('uc_gc_client', $e);
+          drupal_set_message(t('We were unable to obtain a currency exchange rate at this time'), 'warning');
+        }
+      }
+      else drupal_set_message(t('API key is missing for fixer.io'), 'warning');
+
+      $calcs_arr['currency'] = $currency;
+      $calcs_arr['sign'] = $currency_arr['sign'];
+    }
+  }
+  
+  $calcs_arr['name'] = 'Payment for Order #' . $order->id();
+  $calcs_arr['price'] = $product->price->value;
+  $calcs_arr['adjs_total'] = $adjs_total;
+  $calcs_arr['price_x'] = $price_x;
+  $calcs_arr['amount'] = number_format(html::escape($amount, "number"), 2, '.', '');
+  return $calcs_arr;
+}
+
+/**
+ * Implements hook_uc_order_product_delete().
+ */
+/*
+function uc_gc_client_uc_order_product_delete($order_product) {
+
+$ucid = $order_product->order_id;
+
+// Delete record from gc_client table if there is one for the order.
+$db_delete = db_delete('uc_gc_client')
+->condition('ucid', $ucid, '=')
+->execute();
+}
+ */
+
+/**
+ * Implements hook_mail().
+ */
+function uc_gc_client_mail($key, &$message, $params) {
+
+  global $base_url;
+  $order_url = $base_url . '/admin/store/orders/' . $params['order_id'];
+  $link = t('order <a href="@url">#@order_id</a>', ['@order_id' => $params['order_id'], '@url' => $order_url]);
+
+  $message_arr = [
+    '@link' => $link,
+    '@order_url' => $order_url,
+    '@order_id' => $params['order_id'],
+    '@payment_limit' => isset($params['payment_limit']) ? $params['payment_limit'] : NULL,
+    '@amount' => isset($params['amount']) ? $params['amount'] : NULL,
+    '@sign' => isset($params['sign']) ? $params['sign'] : NULL,
+  ];
+
+  $message['headers']['Content-Type'] = 'text/html; charset=UTF-8; format=flowed';
+
+  switch ($key) {
+
+    case 'payment-less-than-one':
+      $message['subject'] = "A payment's Amount was less than @sign1 !";
+      $message['body'][] = t("<p>A payment for order <a href='@order_url'>#@order_id</a> has failed because it's amount was less than @sign1.</p>", $message_arr);
+      break;
+
+    case 'payment-limit-reached':
+      $message['subject'] = "The daily payment limit has been exceeded for an order!";
+      $message['body'][] = t("<p>A payment of @amount for order <a href='@order_url'>#@order_id</a> could not be raised because the daily automatic limit of @payment_limit has been exceeded.</p>", $message_arr);
+      break;
+  }
+}
+
+/**
+ * Implements hook_mail_alter().
+ */
+/*
+function uc_gc_client_mail_alter(&$message) {
+
+// echo '<pre>', print_r($message); die;
+switch ($message['key']) {
+case 'payment-limit-reached':
+$message['headers']['Content-Type'] = 'text/html; charset=UTF-8; format=flowed';
+break;
+
+case 'payment-less-than-one':
+$message['headers']['Content-Type'] = 'text/html; charset=UTF-8; format=flowed';
+break;
+}
+}
+ */
+
+/**
+ * Implements hook_ENTITY_TYPE_update().
+ */
+function uc_gc_client_uc_order_update(EntityInterface $order) {
+  if ($order->order_status->getString() == 'canceled') {
+    uc_gc_client_uc_order_cancel($order);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ *
+ * Removes records from the database upon deletion of an order.
+ */
+function uc_gc_client_uc_order_delete($order) {
+
+  // Cancel GoCardless mandate first if order status is not canceled.
+  if ($order->order_status->getString() != 'canceled') {
+    uc_gc_client_uc_order_cancel($order);
+  }
+
+  db_delete('uc_gc_client')
+    ->condition('ucid', $order->id())
+    ->execute();
+
+  $aid = db_delete('uc_gc_client_schedules')
+    ->condition('ucid', $order->id())
+    ->execute();
+}
+
+/**
+ * Cancels a GC mandate upon cancelling an order.
+ */
+function uc_gc_client_uc_order_cancel($order) {
+
+  $gc_client = db_select('uc_gc_client', 'c')
+    ->fields('c')
+    ->condition('ucid', $order->id())
+    ->condition('status', 'canceled', '!=')
+    ->execute()->fetch();
+
+  if (empty($gc_client)) {
+    return;
+  }
+
+  $partner = new GoCardlessPartner();
+  $result = $partner->api([
+    'endpoint' => 'mandates',
+    'action' => 'cancel',
+    'mandate' => $gc_client->gcid,
+  ]);
+
+  if ($result->response->status_code == 200) {
+    // Update status on database for all products in order.
+    $update = db_update('uc_gc_client')
+      ->fields([
+        'status' => 'canceled',
+        'updated' => REQUEST_TIME,
+      ])
+      ->condition('ucid', $order->id())
+      ->execute();
+
+    $comment = t('Order @order_id cancelled by customer.', ['@order_id' => $order->id()]);
+    uc_order_comment_save($order->id(), $order->getOwnerId(), $comment, 'order', 'canceled', TRUE);
+    drupal_set_message(t('GoCardless direct debit mandate @ucid has been cancelled, and you will receive an email confirmation.', ['@ucid' => $gc_client->gcid]));
+  }
+  else {
+    drupal_set_message(t('Something went wrong cancelling GoCardless direct debit mandate @ucid. Please try again or contact the site administrator for assistance.', ['@ucid' => $gc_client->gcid]), 'error');
+  }
+}
+
+/**
+ * Return the Ubercart order ID from database for specified GC mandate ID.
+ */
+function uc_gc_client_id($gcid) {
+
+  $ucid = db_select('uc_gc_client', 'c')
+    ->fields('c', ['ucid'])
+    ->condition('gcid', $gcid)
+    ->execute()->fetchField();
+  return $ucid;
+}
+
+/**
+ * Returns a date calculated as working days from the date provided.
+ *
+ * @Todo
+ * This function will malfunction if there is a bank holiday(s) within the
+ * specified range of days
+ */
+function uc_gc_client_working_days_calculate($op, $days, $date) {
+
+  $x = 1;
+  $string = $op . '1 day';
+  while ($x <= $days) {
+    $date = date('Y-m-d', strtotime($string, strtotime($date)));
+    if (!in_array(date('D', strtotime($date)), ['Sat', 'Sun'])) {
+      $x++;
+    }
+  }
+  return $date;
+}
+
+/**
+ * Returns currency information.
+ *
+ * @param string $country_code
+ *   The country either as an ISO Numeric code or a ISO ALPHA-2 code.
+ *
+ * @return array
+ *   Array including currency code and symbol.
+ */
+function uc_gc_client_currency($country_code) {
+
+  $countries = \Drupal::config('uc_gc_client.settings')->get('countries');
+  if (is_numeric($country_code)) {
+    $country_code = db_select('uc_countries', 'c')
+      ->fields('c', ['country_iso_code_2'])
+      ->condition('country_id', $country_code)
+      ->execute()->fetchField();
+  }
+  if (isset($countries[$country_code])) {
+    return [
+      'currency' => $countries[$country_code]['currency'],
+      'sign' => $countries[$country_code]['sign'],
+    ];
+  }
+}
+
+/**
+ * Formats an amount for display with the required currency sign.
+ *
+ * @param string $country_code
+ *   The country either as an ISO Numeric code or a ISO ALPHA-2 code.
+ *
+ * @see uc_curency_format()
+ *
+ * @return string
+ *   String containing price formatted with currency symbol and separators.
+ */
+function uc_gc_client_currency_format($value, $country_code, $thou = NULL, $dec = NULL) {
+
+  $sign = uc_gc_client_currency($country_code)['sign'];
+  return uc_currency_format($value, $sign, $thou = NULL, $dec = NULL);
+}
+
+/**
+ * Defines an array of countries, currency codes, and GC regions.
+ *
+ * https://www.iban.com/currency-codes for currency codes.
+ * https://www.nationsonline.org/oneworld/country_code_list.htm for country
+ * codes.
+ */
+function uc_gc_client_countries_define() {
+
+  $countries = [
+    'GB' => [
+      'region' => 'bacs',
+      'currency' => 'GBP',
+      'sign' => '£',
+      'enabled' => '1',
+    ],
+    'SE' => [
+      'region' => 'autogiro',
+      'currency' => 'SEK',
+      'sign' => 'kr',
+      'enabled' => '0',
+    ],
+    'AU' => array(
+      'region' => 'becs',
+      'currency' => 'AUD',
+      'sign' => '$',
+      'enabled' => '0',
+    ),
+    'DK' => array(
+      'region' => 'betalingsservice',
+      'currency' => 'DKK',
+      'sign' => 'kr',
+      'enabled' => '0',
+    ),
+    'NZ' => array(
+      'region' => 'becs_nz',
+      'currency' => 'NZD',
+      'sign' => '$',
+      'enabled' => '0',
+    ),
+    'AX' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'AT' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'BE' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'CY' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'EE' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'FI' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'FR' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'GF' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'DE' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'GR' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'GP' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'IE' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'IT' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'LV' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'LT' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'LU' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'MT' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'MQ' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'YT' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'MC' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'NL' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'PT' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'RE' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'BL' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'MF' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'PM' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'SM' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'SK' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'SI' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+    'ES' => [
+      'region' => 'sepa_core',
+      'currency' => 'EUR',
+      'sign' => '€',
+      'enabled' => '0',
+    ],
+  ];
+  return $countries;
+}
