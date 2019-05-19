@@ -1,0 +1,166 @@
+<?php
+
+use Drupal\Core\Cache\Cache;
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function simple_ldap_user_form_user_login_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  // Put our validation function after Drupal's auth (::validateAuthentication)
+  // and before ::validateFinal. This way, we have the chance to set the uid
+  // so ::validateFinal passes. By doing it this way, we still benefit from
+  // Drupal's flood control.
+  foreach ($form['#validate'] as $key => $validation) {
+    if ($validation === '::validateAuthentication') {
+      $first_array = array_slice($form['#validate'], 0, $key + 1);
+      $first_array[] = 'simple_ldap_user_login_validate';
+      array_splice($form['#validate'], 0, $key + 1, $first_array);
+      break;
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function simple_ldap_user_form_user_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  $server = \Drupal::service('simple_ldap.server');
+  /** @var \Drupal\user\UserInterface $user */
+  $user = $form_state->getFormObject()->getEntity();
+
+  // Lock down the fields if applicable
+  $readonly = FALSE;
+  if ($server->isReadOnly() && !$user->isNew() && $user->id() != 1) {
+    \Drupal::messenger()->addWarning(
+      t('Some fields have been marked <em>read-only</em>, as they are controlled by the LDAP server.')
+    );
+    $readonly = TRUE;
+  }
+
+  // @TODO add server-specific conditions for readonly fields. Active Directory will have some requirements.
+
+  $form['account']['name']['#disabled'] = $readonly;
+  $form['account']['mail']['#disabled'] = $readonly;
+  $form['account']['pass']['#disabled'] = $readonly;
+  $form['account']['status']['#disabled'] = $readonly;
+
+  // @TODO add other attributes from attribute mapping.
+
+  array_unshift($form['#validate'], 'simple_ldap_user_profile_validate');
+}
+
+/**
+ * Custom validation handler for the login form.
+ *
+ * Attempts LDAP authentication for user login attempts.
+ */
+function simple_ldap_user_login_validate(&$form, \Drupal\Core\Form\FormStateInterface $form_state) {
+  $name = $form_state->getValue('name');
+  $password = $form_state->getValue('pass');
+
+  $authenticator = \Drupal::service('simple_ldap_user.auth');
+  $manager = \Drupal::service('simple_ldap_user.manager');
+
+  // Ensure we should provide extra authentication for this user.
+  if (!$authenticator->canAuthenticate($name)) {
+    return;
+  }
+  // Check whether the user exists on LDAP.
+  $ldap_user = $manager->getLdapUser($name);
+  if (!$ldap_user) {
+    $form_state->set('uid', FALSE);
+    $form_state->setErrorByName(
+      'name',
+      t('An account could not be found or an ID conflict has been detected.  Please contact your site administrator.')
+    );
+
+    // If we could not get an LdapUser, we don't need to worry about the rest of this function.
+    return;
+  }
+
+  // Attempt LDAP authentication.
+  if (!$authenticator->authenticate($ldap_user->getDn(), $password)) {
+    $form_state->set('uid', FALSE);
+    $form_state->setError(
+      $form,
+      t('Could not authenticate with your username/password in LDAP. Please contact your site administrator.')
+    );
+    return;
+  }
+
+  $user = \Drupal::service('simple_ldap_user.sync')
+    ->importIntoDrupal($ldap_user, $password);
+
+  // Set the uid so Drupal authentication passes if LDAP authentication passes.
+  $form_state->set('uid', $user->id());
+}
+
+/**
+ * Custom validation handler for the user profile form.
+ */
+function simple_ldap_user_profile_validate(&$form, \Drupal\Core\Form\FormStateInterface $form_state) {
+  // Only do this validation if the Submit button was pressed. Otherwise, it
+  // gets annoying.
+  if ($form_state->getTriggeringElement() !== 'submit') {
+    return;
+  }
+  $authenticator = \Drupal::service('simple_ldap_user.auth');
+  $manager = \Drupal::service('simple_ldap_user.manager');
+  $drupal_user = $form_state->getFormObject()->getEntity();
+
+  if ($authenticator->skipCheck($drupal_user)) {
+    return;
+  }
+
+  $name = $form_state->getValue('name');
+  $password = $form_state->getValue('pass');
+  $mail = $form_state->getValue('mail');
+
+  $ldap_user_from_name = $manager->getLdapUser($name);
+  $ldap_user_from_email = $manager->getLdapUser($mail);
+
+  // If both found, but they have different DNs, then there are conflicting accounts.
+  // If one is not found, then
+  if ($ldap_user_from_name && $ldap_user_from_email && ($ldap_user_from_name->getDn() != $ldap_user_from_email->getDn())) {
+    $form_state->setErrorByName('account', t('Another user has that username or email address.'));
+  }
+  else {
+    $form_state->setErrorByName('account', t('Could not find a corresponding LDAP account for the given credentials.'));
+  }
+
+  // Now we check if the actual password is correct.
+  if (!$authenticator->authenticate($ldap_user_from_name->getDn(), $password)) {
+    $form_state->setErrorByName('pass', t('The username/password combination could not authenticate to LDAP.'));
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_load().
+ */
+function simple_ldap_user_user_load($entities) {
+  $authenticator = \Drupal::service('simple_ldap_user.auth');
+  $manager = \Drupal::service('simple_ldap_user.manager');
+
+  /** @var \Drupal\user\UserInterface[] $entities */
+  foreach ($entities as $user) {
+    if ($authenticator->skipCheck($user)) {
+      continue;
+    }
+
+    // Block the user if they are not found in the LDAP server.
+    $ldap_user = $manager->getLdapUser($user->getUsername());
+    $was_blocked = $user->isBlocked();
+    if ($ldap_user === FALSE && !$was_blocked) {
+      $user->block();
+      // Invalidate caches mid-request after altering the user.
+      Cache::invalidateTags($user->getCacheTagsToInvalidate());
+    }
+    else {
+      if ($ldap_user && $was_blocked) {
+        $user->activate();
+        Cache::invalidateTags($user->getCacheTagsToInvalidate());
+      }
+    }
+  }
+}
+
