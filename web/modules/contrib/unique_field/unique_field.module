@@ -1,0 +1,592 @@
+<?php
+
+
+/**
+ * Query scope definitions.
+ */
+define('UNIQUE_FIELD_SCOPE_NODE', 'node');
+define('UNIQUE_FIELD_SCOPE_TYPE', 'type');
+define('UNIQUE_FIELD_SCOPE_LANGUAGE', 'language');
+define('UNIQUE_FIELD_SCOPE_ALL', 'all');
+define('UNIQUE_FIELD_SCOPE_VOCABULARY', 'vocabulary');
+define('UNIQUE_FIELD_SCOPE_TERM', 'term');
+
+// Query comparison definitions.
+define('UNIQUE_FIELD_COMP_EACH', 'each');
+define('UNIQUE_FIELD_COMP_ALL', 'all');
+
+// Query field definitions.
+define('UNIQUE_FIELD_FIELDS_TITLE', 'title');
+define('UNIQUE_FIELD_FIELDS_LANGUAGE', 'language');
+
+// Setting definition.
+define('UNIQUE_FIELD_SHOW_MATCHES', 'show_matches');
+
+// Used for hook_help.
+use Drupal\Core\Routing\RouteMatchInterface;
+// Used for hook_form_BASE_FORM_ID_alter.
+use Drupal\Core\Form\FormStateInterface;
+
+// Used for entity builder.
+use Drupal\field\Entity;
+use Drupal\node\NodeInterface;
+use Drupal\node\Entity\NodeType;
+use Drupal\field\Entity\FieldConfig;
+use Drupal\Core\Entity\EntityManager;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+// Used for language.
+use Drupal\Core\Language;
+
+/**
+ * Implements hook_help().
+ */
+function unique_field_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.unique_field':
+      $output = '';
+      $output .= t("The Unique Field module allows administrators to require that content supplied for specified fields is unique. For example, you may require that each node has a unique title or a different author. For configuration options, please see the <em>Unique Field restrictions</em> section of a content type's administration page.");
+      return $output;
+
+  }
+}
+
+/**
+ * Hook_form_BASE_FORM_ID_alter().
+ */
+function unique_field_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+
+  $bundles = entity_get_bundles('node');
+  $bundle_id = array();
+  foreach ($bundles as $key => $value) {
+    $bundle_id['node_' . $key . '_form'] = $key;
+    $bundle_id['node_' . $key . '_add_form'] = $key;
+    $bundle_id['node_' . $key . '_edit_form'] = $key;
+  }
+  // Call form validate function for nodes.
+  if (in_array($form_id, array_keys($bundle_id))) {
+    $form['#validate'][] = 'unique_field_form_validate';
+    $form['bundle'] = $bundle_id[$form_id];
+    $form['unique_field_override'] = array(
+      '#type' => 'hidden',
+      '#default_value' => '0',
+    );
+  }
+
+  $taxonomy_vocabularies = entity_get_bundles('taxonomy_term');
+  $taxonomy_term_form_id = array();
+  foreach ($taxonomy_vocabularies as $key => $value) {
+    $taxonomy_term_form_id['taxonomy_term_' . $key . '_form'] = $key;
+  }
+  // Call form validate function for taxonomy terms.
+  if (in_array($form_id, array_keys($taxonomy_term_form_id))) {
+    $form['#validate'][] = 'unique_field_taxonomy_term_form_validate';
+    $form['bundle'] = $taxonomy_term_form_id[$form_id];
+    $form['unique_field_override'] = array(
+      '#type' => 'hidden',
+      '#default_value' => '0',
+    );
+  }
+
+  // Call form validate function for user registration.
+  if ($form_id == 'user_register_form' || $form_id == 'user_form') {
+    $form['#validate'][] = 'unique_field_user_form_validate';
+    $form['bundle'] = 'user';
+    $form['unique_field_override'] = array(
+      '#type' => 'hidden',
+      '#default_value' => '0',
+    );
+  }
+
+  // Get the current user.
+  $user = \Drupal::currentUser();
+
+  // Load default values.
+  $config = \Drupal::configFactory()->get('unique_field.settings');
+  // Add unique field settings form.
+  if (($form_id == 'node_type_add_form' || $form_id == 'node_type_edit_form') && isset($form['type']) && $user->hasPermission('unique_field_perm_admin')) {
+    // Load fields for content type.
+    $type = $form_state->getFormObject()->getEntity();
+    $ntype = $type->id();
+    $fieldopts = array();
+
+    if ((\Drupal::moduleHandler()->moduleExists('language')) && !empty($ntype) && \Drupal::languageManager()->getCurrentLanguage()->getId()) {
+      $fieldopts[UNIQUE_FIELD_FIELDS_LANGUAGE] = t('Language');
+    }
+
+    if (!empty($ntype)) {
+      $entity_type_id = 'node';
+      $bundle = $ntype;
+      foreach (\Drupal::entityManager()->getFieldDefinitions($entity_type_id, $bundle) as $field_name => $field_definition) {
+        if (!empty($field_definition->getTargetBundle())) {
+          $fieldopts[$field_name] = $field_definition->getLabel() . '(' . $field_name . ')';
+        }
+      }
+    }
+
+    foreach ($fieldopts as $key => $value) {
+      if ($key === "status" || $key === "promote") {
+        unset($fieldopts[$key]);
+      }
+    }
+
+    // Buid the unique field form.
+    $form['unique_field'] = array(
+      '#title' => t('Unique Field restrictions'),
+      '#type' => 'details',
+      '#group' => 'additional_settings',
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+      '#weight' => 1,
+    );
+    $form['unique_field']['unique_field_fields'] = array(
+      '#type' => 'checkboxes',
+      '#title' => t('Choose the fields that should be unique'),
+      '#options' => $fieldopts,
+      '#default_value' => !empty($ntype) ? $config->get('unique_field_settings.' . $ntype . '.fields') : array(),
+      '#description' => t('After designating that certain fields should be unique, users will not be able to submit the content form to create a new node or update an existing one if it contains values in the designated fields that duplicate others.'),
+    );
+
+    $form['unique_field']['unique_field_scope'] = array(
+      '#type' => 'radios',
+      '#title' => t('Choose the scope for the unique values'),
+      '#options' => array(
+        UNIQUE_FIELD_SCOPE_TYPE => t('Content type'),
+        UNIQUE_FIELD_SCOPE_LANGUAGE => t('Language'),
+        UNIQUE_FIELD_SCOPE_ALL => t('All nodes'),
+        UNIQUE_FIELD_SCOPE_NODE => t('Single node only'),
+      ),
+      '#default_value' => !empty($ntype) ? $config->get('unique_field_settings.' . $ntype . '.scope') : UNIQUE_FIELD_SCOPE_TYPE,
+      '#description' => t('Choose whether the values in the specified fields must be unique among nodes of this content type, among nodes of the same language, among all nodes, or only among the fields of the present node.'),
+    );
+
+    $form['unique_field']['unique_field_comp'] = array(
+      '#type' => 'radios',
+      '#title' => t('Choose whether values must be unique individually or in combination'),
+      '#options' => array(
+        UNIQUE_FIELD_COMP_EACH => t('Each of the specified fields must have a unique value'),
+        UNIQUE_FIELD_COMP_ALL => t('The combination of values from the specified fields must be unique'),
+      ),
+      '#default_value' => !empty($ntype) ? $config->get('unique_field_settings.' . $ntype . '.comp') : UNIQUE_FIELD_COMP_EACH,
+      '#description' => t('For example, if you have fields for the parts of a street address (street number and name, city, and zip code) on a node, and want to allow only one node per complete address, but not only one node per city or per zip code, then you would want to choose that the fields must be unique in combination.'),
+    );
+
+    // Add validation function in submit handler.
+    $form['actions']['submit']['#submit'][] = 'unique_field_form_node_type_form_submit';
+  }
+  // Unique field for taxonomy terms.
+  if ($form_id == 'taxonomy_vocabulary_form' && $user->hasPermission('unique_field_perm_admin')) {
+
+    $type = $form_state->getFormObject()->getEntity();
+    $taxonomy_vocabulary_name = $type->id();
+    $fieldopts = array();
+    $fieldopts['name'] = t('Term Name');
+    $fieldopts['description'] = t('Term Description');
+
+    if (!empty($taxonomy_vocabulary_name)) {
+      $entity_type_id = 'taxonomy_term';
+      foreach (\Drupal::entityManager()->getFieldDefinitions($entity_type_id, $taxonomy_vocabulary_name) as $field_name => $field_definition) {
+        if (!empty($field_definition->getTargetBundle())) {
+          $fieldopts[$field_name] = $field_definition->getLabel() . '(' . $field_name . ')';
+        }
+      }
+    }
+
+    // Buid the unique field form.
+    $form['unique_field_taxonomy'] = array(
+      '#title' => t('Unique Field restrictions'),
+      '#type' => 'details',
+      '#group' => 'additional_settings',
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+      '#weight' => 1,
+    );
+    $form['unique_field_taxonomy']['unique_field_taxonomy_fields'] = array(
+      '#type' => 'checkboxes',
+      '#title' => t('Choose the fields that should be unique'),
+      '#options' => $fieldopts,
+      '#default_value' => !empty($taxonomy_vocabulary_name) ? $config->get('unique_field_taxonomy.' . $taxonomy_vocabulary_name . '.fields') : array(),
+      '#description' => t('After designating that certain fields should be unique, users will not be able to submit the content form to create a new term or update an existing one if it contains values in the designated fields that duplicate others.'),
+    );
+    $form['unique_field_taxonomy']['unique_field_taxonomy_scope'] = array(
+      '#type' => 'radios',
+      '#title' => t('Choose the scope for the unique values'),
+      '#options' => array(
+        UNIQUE_FIELD_SCOPE_VOCABULARY => t('Vocabulary'),
+        UNIQUE_FIELD_SCOPE_LANGUAGE => t('Language'),
+        UNIQUE_FIELD_SCOPE_ALL => t('All Vocabularies'),
+        UNIQUE_FIELD_SCOPE_TERM => t('Single Term only'),
+      ),
+      '#default_value' => !empty($taxonomy_vocabulary_name) ? $config->get('unique_field_taxonomy.' . $taxonomy_vocabulary_name . '.scope') : UNIQUE_FIELD_SCOPE_VOCABULARY,
+      '#description' => t('Choose whether the values in the specified fields must be unique among terms of this Vocabulary, among terms of the same language, among all terms, or only among the fields of the present term.'),
+    );
+    $form['unique_field_taxonomy']['unique_field_taxonomy_comp'] = array(
+      '#type' => 'radios',
+      '#title' => t('Choose whether values must be unique individually or in combination'),
+      '#options' => array(
+        UNIQUE_FIELD_COMP_EACH => t('Each of the specified fields must have a unique value'),
+        UNIQUE_FIELD_COMP_ALL => t('The combination of values from the specified fields must be unique'),
+      ),
+      '#default_value' => !empty($taxonomy_vocabulary_name) ? $config->get('unique_field_taxonomy.' . $taxonomy_vocabulary_name . '.comp') : UNIQUE_FIELD_COMP_EACH,
+      '#description' => t('For example, if you have fields for the parts of a street address (street number and name, city, and zip code) on a term, and want to allow only one node per complete address, but not only one node per city or per zip code, then you would want to choose that the fields must be unique in combination.'),
+    );
+
+    // Add validation function in submit handler.
+    $form['actions']['submit']['#submit'][] = 'unique_field_form_taxonomy_term_form_submit';
+
+  }
+
+  // Unique field form for User fields.
+  if ($form_id == 'user_admin_settings') {
+    $bundles = entity_get_bundles('user');
+    $fieldoptions = array();
+    $config = \Drupal::configFactory()->get('unique_field.settings');
+    foreach (\Drupal::entityManager()->getFieldDefinitions('user', 'user') as $field_name => $field_definition) {
+      if (!empty($field_definition->getTargetBundle())) {
+        $fieldoptions[$field_name] = $field_definition->getLabel() . '(' . $field_name . ')';
+      }
+    }
+
+    // Buid the unique field form.
+    $form['unique_field_user'] = array(
+      '#title' => t('Unique Field restrictions'),
+      '#type' => 'details',
+      '#group' => 'additional_settings',
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+      '#weight' => 1,
+    );
+    $form['unique_field_user']['unique_field_user_fields'] = array(
+      '#type' => 'checkboxes',
+      '#title' => t('Choose the fields that should be unique'),
+      '#options' => $fieldoptions,
+      '#default_value' => !empty($config->get('unique_field_user.fields')) ? $config->get('unique_field_user.fields') : array(),
+      '#description' => t('After designating that certain fields should be unique, users will not be able to submit the User form to create a new user or update an existing one if it contains values in the designated fields that duplicate others.'),
+    );
+    $form['unique_field_user']['unique_field_user_comp'] = array(
+      '#type' => 'radios',
+      '#title' => t('Choose whether values must be unique individually or in combination'),
+      '#options' => array(
+        UNIQUE_FIELD_COMP_EACH => t('Each of the specified fields must have a unique value'),
+        UNIQUE_FIELD_COMP_ALL => t('The combination of values from the specified fields must be unique'),
+      ),
+      '#default_value' => !empty($config->get('unique_field_user.comp')) ? $config->get('unique_field_user.comp') : UNIQUE_FIELD_COMP_EACH,
+      '#description' => t('For example, if you have fields for the parts of a street address (street number and name, city, and zip code) on a node, and want to allow only one node per complete address, but not only one node per city or per zip code, then you would want to choose that the fields must be unique in combination.'),
+    );
+
+    // Add validation function in submit handler.
+    $form['actions']['submit']['#submit'][] = 'unique_field_form_user_type_form_submit';
+  }
+}
+
+/**
+ * Validate the node for unique field conditions on submission.
+ */
+function unique_field_form_validate(array &$form, FormStateInterface $form_state) {
+
+  // If override permission set show warring message and skip validation.
+  if ($form_state->getValues()['unique_field_override'] == 1) {
+    return;
+  }
+  // Load default  configuration for validation.
+  $config = \Drupal::configFactory()->get('unique_field.settings');
+
+  $fields = $config->get('unique_field_settings.' . $form['bundle'] . '.fields');
+  $scope = $config->get('unique_field_settings.' . $form['bundle'] . '.scope');
+  $comp_type = $config->get('unique_field_settings.' . $form['bundle'] . '.comp');
+
+  $title = $form_state->getValues()['title'][0]['value'];
+  $langcode = $form_state->getValues()['langcode'][0]['value'];
+  $node = \Drupal::routeMatch()->getParameter('node');
+
+  if ($comp_type == UNIQUE_FIELD_COMP_ALL) {
+    $query = db_select('node_field_data', 'n');
+    $query->fields('n', array('nid'));
+  }
+  foreach ($fields as $field_name) {
+    if ($comp_type == UNIQUE_FIELD_COMP_EACH) {
+      $query = db_select('node_field_data', 'n');
+      $query->fields('n', array('nid'));
+    }
+    $query = db_select('node_field_data', 'n');
+    $query->fields('n', array('nid'));
+    if ($field_name == 'title') {
+      $query->condition('n.title', $title);
+    }
+    else {
+      $field_type = \Drupal\field\Entity\FieldStorageConfig::loadByName('node', $field_name)->get('type');
+      $values = $form_state->getValues()[$field_name];
+      $field_values = array();
+      foreach ($values as $value) {
+        $field_values[] = ($field_type == 'entity_reference') ? $value['target_id'] : $value['value'];
+      }
+      if ($scope == UNIQUE_FIELD_SCOPE_NODE) {
+        $unique_values = array_unique($field_values);
+        if (count($field_values) != count($unique_values)) {
+          $form_state->setErrorByName($field_name, t('The field @field_name has to be unique.', array('@field_name' => $field_name)));
+          $form_state->setRebuild();
+          continue;
+        }
+      }
+      $table_name = 'node__' . $field_name;
+      $col_name = $field_type == 'entity_reference' ? $field_name . '_target_id' : $field_name . '_value';
+
+      $query->join($table_name, 'f', 'n.nid = f.entity_id');
+      $query->condition('f.' . $col_name, $field_values, 'IN');
+
+      if ($scope == UNIQUE_FIELD_SCOPE_LANGUAGE) {
+        $query->condition('f.langcode', $langcode);
+      }
+    }
+    if ($scope == UNIQUE_FIELD_SCOPE_TYPE) {
+      $query->condition('n.type', $form['bundle']);
+    }
+    if ($node) {
+      $query->condition('n.nid', $node->id(), '<>');
+    }
+    $res = $query->execute()->fetchField();
+    if ($res) {
+      $form_state->setErrorByName($field_name, t('The field @field_name has to be unique.', array('@field_name' => $field_name)));
+      $user = \Drupal::currentUser();
+      if ($user->hasPermission('unique_field_perm_bypass')) {
+        $form_id = str_replace('_', '-', $form['#id']);
+        $msg = t('Your form has unique field validation errors. Click !here to bypass this check and resubmit.', array('!here' => "<a href=\"#\" onclick=\"jQuery('form#" . $form_id . " input[name=\'unique_field_override\']').val(1);jQuery('form#" . $form_id . "').submit();return false;\">" . t('here') . '</a>'));
+        drupal_set_message($msg, 'warning');
+      }
+      $form_state->setRebuild();
+    }
+  }
+}
+
+/**
+ * Validate the taxonomy term for unique field conditions on submission.
+ */
+function unique_field_taxonomy_term_form_validate(array &$form, FormStateInterface $form_state) {
+
+  // If override permission set show warring message and skip validation.
+  if ($form_state->getValues()['unique_field_override'] == 1) {
+    return;
+  }
+
+  $config = \Drupal::configFactory()->get('unique_field.settings');
+  $fields = $config->get('unique_field_taxonomy.' . $form['bundle'] . '.fields');
+  $scope = $config->get('unique_field_taxonomy.' . $form['bundle'] . '.scope');
+  $comp_type = $config->get('unique_field_taxonomy.' . $form['bundle'] . '.comp');
+
+  $name = $form_state->getValues()['name'][0]['value'];
+  $langcode = $form_state->getValues()['langcode'][0]['value'];
+  $description = $form_state->getValues()['description'][0]['value'];
+
+  foreach ($fields as $field_name) {
+    if ($comp_type == UNIQUE_FIELD_COMP_EACH) {
+      $query = db_select('taxonomy_term_field_data', 't');
+      $query->fields('t', array('tid'));
+    }
+    $query = db_select('taxonomy_term_field_data', 't');
+    $query->fields('t', array('tid'));
+    if ($field_name == 'name') {
+      $query->condition('t.name', $name);
+    }
+    elseif ($field_name == 'description') {
+      $query->condition('t.description__value', $description);
+    }
+    else {
+      $field_type = \Drupal\field\Entity\FieldStorageConfig::loadByName('taxonomy_term', $field_name)->get('type');
+      $values = $form_state->getValues()[$field_name];
+      $field_values = array();
+      foreach ($values as $value) {
+        $field_values[] = ($field_type == 'entity_reference') ? $value['target_id'] : $value['value'];
+      }
+      if ($scope == UNIQUE_FIELD_SCOPE_TERM) {
+        $unique_values = array_unique($field_values);
+        if (count($field_values) != count($unique_values)) {
+          $form_state->setErrorByName($field_name, t('The field @field_name has to be unique.', array('@field_name' => $field_name)));
+          $form_state->setRebuild();
+          continue;
+        }
+      }
+      $table_name = 'taxonomy_term__' . $field_name;
+      $col_name = $field_type == 'entity_reference' ? $field_name . '_target_id' : $field_name . '_value';
+
+      $query->join($table_name, 'f', 't.tid = f.entity_id');
+      $query->condition('f.' . $col_name, $field_values, 'IN');
+
+      if ($scope == UNIQUE_FIELD_SCOPE_LANGUAGE) {
+        $query->condition('f.langcode', $langcode);
+      }
+    }
+
+    if ($scope == UNIQUE_FIELD_SCOPE_VOCABULARY) {
+      $query->condition('t.vid', $form['bundle']);
+    }
+    if ($form_state->getValues()['tid']) {
+      $query->condition('t.tid', $form_state->getValues()['tid'], '<>');
+    }
+    $res = $query->execute()->fetchField();
+    if ($res) {
+      $form_state->setErrorByName($field_name, t('The field @field_name has to be unique.', array('@field_name' => $field_name)));
+      $user = \Drupal::currentUser();
+      if ($user->hasPermission('unique_field_perm_bypass')) {
+        $form_id = str_replace('_', '-', $form['#id']);
+        $msg = t('Your form has unique field validation errors. Click !here to bypass this check and resubmit.', array('!here' => "<a href=\"#\" onclick=\"jQuery('form#" . $form_id . " input[name=\'unique_field_override\']').val(1);jQuery('form#" . $form_id . "').submit();return false;\">" . t('here') . '</a>'));
+        drupal_set_message($msg, 'warning');
+      }
+      $form_state->setRebuild();
+    }
+  }
+}
+
+/**
+ * Validate the user fields for unique field conditions on submission.
+ */
+function unique_field_user_form_validate(array &$form, FormStateInterface $form_state) {
+
+  // If override permission set show warring message and skip validation.
+  if ($form_state->getValues()['unique_field_override'] == 1) {
+    return;
+  }
+
+  // Load default  configuration for validation.
+  $config = \Drupal::configFactory()->get('unique_field.settings');
+
+  $fields = $config->get('unique_field_user.fields');
+
+  $comp_type = $config->get('unique_field_user.comp');
+
+  if ($comp_type == UNIQUE_FIELD_COMP_ALL) {
+    $query = db_select('users_field_data', 'u');
+    $query->fields('n', array('nid'));
+  }
+  foreach ($fields as $field_name) {
+    if ($comp_type == UNIQUE_FIELD_COMP_EACH) {
+      $query = db_select('users_field_data', 'u');
+      $query->fields('u', array('uid'));
+    }
+    $query = db_select('users_field_data', 'u');
+    $query->fields('u', array('uid'));
+
+    $field_type = \Drupal\field\Entity\FieldStorageConfig::loadByName('user', $field_name)->get('type');
+    $values = $form_state->getValues()[$field_name];
+    $field_values = array();
+    foreach ($values as $value) {
+      $field_values[] = ($field_type == 'entity_reference') ? $value['target_id'] : $value['value'];
+    }
+
+    $table_name = 'user__' . $field_name;
+    $col_name = $field_type == 'entity_reference' ? $field_name . '_target_id' : $field_name . '_value';
+
+    $query->join($table_name, 'f', 'u.uid = f.entity_id');
+    $query->condition('f.' . $col_name, $field_values, 'IN');
+
+    $res = $query->execute()->fetchField();
+    if ($res) {
+      $form_state->setErrorByName($field_name, t('The field @field_name has to be unique.', array('@field_name' => $field_name)));
+      $user = \Drupal::currentUser();
+      if ($user->hasPermission('unique_field_perm_bypass')) {
+        $form_id = str_replace('_', '-', $form['#id']);
+        $msg = t('Your form has unique field validation errors. Click !here to bypass this check and resubmit.', array('!here' => "<a href=\"#\" onclick=\"jQuery('form#" . $form_id . " input[name=\'unique_field_override\']').val(1);jQuery('form#" . $form_id . "').submit();return false;\">" . t('here') . '</a>'));
+        drupal_set_message($msg, 'warning');
+      }
+      $form_state->setRebuild();
+    }
+  }
+}
+
+/**
+ * Submit handler for the form.
+ */
+function unique_field_form_node_type_form_submit(&$form, FormStateInterface $form_state) {
+  $ntype = $form_state->getFormObject()->getEntity();
+
+  $unique_field_field_items = $form_state->getValue('unique_field_fields');
+  if (!empty($unique_field_field_items)) {
+    foreach (array_keys($unique_field_field_items, '0') as $key) {
+      unset($unique_field_field_items[$key]);
+    }
+    \Drupal::configFactory()->getEditable('unique_field.settings')
+      ->set('unique_field_settings.' . $ntype->id() . '.fields', $unique_field_field_items)
+      ->save();
+  }
+  $unique_field_scope_items = $form_state->getValue('unique_field_scope');
+  if (!empty($unique_field_scope_items)) {
+    \Drupal::configFactory()->getEditable('unique_field.settings')
+      ->set('unique_field_settings.' . $ntype->id() . '.scope', $unique_field_scope_items)
+      ->save();
+  }
+  $unique_field_comp_items = $form_state->getValue('unique_field_comp');
+  if (!empty($unique_field_comp_items)) {
+    \Drupal::configFactory()->getEditable('unique_field.settings')
+      ->set('unique_field_settings.' . $ntype->id() . '.comp', $unique_field_comp_items)
+       ->save();
+  }
+  $unique_field_show_matches = $form_state->getValue('unique_field_show_matches');
+  if (!empty($unique_field_show_matches)) {
+    \Drupal::configFactory()->getEditable('unique_field.settings')
+      ->set('unique_field_settings.' . $ntype->id() . '.show_matches', $unique_field_show_matches)
+      ->save();
+  }
+  if ($form_state->getValue(['unique_field', 'unique_field_scope']) === UNIQUE_FIELD_SCOPE_NODE) {
+    if ($form_state->getValue(['unique_field', 'unique_field_comp']) === UNIQUE_FIELD_COMP_ALL) {
+      drupal_set_message(t('The scope of a single node requires that each field must be unique.'), 'error');
+      $form_state->setRebuild();
+    }
+  }
+}
+
+/**
+ * Submit handler for the form.
+ */
+function unique_field_form_taxonomy_term_form_submit(&$form, FormStateInterface $form_state) {
+  $taxonomy_vocabulary_name = $form_state->getFormObject()->getEntity();
+
+  $unique_field_taxonomy_field_items = $form_state->getValue('unique_field_taxonomy_fields');
+  if (!empty($unique_field_taxonomy_field_items)) {
+    foreach (array_keys($unique_field_taxonomy_field_items, '0') as $key) {
+      unset($unique_field_taxonomy_field_items[$key]);
+    }
+    \Drupal::configFactory()->getEditable('unique_field.settings')
+      ->set('unique_field_taxonomy.' . $taxonomy_vocabulary_name->id() . '.fields', $unique_field_taxonomy_field_items)
+      ->save();
+  }
+  $unique_field_taxonomy_scope_items = $form_state->getValue('unique_field_taxonomy_scope');
+  if (!empty($unique_field_taxonomy_scope_items)) {
+    \Drupal::configFactory()->getEditable('unique_field.settings')
+      ->set('unique_field_taxonomy.' . $taxonomy_vocabulary_name->id() . '.scope', $unique_field_taxonomy_scope_items)
+      ->save();
+  }
+
+  $unique_field_taxonomy_comp_items = $form_state->getValue('unique_field_taxonomy_comp');
+  if (!empty($unique_field_taxonomy_comp_items)) {
+    \Drupal::configFactory()->getEditable('unique_field.settings')
+      ->set('unique_field_taxonomy.' . $taxonomy_vocabulary_name->id() . '.comp', $unique_field_taxonomy_comp_items)
+      ->save();
+  }
+  if ($form_state->getValue('unique_field_taxonomy_scope') === UNIQUE_FIELD_SCOPE_VOCABULARY) {
+    if ($form_state->getValue('unique_field_taxonomy_comp') === UNIQUE_FIELD_COMP_ALL) {
+      drupal_set_message(t('The scope of a single term requires that each field must be unique.'), 'error');
+      $form_state->setRebuild();
+    }
+  }
+}
+
+/**
+ * Submit handler for the user form.
+ */
+function unique_field_form_user_type_form_submit(&$form, FormStateInterface $form_state) {
+
+  $unique_field_field_items = $form_state->getValue('unique_field_user_fields');
+  if (!empty($unique_field_field_items)) {
+    foreach (array_keys($unique_field_field_items, '0') as $key) {
+      unset($unique_field_field_items[$key]);
+    }
+    \Drupal::configFactory()->getEditable('unique_field.settings')
+      ->set('unique_field_user.fields', $unique_field_field_items)
+      ->save();
+  }
+  $unique_field_comp_items = $form_state->getValue('unique_field_user_comp');
+  if (!empty($unique_field_comp_items)) {
+    \Drupal::configFactory()->getEditable('unique_field.settings')
+      ->set('unique_field_user.comp', $unique_field_comp_items)
+      ->save();
+  }
+}
