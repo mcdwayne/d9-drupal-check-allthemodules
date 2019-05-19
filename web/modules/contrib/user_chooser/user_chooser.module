@@ -1,0 +1,192 @@
+<?php
+
+
+function user_chooser_menu() {
+  $items['admin/config/people/user_chooser'] = array(
+    'title' => 'User Chooser Settings',
+    'description' => t('Change settings for the User Chooser widget.'),
+    'route_name' => 'user_chooser.admin',
+    'weight' => 5
+  );
+  $items['system/ajax/uchoo'] = array(
+    'page callback' => 'uchoo_autocomplete',
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+    'file' => 'uchoo.inc'
+  );
+  return $items;
+}
+
+/**
+ * implements hook_element_info
+ * the three elements we are offer are essentially the same
+ */
+function user_chooser_element_info() {
+  $common = array(
+    '#input' => TRUE,
+    '#theme_wrappers' => array('form_element'),
+    '#required' => TRUE,
+    '#multiple_fail_alert' => 1,//values 0 no alert, 1 warning, 2 error
+    '#allow_blocked' => FALSE, //just to be explicit
+    '#exclude' => array()
+  );
+  return array(
+    'user_chooser_few' => $common + array(
+      '#callback' => '',//this is requried
+      '#args' => array(),//optional
+      '#process' => array('uchoo_process_few'),
+      '#element_validate' => array('user_chooser_few_validate'),
+      '#multiple' => FALSE,
+      //more specialised properties
+      '#sort' => TRUE //otherwise results will be uid order
+    ),
+   'user_chooser_many' => $common + array(
+     '#process' => array('uchoo_process_many'),
+     '#multiple' => TRUE,
+     '#description' => t("Choose a segment of the site's membership"),
+     '#config' => FALSE,//this will cause the widget to return the select field key, NOT the users
+    )
+  );
+}
+
+/**
+ * implements hook_uchoo_segments
+ * provides some default segments to work with
+ * each of these is a callback which takes an arg and returns an array of uids
+ * and another callback 'in_'.CALLBACK which takes an arg and a uid and returns TRUE or FALSE
+ * Because sometimes it is quicker to say whether a uid is a segment without calculating all the uids in the segment first
+ */
+function user_chooser_uchoo_segments() {
+  foreach (user_role_names(TRUE) as $rid => $title) {
+    $callbacks['user_chooser_segment_roles:'.$rid] = t('Role: @role', array('@role' => $title));
+  }
+  //could group these further by module if we could be bothered to module_implement()....
+  foreach (module_invoke_all('permission') as $perm => $info) {
+    $callbacks['user_chooser_segment_perms:'.$perm] = t('Permission: @permission', array('@permission' => strip_tags($info['title'])));
+  }
+  /*
+  if (module_exists('og')) {
+    //assumes that there's only one group bundle
+    $bundles = og_get_all_group_bundle();
+    $entity_type = key($bundles);
+    $bundle = key($bundles[$entity_type]);
+    $nodes = entity_load($entity_type, NULL, array('type' => $bundle));
+    //provide an option for every group nodes
+    foreach ($nodes as $node) {
+      $callbacks['user_chooser_segment_og:'.$node->nid] = t('Member of group: @groupname', array('@groupname' => $node->title));
+    }
+  }
+  */
+  return $callbacks;
+}
+
+
+/**
+ * Callbacks to process the user_chooser elements
+ * provides all the other metadata for the form element
+ */
+function uchoo_process_few($element, &$form_state) {
+  form_load_include($form_state, 'inc', 'user_chooser', 'uchoo');
+  return _process_uchoo_few($element, $form_state);
+}
+function uchoo_process_many($element, &$form_state) {
+  form_load_include($form_state, 'inc', 'user_chooser', 'uchoo');
+  if (!isset($element['#options'])) {
+    $element['#options'] = module_invoke_all('uchoo_segments', $form_state['build_info']['form_id'], @$element['#name']);
+  }
+  $element['#theme'] = 'select';
+  $element['#multiple_fail_alert'] = 1;
+
+  return $element;
+}
+
+/**
+ * API function
+ * get a segment of users
+ */
+function user_chooser_segment($callback, $args, $settings = array()) {
+  module_load_include('inc', 'user_chooser', 'uchoo');
+  $settings += array(
+    '#allow_blocked' => FALSE,
+    'exclude' => array()
+  );
+  $query = _uchoo_query_helper($settings);
+  $callback($query, $args);
+  return $query->execute()->fetchCol();
+}
+
+/**
+ * API function
+ * check whether a user is in a segment
+ * great for sophiticated access control
+ */
+function in_user_chooser_segment($callback, $args, $uid = NULL) {
+  $function = 'in_'.$callback;
+  //this is to make the transition easier
+  if (!function_exists($function)) {
+    drupal_set_message("'in_' version of user_chooser callback '$callback' not found: <pre>\n".debug_backtrace().'</pre>', 'error');
+    return FALSE;
+  }
+  $uid = $uid ? $uid : \Drupal::currentUser()->id();
+  return $function($args, $uid);
+}
+
+/**
+ * user_chooser segment callbacks
+ * return a list of uids
+ * keep these in the .module file unless we want to expand hook_user_chooser_segments to contain .inc file details
+ */
+function user_chooser_segment_perms($query, array $perms) {
+  $rids = array();
+  foreach($perms as $perm) {
+    $rids += array_keys(user_role_names(TRUE, $perm));
+  }
+  return user_chooser_segment_roles($query, array_unique($rids), TRUE);
+}
+
+function user_chooser_segment_roles($query, array $rids, $user1 = FALSE) {
+	//if the authenticated role is there we don't need to filter for anything.
+  $pos = array_search(DRUPAL_AUTHENTICATED_RID, $rids);
+  if (is_null($pos) && count($rids)) {
+    $query->leftjoin('users_roles', 'ur', 'ur.uid = u.uid');
+    if ($user1) {
+      $or = db_or();
+      $or->condition('ur.rid', $rids);
+      $or->condition('u.uid', 1);
+      $query->condition($or);
+      $query->distinct();
+    }
+    else {
+    	$query->condition('ur.rid', $rids);
+    }
+  }
+}
+
+/**
+ * 'in_' versions of user_chooser segment callbacks
+ * return whether the passed user is in the segment
+ */
+function in_user_chooser_segment_perms(array $perms, $uid = NULL) {
+  if ($uid == 1)return TRUE;
+  $account = empty($uid) ? \Drupal::currentUser() : user_load($uid);
+  foreach ($perms as $perm) {
+    if (user_access($perm, $account)) return TRUE;
+  }
+}
+
+//in_ version of user_chooser segment
+function in_user_chooser_segment_roles(array $rids, $uid = NULL) {
+  //we could just query the db table, but I'm guessing the $account is cached and this is quicker
+  $account = empty($uid) ? \Drupal::currentUser() : user_load($uid);
+  return array_intersect($rids, $account->getRoles());
+}
+
+function user_chooser_segment_og($query, $gids) {
+  $query->join('og_membership', 'm', 'm.etid = u.uid');
+  $query->condition('m.entity_type', 'user');
+  $query->condition('m.gid', $gids);
+}
+
+function in_user_chooser_segment_og(array $gids, $uid = NULL) {
+  return db_query("SELECT 1 FROM {og_membership} WHERE etid = :uid AND gid in (:gids) AND entity_type = 'user'", array(':uid' => $uid, ':gids' => implode(', ', $gids)))->fetchField();
+}
