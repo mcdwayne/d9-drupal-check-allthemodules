@@ -1,0 +1,218 @@
+<?php
+/**
+ * @file
+ * Webtrees authentication module for Drupal.
+ *
+ * This authentication module is based on the LDAP authentication module.
+ * It is designed to work with the Webtrees genealogy software foudn at https://www.webtrees.net/.
+ *
+ */
+
+use Drupal\Core\Url;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\webtrees\Helper\WebtreesUser;
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function webtrees_form_user_login_form_alter(&$form, $form_state) {
+  // Add our user password validation before the user module's validation.
+  array_unshift($form['#validate'], 'webtrees_user_login_validate');
+}
+
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function webtrees_form_user_pass_alter(&$form, $form_state) {
+  // Add our user validation before the user module's password reset.
+  array_unshift($form['#validate'], 'webtrees_user_pass_validate');
+}
+
+
+/**
+ * Change how password is validated.
+ *
+ * @param array $form
+ *   The form.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   The form state.
+ */
+function webtrees_user_login_validate(array &$form, FormStateInterface $form_state) {
+  $my_config=\Drupal::config('webtrees.settings');
+
+  $name = trim($form_state->getValue('name'));
+  $user  = user_load_by_name($name) ;
+  $user2 = user_load_by_mail($name);
+
+  if ($user) {
+    if ($user2 && $user->get('uid')->value!=$user2->get('uid')->value) {
+      return; // assume Drupal will catch this error
+    }
+  } else {
+    $user=$user2;
+  }
+
+  // see if we need to skip Webtrees checking
+  if ($user && $user->hasRole($my_config->get('configuration.exclude'))) {
+    return;
+  }
+
+  $webtrees=new WebtreesUser();
+  $webtrees->validateLogin($form_state);
+  $webtrees->close();
+}
+
+
+/**
+ * Implements hook_user_login().
+ */
+function webtrees_user_login($account) {
+  $my_config=\Drupal::config('webtrees.settings');
+
+  if ($account->hasRole($my_config->get('configuration.exclude'))){
+    return;
+  }
+
+  if($my_config->get('configuration.enable') && ($my_config->get('configuration.login'))){
+    $webtrees = new WebtreesUser();
+    if ($webtrees->connectError()) {
+      $msg=t('Webtrees login enabled but database inaccessible');
+      drupal_set_message($msg,'error');
+      $webtrees->log('webtrees_user_login - '.$msg,'error');
+      return;
+    }
+
+    
+    if (!$webtrees->load($account->getAccountName(),'name_or_email')){
+      $webtrees->log('webtrees_user_login load_by_name_or_email failed - '.$account->getAccountName(),'error');
+    }
+
+    // Set up Webtrees session for the user
+    $webtrees->log('webtrees_user_login');
+
+    $uuid_service = \Drupal::service('uuid');
+    $session_id = str_replace('-','',$uuid_service->generate());
+    setcookie('WT_SESSION',$session_id,0,$my_config->get('configuration.url'),'',false,true);
+
+    
+    $session_time=time();
+    $user_id=$webtrees->user_id;
+    $ip_address=\Drupal::request()->getClientIp();
+    $theme=isset($webtrees->settings['theme']) ? $webtrees->settings['theme'] : 'xenea';
+
+    $data['initiated']=true;
+    $data['locale']=isset($webtrees->settings['locale']) ? $webtrees->settings['locale'] : 'en-US';
+    $data['theme_id']=$theme ? $theme : 'xenea';
+    $data['CSRF_TOKEN']='8I8QpyyYzaC7kS8zBypxFUCqn2fhIU5P';
+    $data['wt_user']=$user_id;
+
+    $session_data='';
+    foreach ($data as $key => $value) {
+      $session_data.=$key.'|'.serialize($value);
+    }
+
+    $stmt = $webtrees->database->prepare('INSERT INTO '.$my_config->get('database.prefix').'session (session_id,user_id,ip_address,session_data) VALUES (?,?,?,?)');
+    $stmt->bind_param('ssss',$session_id,$user_id,$ip_address,$session_data);
+    if (!$stmt->execute()) {
+      $webtrees->log('webtrees_user_login insert - '.$stmt->error,'error');
+    }
+    $stmt->close();
+
+    $webtrees->close();    
+  }
+}
+
+
+/**
+ * Implements hook_user_logout().
+ */
+function webtrees_user_logout($account) {
+  $my_config=\Drupal::config('webtrees.settings');
+
+  if($my_config->get('configuration.enable') && ($my_config->get('configuration.login'))){
+    $webtrees = new WebtreesUser();
+    if ($webtrees->connectError()) {
+      $msg=t('Webtrees login enabled but database inaccessible');
+      drupal_set_message($msg,'error');
+      $webtrees->log('webtrees_user_logout - '.$msg,'error');
+      return;
+    }
+
+    // Remove Webtrees session for the user
+    $webtrees->log('webtrees_user_logout');
+
+    $session_id=session_id('WT_SESSION');
+
+    setcookie('WT_SESSION','',time()-3600,$my_config->get('configuration.url'),'',false,true);
+
+    $stmt = $webtrees->database->prepare('DELETE FROM '.$my_config->get('database.prefix').'session WHERE session_id=?');
+    $stmt->bind_param('s',$session_id);
+    if (!$stmt->execute()) {
+      $webtrees->log('webtrees_user_logout delete - '.$stmt->error,'error');
+    }
+    $stmt->close();
+
+    $webtrees->close();
+  }
+}
+
+
+/**
+ * Change how password reset email is validated.
+ *
+ * @param array $form
+ *   The form.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   The form state.
+ */
+function webtrees_user_pass_validate(array &$form, FormStateInterface $form_state){
+  $my_config=\Drupal::config('webtrees.settings');
+
+  if($my_config->get('configuration.enable') && ($my_config->get('configuration.login'))){
+    $webtrees = new WebtreesUser();
+    if ($webtrees->connectError()) {
+      $msg=t('Webtrees database inaccessible');
+      $form_state->setErrorByName('name',$msg);
+      $webtrees->log('webtrees_password_reset - '.$msg,'error');
+      return;
+    }
+
+    $name = $form_state->getValue('name');
+    $user = user_load_by_mail($name);
+    if (!$user) {
+      $user = user_load_by_name($name);
+    }
+
+    $webtrees->load($name,'name_or_email');
+
+    if ($user) {
+      if ($my_config->get('configuration.user_webtrees') && $webtrees->isLoaded() && $webtrees->isBlocked()) {
+        $form_state->setErrorByName('name', $this->t('%name is blocked (Webtrees).', ['%name' => $name]));
+      }
+      return; // Drupal user exists so return to use the default validation 
+    }
+
+    // No Drupal user. Check Webtrees user
+    if ($my_config->get('configuration.use_webtrees') && $webtrees->isLoaded()) {
+      if ($webtrees->isBlocked()) {
+        $form_state->setErrorByName('name', $this->t('%name is blocked (Webtrees).', ['%name' => $name]));
+      } else {
+        // create Drupal user with random password
+        $user=$webtrees->createDrupalUser();
+
+        $password = '';
+        $chars    = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+        $count    = mb_strlen($chars);
+ 
+        for ($i = 0, $result = ''; $i < 32; $i++) {
+          $index = rand(0, $count - 1);
+          $password .= mb_substr($chars, $index, 1);
+        }
+        $user->setPassword($password);
+        $user->save();
+      }
+    }
+  }
+}
+
