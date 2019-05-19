@@ -1,0 +1,191 @@
+<?php
+
+/**
+ * @file
+ * Holds install hooks for the jQuery Colorpicker module.
+ */
+
+use Drupal\field\Entity\FieldConfig;
+use Drupal\field\Entity\FieldStorageConfig;
+use Drupal\colorapi\Plugin\Field\FieldType\ColorItem;
+use Drupal\jquery_colorpicker\Plugin\Field\FieldType\JqueryColorpickerColorItem;
+
+/**
+ * Implements hook_requirements().
+ */
+function jquery_colorpicker_requirements($phase) {
+
+  $requirements = [];
+  if ($phase == 'runtime') {
+    if (file_exists(DRUPAL_ROOT . '/libraries/jquery_colorpicker/js/colorpicker.js')) {
+      $requirements['jquery_colorpicker'] = [
+        'title' => t('Jquery Colorpicker'),
+        'description' => t('The Jquery Colorpicker module no longer requires the jQuery Colorpicker Library located at %path. This library should now be removed as it could be a security risk.', ['%path' => DRUPAL_ROOT . '/libraries/jquery_colorpicker']),
+        'severity' => REQUIREMENT_WARNING,
+      ];
+    }
+  }
+
+  return $requirements;
+}
+
+/**
+ * Updates the Jquery Colorpicker module from 8.x-1.x to 8.x-2.x.
+ *
+ * Version 8.x-2.x of the module changes the underlying field type from
+ * jquery_colorpicker to colorapi_color, adding a dependency on the Color API
+ * module. As such, the configuration needs to be converted to match the new
+ * structure. This function handles the configuration changes.
+ */
+function jquery_colorpicker_update_8200() {
+  // If the Color API Color Field is not enabled, an error is thrown, so it is
+  // enabled here.
+  \Drupal::configFactory()->getEditable('colorapi.settings')->set('enable_color_field', TRUE)->save();
+  drupal_flush_all_caches();
+  $entity_manager = \Drupal::entityManager();
+  $database = \Drupal::database();
+
+  if ($field_storage_configs = $entity_manager->getStorage('field_storage_config')->loadByProperties(['type' => 'jquery_colorpicker'])) {
+    /** @var \Drupal\field\FieldStorageConfigInterface $field_storage */
+    // Update the field storage settings.
+    foreach ($field_storage_configs as $field_storage) {
+      $entity_type_id = $field_storage->getTargetEntityTypeId();
+      $field_name = $field_storage->getName();
+      $old_schema = JqueryColorpickerColorItem::schema($field_storage);
+      $new_schema = ColorItem::schema($field_storage);
+      $entity_table_name = $entity_type_id . '__' . $field_name;
+      $revision_table_name = $entity_type_id . '_revision__' . $field_name;
+
+      $database->schema()->addField($entity_table_name, $field_name . '_color', $new_schema['columns']['color']);
+      $entity_table_data = $database->select($entity_table_name, 'field_table')
+        ->fields('field_table', [
+          'bundle',
+          'deleted',
+          'entity_id',
+          'revision_id',
+          'langcode',
+          'delta',
+          $field_name . '_value',
+        ])
+        ->execute();
+
+      $revision_table_data = [];
+      if ($database->schema()->tableExists($revision_table_name)) {
+        $database->schema()->addField($revision_table_name, $field_name . '_color', $new_schema['columns']['color']);
+        $database->schema()->addField($revision_table_name, $field_name . '_name', $new_schema['columns']['name']);
+        $revision_table_data = $database->select($revision_table_name, 'field_table')
+          ->fields('field_table', [
+            'bundle',
+            'deleted',
+            'entity_id',
+            'revision_id',
+            'langcode',
+            'delta',
+            $field_name . '_value',
+          ])
+          ->execute();
+      }
+
+      // Since the usual workflow for field storages do not allow changing the
+      // field type, we have to work around it in this case.
+      $faux_old_field_storage = $field_storage->toArray();
+      $faux_old_field_storage['type'] = 'colorapi_color_field';
+      $faux_old_field_storage['module'] = 'colorapi';
+      $new_field_storage = $faux_old_field_storage;
+      $new_field_storage['dependencies']['module'][array_search('jquery_colorpicker', $new_field_storage['dependencies']['module'])] = 'colorapi';
+      $faux_old_field_storage['schema'] = $old_schema;
+      $new_field_storage['schema'] = $new_schema;
+      $new_field_storage = FieldStorageConfig::create($new_field_storage);
+      $faux_old_field_storage = FieldStorageConfig::create($faux_old_field_storage);
+      $new_field_storage->original = $faux_old_field_storage;
+      $new_field_storage->enforceIsNew(FALSE);
+      $new_field_storage->save();
+
+      foreach ($entity_table_data as $result) {
+        db_insert($entity_table_name)
+          ->fields([
+            'bundle' => $result->bundle,
+            'deleted' => $result->deleted,
+            'entity_id' => $result->entity_id,
+            'revision_id' => $result->revision_id,
+            'langcode' => $result->langcode,
+            'delta' => $result->delta,
+            $field_name . '_color' => '#' . strtoupper($result->{$field_name . '_value'}),
+          ])
+          ->execute();
+      }
+
+      if ($database->schema()->tableExists($revision_table_name)) {
+        foreach ($revision_table_data as $result) {
+          db_insert($revision_table_name)
+            ->fields([
+              'bundle' => $result->bundle,
+              'deleted' => $result->deleted,
+              'entity_id' => $result->entity_id,
+              'revision_id' => $result->revision_id,
+              'langcode' => $result->langcode,
+              'delta' => $result->delta,
+              $field_name . '_color' => '#' . strtoupper($result->{$field_name . '_value'}),
+            ])
+            ->execute();
+        }
+      }
+
+      // Update the field settings.
+      $field_name = $field_storage->getName();
+      if ($fields = $entity_manager->getStorage('field_config')->loadByProperties(['field_name' => $field_name, 'entity_type' => $field_storage->getTargetEntityTypeId()])) {
+        /** @var \Drupal\field\FieldConfigInterface $field */
+        // Update the field settings.
+        foreach ($fields as $field) {
+          $new_field = $field->toArray();
+          $new_field['dependencies']['module'][array_search('jquery_colorpicker', $new_field['dependencies']['module'])] = 'colorapi';
+          $new_field['default_value'][0]['color'] = '#' . $new_field['default_value'][0]['value'];
+          unset($new_field['default_value'][0]['value']);
+          $new_field['field_type'] = 'colorapi_color_field';
+
+          $new_field = FieldConfig::create($new_field);
+          $new_field->original = $field;
+          $new_field->enforceIsNew(FALSE);
+          $new_field->save();
+
+          // Update entity view displays.
+          $properties = [
+            'targetEntityType' => $field->getTargetEntityTypeId(),
+            'bundle' => $field->getTargetBundle(),
+          ];
+
+          if ($view_displays = $entity_manager->getStorage('entity_view_display')->loadByProperties($properties)) {
+            foreach ($view_displays as $view_display) {
+              if ($component = $view_display->getComponent($field_name)) {
+                $component['type'] = str_replace('jquery_colorpicker', 'colorapi', $component['type']);
+
+                $view_display->setComponent($field_name, [
+                  'settings' => [],
+                ] + $component);
+
+                $view_display->save();
+              }
+            }
+          }
+
+          // Update entity form displays.
+          $properties = [
+            'targetEntityType' => $field->getTargetEntityTypeId(),
+            'bundle' => $field->getTargetBundle(),
+          ];
+
+          if ($form_displays = $entity_manager->getStorage('entity_form_display')->loadByProperties($properties)) {
+            foreach ($form_displays as $form_display) {
+              if (($component = $form_display->getComponent($field_name)) && $component['type'] == 'jquery_colorpicker') {
+                $form_display->setComponent($field_name, [
+                  // Note: 8.x-2.x does removes unused settings from V1.
+                  'settings' => [],
+                ] + $component)->save();
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
