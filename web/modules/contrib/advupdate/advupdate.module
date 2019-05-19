@@ -1,0 +1,210 @@
+<?php
+
+/**
+ * @file
+ * Contains advupdate.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Url;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\update\UpdateManagerInterface;
+use Drupal\update\UpdateFetcherInterface;
+
+/**
+ * Implements hook_help().
+ */
+function advupdate_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the advupdate module.
+    case 'help.page.advupdate':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('The module modifies the Drupal "Updates available" email to include the information normally shown at /admin/reports/updates/update, with links to the module updates and their release notes.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function advupdate_form_update_settings_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $advupdate_config = \Drupal::config('advupdate.settings');
+
+  $form['update_notification_extend_email_report'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Expand the report using "Update Manager Advanced" module'),
+    '#default_value' => $advupdate_config->get('notification.extend_email_report'),
+    '#description' => t('An email will include more detailed information with a list of modules.'),
+  ];
+
+  $form['#submit'][] = 'advupdate_form_update_settings_submit_handler';
+}
+
+/**
+ * Save "notification.extend_email_report" to the configuration.
+ */
+function advupdate_form_update_settings_submit_handler($form, FormStateInterface $form_state) {
+  \Drupal::configFactory()->getEditable('advupdate.settings')
+    ->set('notification.extend_email_report', $form_state->getValue('update_notification_extend_email_report'))
+    ->save();
+}
+
+/**
+ * Implements hook_mail_alter().
+ */
+function advupdate_mail_alter(&$message) {
+  if ($message['id'] == 'update_status_notify'
+    && \Drupal::config('advupdate.settings')
+      ->get('notification.extend_email_report') == 1) {
+    $additional_data = _advupdate_mail_additional_data();
+    if ($additional_data != '') {
+      $message['body'][] = "\n" . $additional_data;
+      $message['body'][] = "\n"
+        . t('This email also uses an additional information added by "Update Manager Advanced" module :url if the data available.', [
+          ':url' => Url::fromUri('https://www.drupal.org/project/advupdate', ['absolute' => TRUE])
+            ->toString(),
+        ]);
+    }
+  }
+}
+
+/**
+ * Render a list for available updating of core/modules/themes.
+ */
+function _advupdate_mail_additional_data() {
+  module_load_include('module', 'update');
+  module_load_include('inc', 'update', 'update.manager');
+  module_load_include('inc', 'update', 'update.compare');
+
+  $available = update_get_available(TRUE);
+  if (empty($available)) {
+    return '';
+  }
+
+  // This will be a nested array. The first key is the kind of project, which
+  // can be either 'enabled', 'disabled', 'manual' (projects which require
+  // manual updates, such as core). Then, each sub-array is an array of
+  // projects of that type, indexed by project short name, and containing an
+  // array of data for items.
+  $projects = [];
+
+  // This stores the actual download link we're going to update from for each
+  // project in the build, regardless of if it's enabled or disabled.
+  $build['project_downloads'] = ['#tree' => TRUE];
+
+  $project_data = update_calculate_project_data($available);
+  foreach ($project_data as $name => $project) {
+    // Filter out projects which are up to date already.
+    if ($project['status'] == UpdateManagerInterface::CURRENT) {
+      continue;
+    }
+    // The project name to display can vary based on the info we have.
+    if (!empty($project['title'])) {
+      $project_name = $project['title'];
+    }
+    elseif (!empty($project['info']['name'])) {
+      $project_name = $project['info']['name'];
+    }
+    else {
+      $project_name = $name;
+    }
+    if ($project['project_type'] == 'theme' || $project['project_type'] == 'theme-disabled') {
+      $project_name .= ' ' . t('(Theme)');
+    }
+
+    if (empty($project['recommended'])) {
+      // If we don't know what to recommend they upgrade to, we should skip
+      // the project entirely.
+      continue;
+    }
+
+    $recommended_release = $project['releases'][$project['recommended']];
+
+    switch ($project['status']) {
+      case UpdateManagerInterface::NOT_SECURE:
+      case UpdateManagerInterface::REVOKED:
+        $project_name .= ' ' . t('(Security update)');
+        break;
+
+      case UpdateManagerInterface::NOT_SUPPORTED:
+        $project_name .= ' ' . t('(Unsupported)');
+        break;
+
+      case UpdateFetcherInterface::UNKNOWN:
+      case UpdateFetcherInterface::NOT_FETCHED:
+      case UpdateFetcherInterface::NOT_CHECKED:
+      case UpdateManagerInterface::NOT_CURRENT:
+        break;
+
+      default:
+        // Jump out of the switch and onto the next project in foreach.
+        continue 2;
+    }
+
+    if (!empty($project['link'])) {
+      $project_name .= "\n" . Url::fromUri($project['link'], ['absolute' => TRUE])
+        ->toString();
+    }
+
+    // Create an entry for this project and use the project title
+    // and an additional information.
+    $entry['title'] = [
+      'data' => [
+        '#markup' => t("@project \n Installed: @version \n Recommended: @recommended \n Release notes: @link \n", [
+          '@project' => $project_name,
+          '@version' => $project['existing_version'],
+          '@recommended' => $recommended_release['version'],
+          '@link' => $recommended_release['release_link'],
+        ]),
+      ],
+    ];
+
+    // Based on what kind of project this is, save the entry into the
+    // appropriate sub-array.
+    switch ($project['project_type']) {
+      case 'core':
+        // Core needs manual updates at this time.
+        $projects['manual'][$name] = $entry;
+        break;
+
+      case 'module':
+      case 'theme':
+        $projects['enabled'][$name] = $entry;
+        break;
+
+      case 'module-disabled':
+      case 'theme-disabled':
+        $projects['disabled'][$name] = $entry;
+        break;
+    }
+  }
+
+  if (!empty($projects['enabled'])) {
+    $build['projects'] = [
+      '#theme' => 'item_list',
+      '#title' => t('Enabled'),
+      '#items' => $projects['enabled'],
+    ];
+  }
+
+  if (!empty($projects['disabled'])) {
+    $build['disabled_projects'] = [
+      '#theme' => 'item_list',
+      '#title' => t('Disabled'),
+      '#items' => $projects['disabled'],
+    ];
+  }
+
+  if (!empty($projects['manual'])) {
+    $build['manual_updates'] = [
+      '#theme' => 'item_list',
+      '#title' => t('Manual updates required'),
+      '#items' => $projects['manual'],
+    ];
+  }
+
+  return \Drupal::service('renderer')->render($build);
+}
