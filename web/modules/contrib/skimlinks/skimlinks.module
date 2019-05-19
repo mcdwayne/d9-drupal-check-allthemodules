@@ -1,0 +1,571 @@
+<?php
+
+/**
+ * @file
+ * Hooks and utilities for the Skimlinks module.
+ */
+
+use Drupal\Component\Utility\SafeMarkup;
+use Drupal\Component\Utility\Html;
+use Drupal\Component\Utility\UrlHelper;
+use Drupal\Core\Url;
+use Drupal\Core\Database\Database;
+use Drupal\Core\Cache\CacheBackendInterface;
+use Drupal\skimlinks\SkimlinksApiConnection;
+
+/**
+ * Implements hook_entity_insert().
+ *
+ * @param $entity
+ * @param $type
+ */
+function skimlinks_entity_insert($entity, $type) {
+  _skimlinks_entity_update_known_domains($entity);
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function skimlinks_entity_update($entity) {
+  _skimlinks_entity_update_known_domains($entity);
+}
+
+/**
+ * Implements hook_page_bottom.
+ *
+ * Adds the client-side code.
+ */
+function skimlinks_page_bottom(array &$page_bottom) {
+  $config = \Drupal::config('skimlinks.settings');
+  $id = $config->get('domainid');
+  $subdomain = $config->get('subdomain');
+
+  if (!empty($id) && !_skimlinks_is_admin_page()) {
+    if (!empty($subdomain)) {
+      // Remove http:// or https://
+      foreach (['http://', 'https://'] as $protocol) {
+        $subdomain = str_replace($protocol, '', $subdomain);
+      }
+      // Add the variable
+      $page_bottom['skimlinks_subdomain'] = [
+        '#type' => 'markup',
+        '#children' => "<script>
+  <!--//--><![CDATA[//><!--
+    var skimlinks_domain = '{$subdomain}';
+  //--><!]]>
+</script>",
+      ];
+    }
+    $page_bottom['skimlinks_domainid'] = [
+      '#type' => 'html_tag',
+      '#tag' => 'script',
+      '#value' => '',
+      '#attributes' => ['src' => "//s.skimresources.com/js/{$id}.skimlinks.js"],
+    ];
+  }
+}
+
+/**
+ * Gets a list of blacklisted domains.
+ *
+ * @return array The list
+ */
+function skimlinks_domain_blacklist() {
+  // Return if the tables haven't been created yet, this can occur before updates have run.
+  if (db_table_exists('skimlinks_blacklist') == FALSE) {
+    return [];
+  }
+
+  $result = db_select('skimlinks_blacklist', 'b')
+    ->fields('b', ['domain'])
+    ->execute()
+    ->fetchAllAssoc('domain');
+
+  return array_keys($result);
+}
+
+/**
+ * Checks if any submitted domains exceed the DB limit.
+ *
+ * @todo also validate domain formatting
+ */
+function skimlinks_validate_blacklist($domains) {
+  $too_long = _skimlinks_max_domain_length() + 1;
+  // A string of non-whitespace characters longer than the limit
+  $pattern = "/\S{{$too_long},}/";
+  return preg_match($pattern, $domains) === 0;
+}
+
+/**
+ * Helper to save the blacklist on the database.
+ *
+ * @param $domains
+ *
+ * @todo remove protocols?
+ */
+function skimlinks_create_blacklist($domains) {
+  $domains = explode("\n", $domains);
+  $domains = array_map('trim', $domains);
+  $domains = array_filter($domains, 'trim');
+  $domains = array_unique($domains);
+
+  db_truncate('skimlinks_blacklist')->execute();
+  $query = db_insert('skimlinks_blacklist')->fields(['domain']);
+
+  foreach ($domains as $domain) {
+    $query->values(['domain' =>  SafeMarkup::checkPlain($domain)]);
+  }
+
+  $query->execute();
+
+  /**
+   * @todo create cache
+   * @todo delete cache here
+   */
+  // Clear allowed domain cache.
+  // cache_clear_all('skimlinks_domain_allowed:', 'cache', TRUE);
+  // \Drupal::cache()
+}
+
+/**
+ * @todo merge this into the filter functionality?
+ */
+function _skimlinks_entity_update_known_domains($entity = FALSE) {
+  $config = \Drupal::config('skimlinks.settings');
+
+  // Check that Server side implementation is enabled.
+  if (($config->get('environment') ?: 0) != 1 || !$entity || !method_exists($entity, 'getFields')) {
+    return;
+  }
+
+  // Check if the configuration to update the known domains when entity is
+  // changed is on.
+  if (($config->get('update_known_domains_on_entity_update') ?: 1) != 1) {
+    return;
+  }
+
+  _skimlinks_iterate_entity_text_fields($entity, '_skimlinks_entity_update_known_domains_field');
+}
+
+/**
+ * @todo merge this into the filter functionality?
+ */
+function _skimlinks_entity_update_known_domains_field($field, $field_name, $index, $field_item) {
+  $doc = Html::load($field_item['value']);
+
+  foreach (_skimlinks_get_external_links($doc) as $domElement) {
+    $href = $domElement->getAttribute('href');
+
+    if (UrlHelper::isExternal($href)) {
+      $domain = _skimlinks_get_host($href);
+
+      // If the domain isn't yet known, look it up straight away.
+      if (!empty($domain) && !_skimlinks_domain_exists($domain)) {
+        try {
+          skimlinks_validate_merchant($domain, 5);
+        }
+        catch (Exception $e) {
+          watchdog('skimlinks', $e->getMessage());
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Tests a domain against the Merchant API
+ * http://developers.skimlinks.com/merchant.html
+ * Adds the entry to the known domains list.
+ *
+ * @param $domain The domain
+ * @param $timeout The timeout in seconds
+*/
+function skimlinks_validate_merchant($domain, $timeout = 10) {
+  $connection = new SkimlinksApiConnection();
+
+  $result = $connection->getDomain($domain, $timeout);
+  if (!empty($result->merchants)) {
+    skimlinks_known_domains_update($domain, TRUE);
+  }
+  else {
+    skimlinks_known_domains_update($domain, FALSE);
+  }
+}
+
+/**
+ * Adds/Updates a domain to the known domains list.
+ *
+ * @param string $domain
+ * @param bool|null $valid
+ * @return bool
+ */
+function skimlinks_known_domains_update($domain, $valid = NULL) {
+  // Return if the tables haven't been created yet, this can occur before updates have run.
+  $schema = _skimlinks_get_schema($domain);
+  if (!$schema) {
+    return FALSE;
+  }
+
+  // Create a stub domain entry if we don't yet know if it is valid.
+  // - Invalid by default.
+  // - Set last_updated to 0 so that it is checked in the next cron run.
+  if (is_null($valid)) {
+    $valid = FALSE;
+    $last_updated = 0;
+  }
+  else {
+    $last_updated = REQUEST_TIME;
+  }
+
+  db_merge('skimlinks_domains')
+    ->key(['domain' => $domain])
+    ->fields([
+      'domain' => $domain,
+      'last_updated' => $last_updated,
+      'valid' => ($valid === TRUE) ? 1 : 0,
+    ])
+    ->execute();
+
+  _skimlinks_clear_domain_cache($domain);
+
+  return TRUE;
+}
+
+/**
+ * Test if the domain of the url is known, valid and not blacklisted.
+ *
+ * @param $url The url to be tested.
+ *
+ * @return TRUE if the domain is allowed.
+ */
+function skimlinks_domain_allowed($url) {
+  // Do not change internal urls.
+  if (!UrlHelper::isExternal($url)) {
+    return FALSE;
+  }
+
+  $domain = _skimlinks_get_host($url);
+  if (empty($domain)) {
+    return FALSE;
+  }
+
+  $cid = _skimlinks_domain_allowed_cid($domain);
+
+  // Return static cache if already looked up.
+  $allowed = &drupal_static($cid);
+  if (!is_null($allowed)) {
+    return $allowed;
+  }
+
+  // Get cached value and statically cache for next lookup.
+  if ($cache = \Drupal::cache()->get($cid)) {
+    $allowed = $cache->data;
+    return $allowed;
+  }
+
+  // Return if the tables haven't been created yet, this can occur before updates have run.
+  if (db_table_exists('skimlinks_domains') == FALSE) {
+    return FALSE;
+  }
+  if (db_table_exists('skimlinks_blacklist') == FALSE) {
+    return FALSE;
+  }
+
+  // Not allowed by default.
+  $allowed = FALSE;
+
+  $query = db_select('skimlinks_domains', 'w');
+  $query->addField('w', 'domain');
+  $query->leftJoin('skimlinks_blacklist', 'b', 'w.domain = b.domain');
+  $query->condition('w.domain', $domain);
+  $query->condition('w.valid', 1);
+  $query->isNull('b.domain');
+
+  $result = $query->execute()->fetchAllAssoc('domain');
+
+  if (sizeof($result) > 0) {
+    $allowed = TRUE;
+  }
+
+  \Drupal::cache()->get($cid, $allowed);
+
+  return $allowed;
+}
+
+/**
+ * Builds the redirect url.
+ */
+function _skimlinks_get_redirect_url($path, $node) {
+  $config = \Drupal::config('skimlinks.settings');
+
+  $xcust = $node->id();
+  $context = ['node' => $node];
+
+  // Allow other modules to alter xcust.
+  \Drupal::moduleHandler()->alter('skimlinks_xcust', $xcust, $context);
+
+  /**
+   * @todo quicker (safe) way to get the current url? I'm just following the
+   * D7 protocol here.
+   */
+  $current_route = \Drupal\Core\Url::fromRoute('<current>', \Drupal::request()->get('keys') ?: [], ['absolute' => TRUE])->toString();
+  $current_url = \Drupal::service('path.validator')->getUrlIfValid($current_route)->toString();
+
+  $parameters = [
+    'id' => SafeMarkup::checkPlain($config->get('domainid'))->__toString(),
+    'url' => UrlHelper::filterBadProtocol($path),
+    'xcust' => SafeMarkup::checkPlain($xcust)->__toString(),
+    'sref' => UrlHelper::filterBadProtocol($current_url),
+  ];
+
+  $redirect_url = trim(Url::fromUri($config->get('subdomain'), ['query' => $parameters])->toString());
+
+  return $redirect_url;
+}
+
+/**
+ * Clear the cache for the provided domain.
+ */
+function _skimlinks_clear_domain_cache($domain) {
+  // Clear cache so that it will be checked again.
+  $cids = [
+    _skimlinks_domain_exists_cid($domain),
+    _skimlinks_domain_allowed_cid($domain),
+  ];
+  \Drupal::cache()->deleteMultiple($cids);
+  array_map('drupal_static_reset', $cids);
+}
+
+/**
+ * Cache ID for allowed URL.
+ */
+function _skimlinks_domain_allowed_cid($domain) {
+  return 'skimlinks_domain_allowed:' . $domain;
+}
+
+/**
+ * Cache ID for domain exists.
+ *
+ * @param $domain
+ * @return string
+ */
+function _skimlinks_domain_exists_cid($domain) {
+  return 'skimlinks_domain_exists:' . $domain;
+}
+
+/**
+ * Utility function to iterate through fields with callback.
+ */
+function _skimlinks_iterate_entity_text_fields($entity, $callback) {
+  foreach ($entity->toArray() as $field_name => $field) {
+    foreach ($field as $index => $field_item) {
+      if (isset($field_item['format'])) {
+        call_user_func($callback, $field, $field_name, $index, $field_item, $entity);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function skimlinks_cron() {
+  $config = \Drupal::config('skimlinks.settings');
+  if (!$config->get('api_cron_enabled')) {
+    return;
+  }
+
+  // Return if the tables haven't been created yet, this can occur before updates have run.
+  $schema = _skimlinks_get_schema();
+  if (!$schema) {
+    return;
+  }
+
+  $end = time() + (int) $config->get('cron_process_time', 60);
+
+  /**
+   * @todo check empty 'domains_update_threshold' value
+   * @todo check when not returns false
+   */
+  $expired_domains = skimlinks_get_expired_domains_query($config->get('domains_update_threshold'));
+  while (time() < $end && _skimlinks_within_api_rate_limit() && ($item = $expired_domains->fetchObject())) {
+    try {
+      skimlinks_validate_merchant($item->domain);
+    }
+    catch (Exception $e) {
+      watchdog('skimlinks', $e->getMessage());
+      // Stop processing if we have hit the API limit.
+      // Continue processing if the request failed for any other reason.
+      if ($e->getCode() === 406) {
+        break;
+      }
+    }
+  }
+}
+
+/**
+ * Get list of expired domain items.
+ *
+ * @return \DatabaseStatementInterface
+ *
+ * @todo we're not creating these yet so this always returns empty. Confirm
+ * working.
+ */
+function skimlinks_get_expired_domains_query($minutes) {
+  $minutes = $minutes ?: 720;
+  $expiry_time = REQUEST_TIME - ($minutes * 60);
+
+  $query = db_select('skimlinks_domains', 'd');
+  $query->addField('d', 'domain');
+  $query->condition('d.last_updated', $expiry_time, '<');
+  $query->orderBy('d.last_updated', 'ASC');
+
+  return $query->execute();
+}
+
+
+
+
+/**
+ * Check if a domain exists in the DB.
+ *
+ * @param $domain
+ * @return mixed
+ */
+function _skimlinks_domain_exists($domain) {
+ $cid = _skimlinks_domain_exists_cid($domain);
+
+ // Return static cache if already looked up.
+ $exists = &drupal_static($cid);
+ if (!is_null($exists)) {
+   return $exists;
+ }
+
+ // Get cached value and statically cache for next lookup.
+ if ($cache = \Drupal::cache()->get($cid)) {
+   $exists = $cache->data;
+   return $exists;
+ }
+
+  // Return if the tables haven't been created yet, this can occur before updates have run.
+  $schema = _skimlinks_get_schema($domain);
+  if (!$schema) {
+    return FALSE;
+  }
+
+  // Not known by default.
+  $exists = FALSE;
+
+  // Lookup value in DB and cache.
+  /**
+   * @todo depreciated but not removed yet
+   */
+  $query = db_select('skimlinks_domains', 'w');
+  $query->addField('w', 'domain');
+  $query->condition('w.domain', $domain);
+  if ($query->execute()->fetchObject()) {
+    $exists = TRUE;
+  }
+
+  \Drupal::cache()->set($cid, $exists, CacheBackendInterface::CACHE_PERMANENT, ['skimlinks_domain']);
+
+  return $exists;
+}
+
+/**
+ * Get all links, excluding internal links.
+ *
+ * @param \DOMDocument $doc
+ * @return \DOMNodeList
+ *
+ * @todo should be just get_links?
+ */
+function _skimlinks_get_external_links($doc) {
+  global $base_url;
+  $host = _skimlinks_get_host($base_url);
+
+  // Get all links, excluding internal links.
+  $xpath = new DOMXpath($doc);
+
+  $count = count($xpath->query("//a[not(contains(@href,'$host'))]"));
+  return $xpath->query("//a[not(contains(@href,'$host'))]");
+}
+
+/**
+ * Helper to return only the host bit of the base url.
+ *
+ * @param $url The url
+ *
+ * @return string The host part of the url
+ */
+function _skimlinks_get_host($url) {
+  if ($parsed_url = parse_url($url)) {
+    if (isset($parsed_url['host'])) {
+      return str_replace('www.', '', $parsed_url['host']);
+    }
+    else {
+      return $url;
+    }
+  }
+}
+
+/**
+ * Check that rate limit hasn't been reached.
+ *
+ * @return bool
+ *
+ * @todo confirm working
+ */
+function _skimlinks_within_api_rate_limit() {
+  $time_start = &drupal_static(__FUNCTION__ . '_time_start', time());
+  $lookups = &drupal_static(__FUNCTION__ . '_lookups', 0);
+
+  # Reset lookups each minute.
+  if ((time() - $time_start) >= 60) {
+    $time_start = time();
+    $lookups = 0;
+  }
+
+  # Return FALSE if we have hit the API limit, which is
+  # 40 requests per min per API key.
+  if ($lookups++ >= 40) {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+// Max key length for innoDB primary key. utf8mb4 allows 4 bytes per
+// character and max key length is 767 (/4 = 191.something). Longer domains
+// are possible, but highly unlikely.
+function _skimlinks_max_domain_length() {
+  return 191;
+}
+
+/**
+ * Checks for admin pages or node edit pages
+ * @return  bool  TRUE for admin pages
+ */
+function _skimlinks_is_admin_page() {
+  // Admin
+  $route = \Drupal::routeMatch()->getRouteObject();
+  if (\Drupal::service('router.admin_context')->isAdminRoute($route)) {
+    return TRUE;
+  }
+
+  // Node edit
+  $current_path = \Drupal::service('path.current')->getPath();
+  if (preg_match('/node\/(\d+)\/edit/', $current_path, $matches)) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+function _skimlinks_get_schema() {
+  $schema = Database::getConnection()->schema();
+  if (!$schema->tableExists('skimlinks_domains')) {
+    return FALSE;
+  }
+  return $schema;
+}
