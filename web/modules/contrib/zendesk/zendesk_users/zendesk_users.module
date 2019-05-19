@@ -1,0 +1,199 @@
+<?php
+
+/**
+ * @file
+ * The Zendesk module helps you to interact with zendesk using Drupal.
+ */
+
+use Symfony\Component\HttpFoundation\RedirectResponse;
+use Drupal\zendesk;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Component\Serialization\Json;
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function zendesk_users_form_zendesk_admin_form_alter(array &$form, FormStateInterface $form_state) {
+  $config = \Drupal::config('zendesk.settings');
+
+  $form['zendesk']['zendesk_users'] = array(
+    '#type'  => 'fieldset',
+    '#title' => 'Users configuration',
+  );
+
+  $form['zendesk']['zendesk_users']['zendesk_authed_user'] = array(
+    '#type'          => 'checkbox',
+    '#title'         => t('Create user as verified users'),
+    '#default_value' => $config->get('zendesk_authed_user'),
+    '#description'   => t('Check this is you want to create user as already verified users.'),
+  );
+  // We need tu save those values. So we add our own custom submit handler.
+  $form['#submit'][] = 'zendesk_admin_zendesk_users_submit';
+}
+
+/**
+ * Submit callback.
+ *
+ * @see zendesk_sso_form_zendesk_admin_form_alter().
+ *
+ * @param array              $form
+ * @param FormStateInterface $form_state
+ */
+function zendesk_admin_zendesk_users_submit(array &$form, FormStateInterface $form_state) {
+  \Drupal::config('zendesk.settings')
+    ->set('zendesk_authed_user', $form_state->getValue('zendesk_authed_user'))
+    ->save();
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert() for user entities.
+ */
+function zendesk_user_insert(AccountInterface $account) {
+  if (Drupal::config('zendesk.settings')->get('zendesk_api_sync_users') && zendesk_user_has_access($account)) {
+    zendesk_users_create_user($account);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update() for user entities.
+ */
+function zendesk_users_user_update(AccountInterface $account) {
+  if (Drupal::config('zendesk.settings')->get('zendesk_api_sync_users') && zendesk_user_has_access($account)) {
+    if ($user_id = _zendesk_users_get_user($account->id())) {
+      $data = array(
+        'id' => $user_id,
+        'name' => $account->getUsername(),
+        'email' => $account->getEmail(),
+        'role' => 'end-user',
+      );
+
+      // Invoke a alter call to allow other modules to pass data to ZenDesk.
+      \Drupal::moduleHandler()
+        ->alter(array('zendesk_user', 'zendesk_user_update'), $data, $account);
+
+      // Make the call
+      $client = zendesk_initialize_library();
+      $client->users()->update($data);
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete() for user entities.
+ */
+function zendesk_users_user_delete(AccountInterface $account) {
+  if (Drupal::config('zendesk.settings')->get('zendesk_api_sync_users')) {
+    if ($user_id = _zendesk_users_get_user($account->id())) {
+      $data = array(
+          'id' => $user_id,
+          'name' => $account->getUsername(),
+          'email' => $account->getEmail(),
+          'suspended' => TRUE,
+      );
+      // Alter call to omitted since we are destroying the User object.
+
+      // Make the call
+      $client = zendesk_initialize_library();
+      $client->users()->delete($data);
+    }
+  }
+}
+
+/**
+ * Create a user on Zendesk's side.
+ *
+ * @param object $account
+ *   The Drupal user object that we want to create on zendesk.
+ *
+ * @return mixed
+ *   The zendesk's user id if succeeded, FALSE otherwise.
+ */
+function zendesk_users_create_user(AccountInterface $account) {
+  $client = zendesk_initialize_library();
+  $data = array(
+      'name' => $account->getUsername(),
+      'email' => $account->getEmail(),
+      'role' => 'end-user',
+  );
+  if (\Drupal::config('zendesk.settings')->get('zendesk_authed_user')) {
+    $data['user']['verified'] = TRUE;
+  }
+
+  // Invoke a alter call to allow other modules to pass data to ZenDesk.
+  \Drupal::moduleHandler()
+    ->alter(array('zendesk_user', 'zendesk_user_update'), $data, $account);
+
+  // Make the call
+  $result = $client->users()->create($data);
+
+  if (!empty($result->error)) {
+    // Try to handle special case where a user can be on zendesk's side, but
+    // not recorded on our table.
+    if ($result->error == 'RecordInvalid' && $result->details->email[0]->description == 'Email: ' . $account->getEmail() . ' is already being used by another user') {
+      return zendesk_users_sync_user_back($account);
+    }
+    \Drupal::logger('zendesk_users')->error($result->description . ': ' . print_r($result->details, 1));
+
+    return FALSE;
+  }
+  else {
+    db_insert('zendesk_users')
+      ->fields(array(
+        'uid' => $account->id(),
+        'zid' => $result->user->id,
+      ))
+      ->execute();
+
+    return $result->user->id;
+  }
+}
+
+/**
+ * Try to sync user from zendesk on drupal side.
+ *
+ * If a user already exist on zendesk's side but not our the drupal side, add
+ * it in our database.
+ *
+ * @param AccountInterface $account
+ *   An object containing the user account.
+ *
+ * @return mixed
+ *   Zendesk's user ID if succeeded, FALSE otherwise.
+ */
+function zendesk_users_sync_user_back(AccountInterface $account) {
+  // Look for the user.
+  $client = zendesk_initialize_library();
+  $result = $client->users()->search($account->getEmail());
+  if (isset($result->users[0]->id)) {
+    db_insert('zendesk_users')
+      ->fields(array(
+        'uid' => $account->id(),
+        'zid' => $result->users[0]->id,
+      ))
+      ->execute();
+
+    return $result->users[0]->id;
+  }
+  else {
+    return FALSE;
+  }
+}
+
+/**
+ * Helper function to retrieve zendesk id of the user.
+ */
+function _zendesk_users_get_user($uid) {
+  $result = db_select('zendesk_users', 'zu')
+    ->fields('zu', array('uid', 'zid'))
+    ->condition('zu.uid', $uid, '=')
+    ->execute();
+  if ($result->rowCount() <> 0) {
+    foreach ($result as $user) {
+      return $user->zid;
+    }
+  }
+  else {
+    return FALSE;
+  }
+}
