@@ -1,0 +1,319 @@
+<?php
+
+use Drupal\file\Entity\File;
+use Drupal\Component\Utility\NestedArray;
+use Drupal\Component\Utility\Unicode;
+use Drupal\Core\Entity\EntityStorageControllerInterface;
+use Drupal\Core\Template\Attribute;
+use Drupal\file\FileUsage\FileUsageInterface;
+use Drupal\Core\Url;
+use Drupal\browscap\BrowscapService;
+use Drupal\Core\Controller\ControllerBase;
+
+/**
+ * @file
+ * This file contains Track da files main functions.
+ */
+
+/**
+ * Implements hook_help().
+ */
+function track_da_files_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#track_da_files':
+      return '<p>' . t('Gives the possibility to track da files. Select appropriate displays in the content type interface for the file fields to be tracked. You can also custom links to files to be tracked: follow indications in readme file located in module directory.') . '</p>';
+  }
+}
+
+/**
+ * Implements hook_menu().
+ */
+function track_da_files_menu() {
+
+  $items['system/tdf'] = array(
+    'title' => 'Track da files tracking',
+    'description' => 'Url which triggers track da files tracking function',
+    'route_name' => 'track_da_files.tracking',
+  );
+
+
+  // General Report.
+  $items['admin/reports/track_da_files'] = array(
+    'title' => 'Track da files',
+    'description' => 'Tracked files reports',
+    'route_name' => 'track_da_files.table',
+  );
+
+ // Report for specific file.
+ $items['admin/reports/track_da_files/file_report/%/%'] = array(
+    'title' => 'File specific report',
+    'description' => 'Allow users to see tracking datas for a specific file',
+    'route_name' => 'track_da_files.table_file_report',
+  );
+
+ // Report for specific user.
+  $items['admin/reports/track_da_files/user_report/%'] = array(
+    'title' => 'User specific report',
+    'description' => 'Allow users to see tracking datas for a specific user',
+    'route_name' => 'track_da_files.table_user_report',
+  );
+
+  // Module configuration.
+  $items['admin/config/media/track_da_files'] = array(
+    'title' => 'Track da files',
+    'description' => 'Provides tracking of displayed files.',
+    'route_name' => 'track_da_files.settings',
+  );
+
+  return $items;
+}
+
+
+/**
+ * Implements hook_permission().
+ */
+function track_da_files_permission() {
+  $permissions = array(
+    'administer track da files' => array(
+      'title' => 'Administer track da files',
+      'description' => '',
+    ),
+    'initialize tracked files displays datas' => array(
+      'title' => 'Initialize tracked files displays datas',
+      'description' => '',
+    ),
+    'view tracked files displays datas' => array(
+      'title' => 'View tracked files displays datas',
+      'description' => '',
+    ),
+  );
+  return $permissions;
+}
+
+
+/**
+ * This function returns TRUE if role should be tracked.
+ */
+function track_da_files_roles($user) {
+
+  $track = \Drupal::config('track_da_files.settings')->get('roles');
+  $enabled = $track;
+  $roles = \Drupal::config('track_da_files.settings')->get('specific_roles');
+
+  if (array_sum($roles) > 0) {
+    // One or more roles are selected.
+    foreach (array_keys($user->roles) as $rid) {
+      // Is the current user a member of one of these roles?
+      if (isset($roles[$rid]) && $rid == $roles[$rid]) {
+        // User has a role that should be tracked/excluded from tracking.
+        $enabled = !$track;
+        break;
+      }
+    }
+  }
+  else {
+    // No role is selected for tracking, therefore all roles should be tracked.
+    $enabled = TRUE;
+  }
+  return $enabled;
+}
+
+
+/**
+ * Implements hook_theme().
+ */
+function track_da_files_theme() {
+  return array(
+  	'track_da_files_file_link' => array(
+  		'variables' => array('file' => 'includes/track_da_files_formatter.inc', 'description' => NULL, 'attributes' => array(), 'entity_type' => NULL, 'entity_bundle' => NULL, 'entity_id' => NULL),
+  	),
+  );
+}
+
+/**
+ * Track da files version of file_create_url.
+ */
+function track_da_files_create_url($uri, $id = NULL) {
+
+  $scheme = file_uri_scheme($uri);
+  if ($scheme == 'public') {
+  	return file_create_url('system/tdf/' . file_uri_target($uri));
+  }
+
+  return file_create_url($uri);
+
+}
+
+
+/**
+ * Registers new files displays.
+ */
+function track_da_files_register_new_display($uri, $fid, $id = NULL, $type = NULL) {
+
+  // Get variables to use later.
+  $counter = '';
+  if (!empty($fid)) {
+    $file = file_load($fid);
+  }
+
+  $moduleHandler = \Drupal::service('module_handler');
+
+  $account = \Drupal::currentUser();
+  $uid = $account->id();
+  $ip = Drupal::request()->getClientIp();
+
+  $browser = \Drupal::service('browscap')->getBrowser();
+  $browser_name = isset($browser['browser']) ? $browser['browser'] : NULL;
+  $browser_version = isset($browser['version']) ? $browser['version'] : NULL;
+  $browser_platform = isset($browser['platform']) ? $browser['platform'] : NULL;
+  $referer = isset($_SERVER['HTTP_REFERER']) ? $_SERVER['HTTP_REFERER'] : NULL;
+
+  // We check if path id exists.
+  if (!empty($fid)) {
+    $query = "SELECT p.pid FROM {track_da_files_paths} p WHERE p.fid = :fid AND p.path = :uri";
+    $results = db_query($query, array(':fid' => $fid, ':uri' => $uri))->fetch();
+    if (!empty($results)) {
+      $pid = $results->pid;
+    }
+  }
+  else {
+    $query = "SELECT p.pid FROM {track_da_files_paths} p WHERE p.path = :uri";
+    $results = db_query($query, array(':uri' => $uri))->fetch();
+    if (!empty($results)) {
+      $pid = $results->pid;
+    }
+  }
+
+  if (!empty($pid)) {
+    // If path is registered we make verifications to avoid duplicated entries.
+    $query = "SELECT t.ip, t.pid, MAX(time) max_time FROM {track_da_files} t " .
+             "WHERE t.pid = :pid GROUP BY t.ip, t.pid ";
+    $results = db_query($query, array(':pid' => $pid))->fetch();
+
+    $last_display = $results->max_time;
+    $last_display_ip  = $results->ip;
+    $time = REQUEST_TIME;
+
+    if (isset($last_display)) {
+      $last_display_no_flood = $last_display + 10;
+    }
+
+    // No duplicated entry.
+    // If current viewer ip is the same as last displayer ip.
+    // And if time has passed between last display and current time.
+    // We can continue.
+    if (($ip == $last_display_ip) && ($last_display_no_flood > $time)) {
+      return NULL;
+    }
+  }
+  else {
+
+    // If no path id we register new path.
+    $query = db_insert('track_da_files_paths')
+      ->fields(array(
+        'fid' => isset($fid) ? $fid : NULL,
+        'pid' => isset($pid) ? $pid : NULL,
+        'path' => $uri,
+      ))
+      ->execute();
+
+    // Then we select path id for our file.
+    if (!empty($fid)) {
+      $query = "SELECT p.pid FROM {track_da_files_paths} p " .
+             "WHERE p.fid = :fid AND p.path = :uri ";
+      $results = db_query($query, array(':fid' => $fid, ':uri' => $uri))->fetch();
+    }
+    else {
+      $query = "SELECT p.pid FROM {track_da_files_paths} p WHERE p.path = :uri";
+      $results = db_query($query, array(':uri' => $uri))->fetch();
+    }
+    $pid  = $results->pid;
+  }
+
+  $query = db_insert('track_da_files')
+  ->fields(array(
+    'pid' => isset($pid) ? $pid : NULL,
+    'ip' => $ip,
+    'browser' => isset($browser_name) ? $browser_name : NULL,
+    'browser_version' => isset($browser_version) ? $browser_version : NULL,
+    'browser_platform' => isset($browser_platform) ? $browser_platform : NULL,
+    'referer' => $referer,
+    'uid' => $uid,
+    'time' => REQUEST_TIME,
+    'id' => $id,
+    'type' => $type,
+  ))
+  ->execute();
+
+  // Each time a file is displayed an event is declared to Rules module.
+  //if (module_exists('rules') && (isset($file))) {
+  if ($moduleHandler->moduleExists('rules') && (isset($file))) {
+    rules_invoke_event('track_da_files', (object) $file, $user);
+  }
+}
+
+/**
+ * Prepares variables for file link templates.
+ *
+ * Default template: file-link.html.twig.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - file: A file object to which the link will be created.
+ *   - icon_directory: (optional) A path to a directory of icons to be used for
+ *     files. Defaults to the value of the "icon.directory" variable.
+ *   - description: A description to be displayed instead of the filename.
+ *   - attributes: An associative array of attributes to be placed in the a tag.
+ */
+function template_preprocess_track_da_files_file_link(&$variables) {
+
+	$file = $variables['file'];
+	$options = array();
+	$url = file_create_url($file->uri);
+
+	$mime_type = $file->getMimeType();
+  $filesize = $file->getSize();
+  $filename = $file->getFilename();
+
+	// Set options as per anchor format described at
+	// http://microformats.org/wiki/file-format-examples
+	$options['attributes']['type'] = $mime_type . '; length=' . $filesize;
+
+	// Use the description as the link text if available.
+	if (empty($variables['description'])) {
+		$link_text = $filename;
+	}
+	else {
+		$link_text = $variables['description'];
+		$options['attributes']['title'] = SafeMarkup::checkPlain($filename);
+	}
+
+	// Classes to add to the file field for icons.
+	$classes = array(
+			'file',
+			// Add a specific class for each and every mime type.
+			'file--mime-' . strtr($mime_type, array('/' => '-', '.' => '-')),
+			// Add a more general class for groups of well known mime types.
+			'file--' . file_icon_class($mime_type),
+	);
+
+	$options['query']['file'] = '1';
+
+	if (isset($variables['entity_bundle'])) {
+		$options['query']['type'] = $variables['entity_bundle'];
+	}
+
+	if (isset($variables['entity_id'])) {
+		$options['query']['id'] = $variables['entity_id'];
+	}
+
+	// Set file classes to the options array.
+	$variables['attributes'] = new Attribute($variables['attributes']);
+	$variables['attributes']->addClass($classes);
+	$url = track_da_files_create_url($file->getFileUri());
+
+	$link = \Drupal::l($text, Url::fromUri($url, $options));
+
+	$variables['link'] = $link;
+
+}
