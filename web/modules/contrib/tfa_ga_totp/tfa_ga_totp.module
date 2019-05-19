@@ -1,0 +1,127 @@
+<?php
+
+/**
+ * @file
+ * This is the module for supporting tfa module provide extra features.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\encrypt\Entity\EncryptionProfile;
+use ParagonIE\ConstantTime\Encoding;
+use Drupal\tfa_ga_totp\GaOtp;
+
+/**
+ * Implements hook_form_alter() for tfa login form.
+ */
+function tfa_ga_totp_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+
+  /*
+   * Get TFA settings and default recovery settings
+   *
+   */
+  $tfa_settings = \Drupal::config('tfa.settings')->getRawData();
+  $default_plugin = $tfa_settings['default_validation_plugin'];
+  if (isset($tfa_settings['fallback_plugins'][$default_plugin])) {
+    $enabled_fallback_plugin = $tfa_settings['fallback_plugins'][$default_plugin]['tfa_recovery_code']['enable'];
+  }
+
+  /*
+   * Set message on page top to instruct user to setup TFA to move a head
+   *
+   */
+  if ($form_id == 'tfa_base_overview' && \Drupal::request()->query->get('tfa_required') == 1) {
+    drupal_set_message(t('TFA setup is mandatory. Please setup the TFA first!'), 'status', TRUE);
+  }
+
+  /*
+   * Remove Recovery code if fallback is not enabled
+   *
+   */
+  if ($form_id == 'tfa_base_overview') {
+    if (!$enabled_fallback_plugin) {
+      unset($form['recovery']);
+    }
+  }
+
+  /*
+   * Remove recovery code option from TFA overview page
+   * and setup custom validate.
+   *
+   */
+  if ($form_id == 'tfa_entry_form') {
+    if (!$enabled_fallback_plugin) {
+      unset($form['change_validation_plugin']);
+    }
+    array_unshift($form['#validate'], 'tfa_ga_validate');
+  }
+
+  /*
+   * Add option to enforce users to setup TFA
+   *
+   */
+  if ($form_id == 'tfa_settings_form') {
+    $validation_plugins_fallbacks = [];
+
+    $config = \Drupal::config('tfa.settings');
+    $force_setup = $config->get('tfa_force_setup');
+    $form['tfa_force_setup'] = [
+      '#type' => 'checkbox',
+      '#title' => t('Force users to setup TFA after login'),
+      '#default_value' => $force_setup,
+      '#weight' => 0
+    ];
+
+    $validation_plugin_manager = \Drupal::service('plugin.manager.tfa.validation');
+    $validation_plugins = $validation_plugin_manager->getDefinitions();
+    $enabled_fallback_plugins = $config->get('fallback_plugins');
+
+    foreach ($validation_plugins as $key => $plugin) {
+      if (!empty($plugin['fallbacks'])) {
+        $validation_plugins_fallbacks[$plugin['id']] = $plugin['fallbacks'];
+      }
+    }
+
+    if (count($validation_plugins_fallbacks)) {
+      foreach ($validation_plugins_fallbacks as $plugin => $fallbacks) {
+         if (count($fallbacks)) {
+          foreach ($fallbacks as $fallback) {
+            $fallback_value = $enabled_fallback_plugins[$plugin][$fallback]['enable'];
+            $form['tfa_fallback'][$plugin][$fallback]['enable']['#default_value'] = $fallback_value;
+          }
+        }
+      }
+    }
+
+    array_unshift($form['#submit'], 'tfa_ga_totp_submit');
+  }
+}
+
+/**
+ * TFA application code validate function.
+ */
+function tfa_ga_validate(&$form, FormStateInterface $form_state) {
+  $values = $form_state->getValues();
+  $code = $values['code'];
+  $code = preg_replace('/\s+/', '', $code);
+  $ga_otp = new GaOtp();
+  $userData = \Drupal::service('user.data');
+  $uid = $values['account']->id();
+  $result = $userData->get('tfa', $uid, 'tfa_totp_seed');
+  $encrypted = base64_decode($result['seed']);
+  $encryption_profile = EncryptionProfile::load('tfa_encryption');
+  $seed = Drupal::service('encryption')->decrypt($encrypted, $encryption_profile);
+  $bool_otp = $ga_otp->gaCheckTotp(Encoding::base32DecodeUpper($seed), $code, 30);
+
+  if (!$bool_otp) {
+    $form_state->clearErrors();
+    $form_state->setErrorByName('code', t('Invalid Application Code. Please try again!'));
+  }
+}
+
+/**
+ * Save Froce to login field in configuration.
+ */
+function tfa_ga_totp_submit(array &$form, FormStateInterface $form_state) {
+  $force_setup = $form_state->getValue('tfa_force_setup');
+  \Drupal::configFactory()->getEditable('tfa.settings')->set('tfa_force_setup', intval($force_setup))->save();
+}
