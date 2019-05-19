@@ -1,0 +1,136 @@
+<?php
+
+use Drupal\Core\Url;
+use Drupal\Core\Routing\RouteMatchInterface;
+
+/**
+ * Implements hook_help().
+ */
+function simpleautologout_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.simple_autologout':
+      $output = '<h3>' . t('About Simple Autologout') . '</h3>';
+      $output .= '<p>' . t("This module allows you to force site users to be logged out after a given amount of time due to inactivity.") . '</p>';
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_page_attachments().
+ *
+ * Add a form element to every page which is used to detect if the page was
+ * loaded from browser cache. This happens when the browser's back button is
+ * pressed for example. The JS will set the value of the hidden input element
+ * to 1 after initial load. If this is 1 on subsequent loads, the page was
+ * loaded from cache and an autologout timeout refresh needs to be triggered.
+ */
+function simpleautologout_page_attachments(array &$page) {
+
+  $service = \Drupal::service('user.private_tempstore')->get('simpleautologout');
+  $service->set('simpleautologout_session_time', time());
+  
+  $simpleautologout_session_time = $service->get('simpleautologout_session_time');
+  
+  $settings = \Drupal::config('simpleautologout.settings');
+
+  $timeout = $settings->get('timeout');
+  $max_timeout = $settings->get('max_timeout');
+  $timeout_refresh_rate = $settings->get('timeout_refresh_rate');
+  $redirect_url = $settings->get('redirect_url');
+  $redirect_query = \Drupal::service('redirect.destination')->getAsArray() + ['autologout_timeout' => 1];
+
+  // Get all settings JS will needed.
+  $settings = [
+    'timeout' => $timeout * 1000,
+    'max_timeout' => $max_timeout * 1000,
+    'timeout_refresh_rate' => $timeout_refresh_rate * 1000,
+    'simpleautologout_session_time' => $simpleautologout_session_time * 1000,
+    'redirect_url' => Url::fromUserInput($redirect_url, ['query' => $redirect_query])->toString(),
+  ];
+
+  // If this is an AJAX request, then the logout redirect url should still be
+  // referring to the page that generated this request.
+  if (isset($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) == 'xmlhttprequest') {
+    global $base_url;
+    $relative_url = str_replace($base_url . '/', '', $_SERVER['HTTP_REFERER']);
+    $settings['redirect_url'] = Url::fromUserInput($redirect_url, [
+      'query' => ['destination' => urlencode($relative_url)],
+      'autologout_timeout' => 1,
+    ]);
+  }
+
+  simpleautologout_attach_js($page, $settings, TRUE);
+
+}
+
+/**
+ * Adds the necessary js and libraries.
+ *
+ * @param array $element
+ *   The renderable array element to #attach the js to.
+ * @param array $settings
+ *   The JS Settings.
+ */
+function simpleautologout_attach_js(&$element, $settings) {
+  $element['#attached']['drupalSettings']['simpleautologout'] = $settings;
+  $element['#attached']['library'][] = 'simpleautologout/drupal.simpleautologout';
+}
+
+/**
+ * Implements hook_user_login().
+ *
+ * Delete stale sessions for the user on login.
+ */
+function simpleautologout_user_login($account) {
+
+  $service = \Drupal::service('user.private_tempstore')->get('simpleautologout');
+  $service->set('simpleautologout_session_time', time());
+
+  $timeout = \Drupal::config('simpleautologout.settings')->get('timeout');
+  $max_timeout = \Drupal::config('simpleautologout.settings')->get('max_timeout');
+  $timestamp = REQUEST_TIME - ($timeout + $max_timeout);
+
+  // Find all stale sessions.
+  $database = \Drupal::database();
+  $sids = $database->select('sessions', 's')
+    ->fields('s', ['sid'])
+    ->condition('uid', $account->id())
+    ->condition('timestamp', $timestamp, '<')
+    ->orderBy('timestamp', 'DESC')
+    ->execute()
+    ->fetchCol();
+
+  if (!empty($sids)) {
+    // Delete stale sessions at login.
+    $database->delete('sessions')
+      ->condition('sid', $sids, 'IN')
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Delete stale sessions from database.
+ */
+function simpleautologout_cron() {
+
+  $timeout = \Drupal::config('simpleautologout.settings')->get('timeout');
+  $max_timeout = \Drupal::config('simpleautologout.settings')->get('max_timeout');
+  $timestamp = REQUEST_TIME - ($timeout + $max_timeout);
+
+  $database = \Drupal::database();
+  $sids = $database->select('sessions', 's')
+    ->fields('s', ['sid'])
+    ->condition('timestamp', $timestamp, '<')
+    ->orderBy('timestamp', 'DESC')
+    ->execute()
+    ->fetchCol();
+
+  if (!empty($sids)) {
+    // Delete stale sessions at login.
+    $database->delete('sessions')
+      ->condition('sid', $sids, 'IN')
+      ->execute();
+  }
+}
