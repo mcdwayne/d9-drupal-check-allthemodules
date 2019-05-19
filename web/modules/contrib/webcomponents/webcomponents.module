@@ -1,0 +1,227 @@
+<?php
+/**
+ * @file Web components integration
+ */
+
+/**
+ * Implements hook_page_build().
+ */
+function webcomponents_page_build(&$page) {
+  $components = webcomponents_load_all();
+  foreach ($components as $component) {
+    _webcomponents_add_to_head($component);
+  }
+}
+
+/**
+ * Return output for rendering a component
+ * @param  \Drupal\webcomponents\Entity\WebComponentEntity $component fully loaded webcomponent entity.
+ * @return string            rendered representation of the component
+ */
+function _webcomponents_render_component(\Drupal\webcomponents\Entity\WebComponentEntity $component) {
+  if (isset($componentproperties)) {
+    if (!is_array($component->get('properties'))) {
+      $component->set('properties', unserialize($component->get('properties')));
+    }
+    _webcomponents_add_to_head($component);
+    // support token replacement of properties passed in
+    foreach ($component->get('properties') as &$property) {
+      $property = \Drupal::token()->replace($property);
+    }
+    $vars = [
+      'tag' => $component->get('machine_name'),
+      'properties' => $component->get('properties'),
+      '#theme' => 'web_component'
+    ];
+    // @FIXME
+// theme() has been renamed to _theme() and should NEVER be called directly.
+// Calling _theme() directly can alter the expected output and potentially
+// introduce security issues (see https://www.drupal.org/node/2195739). You
+// should use renderable arrays instead.
+// 
+// 
+// @see https://www.drupal.org/node/2195739
+// $output = theme('webcomponent', $vars);
+
+    return $vars;
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function webcomponents_theme() {
+  // test all components on the file system against what's
+  // in the database to ensure the data models haven't changed
+  _webcomponents_rebuild();
+  // hilariously minor template
+  return array(
+    'web_component' => array(
+      'variables' => array(
+        'tag' => '',
+        'properties' => array(),
+      ),
+      'render element' => 'element',
+      'template' => 'web_component',
+      'path' => drupal_get_path('module', 'webcomponents') . '/templates',
+    ),
+  );
+}
+
+/**
+ * Implements hook_entity_load().
+ */
+function webcomponents_entity_load($entities, $type) {
+  if ($type == 'web_component') {
+    // unpack properties
+    foreach ($entities as $entity) {
+      $entity->properties = unserialize($entity->properties);
+    }
+  }
+}
+
+/**
+ * Load all webcomponents in the database.
+ * @return array array of entities or empty.
+ */
+function webcomponents_load_all() {
+  $entities = &drupal_static(__FUNCTION__);
+  // @ignore druplart_conditional_assignment
+  if (!$entities) {
+    $query = \Drupal::entityQuery('web_component');
+    $result = $query->execute();
+    // flip the results if it found them
+    if (isset($result['web_component'])) {
+      $keys = array_keys($result['web_component']);
+      $entities = \Drupal::entityTypeManager()->getStorage('web_component');
+    }
+    else {
+      $entities = array();
+    }
+  }
+  return $entities;
+}
+
+/**
+ * Rebuild webcomponents from the file system.
+ */
+function _webcomponents_rebuild() {
+  // force rebuild of components from static
+  $processed = array();
+  // load all possible web components
+  $componentfiles = webcomponents_load_webcomponents_files();
+  // build the registry of possible component types
+  $registry = _webcomponents_build_registry();
+  // loop through results found, tagged by format they are in
+  foreach ($componentfiles as $format => $files) {
+    // process each file based on user defined callback for
+    // how we've been told to handle processing of this component type
+    if (!empty($files)) {
+      foreach ($files as $file) {
+        if (isset($registry[$format])) {
+          $processed[$file] = call_user_func($registry[$format]['process'], $file);
+          // ensure there was actually a match in there
+          if (!empty($processed[$file]) && is_object($processed[$file])) {
+            $component = $processed[$file];
+            // try and load webcomponent by machine name
+            if ($entity = webcomponent_load_by_name($component->machine_name)) {
+              foreach ($component as $key => $value) {
+                if (isset($entity->{$key}) && $entity->{$key} != $value) {
+                  drupal_set_message(t('Web components have changed! Make sure that your attributes are correctly reflected in your site. @key changed on @machine from @old to @new', array('@key' => $key, '@old' => $entity->{$key}, '@new' => $value, '@machine' => $component->machine_name)), 'warning', TRUE);
+                  $entity->{$key} = $value;
+                }
+              }
+              if (is_array($entity->properties)) {
+                $entity->properties = serialize($entity->properties);
+              }
+              $entity->save();
+            }
+            else {
+              // try and create the entity instead
+              $component->properties = serialize($component->properties);
+              $entity = \Drupal::entityTypeManager()->getStorage('web_component')->create((array)$component);
+              $entity->save();
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Add webcomponent to the header of the site so it can work.
+ */
+function _webcomponents_add_to_head($component) {
+  $element = array(
+    '#tag' => 'link', // The #tag is the html tag
+    '#attributes' => array( // Set up an array of attributes inside the tag
+      'href' => base_path() . $component->file,
+      'rel' => 'import',
+    ),
+  );
+  drupal_add_html_head($element, 'webcomponent-' . $component->machine_name);
+}
+
+/**
+ * Implements hook_page_attachments().
+ *
+ * @todo: right now it loads all "published" components.  May need a better way to filter.
+ */
+function webcomponents_page_attachments(array &$attachments) {
+  $query = \Drupal::entityQuery('web_component');
+  $query->condition('status', '1');
+  $webcomponent_ids = $query->execute();
+
+  /** @var \Drupal\webcomponents\Entity\WebComponentEntity[] $components */
+  $components = \Drupal\webcomponents\Entity\WebComponentEntity::loadMultiple($webcomponent_ids);
+
+  foreach($components as $component) {
+    $element = array(
+      '#tag' => 'link', // The #tag is the html tag
+      '#attributes' => array( // Set up an array of attributes inside the tag
+        'href' => base_path() . $component->get('file'),
+        'rel' => 'import',
+      ),
+    );
+
+    $attachments['#attached']['html_head'][] = [$element, 'webcomponent-' . $component->get('machine_name')];
+  }
+
+}
+
+/**
+ * Return all available web component types registered.
+ * Basically just that they have a callback so we know how
+ * to process and convert them from static into database driven.
+ * @return array array of possible formats and callbacks
+ */
+function _webcomponents_build_registry() {
+  $formats = \Drupal::moduleHandler()->invokeAll('register_component_format');
+  \Drupal::moduleHandler()->alter('register_component_format', $formats);
+  return $formats;
+}
+
+/**
+ * Assembles components available to Drupal.
+ * @return array files where components live
+ */
+function webcomponents_load_webcomponents_files() {
+  $componentfiles = \Drupal::moduleHandler()->invokeAll('web_components');
+  \Drupal::moduleHandler()->alter('webcomponents', $components);
+  return $componentfiles;
+}
+
+/**
+ * Load webcomponent by name
+ * @param  string $name machine name of a web_component
+ * @return object       fully loaded entity
+ */
+function webcomponent_load_by_name($name) {
+  $entity = // @FIXME
+// To reset the entity cache, use EntityStorageInterface::resetCache().
+\Drupal::entityTypeManager()->getStorage('web_component')->loadByProperties(array('machine_name' => $name));
+  $entity = array_pop($entity);
+  return $entity;
+}
