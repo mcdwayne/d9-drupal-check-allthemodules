@@ -1,0 +1,273 @@
+<?php
+
+/**
+ * @file
+ * Module file of the Translation Management thebigword module.
+ */
+
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Field\FieldDefinitionInterface;
+use Drupal\Core\Field\FieldItemListInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\StringTranslation\TranslatableMarkup;
+use Drupal\Core\Url;
+use Drupal\tmgmt\Entity\RemoteMapping;
+use Drupal\tmgmt\JobInterface;
+use Drupal\tmgmt\JobItemInterface;
+use Drupal\tmgmt_thebigword\Plugin\tmgmt\Translator\ThebigwordTranslator;
+use Drupal\user\UserInterface;
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function tmgmt_thebigword_form_tmgmt_job_edit_form_alter(&$form, FormStateInterface $form_state) {
+  /** @var \Drupal\tmgmt\JobInterface $job */
+  $job = $form_state->getFormObject()->getEntity();
+  if ($job->getTranslatorPlugin()->getPluginId() == 'thebigword' && !$job->isContinuous()) {
+    $remotes = RemoteMapping::loadByLocalData($job->id());
+    if (count($remotes) == 1) {
+      /** @var \Drupal\tmgmt\Entity\RemoteMapping $remote */
+      $remote = reset($remotes);
+      $project_id = $remote->getRemoteIdentifier2();
+      $form['info'][] = [
+        '#type' => 'item',
+        '#title' => t('Project ID'),
+        '#markup' => $project_id,
+        '#prefix' => '<div id="tmgmt-ui-thebigword-project-id" class="tmgmt-ui-thebigword-project-id tmgmt-ui-info-item">',
+        '#suffix' => '</div>',
+        '#value' => $project_id,
+      ];
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function tmgmt_thebigword_form_tmgmt_job_item_edit_form_alter(&$form, FormStateInterface $form_state) {
+  /** @var \Drupal\tmgmt\JobItemInterface $job_item */
+  $job_item = $form_state->getFormObject()->getEntity();
+  if ($job_item->getTranslatorPlugin()->getPluginId() == 'thebigword') {
+    $remotes = RemoteMapping::loadByLocalData($job_item->getJobId(), $job_item->id());
+    if (!empty($remotes)) {
+      /** @var \Drupal\tmgmt\Entity\RemoteMapping $remote */
+      $remote = reset($remotes);
+      $project_id = $remote->getRemoteIdentifier2();
+      $form['info'][] = [
+        '#type' => 'item',
+        '#title' => t('Project ID'),
+        '#markup' => $project_id,
+        '#prefix' => '<div id="tmgmt-ui-thebigword-project-id" class="tmgmt-ui-thebigword-project-id tmgmt-ui-info-item">',
+        '#suffix' => '</div>',
+        '#value' => $project_id,
+      ];
+      $file_id = $remote->getRemoteIdentifier3();
+      $form['info'][] = [
+        '#type' => 'item',
+        '#title' => t('File ID'),
+        '#markup' => $file_id,
+        '#prefix' => '<div id="tmgmt-ui-thebigword-file-id" class="tmgmt-ui-thebigword-file-id tmgmt-ui-info-item">',
+        '#suffix' => '</div>',
+        '#value' => $file_id,
+      ];
+
+      if ($job_item->getTranslatorPlugin()->userHasExternalReviewAccess($job_item, \Drupal::currentUser())) {
+        $url = Url::fromRoute('tmgmt_thebigword.review_redirect', ['tmgmt_job_item' => $job_item->id()])
+          ->setOption('attributes', ['target' => '_blank']);
+        $form['actions']['thebigword_external_review'] = [
+          '#weight' => -50,
+          '#type' => 'link',
+          '#title' => t('External review'),
+          '#url' => $url,
+          '#attributes' => ['class' => ['button', 'button--primary']]
+        ];
+      }
+
+    }
+
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function tmgmt_thebigword_form_tmgmt_settings_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $config = \Drupal::configFactory()->get('tmgmt_thebigword.settings');
+
+  $form['thebigword'] = [
+    '#type' => 'details',
+    '#title' => t('thebigword Connector for Drupal'),
+    '#open' => TRUE,
+  ];
+  $form['thebigword']['debug'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Debug mode'),
+    '#default_value' => $config->get('debug'),
+    '#description' => t('Enabling this will log all communication with thebigword API. Should not be enabled on production.'),
+  ];
+  $form['#submit'][] = 'tmgmt_thebigword_form_tmgmt_settings_form_submit';
+
+}
+
+/**
+ * Submit callback for tmgmt_settings_form.
+ */
+function tmgmt_thebigword_form_tmgmt_settings_form_submit($form, FormStateInterface $form_state) {
+  $config = \Drupal::configFactory()->getEditable('tmgmt_thebigword.settings');
+  $config->set('debug', $form_state->getValue('debug'))->save();
+}
+
+/**
+ * Batch finished calback function.
+ */
+function tmgmt_thebigword_pull_translations_batch_finished($success, $results, $operations) {
+  if ($success) {
+    if (!empty($results['updates']) && array_sum($results['updates'])) {
+      drupal_set_message(t('Fetched: @preview Preview Requests, @review External Review Requests, @translation Completed Translations.', $results['updates']));
+    }
+    else {
+      drupal_set_message(t('No updates found.'));
+    }
+  }
+  else {
+    // An error occurred.
+    $error_operation = reset($operations);
+    $message = new TranslatableMarkup('An error occurred while processing %error_operation with arguments: @arguments', [
+      '%error_operation' => $error_operation[0],
+      '@arguments' => print_r($error_operation[1], TRUE),
+    ]);
+    drupal_set_message($message, 'error');
+  }
+
+}
+
+/**
+ * Implements hook_tmgmt_job_item_state_definitions_alter().
+ */
+function tmgmt_thebigword_tmgmt_job_item_state_definitions_alter(&$definitions) {
+  $definitions[ThebigwordTranslator::JOB_ITEM_STATE_PRIMARY_REVIEW] = [
+    'label' => t('Primary review'),
+    'type' => 'translator_state',
+    'icon' => drupal_get_path('module', 'tmgmt_thebigword') . '/icons/primary.svg',
+    'weight' => 3,
+    'show_job_filter' => TRUE,
+  ];
+  $definitions[ThebigwordTranslator::JOB_ITEM_STATE_SECONDARY_REVIEW] = [
+    'label' => t('Secondary review'),
+    'type' => 'translator_state',
+    'icon' => drupal_get_path('module', 'tmgmt_thebigword') . '/icons/secondary.svg',
+    'weight' => 4,
+    'show_job_filter' => TRUE,
+  ];
+}
+
+/**
+ * Implements hook_entity_operation().
+ */
+function tmgmt_thebigword_entity_operation(\Drupal\Core\Entity\EntityInterface $entity) {
+  if ($entity instanceof JobItemInterface && $entity->hasTranslator() && $entity->getTranslatorPlugin() instanceof ThebigwordTranslator) {
+
+    $translator_plugin = $entity->getTranslatorPlugin();
+
+    if ($translator_plugin->userHasExternalReviewAccess($entity, \Drupal::currentUser())) {
+      $url = Url::fromRoute('tmgmt_thebigword.review_redirect', ['tmgmt_job_item' => $entity->id()])
+        ->setOption('attributes', ['target' => '_blank']);
+      return [
+        'thebigword_external_review' => [
+          'title' => t('External review'),
+          'url' => $url,
+          'weight' => -50,
+
+        ]
+      ];
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ */
+function tmgmt_thebigword_preprocess_tmgmt_progress_bar(&$variables) {
+  if (!empty($variables['entity'])) {
+    $entity = $variables['entity'];
+
+    $external_review_states = [ThebigwordTranslator::JOB_ITEM_STATE_PRIMARY_REVIEW, ThebigwordTranslator::JOB_ITEM_STATE_SECONDARY_REVIEW];
+
+    if ($entity instanceof JobInterface && $entity->hasTranslator() && $entity->getTranslatorPlugin() instanceof ThebigwordTranslator) {
+      $variables['#attached']['library'] = ['tmgmt_thebigword/progress'];
+      $results = \Drupal::entityQueryAggregate('tmgmt_job_item')
+        ->aggregate('count_pending', 'SUM')
+        ->groupBy('translator_state')
+        ->condition('translator_state', $external_review_states, 'IN')
+        ->condition('tjid', $entity->id())
+        ->execute();
+
+      if ($results) {
+        $thebigword_parts = [
+          ThebigwordTranslator::JOB_ITEM_STATE_PRIMARY_REVIEW => [
+            'count' => 0,
+            'width' => 0,
+          ],
+          ThebigwordTranslator::JOB_ITEM_STATE_SECONDARY_REVIEW => [
+            'count' => 0,
+            'width' => 0,
+          ],
+        ];
+
+        foreach ($results as $result) {
+          $thebigword_parts[$result['translator_state']]['count'] = $result['count_pending_sum'];
+          $thebigword_parts[$result['translator_state']]['width'] = $result['count_pending_sum'] / $variables['total'] * 100;
+          $variables['parts']['pending']['count'] -= $result['count_pending_sum'];
+        }
+        $variables['parts']['pending']['width'] = $variables['parts']['pending']['count'] / $variables['total'] * 100;
+
+        $pending = $variables['parts']['pending'];
+        unset($variables['parts']['pending']);
+        $variables['parts'] = ['pending' => $pending] + $thebigword_parts + $variables['parts'];
+
+        $counts = array(
+          '@pending' => $variables['parts']['pending']['count'],
+          '@primary' => $variables['parts'][ThebigwordTranslator::JOB_ITEM_STATE_PRIMARY_REVIEW]['count'],
+          '@secondary' => $variables['parts'][ThebigwordTranslator::JOB_ITEM_STATE_SECONDARY_REVIEW]['count'],
+          '@translated' => $variables['parts']['translated']['count'],
+          '@reviewed' => $variables['parts']['reviewed']['count'],
+          '@accepted' => $variables['parts']['accepted']['count'],
+        );
+
+        $variables['title'] = t('Pending: @pending, Primary review: @primary, Secondary review: @secondary, translated: @translated, reviewed: @reviewed, accepted: @accepted.', $counts);
+      }
+    }
+    if ($entity instanceof JobItemInterface && $entity->hasTranslator() && $entity->getTranslatorPlugin() instanceof ThebigwordTranslator) {
+      $variables['#attached']['library'] = ['tmgmt_thebigword/progress'];
+      if (in_array($entity->getTranslatorState(), $external_review_states)) {
+        $variables['parts'] = [
+          $entity->getTranslatorState() => [
+            'count' => $variables['total'],
+            'width' => 100,
+          ],
+        ];
+
+        $variables['title'] = t('Ready for external review.');
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_field_access().
+ */
+function tmgmt_thebigword_entity_field_access($operation, FieldDefinitionInterface $field_definition, AccountInterface $account, FieldItemListInterface $items = NULL) {
+  if ($field_definition->getName() == 'tmgmt_thebigword_skills') {
+    // Allow access to the field if the user being edited has permissions to
+    // do reviews and the current user has permission to configure the field.
+    if ($operation == 'edit' && $items && $items->getEntity() instanceof UserInterface) {
+      /** @var \Drupal\user\UserInterface $user */
+      $user = $items->getEntity();
+      $user_has_review_access = $user->hasPermission('access tmgmt thebigword primary review') || $user->hasPermission('access tmgmt thebigword secondary review');
+      return AccessResult::forbiddenIf(!$user_has_review_access || !$account->hasPermission('configure tmgmt thebigword language skills'));
+    }
+  }
+
+  return AccessResult::neutral();
+}
