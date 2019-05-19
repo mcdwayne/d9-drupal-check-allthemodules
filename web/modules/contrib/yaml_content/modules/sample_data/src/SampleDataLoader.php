@@ -1,0 +1,259 @@
+<?php
+
+namespace Drupal\sample_data;
+
+use Drupal\Component\Serialization\SerializationInterface;
+use Drupal\taxonomy\Entity\Term;
+
+/**
+ * Provides methods for retrieving sample data to be used in demo content.
+ */
+class SampleDataLoader {
+
+  /**
+   * A plugin manager service to load data generator plugins.
+   *
+   * @var DataGeneratorPluginManager
+   */
+  protected $pluginManager;
+
+  /**
+   * A content data parser to interpret data from content files.
+   *
+   * @var \Drupal\Component\Serialization\SerializationInterface
+   */
+  protected $decoder;
+
+  protected $data;
+
+  /**
+   * SampleData constructor.
+   *
+   * @param \Drupal\sample_data\DataGeneratorPluginManager $plugin_manager
+   *   The plugin manager to load data generator plugins from.
+   * @param \Drupal\Component\Serialization\SerializationInterface $decoder
+   *   The serialization service to use for parsing content files.
+   */
+  public function __construct(DataGeneratorPluginManager $plugin_manager, SerializationInterface $decoder) {
+    $this->pluginManager = $plugin_manager;
+    $this->decoder = $decoder;
+  }
+
+  /**
+   * Load a data set from a given file.
+   *
+   * @param string $file
+   *   The fully qualified filename and path to be loaded.
+   *
+   * @return \Drupal\sample_data\SampleDataSet
+   *   A loaded sample data set.
+   */
+  public function loadDataSet($file) {
+    if (!isset($this->data[$file])) {
+      $data = $this->decoder->decode(file_get_contents($file));
+      $this->data[$file] = new SampleDataSet($data);
+    }
+
+    return $this->data[$file];
+  }
+
+  /**
+   * Load sample data based on type and additional parameters.
+   *
+   * @param string $data_type
+   *   The type of sample data to be loaded. This is used to determine functions
+   *   and/or plugins to be loaded and used.
+   * @param array $params
+   *   Configuration parameters to be passed through to the content plugin.
+   *
+   * @return mixed|false
+   *   The loaded sample data item or FALSE if unable to load.
+   */
+  public function loadSample($data_type, array $params = []) {
+    $sample = FALSE;
+
+    $plugin = $this->loadPluginByDataType($data_type, $params);
+
+    if ($plugin) {
+      return $plugin->execute();
+    }
+
+    switch ($data_type) {
+      case 'term':
+        $sample = $this->getTerm($params['name'], $params['vocabulary']);
+        break;
+
+      case 'short_text':
+        $sample = $this->getLipsum(20);
+        break;
+
+      case 'rich_text':
+        // @todo Support addition of markup.
+        $sample = $this->getLipsum(200);
+        break;
+
+      case 'image':
+        // @todo Handle missing width and height parameters.
+        $sample = $this->getImage($params['width'], $params['height']);
+        break;
+
+      case 'file':
+        $sample = $this->getFile($params['path'], $params['src']);
+        break;
+
+      default:
+        // @todo Handle unsupported data type.
+    }
+
+    return $sample;
+  }
+
+  public function loadPluginByDataType($data_type, array $configuration = []) {
+    // @todo Handle data types that cannot be found.
+    $definition = $this->findPluginByDataType($data_type);
+
+    if ($definition) {
+      return $this->loadPlugin($definition->id, $configuration);
+    }
+    else {
+      return FALSE;
+    }
+  }
+
+  public function loadPlugin($plugin_id, array $configuration = []) {
+    // @todo Validate any required contexts or configuration.
+    $plugin = $this->pluginManager->createInstance($plugin_id, $configuration);
+
+    return $plugin;
+  }
+
+  public function findPluginByDataType($data_type) {
+    $plugins = $this->pluginManager->getDefinitionsByDataType($data_type);
+
+    if (!empty($plugins)) {
+      return $plugins;
+    }
+  }
+
+  /**
+   * Helper function to retrieve files.
+   *
+   * @param string $file_path
+   *   File destination path.
+   * @param string $file_src
+   *   File source path.
+   *
+   * @return \Drupal\file\FileInterface|false
+   *   A file entity, or FALSE on error.
+   */
+  public static function getFile($file_path, $file_src) {
+    $file = file_get_contents($file_src);
+    $destination = \Drupal::service('file_system')->dirname("public://$file_path");
+    file_prepare_directory($destination, FILE_CREATE_DIRECTORY);
+    return file_save_data(
+      $file,
+      "public://$file_path", FILE_EXISTS_REPLACE
+    );
+  }
+
+  /**
+   * Helper function to fetch images.
+   *
+   * @param string $width
+   *   The width of the image to fetch.
+   * @param string $height
+   *   The height of the image to fetch.
+   * @param string $ext
+   *   The extension to use for fetching the image.
+   *
+   * @return \Drupal\file\FileInterface|false
+   *   The file entity that was created.
+   */
+  public static function getImage($width, $height, $ext = 'png') {
+    $image = file_get_contents("http://placehold.it/$width" . 'x' . $height);
+    return file_save_data(
+      $image,
+      "public://$width" . 'x' . "$height.$ext", FILE_EXISTS_REPLACE);
+  }
+
+  /**
+   * Helper function for theme images.
+   *
+   * @param string $file_path
+   *   The destination filename.
+   * @param string $file_src
+   *   The uri to the theme file in the format 'directory/image.jpg'.
+   *
+   * @return \Drupal\file\FileInterface|false
+   *   A file entity, or FALSE on error.
+   */
+  public function getThemeFile($file_path, $file_src) {
+    return static::getFile($file_path,
+      drupal_get_path('theme', $this->srcTheme) . '/' . $file_src);
+  }
+
+  /**
+   * Helper function to generate random Lorem Ipsum content.
+   *
+   * @param int $length
+   *   The integer length of the content to generate.
+   * @param bool $capitalize
+   *   Whether to capitalize the return Lorem ipsum.
+   *
+   * @return string
+   *   The string of content, $length characters long.
+   */
+  public static function getLipsum($length = 200, $capitalize = TRUE) {
+    $lorem_ipsum = file_get_contents(__DIR__ . '/lipsum.txt');
+    $lipsum_count = strlen($lorem_ipsum);
+    $rand_start = max(0, random_int(0, $lipsum_count - $length));
+    $start = $rand_start ? strpos($lorem_ipsum, ' ', $rand_start) + 1 : 0;
+    $lipsum = preg_replace('/^[\W_]+|[\W_]+$/', '',
+      substr($lorem_ipsum, $start, $length));
+    $lipsum = $capitalize ? ucfirst($lipsum) : $lipsum;
+    $missing_char = $length - strlen($lipsum);
+    return $missing_char ? $lipsum . SampleDataLoader::getLipsum($missing_char, FALSE) : $lipsum;
+  }
+
+  /**
+   * Helper function to get or create a term.
+   *
+   * @param string $term_name
+   *   The name of the term.
+   * @param string $vocabulary
+   *   The term vocabulary.
+   *
+   * @return int
+   *   The id of the term.
+   */
+  public static function getTerm($term_name, $vocabulary) {
+    if ($terms = taxonomy_term_load_multiple_by_name($term_name, $vocabulary)) {
+      $term = reset($terms);
+    }
+    else {
+      $term = Term::create([
+        'name' => $term_name,
+        'vid' => $vocabulary,
+      ]);
+      $term->save();
+    }
+
+    return $term->id();
+  }
+
+  /**
+   * Helper function to convert non-alphanumeric characters into dash.
+   *
+   * @param string $str
+   *   The string to convert.
+   * @param string $replace
+   *   The string to replace non-alphanumeric characters.
+   *
+   * @return string
+   *   The converted string.
+   */
+  public static function slugify($str, $replace = '-') {
+    return preg_replace("/[^a-z0-9]/", $replace, strtolower($str));
+  }
+
+}
