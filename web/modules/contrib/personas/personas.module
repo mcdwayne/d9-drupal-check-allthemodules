@@ -1,0 +1,189 @@
+<?php
+
+/**
+ * @file
+ * Contains personas.module..
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\user\UserInterface;
+use Drupal\user\RoleInterface;
+use Drupal\personas\Entity\Persona;
+use Drupal\personas\PersonaUtility;
+
+/**
+ * Implements hook_help().
+ */
+function personas_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the personas module.
+    case 'help.page.personas':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Personas provides an abstraction on top of Drupal&#039;s role system. It promotes best practices and simplifies permissions management.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_entity_base_field_info().
+ *
+ * Attaches a field to the user entity on which to store personas.
+ */
+function personas_entity_base_field_info(EntityTypeInterface $entity_type) {
+  if ($entity_type->id() != 'user') {
+    return;
+  }
+
+  $fields = [];
+  $fields['personas'] = BaseFieldDefinition::create('entity_reference')
+    ->setLabel(t('Personas'))
+    ->setCardinality(BaseFieldDefinition::CARDINALITY_UNLIMITED)
+    ->setDescription(t('The personas the user has.'))
+    ->setSetting('target_type', 'persona')
+    ->setDisplayConfigurable('view', TRUE);
+
+  return $fields;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Adds a form element for saving user personas and disables access to the roles
+ * element.
+ */
+function personas_form_user_form_alter(&$form, FormStateInterface $form_state) {
+  $user = Drupal::currentUser();
+  $account = $form_state->getFormObject()->getEntity();
+
+  $personas = personas_get_names();
+  $current = $account->get('personas')->getValue();
+  if (!empty($current)) {
+    $current = array_column($current, 'target_id');
+  }
+
+  $form['account']['personas'] = [
+    '#type' => 'checkboxes',
+    '#title' => t('Personas'),
+    '#default_value' => $current,
+    '#options' => $personas,
+    '#access' => !empty($personas) && $user->hasPermission('assign personas'),
+  ];
+
+  $form['account']['roles']['#access'] = FALSE;
+
+  $form['#entity_builders'][] = 'personas_user_builder';
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update().
+ *
+ * Adds and removes user roles for all users with the updated persona.
+ */
+function personas_persona_update(EntityInterface $persona) {
+  $current_roles = $persona->getRoles();
+  $original_roles = $persona->original->getRoles();
+
+  $skip_roles = [RoleInterface::ANONYMOUS_ID, RoleInterface::AUTHENTICATED_ID];
+  $add_roles = array_diff($current_roles, $original_roles, $skip_roles);
+  $remove_roles = array_diff($original_roles, $current_roles, $skip_roles);
+
+  // If there are no roles to update, return and do nothing.
+  if (empty($add_roles) && empty($remove_roles)) {
+    return;
+  }
+
+  $batch_processor = Drupal::getContainer()->get('personas.batch_processor');
+  $batch_processor->process($persona);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_presave().
+ *
+ * Updates the user roles to save for a user based on the user's persona(s).
+ */
+function personas_user_presave(EntityInterface $user) {
+  // Gets a list of roles from the set personas.
+  $persona_roles = PersonaUtility::rolesFromUserPersonas($user);
+  // Gets a list of roles currently on the user.
+  $user_roles = $user->getRoles();
+  // Ignore these roles since the user module handles them specially.
+  $skip_roles = [RoleInterface::ANONYMOUS_ID, RoleInterface::AUTHENTICATED_ID];
+
+  // Compiles lists of roles to add and to remove from the user.
+  $add_roles = array_diff($persona_roles, $user_roles, $skip_roles);
+  $remove_roles = array_diff($user_roles, $persona_roles, $skip_roles);
+
+  // Do add the roles that are part of the personas but not yet on the user.
+  array_walk($add_roles, function ($role) use ($user) {
+    $user->addRole($role);
+  });
+
+  // Do remove the roles not specified by any persona on the user.
+  array_walk($remove_roles, function ($role) use ($user) {
+    $user->removeRole($role);
+  });
+}
+
+/**
+ * Maps form values to the user entity.
+ *
+ * @param string $entity_type
+ *   The entity type id of the given entity.
+ * @param \Drupal\user\UserInterface $user
+ *   The user entity on which to attach form values.
+ * @param array $form
+ *   The current form array.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   The current form state.
+ */
+function personas_user_builder($entity_type, UserInterface $user, array &$form, FormStateInterface $form_state) {
+  $value = array_values(array_filter($form_state->getValue('personas')));
+  $user->set('personas', $value);
+}
+
+/**
+ * Retrieves an array of personas matching specified conditions.
+ *
+ * @param string[] $filter_roles
+ *   (optional) List of user_role ids that should be present in the returned
+ *   personas.
+ *
+ * @return \Drupal\personas\PersonaInterface[]
+ *   A list of personas matching the filter criteria.
+ */
+function personas_get(array $filter_roles = []) {
+  $personas = Persona::loadMultiple();
+
+  if (!empty($filter_roles)) {
+    $personas = array_filter($personas, function ($persona) use ($filter_roles) {
+      $match = array_intersect($persona->getRoles(), array_flip($filter_roles));
+      return count($filter_roles) == count($match);
+    });
+  }
+
+  return $personas;
+}
+
+/**
+ * Retrieves an array of persona names matching specified conditions.
+ *
+ * @param string[] $filter_roles
+ *   (optional) List of user_role ids that should be present in the returned
+ *   persona names.
+ *
+ * @return array
+ *   An associative array of persona names matching the filter criteria, keyed
+ *   by its persona type id.
+ */
+function personas_get_names(array $filter_roles = []) {
+  return array_map(function ($persona) {
+    return $persona->label();
+  }, personas_get($filter_roles));
+}
