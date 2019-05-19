@@ -1,0 +1,200 @@
+<?php
+
+/**
+ * @file
+ * Contains votingapi_queue module.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\votingapi_queue\Plugin\QueueWorker\VotingapiQueueWorker;
+use Drupal\Core\Routing\RouteMatchInterface;
+
+/**
+ * Implements hook_help().
+ *
+ * @inheritdoc
+ */
+function votingapi_queue_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.votingapi_queue':
+      $text = file_get_contents(dirname(__FILE__) . "/README.md");
+      if (!\Drupal::moduleHandler()->moduleExists('markdown')) {
+        return '<pre>' . $text . '</pre>';
+      }
+      else {
+        // Use the Markdown filter to render the README.
+        $filter_manager = \Drupal::service('plugin.manager.filter');
+        $settings = \Drupal::configFactory()->get('markdown.settings')->getRawData();
+        $config = array('settings' => $settings);
+        $filter = $filter_manager->createInstance('markdown', $config);
+        return $filter->process($text, 'en');
+      }
+  }
+  return NULL;
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Recalculate results for any entities that have gotten votes since the last
+ * run.
+ */
+function votingapi_queue_cron() {
+  $config = \Drupal::config('votingapi.settings');
+  if ($config->get('calculation_schedule') == 'manual'
+    && $config->get('queue_cron_populate')
+  ) {
+    $limit = $config->get('queue_add_limit');
+    if (!$limit) {
+      $limit = VotingapiQueueWorker::DEFAULT_ADD_LIMIT;
+    }
+    _votingapi_queue_populate($limit);
+  }
+}
+
+/**
+ * Adds items for processing to votingapi queue.
+ *
+ * @param int|false $limit
+ *   Maximum entries to be added in one run. If false is passed all items
+ *   available will be added.
+ */
+function _votingapi_queue_populate($limit) {
+  $state = \Drupal::state();
+  if (FALSE === $limit) {
+    $results = votingapi_queue_get_votes_since_moment(FALSE);
+    foreach ($results as $result) {
+      votingapi_queue_add($result['entity_type'], $result['entity_id'], $result['type']);
+    }
+    $state->delete('votingapi.queue_next_page');
+    $state->set('votingapi.queue_last_run', REQUEST_TIME);
+  }
+  else {
+    $next_page = $state->get('votingapi.queue_next_page', 0);
+    // Check if the last cron was able to add all items. If items are left to be
+    // process, get the next page of items.
+    if ($next_page) {
+      $start = $limit * $next_page;
+    }
+    else {
+      $start = 0;
+    }
+
+    // Try to get at least one more item in order to see if there is more left
+    // to process.
+    $results = votingapi_queue_get_votes_since_moment($limit + 1, $start);
+
+    $more_items_to_process = FALSE;
+    $i = 1;
+    foreach ($results as $result) {
+      if ($i > $limit) {
+        $more_items_to_process = TRUE;
+        break;
+      }
+      votingapi_queue_add($result['entity_type'], $result['entity_id'], $result['type']);
+      $i++;
+    }
+
+    if ($more_items_to_process) {
+      $next_page++;
+      $state->set('votingapi.queue_next_page', $next_page);
+    }
+    else {
+      $state->delete('votingapi.queue_next_page');
+      $state->set('votingapi.queue_last_run', REQUEST_TIME);
+    }
+  }
+}
+
+/**
+ * Returns a list of voted entities since last run.
+ *
+ * @param int|false $limit
+ *   Maximum entries to be returned. If false all items will be returned.
+ * @param int $range_start
+ *   Offset.
+ *
+ * @return array
+ *   array containing entity_type_id, entity_id, vote_type, empty array if no
+ *   results are returned.
+ */
+function votingapi_queue_get_votes_since_moment($limit = 100, $range_start = 0) {
+  $last_cron = \Drupal::state()->get('votingapi.queue_last_run', 0);
+  $entity_query = \Drupal::entityQueryAggregate('vote')
+    ->condition('timestamp', $last_cron, '>')
+    ->groupBy('entity_type')
+    ->groupBy('entity_id')
+    ->groupBy('type');
+  if (FALSE !== $limit) {
+    $entity_query->range($range_start, $limit);
+  }
+  return $entity_query->execute();
+}
+
+/**
+ * Adds a queue item and store it directly to the votingapi_queue.
+ *
+ * @param string $entity_type_id
+ *   Voted entity type id.
+ * @param int $entity_id
+ *   Entity id of voted entity.
+ * @param string $vote_type
+ *   Vote type of the casted vote.
+ *
+ * @return int|false
+ *   A unique ID if the item was successfully created and was (best effort)
+ *   added to the queue, otherwise FALSE. We don't guarantee the item was
+ *   committed to disk etc, but as far as we know, the item is now in the
+ *   queue.
+ *
+ * @see \Drupal\Core\Queue\QueueInterface::createItem()
+ */
+function votingapi_queue_add($entity_type_id, $entity_id, $vote_type) {
+  $queue = \Drupal::queue('votingapi_queue');
+  $item = [
+    'entity_type_id' => $entity_type_id,
+    'entity_id' => $entity_id,
+    'vote_type' => $vote_type,
+  ];
+  return $queue->createItem($item);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Adds votingapi_queue specific entries to votingapi settings form.
+ */
+function votingapi_queue_form_votingapi_settings_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $config = \Drupal::config('votingapi.settings');
+  $limit = $config->get('queue_add_limit');
+  if (!$limit) {
+    $limit = VotingapiQueueWorker::DEFAULT_ADD_LIMIT;
+  }
+  $form['queue_add_limit'] = [
+    '#type' => 'number',
+    '#title' => t('Maximum number of entries to be added to queue for each run.'),
+    '#default_value' => $form_state->getValue('queue_add_limit', $limit),
+    '#min' => 1,
+  ];
+  $form['queue_cron_populate'] = [
+    '#type' => 'checkbox',
+    '#title' => t("Add votingapi queue entries on cron (there is a drush alternative available)."),
+    '#default_value' => $form_state->getValue('queue_cron_populate', TRUE),
+  ];
+  $form['#submit'][] = 'votingapi_queue_settings_submit';
+}
+
+/**
+ * Submit handler to save extended settings.
+ *
+ * @param array $form
+ *   Form API form.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   Form State.
+ */
+function votingapi_queue_settings_submit(array &$form, FormStateInterface $form_state) {
+  $config = \Drupal::configFactory()->getEditable('votingapi.settings');
+  $config->set('queue_add_limit', $form_state->getValue('queue_add_limit', VotingapiQueueWorker::DEFAULT_ADD_LIMIT));
+  $config->set('queue_cron_populate', $form_state->getValue('queue_cron_populate', TRUE));
+  $config->save();
+}
