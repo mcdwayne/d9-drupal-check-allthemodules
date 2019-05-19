@@ -1,0 +1,426 @@
+<?php
+/**
+ * @file
+ * WAYF.dk Login.
+ */
+
+use Drupal\wayf_dk_login\WAYF;
+
+/**
+ * Implements hook_theme().
+ */
+function wayf_dk_login_theme($existing, $type, $theme, $path) {
+
+  $template_path = drupal_get_path('module', 'wayf_dk_login') . '/templates';
+
+  return array(
+    'wayf_dk_login' => array(
+      'variables' => array('icon' => '', 'login_url' => '/wayf/consume'),
+      'template' => 'wayf_dk_login',
+      'path' => $template_path,
+    ),
+  );
+}
+
+/**
+ * @inheritdoc
+ */
+function wayf_dk_login_help($route_name, \Drupal\Core\Routing\RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'admin/help#wayf_dk_login':
+      $output = '<p>' . t('Implements WAYF.dk login.') . '</p>';
+      return $output;
+  }
+}
+
+/**
+ * @inheritdoc
+ */
+function wayf_dk_login_user_cancel($edit, $account, $method) {
+  if ($method == 'user_cancel_delete') {
+    db_delete('wayf_dk_login')
+      ->condition('uid', $account->id())
+      ->execute();
+  }
+}
+
+/**
+ * Generate metadata based on configuration.
+ *
+ * @return string
+ *   XML string with the metadata.
+ */
+function wayf_dk_login__generate_metadata() {
+  $config = $config = \Drupal::config('wayf_dk_login.settings');
+
+  // Set library configuration.
+  $config = array(
+    'cert' => str_replace("\r\n", '', $config->get('sp_cert')),
+    'asc' => $config->get('sp_endpoint'),
+    'logout_redirect' => $config->get('sp_logout_endpoint'),
+    'entityid' => $config->get('sp_entityid'),
+    'contact' => array(
+      'name' => $config->get('sp_contact_name'),
+      'mail' => $config->get('sp_contact_mail'),
+    ),
+    'organization' => array(
+      'language' => $config->get('sp_organizations_name_language'),
+      'name' => $config->get('sp_organizations_name'),
+      'displayname' => $config->get('sp_organizations_displayname'),
+      'url' => $config->get('sp_organizations_url'),
+    ),
+  );
+  $sporto = new WAYF\SPorto($config);
+
+  return $sporto->getMetadata();
+}
+
+/**
+ * Implements hook_wayf_dk_login_create_user();
+ */
+function wayf_dk_login_wayf_dk_login_create_user($attributes) {
+  // eduPersonTargetedID is a persistent, non-reassigned, privacy-preserving
+  // identifier designed to provide a service provider with a unique
+  // identifier for a logged in person while preserving the person's privacy.
+  $edu_person_targeted_id = $attributes['eduPersonTargetedID'][0];
+
+  // eduPersonPrincipalName is the The "NetID" of the person for the purposes
+  // of inter-institutional authentication. It should be represented in the
+  // form "user@scope" where scope defines a local security domain.
+  $edu_person_principal_name = $attributes['eduPersonPrincipalName'][0];
+
+  // The following code is based on user_external_login_register that does
+  // not allow the external identifier to be different from drupal username.
+  $account = wayf_dk_login_load_account($edu_person_targeted_id);
+
+  if (!$account) {
+    $account = wayf_dk_login_create_account($edu_person_targeted_id, $attributes);
+
+    // Save eduPersonTargetedID -> uid mapping.
+    if ($account) {
+      $record = array(
+        'edu_person_targeted_id' => $edu_person_targeted_id,
+        'uid' => $account->id(),
+      );
+      db_insert('wayf_dk_login')->fields($record)->execute();
+    }
+
+  }
+
+  if ($account) {
+    user_login_finalize($account);
+  } else {
+    drupal_set_message(t("Login failed."), 'error');
+    \Drupal::logger('wayf_dk_login')->info("Login failed : %name.", array('%name' => $edu_person_principal_name));
+  }
+}
+
+/**
+ * Load user account.
+ *
+ * @param $edu_person_targeted_id
+ *
+ * @return bool|null|static
+ */
+function wayf_dk_login_load_account($edu_person_targeted_id) {
+  $uid = db_query('SELECT uid FROM {wayf_dk_login} WHERE edu_person_targeted_id = :eptid',
+    array(':eptid' => $edu_person_targeted_id))->fetchField();
+  if ($uid) {
+    return Drupal\user\Entity\User::load($uid);
+  } else {
+    return FALSE;
+  }
+}
+/**
+ * Create new user account.
+ *
+ * @param $edu_person_targeted_id
+ * @param $attributes
+ *
+ * @return \Symfony\Component\HttpFoundation\RedirectResponse|static
+ */
+function wayf_dk_login_create_account($edu_person_targeted_id, $attributes) {
+  // Create a user entity.
+  $userinfo = array();
+  $userinfo['name'] = $edu_person_targeted_id;
+  $userinfo['mail'] = $attributes['mail'][0];
+  $userinfo['pass'] = user_password();
+  $userinfo['status'] = 1;
+
+  $account = Drupal\user\Entity\User::create($userinfo);
+  wayf_dk_login__map_fields($attributes, $account);
+  $account->enforceIsNew();
+  $account->save();
+
+  // Terminate if an error occurred during user_save().
+  if (!$account) {
+    drupal_set_message(t("Error saving user account."), 'error');
+    \Drupal::logger('wayf_dk_login')->error('Error saving user account : %name.', array('%name' => $edu_person_targeted_id));
+    return new \Symfony\Component\HttpFoundation\RedirectResponse('<front>');
+  }
+
+  \Drupal::logger('wayf_dk_login')->error('New account created : %name.', array('%name' => $edu_person_targeted_id));
+
+  return $account;
+}
+
+/**
+ * Implements hook_user_logout().
+ *
+ * Ensures that the WAYF logout function is called on user logout.
+ */
+function wayf_dk_login_user_logout() {
+  // Load configuration.
+  $config = \Drupal::config('wayf_dk_login.settings');
+
+  // Set library configuration.
+  $sportoConfig = array(
+    'idp_certificate' => $config->get('idp_certificate'),
+    'sso' => $config->get('idp_sso'),
+    'slo' => $config->get('idp_slo'),
+    'private_key' => $config->get('sp_key'),
+    'asc' => $config->get('sp_endpoint'),
+    'entityid' => $config->get('sp_entityid'),
+  );
+
+  // Check if the user maybe logged into WAYF.
+  $sporto = new WAYF\SPorto($sportoConfig);
+  if ($sporto->isLoggedIn()) {
+    // Give other an change to clean up.
+    \Drupal::moduleHandler()->invokeAll('wayf_dk_login_pre_logout');
+
+    // Send logout message.
+    $sporto->logout();
+  }
+}
+
+/**
+ * Check if user is mapped in the WAYF table.
+ *
+ * @return bool
+ */
+function wayf_dk_login_current_user_wayf_mapped() {
+  $account = \Drupal::currentUser();
+  $status = db_query('SELECT count(*) FROM {wayf_dk_login} WHERE uid = :uid',
+      array(':uid' => $account->id()))->fetchField();
+  return $status == 1;
+}
+
+/**
+ * Map fields from released attributes to user fields.
+ */
+function wayf_dk_login__map_fields($attributes, &$account) {
+  $mapping = \Drupal::config('wayf_dk_login.settings')->get('mapping');
+  foreach ($mapping as $field_name => $source) {
+    if (!empty($source) && !empty($attributes[$source][0])) {
+      $account->$field_name = $attributes[$source][0];
+    }
+  }
+}
+
+/**
+ * Function wayf_dk_login__icons.
+ *
+ * @return array
+ *   Returns array with icons file names.
+ */
+function wayf_dk_login__icons() {
+  return array(
+    'UK_01.png',
+    'UK_02.png',
+    'UK_03.png',
+    'UK_04.png',
+    'UK_05.png',
+    'UK_01G.png',
+    'UK_02G.png',
+    'UK_03G.png',
+    'UK_04G.png',
+    'UK_05G.png',
+    'wayf_logo.png',
+  );
+}
+
+/**
+ * Function wayf_dk_login__icon_size.
+ *
+ * @param string $icon
+ *   The filename of the icon to return size of.
+ *
+ * @return string
+ *   Width/height attributes.
+ */
+function wayf_dk_login__icon_size($icon) {
+  switch ($icon) {
+    case 'UK_01G.png':
+      return (object) array('width' => 83, 'height' => 34);
+
+    case 'UK_01.png':
+      return (object) array('width' => 79, 'height' => 34);
+
+    case 'UK_02G.png':
+      return (object) array('width' => 79, 'height' => 41);
+
+    case 'UK_02.png':
+      return (object) array('width' => 79, 'height' => 41);
+
+    case 'UK_03G.png':
+      return (object) array('width' => 93, 'height' => 25);
+
+    case 'UK_03.png':
+      return (object) array('width' => 94, 'height' => 26);
+
+    case 'UK_04G.png':
+      return (object) array('width' => 57, 'height' => 25);
+
+    case 'UK_04.png':
+      return (object) array('width' => 58, 'height' => 24);
+
+    case 'UK_05G.png':
+      return (object) array('width' => 71, 'height' => 31);
+
+    case 'UK_05.png':
+      return (object) array('width' => 71, 'height' => 31);
+
+    case 'wayf_logo.png':
+      return (object) array('width' => 125, 'height' => 65);
+  }
+}
+
+/**
+ * Function wayf_dk_login_form_user_login_alter.
+ *
+ * @param [array] $form
+ *   form array
+ * @param [array] $form_state
+ *   form state array
+ */
+
+function wayf_dk_login_form_user_login_form_alter(&$form, &$form_state) {
+
+  $config = \Drupal::config('wayf_dk_login.settings');
+
+  if ($config->get('alter_login_form')) {
+    $icon_path = drupal_get_path('module', 'wayf_dk_login') . '/icons/' . $config->get('icon');
+    $icon_size = wayf_dk_login__icon_size($config->get('icon'));
+    $form['wayf_login'] = array(
+      '#weight' => 1000,
+      '#type' => 'markup',
+      '#markup' => '<div class="wayf-dk-login"><span class="wayf-dk-label">' . t('Login with')
+      . '</span> <a class="wayf-login-link" href="/wayf/consume">'
+      . '<img src="/' . $icon_path . '" width=' . $icon_size->width
+      . ' height=' . $icon_size->height . ' class="wayf-logo">'
+      . '</a></div>',
+    );
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Remove the current password field from the user_profile_form form (user/%/edit).
+ */
+function wayf_dk_login_form_user_form_alter(&$form, &$form_state) {
+  $config = \Drupal::config('wayf_dk_login.settings');
+  
+  if (wayf_dk_login_current_user_wayf_mapped()) {
+    if ($config->get('validate_current_pass_disable')) {
+      // searches the #validate array for the current_pass validation function, and removes it
+      $key = array_search('user_validate_current_pass', $form['#validate']);
+      if ($key !== FALSE) {
+        unset($form['#validate'][$key]);
+      }
+      // hide the current password fields
+      $form['account']['current_pass_required_value']['#access'] = FALSE;
+      $form['account']['current_pass']['#access'] = FALSE;
+    }
+    if ($config->get('pass_disable')) {
+      $form['account']['pass']['#access'] = FALSE;
+    }
+  }
+}
+
+/**
+ * Function wayf_dk_login__get_ipd_metadata.
+ *
+ * @param string $mode
+ *   string with mode : test, qa or production.
+ *
+ * @return object
+ *   Object with the service providers certificate og location.
+ */
+function wayf_dk_login__get_ipd_metadata($mode) {
+  $metadata_url = '';
+  switch ($mode) {
+    case 'test':
+      $metadata_url = 'https://testbridge.wayf.dk/saml2/idp/metadata.php';
+      break;
+
+    case 'qa':
+      $metadata_url = 'https://betawayf.wayf.dk/saml2/idp/metadata.php';
+      break;
+
+    case 'production':
+      $metadata_url = 'https://wayf.wayf.dk/saml2/idp/metadata.php';
+      break;
+  }
+
+  // Set default information.
+  $info = (object) array(
+    'cert' => '',
+    'sso' => '',
+    'slo' => '',
+  );
+
+  @$metadata = file_get_contents($metadata_url);
+  if ($metadata === FALSE) {
+    drupal_set_message(t('An error occurred, WAYF metadata service not available.'), 'error', FALSE);
+  }
+  else {
+    $xml = simplexml_load_string($metadata);
+    $xml->registerXPathNamespace('md', 'urn:oasis:names:tc:SAML:2.0:metadata');
+    $xml->registerXPathNamespace('ds', 'http://www.w3.org/2000/09/xmldsig#');
+
+    $idpssodescriptor = '/md:EntityDescriptor/md:IDPSSODescriptor';
+    $binding = 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect';
+
+    // Get SignOn and logout urls.
+    $sso = $xml->xpath("$idpssodescriptor/md:SingleSignOnService[@Binding='$binding']/@Location");
+    $slo = $xml->xpath("$idpssodescriptor/md:SingleLogoutService[@Binding='$binding']/@Location");
+
+    // Get certificate data.
+    $cert = $xml->xpath("$idpssodescriptor/md:KeyDescriptor[@use='signing']/ds:KeyInfo/ds:X509Data/ds:X509Certificate");
+
+    // Set information form the meta-date.
+    $info = (object) array(
+      'cert' => (string) $cert[0],
+      'sso' => (string) $sso[0]['Location'],
+      'slo' => (string) $slo[0]['Location'],
+    );
+  }
+
+  return $info;
+}
+
+/**
+ * Import organizations from the WAYF service.
+ */
+function wayf_dk_login__organizations_list() {
+  // Set default values for config which require dynamic values.
+  $config = \Drupal::configFactory()->getEditable('wayf_dk_login.settings');
+
+  // Get list from WAYF.
+  $feed_url = $config->get('sp_organizations_list_url');
+  $content = file_get_contents($feed_url);
+
+  // De-code the data and the test end-point.
+  $data = json_decode($content, TRUE);
+  $data['https://testidp.wayf.dk/module.php/core/loginuserpass.php'] = array(
+    'da' => 'WAYF test-institution (IDP)',
+    'en' => 'WAYF test-institution (IDP)',
+    'schacHomeOrganization' => 'testidp.wayf.dk',
+  );
+
+  // Re-encode to json as config don't allow dot's in any depth in keys.
+  $config->set('sp_organizations_list', json_encode($data));
+  $config->save();
+}
