@@ -1,0 +1,120 @@
+<?php
+
+/**
+ * @file
+ * Contains tumbor_effects.module.
+ */
+
+use Drupal\Component\Plugin\Exception\InvalidPluginDefinitionException;
+use Drupal\Component\Plugin\Exception\PluginNotFoundException;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\StreamWrapper\PublicStream;
+use Drupal\Core\StringTranslation\TranslatableMarkup;
+use Drupal\image\ImageEffectInterface;
+use Drupal\thumbor_effects\Plugin\ImageEffect\ThumborImageEffect;
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_file_url_alter().
+ *
+ * Enables serving image styles directly from Thumbor on the client side instead
+ * of Drupal.
+ *
+ * Note, Drupal still needs to generate and store a derivative in 'file/styles'
+ * to be able to use the correct width and height properties. The first request
+ * to an image style thus results in two calls to Thumbor. One server side and
+ * one on the client side. It is advisable to use a cache warmer.
+ *
+ * @todo check if this works with the crop module and their hash logic.
+ */
+function thumbor_effects_file_url_alter(string &$uri): void {
+  $settings = \Drupal::config('thumbor_effects.settings');
+
+  if (empty($settings->get('serve_via_thumbor'))) {
+    return;
+  }
+
+  $scheme = \Drupal::service('file_system')->uriScheme($uri);
+  if (!$scheme || $scheme !== 'public' || !\preg_match('/\/styles\/(\w*)\//', $uri, $matches)) {
+    return;
+  }
+
+  $style_name = $matches[1];
+
+  try {
+    /* @var \Drupal\image\ImageStyleInterface $image_style */
+    $image_style = \Drupal::entityTypeManager()
+      ->getStorage('image_style')
+      ->load($style_name);
+  }
+  catch (InvalidPluginDefinitionException | PluginNotFoundException $e) {
+    watchdog_exception('thumbor_effects', $e);
+    return;
+  }
+
+  foreach ($image_style->getEffects() as $effect) {
+    if ($effect->getPluginId() === 'thumbor_effects') {
+      $thumbor_image_style_effect = $effect;
+      continue;
+    }
+  }
+
+  if (empty($thumbor_image_style_effect)) {
+    return;
+  }
+
+  $base_uri = str_replace('/styles/' . $style_name . '/' . $scheme . '/', '/', $uri);
+  // Workaround for non-uploads (images in modules and themes).
+  if (strpos($base_uri, 'modules') || strpos($base_uri, 'themes')) {
+    $base_uri = str_replace(PublicStream::basePath() . '/', '/', $base_uri);
+    $base_uri = str_replace( $scheme .'://', '/', $base_uri);
+    $url = Url::fromUserInput($base_uri, ["absolute" => TRUE])->toString();
+  }
+  else {
+    $wrapper = \Drupal::service('stream_wrapper_manager')->getViaUri($base_uri);
+    $url = $wrapper->getExternalUrl();
+  }
+
+  // @todo this needs to be dynamic, which class to use per image?
+  $uri = ThumborImageEffect::getUrl($thumbor_image_style_effect->getConfiguration()['data'], $url);
+
+  // Use a different server for client side calls to Thumbor when set.
+  $thumbor_server_client_side_requests = $settings->get('server_client_side_requests');
+  if ($thumbor_server_client_side_requests) {
+    $uri = str_replace($settings->get('server'), $thumbor_server_client_side_requests, $uri);
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for image_style_edit_form.
+ *
+ * Makes sure that Thumbor Effects are not combined with regular effects.
+ */
+function thumbor_effects_form_image_style_edit_form_alter(array &$form, FormStateInterface $form_state, string $form_id): void{
+  /* @var \Drupal\Core\Entity\EntityFormInterface $form_object */
+  $form_object = $form_state->getFormObject();
+  /* @var \Drupal\image\Entity\ImageStyle $image_style */
+  $image_style = $form_object->getEntity();
+
+  // No effect used yet.
+  $image_effects = iterator_to_array($image_style->getEffects());
+  if (empty($image_effects)) {
+    return;
+  }
+
+  $has_thumbor_effect = \in_array('thumbor_effects', \array_map(function (ImageEffectInterface $effect) {
+    return $effect->getPluginId();
+  }, $image_effects), TRUE);
+
+  if ($has_thumbor_effect) {
+    $form['effects']['new']['effect']['data'] = [
+      '#markup' => '<em>' . new TranslatableMarkup("Thumbor effects can't be combined with other effects.") . '</em>',
+    ];
+  }
+  else {
+    $new = &$form['effects']['new']['effect']['data']['new'];
+    $new['#options'] = array_filter($new['#options'], function ($id) {
+      return $id !== 'thumbor_effects';
+    }, ARRAY_FILTER_USE_KEY);
+  }
+}
