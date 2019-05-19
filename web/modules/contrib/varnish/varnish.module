@@ -1,0 +1,365 @@
+<?php
+/**
+ * @file
+ * varnish.module
+ *
+ * Provide drupal hooks for integration with the Varnish control layer.
+ */
+
+// Cache-clearing behaviour. See config: varnish_cache_clear.
+define('VARNISH_NO_CLEAR', 0);
+define('VARNISH_DEFAULT_CLEAR', 1);
+define('VARNISH_SELECTIVE_CLEAR', 2); // Requires Expire.module to be enabled.
+
+// Timeout in milliseconds.
+define('VARNISH_DEFAULT_TIMEOUT', 100);
+
+// Varnish status: up, down, or failed authentication.
+define('VARNISH_SERVER_STATUS_AUTHENTICATION_FAILURE', -1);
+define('VARNISH_SERVER_STATUS_DOWN', 0);
+define('VARNISH_SERVER_STATUS_UP', 1);
+
+// Type of ban to send to Varnish. See config: varnish_bantype.
+define('VARNISH_BANTYPE_NORMAL', 0);
+define('VARNISH_BANTYPE_BANLURKER', 1);
+define('VARNISH_DEFAULT_BANTYPE', VARNISH_BANTYPE_NORMAL);
+
+
+/**
+ * Implements hook_theme().
+ */
+function varnish_theme() {
+  return [
+    'varnish_status' => [
+      'variables' => ['status' => [], 'version' => 3],
+      'function' => 'build_varnish_status',
+    ]
+  ];
+}
+
+/**
+ * Helper function to quickly flush all caches for the current site.
+ */
+function varnish_purge_all_pages() {
+  $path = base_path();
+  $host = _varnish_get_host();
+  varnish_purge($host, $path);
+}
+
+/**
+ * Helper function to purge items for a host that matches the provided pattern.
+ *
+ * Take care to limit the length of $pattern to params.cli_buffer on your
+ * Varnish server, otherwise Varnish will truncate the command. Use
+ * varnish_purge_paths() to protect you from this, if applicable.
+ *
+ * @param string $host the host to purge.
+ * @param string $pattern the pattern to look for and purge.
+ * @param string $operator (optional) the operator used to match the pattern
+ */
+function varnish_purge($host, $pattern, $operator = '~') {
+  global $base_path, $base_root;
+
+  // Validate operator and fallback to default if not valid
+  if (!in_array($operator, ['==', '!==', '~', '!~', '<', '!<', '>', '!>'])) {
+    $operator = '~';
+  }
+
+  $config = \Drupal::config('varnish.settings');
+
+  $bantype = $config->get('varnish_bantype');
+
+  // Modify the patterns to remove base url and base path.
+  $patterns = explode('|', $pattern);
+  foreach ($patterns as $num => $single_pattern) {
+    if (substr($single_pattern, 1, strlen($base_path)) == $base_path) {
+      $single_pattern = substr_replace($single_pattern, '', 1, strlen($base_path));
+    }
+    if (substr($single_pattern, 1, strlen($base_root)) == $base_root) {
+      $single_pattern = substr_replace($single_pattern, '', 1, strlen($base_root));
+    }
+    $patterns[$num] = $single_pattern;
+  }
+  $pattern = implode('|', $patterns);
+
+  switch ($bantype) {
+    case VARNISH_BANTYPE_NORMAL:
+      _varnish_terminal_run(["ban req.http.host ~ $host && req.url $operator \"$pattern\""]);
+      break;
+    case VARNISH_BANTYPE_BANLURKER:
+      _varnish_terminal_run(["ban obj.http.x-host ~ $host && obj.http.x-url  $operator \"$pattern\""]);
+      break;
+    default:
+      // We really should NEVER get here. Log error. I can only see this
+      // happening if a user switches between different versions of the
+      // module where we remove a ban type.
+      \Drupal::logger('varnish')->error('Varnish ban type is out of range.');
+  }
+}
+
+/**
+ * Helper function that wraps around varnish_purge() and compiles a regular
+ * expression of all paths supplied to it. This function takes care to chunk
+ * commands into no more than 7500 bytes each, to avoid hitting
+ * params.cli_buffer.
+ *
+ * @param string $host The host to purge.
+ * @param array $paths The paths (no leading slash) to purge for this host.
+ */
+function varnish_purge_paths($host, $paths) {
+  $config = \Drupal::config('varnish.settings');
+  // Subtract the hostname length from the global length limit.
+  // Note we use strlen() because we're counting bytes, not characters.
+  $length_limit = $config->get('varnish_cmdlength_limit') - strlen($host);
+  $base_path = base_path();
+  while (!empty($paths)) {
+    // Construct patterns and send them to the server when they're full.
+    $purge_pattern = '^';
+    while (strlen($purge_pattern) < $length_limit && !empty($paths)) {
+      $purge_pattern .= $base_path . array_shift($paths) . '$|^';
+    }
+    // Chop the final "|^" off the string, leaving "$".
+    $purge_pattern = substr($purge_pattern, 0, -2);
+    // Remove extra slashes from beginning of URL
+    $purge_pattern = preg_replace('#/+#', '/', $purge_pattern);
+    // Submit this purge chunk.
+    varnish_purge($host, $purge_pattern);
+  }
+}
+
+/**
+ * Get the status (up/down) of each of the varnish servers.
+ *
+ * @return An array of server statuses, keyed by varnish terminal addresses.
+ * The status will be a numeric constant, either:
+ * - VARNISH_SERVER_STATUS_UP
+ * - VARNISH_SERVER_STATUS_DOWN
+ */
+function varnish_get_status() {
+  $config = \Drupal::config('varnish.settings');
+  // use a static-cache so this can be called repeatedly without incurring
+  // socket-connects for each call.
+  static $results = NULL;
+  if (is_null($results)) {
+    $results = [];
+    $status = _varnish_terminal_run(['status']);
+    $terminals = explode(' ', $config->get('varnish_control_terminal'));
+    foreach ($terminals as $terminal) {
+      if ($status[$terminal] === VARNISH_SERVER_STATUS_AUTHENTICATION_FAILURE) {
+        $results[$terminal] = VARNISH_SERVER_STATUS_AUTHENTICATION_FAILURE;
+      }
+      elseif ($status[$terminal] === FALSE) {
+        $results[$terminal] = VARNISH_SERVER_STATUS_DOWN;
+      }
+      else {
+        $stat = $status[$terminal];
+        $results[$terminal] = ($stat['status']['code'] == 200) ? VARNISH_SERVER_STATUS_UP : VARNISH_SERVER_STATUS_DOWN;
+      }
+    }
+  }
+  return $results;
+}
+
+/**
+ * theme build function for 'varnish_status'.
+ */
+function build_varnish_status($variables) {
+  $status = $variables['status'];
+  $items = [];
+  foreach ($status as $terminal => $state) {
+    list($server, $port) = explode(':', $terminal);
+    if ($state === VARNISH_SERVER_STATUS_UP) {
+      $icon = [
+        '#theme' => 'image',
+        '#uri' => 'core/misc/icons/73b355/check.svg',
+        '#alt' => t("Server OK: @server:@port", ['@server' => $server, '@port' => $port]),
+        '#title' => "{$server}:{$port}",
+      ];
+      $icon_markup = \Drupal::service('renderer')->render($icon);
+      $items[] = t('@status_icon Varnish running.', ['@status_icon' => $icon_markup]);
+    }
+    else {
+      $icon = [
+        '#theme' => 'image',
+        '#uri' => 'core/misc/icons/e32700/error.svg',
+        '#alt' => t("Server down: @server:@port", ['@server' => $server, '@port' => $port]),
+        '#title' => "{$server}:{$port}"
+      ];
+      $icon_markup = \Drupal::service('renderer')->render($icon);
+
+      // Present a different "Server Down" message if the error is caused by an
+      // authentication failure.
+      if ($state === VARNISH_SERVER_STATUS_AUTHENTICATION_FAILURE) {
+        $items[] = t('@status_icon The Varnish control terminal has not authenticated at @server on port @port.',
+          ['@status_icon' => $icon_markup, '@server' => $server, '@port' => $port]);
+      }
+      else {
+        $items[] = t('@status_icon The Varnish control terminal is not responding at @server on port @port.',
+          ['@status_icon' => $icon_markup, '@server' => $server, '@port' => $port]);
+      }
+    }
+  }
+  $list = [
+    '#theme' => 'item_list',
+    '#items' => $items,
+  ];
+  return \Drupal::service('renderer')->render($list);
+}
+
+/**
+ * Helper function to parse the host from the global $base_url
+ */
+function _varnish_get_host() {
+  global $base_url;
+  $parts = parse_url($base_url);
+  return $parts['host'];
+}
+
+
+/**
+ * Send one or more commands to Varnish.
+ *
+ * @param mixed $commands
+ *   Either a single command (expressed as a string), or multiple commands
+ *   (expressed as an array of strings).
+ *
+ * @return array
+ *   A multi-dimensional array, indexed firstly by the terminal IP address and
+ *   port, then secondly by the command. The value is the response from
+ *   Varnish.
+ */
+function _varnish_terminal_run($commands) {
+  $config = \Drupal::config('varnish.settings');
+
+  // Convert single commands to an array so we can handle everything in the same way.
+  if (!is_array($commands)) {
+    $commands = [$commands];
+  }
+  $ret = [];
+  $terminals = explode(' ', $config->get('varnish_control_terminal'));
+  // The variable varnish_socket_timeout defines the timeout in milliseconds.
+  $timeout = $config->get('varnish_socket_timeout');
+  $seconds = (int)($timeout / 1000);
+  $microseconds = (int)($timeout % 1000 * 1000);
+  foreach ($terminals as $terminal) {
+    list($server, $port) = explode(':', $terminal);
+    $client = socket_create(AF_INET, SOCK_STREAM, getprotobyname('tcp'));
+    socket_set_option($client, SOL_SOCKET, SO_SNDTIMEO, ['sec' => $seconds, 'usec' => $microseconds]);
+    socket_set_option($client, SOL_SOCKET, SO_RCVTIMEO, ['sec' => $seconds, 'usec' => $microseconds]);
+    if (@!socket_connect($client, $server, $port)) {
+      \Drupal::logger('varnish')->error('Unable to connect to server socket @server:@port: %error', [
+        '@server' => $server,
+        '@port' => $port,
+        '%error' => socket_strerror(socket_last_error($client))
+      ]);
+      $ret[$terminal] = FALSE;
+      // If a varnish server is unavailable, move on to the next in the list.
+      continue;
+    }
+
+    $status = _varnish_read_socket($client);
+    // Do we need to authenticate?
+    if ($status['code'] == 107) { // Require authentication
+      $secret = $config->get('varnish_control_key');
+      $challenge = substr($status['msg'], 0, 32);
+      $pack = $challenge . "\x0A" . $secret . "\x0A" . $challenge . "\x0A";
+      $key = hash('sha256', $pack);
+      socket_write($client, "auth $key\n");
+      $status = _varnish_read_socket($client);
+      if ($status['code'] != 200) {
+        \Drupal::logger('varnish')->error('Authentication to server failed!');
+
+        // Mark this terminal as an authentication failure, and move on to the
+        // next terminal in the list.
+        $ret[$terminal] = VARNISH_SERVER_STATUS_AUTHENTICATION_FAILURE;
+        continue;
+      }
+    }
+    foreach ($commands as $command) {
+      if ($status = _varnish_execute_command($client, $command)) {
+        $ret[$terminal][$command] = $status;
+      }
+    }
+  }
+  return $ret;
+}
+
+function _varnish_execute_command($client, $command) {
+  // Send command and get response.
+  $result = socket_write($client, "$command\n");
+  $status = _varnish_read_socket($client);
+  if ($status['code'] != 200) {
+    \Drupal::logger('varnish')->error('Received status code @code running %command. Full response text: @error',
+      [
+        '@code' => $status['code'],
+        '%command' => $command,
+        '@error' => $status['msg']
+      ]
+    );
+    return FALSE;
+  }
+  else {
+    // successful connection
+    return $status;
+  }
+}
+
+/**
+ * Low-level socket read function.
+ *
+ * @params
+ *   $client an initialized socket client
+ *
+ *   $retty how many times to retry on "temporarily unavalble" errors
+ */
+function _varnish_read_socket($client, $retry = 2) {
+  // Status and length info is always 13 characters.
+  $header = socket_read($client, 13, PHP_BINARY_READ);
+  if ($header == FALSE) {
+    $error = socket_last_error();
+    // 35 = socket-unavailable, so it might be blocked from our write.
+    // This is an acceptable place to retry.
+    if ($error == 35 && $retry > 0) {
+      return _varnish_read_socket($client, $retry-1);
+    }
+    else {
+      \Drupal::logger('varnish')->error('Socket error: @error',
+        [
+          '@error' => socket_strerror($error)
+        ]
+      );
+      return [
+        'code' => $error,
+        'msg' => socket_strerror($error),
+      ];
+    }
+  }
+  $msg_len = (int)substr($header, 4, 6) + 1;
+  $status = [
+    'code' => substr($header, 0, 3),
+    'msg' => socket_read($client, $msg_len, PHP_BINARY_READ)
+  ];
+  return $status;
+}
+
+/**
+ * Implements hook_help().
+ */
+function varnish_help($route_name, \Drupal\Core\Routing\RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.varnish':
+      $text = file_get_contents(dirname(__FILE__) . "/README.txt");
+      if (! \Drupal::moduleHandler()->moduleExists('markdown')) {
+        return '<pre>' . $text . '</pre>';
+      }
+      else {
+        // Use the Markdown filter to render the README.
+        $filter_manager = \Drupal::service('plugin.manager.filter');
+        $settings = \Drupal::configFactory()->get('markdown.settings')->getRawData();
+        $config = ['settings' => $settings];
+        $filter = $filter_manager->createInstance('markdown', $config);
+        return $filter->process($text, 'en');
+      }
+  }
+  return NULL;
+}
