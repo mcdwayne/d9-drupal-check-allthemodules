@@ -1,0 +1,860 @@
+<?php
+
+/**
+ * @file
+ * Contains
+ */
+
+use Drupal\Core\Datetime\DrupalDateTime;
+use Drupal\Core\Entity\ContentEntityInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Link;
+use Drupal\Core\Url;
+use Drupal\tmgmt\Entity\Job;
+use Drupal\tmgmt\Entity\Translator;
+use Drupal\tmgmt\JobInterface;
+use Drupal\tmgmt\JobItemInterface;
+use Drupal\tmgmt_extension_suit\ExtendedTranslatorPluginInterface;
+use Drupal\views\ViewExecutable;
+use Smartling\AuditLog\Params\CreateRecordParameters;
+use Smartling\File\Params\DownloadFileParameters;
+use Smartling\TranslationRequests\Params\SearchTranslationRequestParams;
+use Smartling\TranslationRequests\Params\TranslationSubmissionStates;
+
+define('TMGMT_SMARTLING_CREATE_JOB', '0');
+define('TMGMT_SMARTLING_ADD_TO_JOB', '1');
+
+function tmgmt_smartling_download_file_submit(array &$form, FormStateInterface $form_state) {
+  /* @var \Drupal\tmgmt\Entity\Job $job */
+  $job = $form_state->getFormObject()->getEntity();
+  /* @var \Drupal\tmgmt_smartling\Smartling\SmartlingApi $smartlingApi */
+  tmgmt_smartling_download_file($job);
+}
+
+/**
+ * Implements hook_cron().
+ */
+function tmgmt_smartling_cron() {
+  $smartling_provider_configs = \Drupal::getContainer()
+    ->get("tmgmt_smartling.smartling_config_manager")
+    ->getAvailableConfigs();
+
+  foreach ($smartling_provider_configs as $smartling_provider_config) {
+    $api_wrapper = \Drupal::getContainer()->get("tmgmt_smartling.smartling_api_wrapper");
+    $api_wrapper->setSettings($smartling_provider_config->get("settings"));
+
+    $search_params = new SearchTranslationRequestParams();
+    $search_params->setState(TranslationSubmissionStates::STATE_TRANSLATED);
+    $search_params->setLimit(100);
+
+    $bucket_name = Drupal::state()->get('tmgmt_smartling.bucket_name', 'tmgmt_smartling_default_bucket_name');
+    $result = $api_wrapper->searchTranslationRequest($bucket_name, $search_params);
+
+    foreach ($result as $item) {
+      Drupal::service('tmgmt_extension_suit.utils.queue_unique_item')
+        ->addItem(
+          'tmgmt_extension_suit_download', [
+            'id' => (int) $item['originalAssetKey']['tmgmt_job_id'],
+          ]
+        );
+    }
+  }
+}
+
+function tmgmt_smartling_download_file(JobInterface $job) {
+  $api_wrapper = $job->getTranslatorPlugin()->getApiWrapper($job->getTranslator()->getSettings());
+  $translation_request_manager = Drupal::service('tmgmt_smartling.translation_request_manager');
+  $logger = \Drupal::logger('tmgmt_smartling');
+
+  $translation_request = $translation_request_manager->getTranslationRequest($job);
+
+  if (empty($translation_request)) {
+    $job->addMessage('File download failed for job = @job_id: can\'t find related translation request.', ['@job' => $job->id()], 'error');
+
+    $logger->error('Can\'t retrieve translation request for file @name (job id = @job_id).', [
+      '@name' => $job->getTranslatorPlugin()->getFileName($job),
+      '@job_id' => $job->id(),
+    ]);
+
+    $api_wrapper->createFirebaseRecord("tmgmt_smartling", "notifications", 10, [
+      "message" => t('File @name (job id = @job_id) wasn\'t downloaded: can\'t find related translation request. See logs for more info.', [
+        '@name' => $job->getTranslatorPlugin()->getFileName($job),
+        '@job_id' => $job->id(),
+      ])->render(),
+      "type" => "error",
+    ]);
+
+    return FALSE;
+  }
+
+  $api_wrapper->createAuditLogRecord(
+    $job,
+    NULL,
+    Drupal::currentUser(),
+    CreateRecordParameters::ACTION_TYPE_DOWNLOAD
+  );
+
+  try {
+    $smartling_api = $api_wrapper->getApi('file');
+    $retrieval_type = $job->getTranslator()->getSetting('retrieval_type');
+    $filename = $job->getTranslatorPlugin()->getFileName($job);
+    $download_parameters = new DownloadFileParameters();
+    $download_parameters->set('retrievalType', $retrieval_type);
+    $extension = pathinfo($filename, PATHINFO_EXTENSION);
+    $xml = $smartling_api->downloadFile($filename, $job->getRemoteTargetLanguage(), $download_parameters);
+  }
+  catch (\Exception $e) {
+    Drupal::logger('tmgmt_smartling')->error($e->getMessage());
+
+    $api_wrapper->createFirebaseRecord("tmgmt_smartling", "notifications", 10, [
+      "message" => t('File @name (job id = @job_id) wasn\'t downloaded. Please see logs for more info.', [
+        '@name' => $job->getTranslatorPlugin()->getFileName($job),
+        '@job_id' => $job->id(),
+      ])->render(),
+      "type" => "error",
+    ]);
+
+    $translation_request_manager->commitError($job, $translation_request, $e);
+
+    return FALSE;
+  }
+
+  $path = $job->getSetting('scheme') . '://tmgmt_smartling_translations/' . $job->getTranslatorPlugin()->getFileName($job);
+  $dirname = dirname($path);
+
+  if (file_prepare_directory($dirname, FILE_CREATE_DIRECTORY) && ($file = file_save_data($xml, $path, FILE_EXISTS_REPLACE))) {
+    $plugin = \Drupal::service('plugin.manager.tmgmt_file.format')->createInstance($extension);
+
+    if ($plugin) {
+      // Validate the file on job.
+      if (!$plugin->validateImport($file->getFileUri(), $job)) {
+        $job->addMessage('Failed to validate file @file. Import for job @job_id aborted.', [
+          '@file' => $file->getFileUri(),
+          '@job_id' => $job->id(),
+        ], 'error');
+        \Drupal::logger('tmgmt_smartling')->error('Failed to validate file @file. Import for job @job_id aborted.', [
+          '@file' => $file->getFileUri(),
+          '@job_id' => $job->id(),
+        ]);
+
+        $api_wrapper->createFirebaseRecord("tmgmt_smartling", "notifications", 10, [
+          "message" => t('Translation for "@file" (job id = @job_id) was successfully downloaded but validation failed. See logs for more info.', [
+            '@file' => $file->getFileUri(),
+            '@job_id' => $job->id(),
+          ])->render(),
+          "type" => "error",
+        ]);
+
+        return FALSE;
+      }
+      else {
+        try {
+          // Find job items with related entities which doesn't have
+          // target translation.
+          $job_items = $job->getItems();
+          $force_import = NULL;
+          $entity_type_manager = \Drupal::entityTypeManager();
+
+          foreach ($job_items as $job_item) {
+            // Load target translation. Save job item id if it
+            // doesn't have target translation.
+            try {
+              $entity = $entity_type_manager
+                ->getStorage($job_item->getItemType())
+                ->load($job_item->getItemId());
+
+              // Entity can be removed by the moment we load it from the storage.
+              if ($entity instanceof ContentEntityInterface) {
+                $entity->getTranslation($job->getTargetLangcode());
+              }
+            } catch (Exception $e) {
+              // No translation found.
+              $force_import[$job_item->id()] = $job_item;
+            }
+          }
+
+          // Compare old and new hashes in order to decide should we apply
+          // translation or not. In other words we do not want to apply
+          // downloaded translation if it's the same as it was.
+          $old_hash = $job->get('job_file_content_hash')->getValue();
+          $old_hash = !empty($old_hash[0]['value']) ? $old_hash[0]['value'] : '';
+          $hash = md5($xml);
+
+          if ($old_hash !== $hash || $force_import) {
+            $job->set('job_file_content_hash', $hash);
+            $job->save();
+
+            // Validation successful, start import.
+            foreach ($plugin->import($file->getFileUri(), $job) as $key => $value) {
+              if (isset($job_items[$key])) {
+                if ($old_hash !== $hash || isset($force_import[$key])) {
+                  // Set active state for the job item in order to be able
+                  // force translation. It allows to override existing
+                  // translations that might be in an "Accepted" state.
+                  // @see JobItem::addTranslatedData() method.
+                  $job_items[$key]->setState(JobItemInterface::STATE_ACTIVE);
+
+                  // Import translation.
+                  $job_items[$key]->addTranslatedData($value, [], NULL);
+                }
+              }
+            }
+
+            $job->addMessage('Successfully imported file.');
+
+            \Drupal::logger('tmgmt_smartling')->info(
+              'Translation for "@filename" was successfully downloaded and imported.',
+              ['@filename' => $filename]
+            );
+
+            $api_wrapper->createFirebaseRecord("tmgmt_smartling", "notifications", 10, [
+              "message" => t(
+                'Translation for "@filename" (job id = @job_id) was successfully downloaded and imported.', [
+                  '@filename' => $file->getFileUri(),
+                  '@job_id' => $job->id(),
+                ]
+              )->render(),
+              "type" => "status",
+            ]);
+          }
+          else {
+            $job->addMessage('Import of downloaded file was skipped: downloaded and existing translations are equal.');
+
+            \Drupal::logger('tmgmt_smartling')->warning(
+              'Translation for "@filename" was successfully downloaded but import was skipped: downloaded and existing translations are equal.',
+              ['@filename' => $filename]
+            );
+
+            $api_wrapper->createFirebaseRecord("tmgmt_smartling", "notifications", 10, [
+              "message" => t(
+                'Translation for "@filename" (job id = @job_id) was successfully downloaded but import was skipped: downloaded and existing translations are equal.', [
+                '@filename' => $file->getFileUri(),
+                '@job_id' => $job->id(),
+              ])->render(),
+              "type" => "warning",
+            ]);
+          }
+
+          if (!$translation_request_manager->commitSuccessfulDownload($job, $translation_request)) {
+            $warning_message = 'Can\'t update state and exported date for translation request = @translation_request.';
+            $warning_message_context = [
+              '@translation_request' => json_encode($translation_request),
+            ];
+
+            $logger->warning($warning_message, $warning_message_context);
+
+            $api_wrapper->createFirebaseRecord("tmgmt_smartling", "notifications", 10, [
+              "message" => 'Can\'t update update state and exported date for translation request. See logs for more info.',
+              "type" => "warning",
+            ]);
+          }
+        } catch (Exception $e) {
+          $job->addMessage('File import failed with the following message: @message', ['@message' => $e->getMessage()], 'error');
+          \Drupal::logger('tmgmt_smartling')->error(
+            'File import failed with the following message: @message',
+            ['@message' => $e->getMessage()]
+          );
+
+          $api_wrapper->createFirebaseRecord("tmgmt_smartling", "notifications", 10, [
+            "message" => t(
+              'Translation for "@filename" (job id = @job_id) was successfully downloaded but import failed. See logs for more info.', [
+              '@filename' => $file->getFileUri(),
+              '@job_id' => $job->id(),
+            ])->render(),
+            "type" => "error",
+          ]);
+
+          $translation_request_manager->commitError($job, $translation_request, $e);
+
+          return FALSE;
+        }
+      }
+    }
+  }
+
+  return TRUE;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function tmgmt_smartling_theme() {
+  return [
+    'smartling_dashboard_link' => [
+      'variables' => ['proj_id' => '', 'file_name' => ''],
+    ],
+    'tmgmt_smartling_xml_template' => [
+      'path' => drupal_get_path('module', 'tmgmt_smartling') . '/templates',
+      'template' => 'tmgmt-smartling-xml-template',
+      'variables' => [
+        'items' => NULL,
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_views_data_alter().
+ */
+function tmgmt_smartling_views_data_alter(array &$data) {
+    $data['tmgmt_job']['smartling_dashboard'] = array(
+        'title' => t('Link to Smartling Dashboard'),
+        'field' => array(
+            'title' => t('Link to Smartling Dashboard'),
+            //'help' => t('Flags a specific node type.'),
+            'id' => 'tmgmt_smartling_dashboard_link',
+        ),
+    );
+}
+
+/**
+ * Implements hook_views_pre_view().
+ */
+function tmgmt_smartling_views_pre_view(ViewExecutable $view, $display_id, array &$args) {
+  if ($view->id() === 'tmgmt_translation_all_job_items') {
+    $handlers = $view->getHandlers('field');
+
+    foreach ($handlers as $name => $value) {
+      $view->removeHandler($view->current_display, 'field', $name);
+    }
+
+    $view->addHandler($view->current_display, 'field', 'tmgmt_job_item', 'tmgmt_job_item_bulk_form', array(
+      'id' => 'tmgmt_job_item_bulk_form',
+      'table' => 'tmgmt_job_item',
+      'field' => 'tmgmt_job_item_bulk_form',
+      'group_type' => 'group',
+      'label' => 'Bulk update',
+      'hide_alter_empty' => 1,
+      'action_title' => 'With selection',
+      'include_exclude' => 'exclude',
+      'selected_actions' => [],
+      'entity_type' => 'tmgmt_job_item',
+      'plugin_id' => 'bulk_form',
+      'weight' => -10
+    ));
+
+    foreach ($handlers as $name => $value) {
+      $view->addHandler($view->current_display, 'field', 'tmgmt_job_item', $name, $value);
+    }
+  }
+
+  if ($view->id() === 'tmgmt_job_overview') {
+    $handlers = $view->getHandlers('field');
+
+    $view->removeHandler($view->current_display, 'field', 'operations');
+
+    $view->addHandler($view->current_display, 'field', 'tmgmt_job', 'smartling_dashboard', array(
+      'id' => 'smartling_dashboard',
+      'table' => 'tmgmt_job',
+      'field' => 'smartling_dashboard',
+      'group_type' => 'group',
+      'label' => 'Smartling',
+      'hide_alter_empty' => 1,
+      'selected_actions' => [],
+      'entity_type' => 'tmgmt_job',
+      'plugin_id' => 'tmgmt_smartling_dashboard_link',
+      'weight' => -10
+    ));
+
+    $view->addHandler($view->current_display, 'field', 'tmgmt_job_item', 'operations', $handlers['operations']);
+  }
+}
+
+/**
+ * Implements hook_requirements().
+ */
+function tmgmt_smartling_requirements($phase) {
+  $requirements = [];
+
+  if ($phase == 'runtime') {
+    $user_id = \Drupal::config('tmgmt.translator.smartling')
+      ->get('settings.user_id');
+    $token_secret = \Drupal::config('tmgmt.translator.smartling')
+      ->get('settings.token_secret');
+
+    if (empty($user_id) || empty($token_secret)) {
+      $missing_settings = [];
+
+      if (empty($user_id)) {
+        $missing_settings[] = 'User ID';
+      }
+
+      if (empty($token_secret)) {
+        $missing_settings[] = 'Token Secret';
+      }
+
+      $requirements['tmgmt_smartling'] = [
+        'title' => t('Smartling'),
+        'description' => t('Please set up missing settings for Smartling plugin at @page_url: @settings', [
+          '@page_url' => Link::fromTextAndUrl(
+            t('Smartling provider settings page'),
+            Url::fromUri(
+              'internal:/admin/tmgmt/translators/manage/smartling',
+              [
+                'attributes' => [
+                  'target' => '_blank',
+                ],
+              ]
+            ))->toString(),
+          '@settings' => implode(', ', $missing_settings),
+        ]),
+        'severity' => REQUIREMENT_ERROR,
+      ];
+    }
+  }
+
+  return $requirements;
+}
+
+/**
+ * Implements hook_entity_base_field_info().
+ */
+function tmgmt_smartling_entity_base_field_info(EntityTypeInterface $entity_type) {
+  if ($entity_type->id() === 'tmgmt_job') {
+    $fields['job_file_content_hash'] = BaseFieldDefinition::create('string')
+      ->setLabel(t('File content hash (md5)'))
+      ->setSetting('max_length', 32)
+      ->setTranslatable(FALSE);
+
+    return $fields;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function tmgmt_smartling_form_tmgmt_job_edit_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+  // Lock "Submit all N translation jobs with the same settings" and
+  // add validator/submitter if smartling translator is used.
+  $translator = $form_state->getFormObject()->getEntity()->getTranslator();
+
+  if ($translator->getPluginId() == 'smartling') {
+    // This value can be hidden (without type). Lock this value only if it's
+    // presented as a checkbox.
+    if (!empty($form['translator_wrapper']['submit_all']['#type'])) {
+      $form['translator_wrapper']['submit_all']['#value'] = TRUE;
+      $form['translator_wrapper']['submit_all']['#disabled'] = TRUE;
+    }
+
+    array_unshift($form['#validate'], 'tmgmt_smartling_tmgmt_job_edit_form_validate');
+
+    // Don't run TMGMT's core batch operation in case async mode is enabled.
+    if ($translator->getSetting('async_mode')) {
+      $form['actions']['submit']['#submit'] = [
+        'tmgmt_smartling_tmgmt_job_edit_form_submit',
+      ];
+    }
+    else {
+      array_unshift($form['actions']['submit']['#submit'], 'tmgmt_smartling_tmgmt_job_edit_form_submit');
+    }
+  }
+}
+
+/**
+ * @param array $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ * @param $form_id
+ * @return mixed
+ */
+function tmgmt_smartling_checkout_settings_add_to_job_form_ajax_callback(array &$form, FormStateInterface $form_state, $form_id) {
+  return $form['translator_wrapper']['settings']['add_to_job_tab']['container'];
+}
+
+/**
+ * Validate tmgmt_smartling checkout job form.
+ *
+ * @param array $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+function tmgmt_smartling_tmgmt_job_edit_form_validate(array &$form, FormStateInterface $form_state) {
+  switch ($form_state->getValue('settings')['switcher']) {
+    case TMGMT_SMARTLING_CREATE_JOB:
+      tmgmt_smartling_create_job_form_validate($form, $form_state);
+
+      break;
+
+    case TMGMT_SMARTLING_ADD_TO_JOB:
+      tmgmt_smartling_add_to_job_form_validate($form, $form_state);
+
+      break;
+  }
+}
+
+/**
+ * Validate "Create job" tmgmt_smartling checkout job form part.
+ *
+ * @param array $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+function tmgmt_smartling_create_job_form_validate(array &$form, FormStateInterface $form_state) {
+  $settings = $form_state->getValue('settings');
+  $translator = $form_state->getFormObject()->getEntity()->getTranslator();
+  $translator_plugin = $translator->getPlugin();
+
+  if (empty($settings['create_new_job_tab']['name'])) {
+    $form_state->setError($form['translator_wrapper']['settings']['create_new_job_tab']['name'], t('@name field is required.', [
+      '@name' => t('Job Name'),
+    ]));
+  }
+  else {
+    $response = $translator_plugin->getApiWrapper($translator->getSettings())->listJobs($settings['create_new_job_tab']['name']);
+
+    if (!empty($response['items'])) {
+      foreach ($response['items'] as $item) {
+        if ($item['jobName'] == $settings['create_new_job_tab']['name']) {
+          $form_state->setError(
+            $form['translator_wrapper']['settings']['create_new_job_tab']['name'],
+            t('Job with name "@name" already exists. Please choose another job name.', [
+              '@name' => $settings['create_new_job_tab']['name'],
+            ])
+          );
+
+          break;
+        }
+      }
+    }
+  }
+
+  if (!empty($settings['create_new_job_tab']['due_date']) &&
+    ($settings['create_new_job_tab']['due_date'] instanceof DrupalDateTime) &&
+    $settings['create_new_job_tab']['due_date']->getTimeStamp() < time()
+  ) {
+    $form_state->setError(
+      $form['translator_wrapper']['settings']['create_new_job_tab']['due_date'],
+      t('Due date can not be in the past.')
+    );
+  }
+}
+
+/**
+ * Validate "Add to job" tmgmt_smartling checkout job form part.
+ *
+ * @param array $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+function tmgmt_smartling_add_to_job_form_validate(array &$form, FormStateInterface $form_state) {
+  $settings = $form_state->getValue('settings');
+
+  if (!empty($settings['add_to_job_tab']['container']['job_info']['due_date']) &&
+    ($settings['add_to_job_tab']['container']['job_info']['due_date'] instanceof DrupalDateTime) &&
+    $settings['add_to_job_tab']['container']['job_info']['due_date']->getTimeStamp() < time()
+  ) {
+    $form_state->setError(
+      $form['translator_wrapper']['settings']['add_to_job_tab']['container']['job_info']['due_date'],
+      t('Due date can not be in the past.')
+    );
+  }
+
+  if (empty($settings['add_to_job_tab'])) {
+    $form_state->setError(
+      $form['translator_wrapper']['settings']['add_to_job_tab'],
+      t('There are no available Smartling jobs.')
+    );
+  }
+
+  if (empty($settings['add_to_job_tab']['container']['job_id'])) {
+    $form_state->setError(
+      $form['translator_wrapper']['settings']['add_to_job_tab'],
+      t('Please, select the Smartling job.')
+    );
+  }
+}
+
+/**
+ * Submit tmgmt_smartling checkout job form.
+ *
+ * @param array $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+function tmgmt_smartling_tmgmt_job_edit_form_submit(array &$form, FormStateInterface $form_state) {
+  $batch_uid = FALSE;
+  $settings = $form_state->getValue('settings');
+  $job = $form_state->getFormObject()->getEntity();
+  $translator = $job->getTranslator();
+
+  switch ($settings['switcher']) {
+    case TMGMT_SMARTLING_CREATE_JOB:
+      $job_result = tmgmt_smartling_create_job_form_submit($settings, $translator, $form_state);
+
+      break;
+
+    case TMGMT_SMARTLING_ADD_TO_JOB:
+      $job_result = tmgmt_smartling_add_to_job_form_submit($settings, $translator, $form_state);
+
+      break;
+  }
+
+  $job_queue = Drupal::getContainer()->get('tmgmt.queue');
+  $queue_jobs = $job_queue->getAllJobs();
+  $batch_execute_on_job = !empty($queue_jobs) ? end($queue_jobs) : $job;
+
+  if (!empty($job_result['job_id'])) {
+    $batch_uid = $translator->getPlugin()
+      ->getApiWrapper($translator->getSettings())
+      ->createBatch($job_result['job_id'], $job_result['authorize']);
+  }
+
+  if (empty($batch_uid)) {
+    drupal_set_message(t('Files have not been uploaded. See <a href="@url">logs</a> for more information.', [
+      '@url' => Url::fromUri('internal:/admin/reports/dblog')->toString(),
+    ]), 'error');
+
+    return;
+  }
+
+  $job_settings = $form_state->getValue('settings') + [
+    'batch_uid' => $batch_uid,
+    'batch_execute_on_job' => $batch_execute_on_job->id(),
+  ] + $job_result;
+
+  $form_state->setValue('settings', $job_settings);
+
+  $queue_jobs = empty($queue_jobs) ? [$job] : $queue_jobs;
+  $async_mode = $job->getTranslator()->getSetting('async_mode');
+  $jobs_in_batch = [];
+
+  foreach ($queue_jobs as $log_job) {
+    $jobs_in_batch[] = $log_job->id();
+  }
+
+  Drupal::getContainer()
+    ->get('logger.channel.smartling')
+    ->info(t('Batch info (request translation): uid = "@batch_uid", jobs count = "@jobs_count", jobs = "@jobs_in_batch", execute on job = "@batch_execute_on_job", async mode = "@async_mode"', [
+      '@batch_uid' => $job_settings['batch_uid'],
+      '@jobs_count' => count($jobs_in_batch),
+      '@jobs_in_batch' => implode(', ', $jobs_in_batch),
+      '@batch_execute_on_job' => $job_settings['batch_execute_on_job'],
+      '@async_mode' => $async_mode,
+    ])->render());
+
+  if ($async_mode) {
+    // Save original form object.
+    $job->settings = $job_settings;
+    $job->translator = $translator->id();
+    $job->submitted('Job has been put into upload queue.');
+
+    // Save left jobs and add them into upload queue.
+    foreach ($queue_jobs as $queue_job) {
+      if ($job->id() != $queue_job->id()) {
+        $queue_job->settings = $job_settings;
+        $queue_job->translator = $translator->id();
+        $queue_job->submitted('Job has been put into upload queue.');
+      }
+
+      Drupal::service('tmgmt_extension_suit.utils.queue_unique_item')
+        ->addItem(
+          'tmgmt_extension_suit_upload', [
+            'id' => (int) $queue_job->id(),
+            'batch_uid' => $batch_uid,
+            'batch_execute_on_job' => $batch_execute_on_job->id(),
+          ],
+          TRUE
+        );
+    }
+
+    drupal_set_message(t('Files have been added into upload queue.'));
+  }
+}
+
+/**
+ * Submit "Create job" tmgmt_smartling checkout job form.
+ *
+ * @param array $settings
+ * @param \Drupal\tmgmt\Entity\Translator $translator
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ * @return mixed
+ */
+function tmgmt_smartling_create_job_form_submit(array $settings, Translator $translator, FormStateInterface $form_state) {
+  $job_attributes = $settings['create_new_job_tab'];
+
+  if (!empty($job_attributes['due_date'])) {
+    $users_time_zone = new DateTimeZone($settings['smartling_users_time_zone']);
+    $job_attributes['due_date'] = DateTime::createFromFormat(
+      'Y-m-d H:i:s',
+      date('Y-m-d H:i:s', $job_attributes['due_date']->getTimestamp()),
+      $users_time_zone
+    );
+    $job_attributes['due_date']->setTimeZone(new DateTimeZone('UTC'));
+  }
+
+  $job_id = $translator->getPlugin()->getApiWrapper($translator->getSettings())->createJob(
+    $job_attributes['name'],
+    $job_attributes['description'],
+    $job_attributes['due_date']
+  );
+
+  $due_date_string = $job_attributes['due_date'] instanceOf DateTime ? $job_attributes['due_date']->format('Y-m-d\TH:i:s\Z') : "";
+
+  if (empty($job_id)) {
+    drupal_set_message(t('Job has not been created. See <a href="@url">logs</a> for more information.', [
+      '@url' => Url::fromUri('internal:/admin/reports/dblog')->toString(),
+    ]), 'error');
+
+    return [
+      'job_id' => NULL,
+      'job_name' => $job_attributes['name'],
+      'due_date' => $due_date_string,
+      'authorize' => $job_attributes['authorize'],
+    ];
+  }
+
+  return [
+    'job_id' => $job_id,
+    'job_name' => $job_attributes['name'],
+    'due_date' => $due_date_string,
+    'authorize' => $job_attributes['authorize'],
+  ];
+}
+
+/**
+ * Submit "Add to job" tmgmt_smartling checkout job form.
+ *
+ * @param array $settings
+ * @param \Drupal\tmgmt\Entity\Translator $translator
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ * @return mixed
+ */
+function tmgmt_smartling_add_to_job_form_submit(array $settings, Translator $translator, FormStateInterface $form_state) {
+  $job_attributes = $settings['add_to_job_tab']['container'];
+  $job_raw_attributes = $form_state->getUserInput()['settings']['add_to_job_tab']['container'];
+
+  if (!empty($job_attributes['job_info']['due_date'])) {
+    $users_time_zone = new DateTimeZone($settings['smartling_users_time_zone']);
+    $job_attributes['job_info']['due_date'] = DateTime::createFromFormat(
+      'Y-m-d H:i:s',
+      date('Y-m-d H:i:s', $job_attributes['job_info']['due_date']->getTimestamp()),
+      $users_time_zone
+    );
+    $job_attributes['job_info']['due_date']->setTimeZone(new DateTimeZone('UTC'));
+  }
+
+  $job_result = $translator->getPlugin()
+    ->getApiWrapper($translator->getSettings())
+    ->updateJob(
+      $job_attributes['job_id'],
+      $job_attributes['job_info']['name'],
+      $job_raw_attributes['job_info']['description'],
+      $job_attributes['job_info']['due_date']
+    );
+  $authorize = !empty($job_raw_attributes['job_info']['authorize']);
+
+  if (empty($job_result['translationJobUid'])) {
+    $due_date_string = $job_attributes['job_info']['due_date'] instanceOf DateTime ? $job_attributes['job_info']['due_date']->format('Y-m-d\TH:i:s\Z') : "";
+
+    return [
+      'job_id' => NULL,
+      'job_name' => $job_attributes['job_info']['name'],
+      'due_date' => $due_date_string,
+      'authorize' => $authorize,
+    ];
+  }
+
+  return [
+    'job_id' => $job_result['translationJobUid'],
+    'job_name' => $job_result['jobName'],
+    'due_date' => $job_result['dueDate'],
+    'authorize' => $authorize,
+  ];
+}
+
+/**
+ * Implements hook_tmgmt_extension_suit_updated_entity_jobs().
+ */
+function tmgmt_smartling_tmgmt_extension_suit_updated_entity_jobs(array $job_ids) {
+  $jobs = Job::loadMultiple($job_ids);
+
+  foreach ($jobs as $job) {
+    $translator_plugin = $job->getTranslatorPlugin();
+
+    if ($translator_plugin instanceof ExtendedTranslatorPluginInterface) {
+      Drupal::getContainer()
+        ->get('logger.channel.smartling')
+        ->info(t('File upload queued (track entity changes). Job id: @job_id, file name: @name.', [
+          '@name' => $translator_plugin->getFileName($job),
+          '@job_id' => $job->id(),
+        ])->render());
+    }
+  }
+
+  return Drupal::service('tmgmt_smartling.bucket_job_manager')->handle(Job::loadMultiple($job_ids));
+}
+
+/**
+ * Implements hook_entity_type_alter().
+ *
+ * @param array $entity_types
+ */
+function tmgmt_smartling_entity_type_alter(array &$entity_types) {
+  $entity_types['tmgmt_job']->setFormClass('edit', 'Drupal\tmgmt_smartling\Form\JobExtendedForm');
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function tmgmt_smartling_page_attachments(array &$attachments) {
+  $current_user = \Drupal::currentUser();
+
+  if (!$current_user->hasPermission("see smartling messages")) {
+    return;
+  }
+
+  $firebaseConfigs = \Drupal::getContainer()
+    ->get('tmgmt_smartling.firebase_config_manager')
+    ->getAvailableConfigs();
+
+  if ($firebaseConfigs) {
+    $attachments['#attached']['drupalSettings']['tmgmt_smartling']['firebase']['configs'] = $firebaseConfigs;
+    $attachments['#attached']['library'][] = 'tmgmt_smartling/firebase';
+    $attachments['#attached']['library'][] = 'tmgmt_smartling/notifications';
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_delete().
+ */
+function tmgmt_smartling_tmgmt_job_delete(JobInterface $job) {
+  // Delete file from Smartling dashboard when TMGMT job object is
+  // being deleted.
+  try {
+    // Ignore jobs that don't have a smartling translator.
+    if (!$job->hasTranslator() || $job->getTranslator()->getPluginId() != 'smartling') {
+      return;
+    }
+
+    $translator = $job->getTranslator();
+    $plugin = $translator->getPlugin();
+    $api_wrapper = $plugin->getApiWrapper($translator->getSettings());
+
+    $api_wrapper->createAuditLogRecord(
+      $job,
+      NULL,
+      Drupal::currentUser(),
+      CreateRecordParameters::ACTION_TYPE_DELETE
+    );
+
+    $api_wrapper->deleteFile($plugin->getFileName($job));
+  } catch (Exception $e) {
+    \Drupal::logger('tmgmt_smartling')->error(
+      'File deletion failed with the following message: @message',
+      ['@message' => $e->getMessage()]
+    );
+  }
+}
+
+function tmgmt_smartling_tmgmt_translator_update(Translator $translator) {
+  if ($translator->getPluginId() != 'smartling') {
+    return;
+  }
+
+  $plugin = $translator->getPlugin();
+  $api_wrapper = $plugin->getApiWrapper($translator->getSettings());
+
+  $api_wrapper->createAuditLogRecord(
+    NULL,
+    $translator,
+    Drupal::currentUser(),
+    CreateRecordParameters::ACTION_TYPE_UPDATE_SETTINGS
+  );
+}
