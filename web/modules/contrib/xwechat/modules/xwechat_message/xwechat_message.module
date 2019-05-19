@@ -1,0 +1,183 @@
+<?php
+
+/**
+ * @file
+ *
+ * x wechat message
+ */
+
+use Drupal\Core\Url;
+use Pyramid\Component\WeChat\WeChat;
+use Pyramid\Component\WeChat\Request;
+use Pyramid\Component\WeChat\Response;
+use Pyramid\Component\Utility\HtmlString;
+
+/**
+ * HOOK_wechat_request_ALTER
+ * 记录接受的消息
+ */
+function xwechat_message_wechat_request_alter($request) {
+  $wid     = $request->wechat->getConfig('wid', '0');
+  $openid  = $request->getParameter('FromUserName');
+  $msgtype = $request->getParameter('MsgType');
+  $subtype = WeChat::getHandleEvent($request);
+  if ($subtype == 'reportlocation') {
+      return db_update('xwechat_user')
+                  ->fields(array(
+                      'lat'  => $request->getParameter('Latitude', 0),
+                      'lng'  => $request->getParameter('Longitude', 0),
+                  ))
+                  ->condition('openid', $openid)
+                  ->execute();
+  }
+  db_insert('xwechat_message')
+    ->fields(array(
+        'wid'       => $wid,
+        'openid'    => $openid,
+        'timestamp' => REQUEST_TIME,
+        'type'      => 'receive',
+        'msgtype'   => strtolower($msgtype),
+        'subtype'   => $subtype,
+        'data'      => json_encode($request->getParameters()),
+    ))
+    ->execute();
+}
+
+/**
+ * HOOK_wechat_response_ALTER
+ * 记录回复的消息
+ */
+function xwechat_message_wechat_response_alter($response) {
+    $wid     = $response->wechat->getConfig('wid', '0');
+    $openid  = $response->request->getParameter('FromUserName');
+    $content = $response->getContent();
+    $rstype  = 'text';
+    if (!$content) {
+        return false;
+    }
+    if (is_array($content) || is_object($content)) {
+        $content = (array) $content;
+        if (!empty($content['MsgType'])) {
+            $rstype = $content['MsgType'];
+        } elseif (!empty($content['msgtype'])) {
+            $rstype = $content['msgtype'];
+        }
+    }
+    db_insert('xwechat_message')
+        ->fields(array(
+            'wid'       => $wid,
+            'openid'    => $openid,
+            'timestamp' => time(),
+            'type'      => 'reply',
+            'msgtype'   => $rstype,
+            'subtype'   => $rstype,
+            'data'      => json_encode($content),
+        ))
+        ->execute();
+}
+
+/**
+ * Implements hook_xwechat_operation().
+ */
+function xwechat_message_xwechat_operation($links = array(), $config) {
+  $links['message'] = array(
+    'title' => t('Message'),
+    'url' => Url::fromRoute('xwechat.messgae.list', ['xwechat_config' => $config['wid']]),
+    'attributes' => array('target'=>'_blank'),
+  );
+    
+  return $links;
+}
+
+/**
+ * HOOK_wechat_messageshown
+ * @todo $wechat->downloadFile(MediaId)
+ */
+function xwechat_message_wechat_messageshown($content, $subtype = '', $config = null) {
+    switch ($subtype) {
+        case 'text':
+            return check_plain($content['Content']);
+        case 'image':
+        case 'voice':
+        case 'video':
+        case 'shortvideo':
+            return "<span style='font-size:0.9em;color:#666;'><a href='javascript:void(0);'>[MediaId: {$content['MediaId']}]</a></span>";
+        case 'location':
+            return "<span style='font-size:0.9em;color:#666;'>"
+                   ."<a href='http://apis.map.qq.com/uri/v1/marker?marker=coord:{$content['Location_X']},{$content['Location_Y']};title:{$content['Label']}' target='_blank'>"
+                   ."[lat:{$content['Location_X']} lng:{$content['Location_Y']} scale:{$content['Scale']}]"
+                   ."</a></span>";
+        case 'link':
+            return "<a href='{$content['Url']}' target='_blank' title='" . check_plain($content['Description']) . "'>"
+                    . check_plain($content['Title']) . '</a>';
+        case 'scancode_push':
+        case 'scancode_waitmsg':
+            return !empty($content['ScanCodeInfo']['ScanResult']) ? check_plain($content['ScanCodeInfo']['ScanResult']) : '';
+            break;
+        default:
+            return '';
+    }
+}
+
+/**
+ * @see wechat_message_menu
+ * @newapi HOOK_wechat_messageshown($content, $subtype, $config)
+ * 历史消息列表
+ */
+function xwechat_message_list($config) {
+    $query = db_select('xwechat_message', 'm')->extend(Pyramid\Drupal\Pager::compat());
+    $data  = $query->fields('m')
+                   ->limit(32)
+                   ->condition('wid', $config->wid)
+                   ->orderBy('id', 'DESC')
+                   ->execute()
+                   ->fetchAll();
+    $head  = array(
+        'type'      => t('Type'),
+        'stamp'     => t('Timestamp'),
+        'image'     => t('Image'),
+        'openid'    => t('OpenID'),
+        'msgtype'   => t('MsgType'),
+        'subtype'   => t('LibEvent'),
+        'content'   => t('Content'),
+    );
+    $rows = array();
+    if ($uids = pyramid_array_column($data, 'openid')) {
+        $users = db_select('xwechat_user', 'u')
+                    ->fields('u')
+                    ->condition('openid', $uids)
+                    ->execute()
+                    ->fetchAllAssoc('openid');
+    }
+    foreach ($data as $v) {
+        $content  = json_decode($v->data, true);
+        $username = $v->openid;
+        if (!empty($users[$v->openid]->remark)) {
+            $username = $users[$v->openid]->remark;
+        } elseif (!empty($users[$v->openid]->nickname)) {
+            $username = HtmlString::decodeEmoji($users[$v->openid]->nickname);
+        }
+        if (!empty($users[$v->openid]->headimgurl)) {
+            $headimgurl = $users[$v->openid]->headimgurl;
+        } else {
+            $headimgurl = '';
+        }
+        $body = module_invoke_all('wechat_messageshown', $content, $v->subtype, $config);
+        $rows[$v->id] = array(
+            'type'      => $v->type,
+            'stamp'     => format_date($v->timestamp, 'medium', 'Y-m-d H:i:s'),
+            'image'     => $headimgurl ? "<img style='max-width:48px' src='{$headimgurl}' />" : '',
+            'openid'    => '<strong>' . $username . '</strong>',
+            'msgtype'   => $v->msgtype,
+            'subtype'   => $v->subtype,
+            'content'   => $body[0],
+        );
+    }
+    $form['messages'] = array(
+        '#type' => 'item',
+        '#markup' => theme('table', array('header' => $head, 'rows' => $rows)),
+    );
+    $form['pager'] = array('#markup' => theme('pager'));
+    
+    return $form;
+}

@@ -1,0 +1,160 @@
+<?php
+
+/**
+ * @file
+ *
+ * xwechat_user
+ */
+
+use Drupal\Core\Url;
+use Pyramid\Component\WeChat\WeChat;
+use Pyramid\Component\WeChat\Request;
+use Pyramid\Component\WeChat\Response;
+
+/**
+ * uerinfo updating-frequency
+ */
+const WECHAT_USER_FREQUENCY = 604800;
+
+/**
+ * Implements hook_xwechat_operation().
+ */
+function xwechat_user_xwechat_operation($links = array(), $config) {
+  $links['user'] = array(
+    'title' => t('User'),
+    'url' => Url::fromRoute('xwechat.user.list', ['xwechat_config' => $config['wid']]),
+    'attributes' => array('target'=>'_blank'),
+  );
+    
+  return $links;
+}
+
+
+/**
+ * HOOK_xwechat_request_ALTER
+ * 用户详情,每隔WECHAT_USER_FREQUENCY更新一次
+ */
+function xwechat_user_xwechat_request_alter($request) {
+    $wid    = $request->wechat->getConfig('wid', '0');
+    $openid = $request->getParameter('FromUserName');
+    $exists = db_query("select * from {xwechat_user} where openid=:openid", array(':openid'=>$openid))->fetchObject();
+    if (!$exists) {
+        db_insert('xwechat_user')
+            ->fields(array(
+                'wid'       => $wid,
+                'openid'    => $openid,
+                'subscribe' => 1,
+                'created'   => REQUEST_TIME,
+                'updated'   => REQUEST_TIME,
+                'accessed'  => REQUEST_TIME,
+            ))
+            ->execute();
+        xwechat_user_update_userinfo($request->wechat, $openid);
+    } else {
+        $fields = array('accessed' => REQUEST_TIME);
+        if ($request->getParameter('Event') == 'unsubscribe') {
+            $fields['subscribe'] = 2;
+        } elseif ($request->getParameter('Event') == 'subscribe') {
+            $fields['subscribe'] = 1;
+        }
+        db_update('xwechat_user')->fields($fields)->condition('openid', $openid)->execute();
+        if (REQUEST_TIME > $exists->updated + WECHAT_USER_FREQUENCY) {
+            wechat_user_update_userinfo($request->wechat, $openid);
+        }
+    }
+}
+
+/**
+ * @see xwechat_user_xwechat_request_alter
+ * 获取用户详细信息并更新
+ */
+function xwechat_user_update_userinfo($wechat, $openid) {
+    if ($userinfo = $wechat->getUserInfo($openid)) {
+        db_update('xwechat_user')
+            ->fields(array(
+                'nickname'       => HtmlString::encodeEmoji($userinfo['nickname']),
+                'sex'            => $userinfo['sex'],
+                'language'       => $userinfo['language'],
+                'city'           => $userinfo['city'],
+                'province'       => $userinfo['province'],
+                'country'        => $userinfo['country'],
+                'headimgurl'     => $userinfo['headimgurl'],
+                'subscribe_time' => $userinfo['subscribe_time'],
+                'unionid'        => isset($userinfo['unionid']) ? $userinfo['unionid'] : '',
+                'remark'         => $userinfo['remark'],
+                'groupid'        => $userinfo['groupid'],
+                'updated'        => REQUEST_TIME,
+            ))
+            ->condition('openid', $openid)
+            ->execute();
+    }
+}
+
+/**
+ * HOOK_wechat_operation
+ */
+function xwechat_user_wechat_operation($links = array(), $config) {
+    $links['user'] = array(
+        'title'      => t('User'),
+        'href'       => 'admin/config/xwechat/' . $config->wid . '/user',
+        'attributes' => array('target'=>'_blank'),
+    );
+    
+    return $links;
+}
+
+/**
+ * @see wechat_user_menu
+ * 用户列表
+ */
+function xwechat_user_list($config) {
+    static $sexes = array( 0=>'未知', 1=>'男', 2=>'女' );
+    static $subscribes = array( 0=>'未知', 1=>'已关注', 2=>'已取消' );
+    $query = db_select('xwechat_user', 'u')->extend(Pyramid\Drupal\Pager::compat());
+    $data  = $query->fields('u')
+                   ->limit(32)
+                   ->condition('wid', $config->wid)
+                   ->execute()
+                   ->fetchAll();
+    $head  = array(
+        'subscribe'  => t('Subscribe'),
+        'headimgurl' => t('Image'),
+        'nickname'   => t('Nickname'),
+        'sex'        => t('Sex'),
+        'location'   => t('Location'),
+        'subscribe_time' => t('Subscribe Time'),
+        'accessed'   => t('Last Access'),
+        'operate'    => array('data' => t('Operations')),
+    );
+    $rows = array();
+    foreach ($data as $v) {
+        $nickname = HtmlString::decodeEmoji($v->nickname);
+        $operate  = array('remark' => array(
+                      'title' => t('Remark'),
+                      'href'  => 'admin/config/xwechat/' . $config->wid . '/user/' . $v->openid . '/remark',
+                    ));
+        $rows[$v->openid] = array(
+            'subscribe'  => $subscribes[$v->subscribe],
+            'headimgurl' => $v->headimgurl ? "<img style='max-width:64px' src='{$v->headimgurl}' />" : $v->openid,
+            'nickname'   => $v->remark ? "{$nickname} ({$v->remark})" : $nickname,
+            'sex'        => $sexes[$v->sex],
+            'location'   => $v->country . $v->province . $v->city,
+            'subscribe_time' => $v->subscribe_time ? format_date($v->subscribe_time, 'medium', 'Y-m-d H:i:s') : '',
+            'accessed'   => $v->accessed ? format_date($v->accessed, 'medium', 'Y-m-d H:i:s') : '',
+            'operate'    => array(
+                'data' => array(
+                    '#theme' => 'links__node_operations',
+                    '#links' => $v->subscribe == 1 ? $operate : array(),
+                    '#attributes' => array('class' => array('links', 'inline')),
+                ),
+            ),
+        );
+    }
+    $form['users'] = array(
+        '#type' => 'item',
+        '#markup' => theme('table', array('header' => $head, 'rows' => $rows)),
+    );
+    $form['pager'] = array('#markup' => theme('pager'));
+    
+    return $form;
+}
