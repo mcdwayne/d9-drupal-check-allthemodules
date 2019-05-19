@@ -1,0 +1,71 @@
+<?php
+
+use Drupal\strava\Api\Strava;
+use Drupal\strava_athletes\Entity\Athlete;
+
+/**
+ * Implements hook_cron().
+ */
+function strava_activities_cron() {
+  $config = \Drupal::config('strava_activities_configuration.settings');
+  if ($config->get('cron_sync')) {
+    $strava = new Strava();
+    $queue = \Drupal::queue('strava_activities');
+    $queue->createQueue();
+
+    $ids = \Drupal::database()
+      ->query('SELECT id FROM {athlete} WHERE status = 1')
+      ->fetchCol();
+
+    /** @var Athlete $athlete */
+    foreach (Athlete::loadMultiple($ids) as $athlete) {
+      $client = $strava->getApiClientForAthlete($athlete);
+      if (!$client) {
+        continue;
+      }
+
+      // Get the last synchronisation timestamp for this athlete.
+      $store_key = 'activities_last_sync:' . $athlete->id();
+      $store = \Drupal::keyValue('strava_activities.sync');
+      $current_sync = \Drupal::time()->getRequestTime();
+      $last_sync = $store->get($store_key, NULL);
+
+      // Get the 100 latest Athlete activities.
+      $activities = $client->getAthleteActivities($current_sync, $last_sync, 1, 100);
+      if (is_array($activities) && !empty($activities)) {
+        foreach ($activities as $activity) {
+          $activity_manager = \Drupal::service('strava.activity_manager');
+          $entity = $activity_manager->loadActivityByProperty('id', $activity['id']);
+
+          // Save new items.
+          if (!$entity) {
+            $activity_manager->createActivity($activity);
+          }
+          // Update existing items.
+          else {
+            $activity_manager->updateActivity($activity);
+          }
+
+          // Also set a queue item to retrieve the activity's complete details.
+          $queue->createItem($activity);
+        }
+
+        // Store the last synchronisation timestamp into the database.
+        $store->set($store_key, $current_sync);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function strava_activities_theme($existing, $type, $theme, $path) {
+  return [
+    'activity' => [
+      'render element' => 'elements',
+      'template' => 'activity',
+      'file' => 'activity.page.inc',
+    ],
+  ];
+}
