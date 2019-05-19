@@ -1,0 +1,277 @@
+<?php
+
+/**
+ * @file
+ * Connecting the Webex functionality to drupal website.
+ */
+
+/**
+ * Implements hook_form_alter().
+ */
+function webex_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+ $upload_enabled_types = \Drupal::config('webex.settings')->get('webex_content_type');
+ if($form_id == 'node_'.$upload_enabled_types.'_form'){
+ 	  $form['meetingdate'] = array(
+        '#type' => 'datetime',
+        '#title' => 'Meeting Date',
+        '#required' => TRUE,
+        '#default_value' => '',
+       ); 
+    foreach (array_keys($form['actions']) as $action) {
+      if ($action != 'preview' && isset($form['actions'][$action]['#type']) && $form['actions'][$action]['#type'] === 'submit') {
+        $form['actions'][$action]['#submit'][] = 'webex_api_call';
+      }
+    }   
+    $form['attendees'] = array(
+      '#title' => t('Attendees'),
+      '#type' => 'container',
+      '#tree' => TRUE,
+      '#prefix' => '<div id="attendees">',
+      '#suffix' => '</div>',
+    );
+    for ($i = 1; $i <= 3; $i++) {
+      $form['attendees']['emails'][$i] = array(
+        '#title' => t('Attendees') . $i,
+        '#type' => 'fieldset',
+         '#tree' => TRUE,
+      );
+      if ($i == 1) {
+         $required = TRUE;
+      }
+      else {
+        $required = FALSE;
+      }
+      $form['attendees']['emails'][$i]['name'] = array(
+        '#type' => 'textfield',
+        '#required' => $required,
+        '#description' => t('email@example.com'),
+      );
+    }     
+ }
+}
+/**
+ * Webex Xml Api: Xml Call.
+ */
+function webex_api_call(&$form, \Drupal\Core\Form\FormStateInterface $form_state) {
+  $title = $form['title']['widget'][0]['value']['#value'];
+  $metetingdate = $form['meetingdate']['#value']['date'];
+  $meetingtime = $form['meetingdate']['#value']['time'];
+  $meetingdates = strtotime($metetingdate . ' ' . $meetingtime);
+  $startdate = gmdate("m/d/Y H:i:s", $meetingdates);
+  $nodeid = $form_state->getValue('nid');
+  $attendees = $form['attendees']['emails'];
+  $emails = '';
+  foreach ($attendees as $v) {
+    if (isset($v['name']['#value'])) {
+      $members = $v['name']['#value'];
+      if (!empty($members)) {
+        $emails .= '<attendee>
+                            <emailInvitations>true</emailInvitations>
+                            <person>
+                                <email>' . $members . '</email>
+                            </person>
+                      </attendee>';
+      }
+    }
+  }
+  $webex_api_id = \Drupal::config('webex.settings')->get('webex_api_id');
+  $webex_api_password = \Drupal::config('webex.settings')->get('webex_api_pwd');
+  $webex_api_siteid = \Drupal::config('webex.settings')->get('webex_site_id');
+  $webex_api_email = \Drupal::config('webex.settings')->get('webex_email');
+  $bodycontent = '<bodyContent
+                      xsi:type="java:com.webex.service.binding.meeting.CreateMeeting">';
+  $requestxml = '<?xml version="1.0" encoding="UTF-8"?>
+          <serv:message xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+              <header>
+                  <securityContext>
+                      <webExID>' . $webex_api_id . '</webExID>
+                      <password>' . $webex_api_password . '</password>
+                      <siteID>' . $webex_api_siteid . '</siteID>
+                      <email>' . $webex_api_email . '</email>
+                  </securityContext>
+              </header>
+              <body>
+                  ' . $bodycontent . '
+                      <accessControl>
+                          <meetingPassword>pass123</meetingPassword>
+                      </accessControl>
+                      <metaData>
+                          <confName>' . $title . '</confName>
+                          <agenda>' . $title . '</agenda>
+                      </metaData>
+                      <participants>
+                          <attendees>' . $emails . '</attendees>
+                      </participants>
+                      <enableOptions>
+                          <attendeeList>true</attendeeList>
+                          <chat>true</chat>
+                          <poll>true</poll>
+                          <audioVideo>true</audioVideo>
+                      </enableOptions>
+                      <schedule>
+                          <startDate>' . $startdate . '</startDate>
+                          <openTime>0</openTime>
+                          <joinTeleconfBeforeHost>false</joinTeleconfBeforeHost>
+                          <duration>0</duration>
+                          <timeZoneID>7</timeZoneID>
+                      </schedule>
+                  </bodyContent>
+              </body>
+          </serv:message>';
+  $stdobjparam = new stdClass();
+  $stdobjparam->url = \Drupal::config('webex.settings')->get('webex_api_url');
+  $stdobjparam->method = 'post';
+  $stdobjparam->params = $requestxml;
+  $stdobjparam->is_ret = TRUE;
+  $stdobjparam->returntransfer = TRUE;
+  $stdobjparam->header = '';
+  $stdobjparam->custom_request = '';
+  $result = webex_makewebexcall($stdobjparam);
+  $dom = new DOMDocument();
+  $dom->loadXml($result);
+  $xpath = new DOMXPath($dom);
+  $xpath->registerNamespace('serv', 'http://www.webex.com/schemas/2002/06/service');
+  $xpath->registerNamespace('com', 'http://www.webex.com/schemas/2002/06/common');
+  $xpath->registerNamespace('att', 'http://www.webex.com/schemas/2002/06/service/attendee');
+  $status = $xpath->evaluate('string(/serv:message/serv:header/serv:response/serv:result)');
+  foreach ($xpath->evaluate('/serv:message/serv:body/serv:bodyContent') as $attendee) {
+    $resmeetingkey = $xpath->evaluate('string(meet:meetingkey)', $attendee);
+  }
+  if ($status == 'SUCCESS') {
+    webex_insertmeetingdets($nodeid, $status, $resmeetingkey);
+  }
+  else {
+    drupal_set_message(t('Error on WebEx Meeting Creation!'), 'error');
+  }
+}
+/**
+ * Webex Xml Api: Make Webex Api Call.
+ */
+function webex_makewebexcall($stdObjParam)
+  { 
+    $url      = $stdObjParam->url;
+    $method   = $stdObjParam->method;
+    $params   = $stdObjParam->params;
+    $ret      = $stdObjParam->is_ret;
+    $returnTransfer = $stdObjParam->returntransfer;
+    $header   = $stdObjParam->header;
+    $custom_request = $stdObjParam->custom_request;    
+    switch ($method) 
+    {
+      case 'get':
+        $ch = curl_init();
+        curl_setopt($ch,CURLOPT_URL,$url);
+        curl_setopt($ch, CURLOPT_HEADER, 0);
+        curl_setopt($ch, CURLOPT_HTTPGET, true);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);  
+        $result = curl_exec($ch);
+        curl_close($ch);
+        if($ret == true){
+          return $result;
+        }
+        break;
+      case 'post':
+        $ch = curl_init();
+        curl_setopt($ch,CURLOPT_URL,$url);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt ($ch, CURLOPT_SSL_VERIFYHOST, 0);
+        curl_setopt ($ch, CURLOPT_SSL_VERIFYPEER, 0);
+        if(isset($params) && $params!=''){
+          curl_setopt ($ch, CURLOPT_POSTFIELDS, $params);
+        }
+        if($custom_request){
+          curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $custom_request);
+        }
+        if(isset($header) && is_array($header)){
+          curl_setopt($ch,CURLOPT_HTTPHEADER,$header);
+        }
+        if($returnTransfer == true){
+          curl_setopt ($ch, CURLOPT_RETURNTRANSFER, true);
+        }       
+        $result = curl_exec($ch);
+        if (false === $result) {
+          echo "Error while loading page: ", curl_error($ch), "\n";
+        }
+        curl_close($ch);
+        if($ret == true){
+          return $result;
+        }
+      break;
+      case 'default':
+        return false;
+        break;
+    } 
+  }
+/**
+ * Webex Xml Api: Custom Table Insert.
+ */
+function webex_insertmeetingdets($nodeid, $status, $meetingkey) {
+  db_insert('webex_meeting')
+      ->fields(array(
+        'nid' => $nodeid,
+        'meetingkey' => $meetingkey,
+        'status' => $status,
+      ))->execute();
+}
+/**
+ * Implements hook_node_delete().
+ */
+function webex_node_delete(\Drupal\Core\Entity\EntityInterface $node) { 
+  $contenttype = \Drupal::config('webex.settings')->get('webex_content_type');
+  $type = $node->get('type')[0]->getValue();
+  if ($type['target_id'] == $contenttype) {
+    $query = db_select('webex_meeting', 'wm');
+    $query->fields('wm', array('nid', 'meetingkey', 'status'));
+    $query->condition('wm.nid', $node->nid->value, '=');
+    $result = $query->execute()->fetchAll();
+    if (!empty($result)) {
+      for ($i = 0; $i < count($result); $i++) {
+        webex_cancel_event($result[$i]->nid, $result[$i]->meetingkey, $result[$i]->status, $node->title->value);
+        db_delete('webex_meeting')
+          ->condition('nid', $result[$i]->nid)
+          ->condition('meetingkey', $result[$i]->meetingkey)
+          ->execute();
+      }
+    }
+  }
+}
+/**
+ * Webex Xml Api: Cancel call.
+ */
+function webex_cancel_event($nid, $meetingkey, $status, $title) {
+  $webex_api_id = \Drupal::config('webex.settings')->get('webex_api_id');
+  $webex_api_password = \Drupal::config('webex.settings')->get('webex_api_pwd');
+  $webex_api_siteid = \Drupal::config('webex.settings')->get('webex_site_id');
+  $webex_api_email = \Drupal::config('webex.settings')->get('webex_email');
+  $requestxml = '<?xml version="1.0" encoding="UTF-8"?>
+                  <serv:message xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+                      <header>
+                          <securityContext>
+                              <webExID>' . $webex_api_id . '</webExID>
+                              <password>' . $webex_api_password . '</password>
+                              <siteID>' . $webex_api_siteid . '</siteID>
+                              <email>' . $webex_api_email . '</email>
+                          </securityContext>
+                      </header>
+                      <body>
+                          <bodyContent
+                              xsi:type="java:com.webex.service.binding.ep.DelSession">
+                               <sessionKey>' . $meetingkey . '</sessionKey>
+                               <sendEmail>TRUE</sendEmail>
+                          </bodyContent>
+                      </body>
+                  </serv:message>';
+  $stdobjparam = new stdClass();
+  $stdobjparam->url    = \Drupal::config('webex.settings')->get('webex_api_url');
+  $stdobjparam->method = 'post';
+  $stdobjparam->params = $requestxml;
+  $stdobjparam->is_ret = TRUE;
+  $stdobjparam->returntransfer = TRUE;
+  $stdobjparam->header = '';
+  $stdobjparam->custom_request = '';
+  $res = webex_makewebexcall($stdobjparam);
+  db_delete('webex_meeting')
+            ->condition('nid', $nid)
+            ->condition('meetingkey', $meetingkey)
+            ->execute();
+}
