@@ -1,0 +1,446 @@
+<?php
+
+/**
+ * @file
+ * Main module file.
+ *
+ * Anti-spam module that uses data from www.stopforumspam.com
+ * to protect the user registration form against known spammers and spambots.
+ */
+
+use Drupal\spambot\Form\SpambotSettingsForm;
+use Drupal\user\Entity\User;
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function spambot_form_user_register_form_alter(&$form, &$form_state) {
+
+  if (\Drupal::config('spambot.settings')->get('spambot_user_register_protect')) {
+    spambot_add_form_protection(
+      $form,
+      [
+        'mail' => 'mail',
+        'name' => 'name',
+        'ip' => TRUE,
+      ]
+    );
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function spambot_cron() {
+  $config = \Drupal::config('spambot.settings');
+  // Checks the user limit added in the configuration.
+  if ($limit = $config->get('spambot_cron_user_limit')) {
+    $last_uid = \Drupal::state()->get('spambot_last_checked_uid', 0);
+    if ($last_uid < 1) {
+      // Skip scanning the anonymous and superadmin users.
+      $last_uid = 1;
+    }
+    $query = \Drupal::database()->select('users')
+      ->fields('users', ['uid'])
+      ->condition('uid', $last_uid, '>')
+      ->orderBy('uid')
+      ->range(0, $limit);
+
+    // This checks the Users with the Blocked account for Spam also.
+    if ($config->get('spambot_check_blocked_accounts')) {
+      $query->condition('status', 1);
+    }
+
+    $uids = $query
+      ->execute()
+      ->fetchCol();
+    if ($uids) {
+      // Action to be done after the existing user is known as spam User.
+      $action = $config->get('spambot_spam_account_action');
+      $accounts = User::loadMultiple($uids);
+      foreach ($accounts as $account) {
+        $account_status = $account->status->getValue()[0]['value'];
+        $result = spambot_account_is_spammer($account, $config);
+        if ($result > 0) {
+          switch (\Drupal::currentUser()->hasPermission('protected from spambot scans') ? SpambotSettingsForm::SPAMBOT_ACTION_NONE : $action) {
+
+            case SpambotSettingsForm::SPAMBOT_ACTION_BLOCK:
+
+              if ($account_status) {
+                $account->block();
+                // Block spammer's account.
+                \Drupal::logger('spambot')->notice('Blocked spam account: @name &lt;@email&gt; (uid @uid)',
+                [
+                  '@name' => $account->getDisplayName(),
+                  '@email' => $account->getEmail(),
+                  '@uid' => $account->id(),
+                ]);
+              }
+              else {
+                // Don't block an already blocked account.
+                \Drupal::logger('spambot')->notice('Spam account already blocked: @name &lt;@email&gt; (uid @uid)',
+                  [
+                    '@name' => $account->getDisplayName(),
+                    '@email' => $account->getEmail(),
+                    '@uid' => $account->id(),
+                  ]);
+              }
+              break;
+
+            case SpambotSettingsForm::SPAMBOT_ACTION_DELETE:
+
+              user_delete($account->id());
+              \Drupal::logger('spambot')->notice('Deleted spam account: @name &lt;@email&gt; (uid @uid)',
+                 [
+                   '@name' => $account->getDisplayName(),
+                   '@email' => $account->getEmail(),
+                   '@uid' => $account->id(),
+                 ]);
+              break;
+
+            default:
+              \Drupal::logger('spambot')->notice('Found spam account: @name &lt;@email&gt; (uid @uid)',
+                  [
+                    '@name' => $account->getDisplayName(),
+                    '@email' => $account->getEmail(),
+                    '@uid' => $account->id(),
+                  ]);
+              break;
+          }
+          // Mark this uid as successfully checked.
+          \Drupal::state()->set('spambot_last_checked_uid', $account->id());
+        }
+        elseif ($result == 0) {
+          // Mark this uid as successfully checked.
+          \Drupal::state()->set('spambot_last_checked_uid', $account->id());
+        }
+        elseif ($result < 0) {
+          // Error contacting service, so pause processing.
+          break;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Checks an account to see if it's a spammer.
+ *
+ * This one uses configurable automated criteria checking
+ * of email and username only.
+ *
+ * @param object $account
+ *   User account.
+ *
+ * @return int
+ *   Positive if spammer, 0 if not spammer, negative if error.
+ */
+function spambot_account_is_spammer($account, $config) {
+
+  // Number of times email has been reported as spam in the forum.
+  $email_threshold = $config->get('spambot_criteria_email');
+
+  $username_threshold = $config->get('spambot_criteria_username');
+  $ip_threshold = $config->get('spambot_criteria_ip');
+
+  // Build request parameters according to the criteria to use.
+  $request = [];
+  if (!empty($account->getEmail()) && $email_threshold > 0 && !spambot_check_whitelist('email', $config, $account->getEmail())) {
+    $request['email'] = $account->getEmail();
+  }
+
+  if (!empty($account->getDisplayName()) && $username_threshold > 0 && !spambot_check_whitelist('username', $config, $account->getDisplayName())) {
+    $request['username'] = $account->getDisplayName();
+  }
+
+  // Only do a remote API request if there is anything to check.
+  if ($request) {
+    $data = [];
+
+    if (spambot_sfs_request($request, $data)) {
+      if (($email_threshold > 0 && !empty($data['email']['appears']) && $data['email']['frequency'] >= $email_threshold)
+        || ($username_threshold > 0 && !empty($data['username']['appears']) && $data['username']['frequency'] >= $username_threshold)) {
+
+        return 1;
+      }
+    }
+    else {
+      // Return error.
+      return -1;
+    }
+  }
+
+  // Now check IP's
+  // If any IP matches the threshold, then flag as a spammer.
+  if ($ip_threshold > 0) {
+
+    $ips = spambot_account_ip_addresses($account);
+    foreach ($ips as $ip) {
+      // Skip the loopback interface.
+      if ($ip == '127.0.0.1') {
+        continue;
+      }
+      elseif (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_IPV6) === FALSE) {
+        \Drupal::logger('spambot')->notice('Invalid IP address: %ip (uid=%uid, name=%name, email=%email). Spambot will not rely on it',
+           [
+             '%ip' => $ip,
+             '%name' => $account->getDisplayName(),
+             '%email' => $account->getEmail(),
+             '%uid' => $account->id(),
+           ]);
+        continue;
+      }
+
+      $request = ['ip' => $ip];
+      $data = [];
+      if (spambot_sfs_request($request, $data)) {
+        if (!empty($data['ip']['appears']) && $data['ip']['frequency'] >= $ip_threshold) {
+          return 1;
+        }
+      }
+      else {
+        // Abort on error.
+        return -1;
+      }
+    }
+  }
+
+  // Return no match.
+  return 0;
+}
+
+/**
+ * Retrieves a list of IP addresses for an account.
+ *
+ * @param object $account
+ *   Account to retrieve IP addresses for.
+ *
+ * @return array
+ *   An array of IP addresses, or an empty array if none found
+ */
+function spambot_account_ip_addresses($account) {
+  $hostnames = [];
+
+  // Retrieve IPs from any sessions which may still exist in the CMS.
+  $items = \Drupal::database()->select('sessions')
+    ->distinct()
+    ->fields('sessions', ['hostname'])
+    ->condition('uid', $account->id(), '=')
+    ->execute()
+    ->fetchCol();
+  $hostnames = array_merge($hostnames, $items);
+
+  // Retrieve IPs from comments.
+  $module_handler = \Drupal::moduleHandler();
+
+  if ($module_handler->moduleExists('comment')) {
+    $comment_cid = \Drupal::database()->select('comment_entity_statistics')
+      ->distinct()
+      ->fields('comment_entity_statistics', ['cid'])
+      ->condition('last_comment_uid', $account->id(), '=')
+      ->execute()
+      ->fetchCol();
+
+    $items = \Drupal::database()->select('comment_field_data')
+      ->distinct()
+      ->fields('comment_field_data', ['hostname'])
+      ->condition('cid', $comment_cid, '=')
+      ->execute()
+      ->fetchCol();
+    $hostnames = array_merge($hostnames, $items);
+  }
+  $hostnames = array_unique($hostnames);
+  return $hostnames;
+}
+
+/**
+ * Form builder function to add spambot validations.
+ *
+ * @param array $form
+ *   Form array on which will be added spambot validation.
+ * @param array $options
+ *   Array of options to be added to form.
+ */
+function spambot_add_form_protection(array &$form, array $options = []) {
+
+  // Don't add any protections if the user can bypass the Spambot.
+  if (!\Drupal::currentUser()->hasPermission('protected from spambot scans')) {
+    $form['#spambot_validation']['name'] = !empty($options['name']) ? $options['name'] : '';
+    $form['#spambot_validation']['mail'] = !empty($options['mail']) ? $options['mail'] : '';
+    $form['#spambot_validation']['ip'] = isset($options['ip']) && is_bool($options['ip']) ? $options['ip'] : TRUE;
+    // Overriding the ::validateForm() of user registartion form.
+    $form['#validate'][] = 'spambot_user_register_form_validate';
+  }
+}
+
+/**
+ * Validate callback for user_register form.
+ */
+function spambot_user_register_form_validate(&$form, &$form_state) {
+
+  $config = \Drupal::config('spambot.settings');
+  $validation_field_names = $form['#spambot_validation'];
+  $values = $form_state->getValues();
+  $form_errors = $form_state->getErrors();
+  $email_threshold = $config->get('spambot_criteria_email');
+  $username_threshold = $config->get('spambot_criteria_username');
+  $ip_threshold = $config->get('spambot_criteria_ip');
+  // Build request parameters according to the criteria to use.
+  $request = [];
+  if (!empty($values[$validation_field_names['mail']]) && $email_threshold > 0 && !spambot_check_whitelist('email', $config, $values[$validation_field_names['mail']])) {
+    $request['email'] = $values[$validation_field_names['mail']];
+  }
+
+  if (!empty($values[$validation_field_names['name']]) && $username_threshold > 0 && !spambot_check_whitelist('username', $config, $values[$validation_field_names['name']])) {
+    $request['username'] = $values[$validation_field_names['name']];
+  }
+
+  $ip = \Drupal::request()->getClientIp();
+  if ($ip_threshold > 0 && $ip != '127.0.0.1' && $validation_field_names['ip'] && !spambot_check_whitelist('ip', $config, $ip)) {
+    // Make sure we have a valid IPv4 address (API doesn't support IPv6 yet).
+    if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_IPV6) === FALSE) {
+      \Drupal::logger('spambot')->notice('Invalid IP address on registration: @ip. Spambot will not rely on it.', ['@ip' => $ip]);
+    }
+    else {
+      $request['ip'] = $ip;
+    }
+  }
+
+  // Only do a remote API request if there is anything to check.
+  if ($request && !$form_errors) {
+    $data = [];
+    if (spambot_sfs_request($request, $data)) {
+      $substitutions = [
+        '@email' => $values[$validation_field_names['mail']],
+        '%email' => $values[$validation_field_names['mail']],
+        '@username' => $values[$validation_field_names['name']],
+        '%username' => $values[$validation_field_names['name']],
+        '@ip' => $ip,
+        '%ip' => $ip,
+      ];
+
+      $reasons = [];
+      if ($email_threshold > 0 && !empty($data['email']['appears']) && $data['email']['frequency'] >= $email_threshold) {
+
+        $form_state->setErrorByName('mail', format_string($config->get('spambot_blocked_message_email'), $substitutions));
+        $reasons[] = t('email=@value', ['@value' => $request['email']]);
+      }
+
+      if ($username_threshold > 0 && !empty($data['username']['appears']) && $data['username']['frequency'] >= $username_threshold) {
+
+        $form_state->setErrorByName('name', format_string($config->get('spambot_blocked_message_username'), $substitutions));
+        $reasons[] = t('username=@value', ['@value' => $request['username']]);
+      }
+      if ($ip_threshold > 0 && !empty($data['ip']['appears']) && $data['ip']['frequency'] >= $ip_threshold) {
+
+        $form_state->setErrorByName('', t('Error Message'));
+        $reasons[] = t('ip=@value', ['@value' => $request['ip']]);
+      }
+
+      if ($reasons) {
+        if ($config->get('spambot_log_blocked_registration')) {
+          \Drupal::logger('spambot')->notice('Blocked registration: @reasons', ['@reasons' => implode(',', $reasons)]);
+
+          $hook_args = [
+            'request' => $request,
+            'reasons' => $reasons,
+          ];
+          \Drupal::moduleHandler()->invokeAll('spambot_registration_blocked', [$hook_args]);
+        }
+
+        if ($delay = $config->get('spambot_blacklisted_delay')) {
+          sleep($delay);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Check if current data $type is whitelisted.
+ *
+ * @param string $type
+ *   Type can be one of these three values: 'ip', 'email' or 'username'.
+ * @param object $config
+ *   Value for the configuration object.
+ * @param string $value
+ *   Value to be checked.
+ *
+ * @return bool
+ *   TRUE if data is whitelisted, FALSE otherwise.
+ */
+function spambot_check_whitelist($type, $config, $value) {
+  switch ($type) {
+    case 'ip':
+      $whitelist_ips = $config->get('spambot_whitelist_ip');
+      $result = strpos($whitelist_ips, $value) !== FALSE;
+      break;
+
+    case 'email':
+      $whitelist_usernames = $config->get('spambot_whitelist_email');
+      $result = strpos($whitelist_usernames, $value) !== FALSE;
+      break;
+
+    case 'username':
+      $whitelist_emails = $config->get('spambot_whitelist_username');
+      $result = strpos($whitelist_emails, $value) !== FALSE;
+      break;
+
+    default:
+      $result = FALSE;
+      break;
+  }
+
+  return $result;
+}
+
+/**
+ * Invoke www.stopforumspam.com's api.
+ *
+ * @param array $query
+ *   A keyed array of url parameters ie. ['email' => 'blah@blah.com'].
+ * @param array $data
+ *   An array that will be filled with the data from www.stopforumspam.com.
+ *
+ * @return bool
+ *   TRUE on successful request (and $data will contain the data)
+ *   FALSE otherwise.
+ */
+function spambot_sfs_request(array $query, array &$data) {
+
+  // An empty request results in no match.
+  if (empty($query)) {
+    return FALSE;
+  }
+
+  // Use php serialisation format.
+  $query['f'] = 'serial';
+  $url = 'http://www.stopforumspam.com/api?' . urldecode(http_build_query($query, '', '&'));
+  $response = \Drupal::httpClient()->get(
+  $url, [
+    'headers' => ['Accept' => 'text/plain',
+    ],
+  ]
+  );
+
+  $status_code = $response->getStatusCode();
+
+  if (!empty($status_code) && $status_code == 200) {
+    $data = unserialize($response->getBody()->getContents());
+    $vars = [
+      '%url' => $url,
+      '%data' => serialize($data),
+    ];
+    if (!empty($data['success'])) {
+      \Drupal::logger('spambot')->notice("Success: %url %data", $vars);
+      return TRUE;
+    }
+    else {
+      \Drupal::logger('spambot')->notice("Request unsuccessful: %url %data", $vars);
+    }
+  }
+  else {
+    \Drupal::logger('spambot')->error("Error contacting service: %url", ['%url' => $url]);
+  }
+  return FALSE;
+}
