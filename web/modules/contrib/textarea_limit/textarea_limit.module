@@ -1,0 +1,197 @@
+<?php
+
+/**
+ * @file
+ * Contains textarea_limit.module.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Field\FieldConfigInterface;
+
+const TL_CHAR_LIMIT_ID = 'textarea_limit_char_limit';
+const TL_USE_GLOBAL_LIMIT_ID = 'textarea_limit_use_global_limit';
+
+/**
+ * Implements hook_field_widget_third_party_settings_form().
+ */
+function textarea_limit_field_widget_third_party_settings_form($plugin, $field_definition, $form_mode, $form, $form_state) {
+  $element = [];
+  if ($plugin->getPluginId() == 'string_textarea') {
+    $element[TL_USE_GLOBAL_LIMIT_ID] = [
+      '#type' => 'checkbox',
+      '#title' => t('Use global limit'),
+      '#description' => t('Limit number of characters using the global character limit'),
+      '#default_value' => $plugin->getThirdPartySetting('textarea_limit', TL_USE_GLOBAL_LIMIT_ID),
+    ];
+
+    $element[TL_CHAR_LIMIT_ID] = [
+      '#type' => 'textfield',
+      '#size' => '6',
+      '#title' => t('Limit text custom'),
+      '#description' => t('Limit number of characters by a custom amount. Leave blank to disable.'),
+      '#default_value' => $plugin->getThirdPartySetting('textarea_limit', TL_CHAR_LIMIT_ID),
+    ];
+
+  }
+  return $element;
+}
+
+/**
+ * Implements hook_field_widget_settings_summary_alter().
+ */
+function textarea_limit_field_widget_settings_summary_alter(&$summary, $context) {
+  if ($context['widget']->getPluginId() == 'string_textarea') {
+    $use_global = $context['widget']->getThirdPartySetting('textarea_limit', TL_USE_GLOBAL_LIMIT_ID);
+    if ($use_global) {
+      $summary[] = t('Limited to global character limit');
+    }
+    else {
+      $char_limit = $context['widget']->getThirdPartySetting('textarea_limit', TL_CHAR_LIMIT_ID);
+      if (!empty($char_limit)) {
+        $summary[] = t('Limited to @chars characters', ['@chars' => $char_limit]);
+      }
+    }
+  }
+}
+
+/**
+ * Fetch the field definitions.
+ */
+function textarea_limit_fetch_field_definitions($entity_type, $bundle, $field_definitions = NULL) {
+  if ($field_definitions === NULL) {
+    $entity_manager = \Drupal::entityManager();
+    $field_definitions = $entity_manager->getFieldDefinitions($entity_type, $bundle);
+  }
+
+  $field_definitions = array_filter($field_definitions, function ($field_definition) {
+    return $field_definition instanceof FieldConfigInterface;
+  });
+
+  uasort($field_definitions, ['\Drupal\Core\Config\Entity\ConfigEntityBase', 'sort']);
+
+  return $field_definitions;
+}
+
+/**
+ * Apply textarea limit to form field.
+ */
+function textarea_limit_form_field_apply_limit(&$field, &$form, $limit = NULL) {
+  global $_textarea_limit_id;
+
+  if ($limit === NULL) {
+    $config = \Drupal::configFactory()->get('textarea_limit.settings');
+    $limit = $config->get('global_limit');
+  }
+
+  foreach (Element::children($field['widget']) as $key) {
+    if ($_textarea_limit_id === NULL) {
+      $_textarea_limit_id = 0;
+    }
+    else {
+      $_textarea_limit_id++;
+    }
+
+    $limit_render_array = [
+      '#limit' => $limit,
+      '#id' => 'limit-count-number-' . $_textarea_limit_id,
+      '#theme' => 'textarea_limit_remaining',
+    ];
+
+    $limit_rendered = \Drupal::service('renderer')->renderPlain($limit_render_array);
+
+    $field['widget'][$key]['#suffix'] = $limit_rendered;
+  }
+
+  $field['#attributes']['class'][] = 'character-limited';
+
+  textarea_limit_form_add_library($form);
+}
+
+/**
+ * Add library to form.
+ */
+function textarea_limit_form_add_library(&$form) {
+  if (!in_array('textarea_limit/textarea_limit', $form['#attached']['library'])) {
+    $form['#attached']['library'][] = 'textarea_limit/textarea_limit';
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function textarea_limit_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $entity_type_manager = \Drupal::entityTypeManager();
+
+  if (isset($form['#entity_builders'])) {
+    $storage = $form_state->getStorage();
+    if (!isset($storage['form_display'])) {
+      return;
+    }
+
+    $form_display = $storage['form_display'];
+    if ($form_display === NULL) {
+      return;
+    }
+    $field_definitions = textarea_limit_fetch_field_definitions($form_display->getTargetEntityTypeId(), $form_display->getTargetBundle());
+
+    foreach ($field_definitions as $field_name => $field_definition) {
+      if ($field_definition->getType() == 'field_collection') {
+        $fc_definitions = textarea_limit_fetch_field_definitions('field_collection_item', $field_name);
+        $fc_form_display = $entity_type_manager->getStorage('entity_form_display')->load('field_collection_item.' . $field_name . '.default');
+        foreach ($fc_definitions as $fc_field_name => $fc_field_definition) {
+          $fc_field_widget = $fc_form_display->getRenderer($fc_field_name);
+          $value_applies = textarea_limit_widget_applies($fc_field_widget);
+          if ($value_applies !== FALSE) {
+            foreach (Element::children($form[$field_name]['widget']) as $fc_widget_key) {
+              if ($fc_widget_key !== 'add_more') {
+                textarea_limit_form_field_apply_limit($form[$field_name]['widget'][$fc_widget_key][$fc_field_name], $form, $value_applies);
+              }
+            }
+          }
+        }
+
+        continue;
+      }
+
+      $widget = $form_display->getRenderer($field_name);
+      $value_applies = textarea_limit_widget_applies($widget);
+
+      if ($value_applies !== FALSE) {
+        textarea_limit_form_field_apply_limit($form[$field_name], $form, $value_applies);
+      }
+    }
+  }
+}
+
+/**
+ * Return whether a widget has text limiting.
+ */
+function textarea_limit_widget_applies($widget) {
+  if (method_exists($widget, 'getPluginId') && $widget->getPluginId() == 'string_textarea') {
+    $use_global = $widget->getThirdPartySetting('textarea_limit', TL_USE_GLOBAL_LIMIT_ID);
+    if (!empty($use_global)) {
+      $config = \Drupal::configFactory()->get('textarea_limit.settings');
+      return $config->get('global_limit');
+    }
+
+    $char_limit = $widget->getThirdPartySetting('textarea_limit', TL_CHAR_LIMIT_ID);
+
+    return empty($char_limit) ? FALSE : $char_limit;
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function textarea_limit_theme($existing, $type, $theme, $path) {
+  return [
+    'textarea_limit_remaining' => [
+      'variables' => [
+        'limit' => '',
+        'id' => '',
+      ],
+    ],
+  ];
+}
