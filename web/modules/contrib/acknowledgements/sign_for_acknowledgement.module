@@ -1,0 +1,396 @@
+<?php
+
+use Drupal\Core\Url;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Link;
+use Drupal\field\Entity;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\ContentEntityInterface;
+use Drupal\field\Entity\FieldStorageConfig;
+use Drupal\Core\Database\Database;
+use Drupal\Core\Cache\Cache;
+use Drupal\views\ViewEntityInterface;
+use Drupal\views\ViewExecutable;
+
+
+/**
+ * Implements hook_theme().
+ *
+ */
+function sign_for_acknowledgement_theme() {
+  return [
+    'sign_for_acknowledgement_checkbox' => [
+      'template' => 'checkbox',
+      'variables' => [
+        'form' => NULL,
+        'expire' => NULL,
+      ],
+    ],
+    'sign_for_acknowledgement_checkbox_signed' => [
+      'template' => 'checkbox_signed',
+      'variables' => [
+        'expire' => NULL,
+        'date' => NULL,
+        'agreement' => NULL,
+        'annotation' => NULL,
+      ],
+    ],
+    'sign_for_acknowledgement_checkbox_expired' => [
+      'template' => 'checkbox_expired',
+      'variables' => [
+        'expire' => NULL,
+      ],
+    ],
+    'sign_for_acknowledgement_filters' => [
+      'template' => 'filters',
+      'variables' => [
+        'form' => NULL,
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_node_view
+ *
+ **/
+function sign_for_acknowledgement_node_view(array &$build, Drupal\Core\Entity\EntityInterface $node, Drupal\Core\Entity\Entity\EntityViewDisplay  $display, $view_mode) {
+  $config = \Drupal::config('sign_for_acknowledgement.settings');
+  $fieldman = \Drupal::service('sign_for_acknowledgement.field_manager');
+  $dbman = \Drupal::service('sign_for_acknowledgement.db_manager');
+  $show_submit = $config->get('show_submit');
+  $weight = $config->get('weight');
+
+  $renderer = \Drupal::service('renderer');
+  $renderer->addCacheableDependency($build, $node->id());
+
+  if (!$fieldman->appliesToBundle($node->bundle())) {
+    return;
+  }
+  if (!$fieldman->appliesToUser($node)) {
+    return;
+  }
+
+  $timestamp = $fieldman->expirationDate(TRUE, $node->id(), $node);
+  if ($timestamp) {
+    $formatted = \Drupal::service('date.formatter')->format(
+      $timestamp, 'medium'
+    );
+  }
+  else {
+	$formatted = '---';
+  }
+  $signature_timestamp = -1;
+  $alternate = '';
+  $annotation = '';
+  $already_signed = $dbman->alreadySigned(\Drupal::currentUser()->id(), $node->id(), $signature_timestamp, $alternate, $annotation);
+  $is_expired = ($timestamp && $config->get('block_expired') && time() > $timestamp);
+
+  // No full viewing?
+  if ($view_mode != 'full') {
+    $build['partial'] = array('#markup' => sign_for_acknowledgement_partial($is_expired, $already_signed));
+    $build['partial']['#weight'] = -1;
+    return;
+  }
+
+  //$build['checkbox']['#weight'] = $weight;
+
+  if ($already_signed) {
+	$signed = \Drupal::service('date.formatter')->format(
+      $signature_timestamp, 'medium'
+    );
+
+    $build['checkbox'] = [
+        '#theme' => 'sign_for_acknowledgement_checkbox_signed',
+        '#expire' => $formatted,
+        '#date' => $signed,
+        '#annotation' => $annotation,
+        '#agreement' => $alternate,
+        '#weight' => $weight,
+      ];
+  }
+  else if ($is_expired) {
+    $build['checkbox'] = [
+        '#theme' => 'sign_for_acknowledgement_checkbox_expired',
+        '#expire' => $formatted,
+        '#weight' => $weight,
+      ];
+  }
+  else {
+    $alt = $node->alternate_form->value;
+    $multi = @$node->alternate_form_multiselect->value;
+    if ($alt || $multi) {// alternate form
+      $myform = Drupal::formBuilder()->getForm('Drupal\sign_for_acknowledgement\Form\AlternateForm', $node);
+	  } else {// normal form
+      $myform = Drupal::formBuilder()->getForm('Drupal\sign_for_acknowledgement\Form\CheckboxForm', $show_submit, $node);
+    }
+    $build['checkbox'] = [
+        '#theme' => 'sign_for_acknowledgement_checkbox',
+        '#form' => $myform,
+    	  '#expire' => $formatted,
+        '#weight' => $weight,
+      ];
+	  
+    $msg = t('<strong>Please, remember to sign for acknowledgement.</strong>');
+    drupal_set_message($msg, 'warning', TRUE);
+
+  }
+
+}
+ 
+/**
+ * Implements hook_form_BASE_FORM_ID_alter
+ *
+ **/
+function sign_for_acknowledgement_form_node_form_alter(&$form, FormStateInterface &$form_state, $form_id) {
+  $config = \Drupal::config('sign_for_acknowledgement.settings');
+  $found = FALSE;
+  $edit = FALSE;
+  $apply_to = $config->get('node_types');
+  $beautify = $config->get('beautify_node_edit');
+  foreach($apply_to as $nodetype) {
+    if ($form_id == 'node_' . $nodetype . '_form') {
+      $found = TRUE;
+      break;
+    }
+    if ($form_id == 'node_' . $nodetype . '_edit_form') {
+      $found = $edit = TRUE;
+      break;
+    }
+  }
+  if (!$found) {
+    return;
+  }
+
+  if ($beautify) {
+    $form['sign_for_acknowledgement_roles'] = array(
+      '#type' => 'details',
+      '#title' => t('Roles'),
+      '#open' => TRUE,
+      '#weight' => 121,
+      );
+
+    $form['sign_for_acknowledgement_users'] = array(
+      '#type' => 'details',
+      '#title' => t('Users'),
+      '#open' => TRUE,
+      '#weight' => 122,
+      );
+
+    $form['sign_for_acknowledgement_alternate'] = array(
+      '#type' => 'details',
+      '#title' => t('alternate form'),
+      '#open' => FALSE,
+      '#weight' => 123,
+      );
+
+    $form['sign_for_acknowledgement_note'] = array(
+      '#type' => 'details',
+      '#title' => t('Annotation'),
+      '#open' => FALSE,
+      '#weight' => 124,
+      );
+
+    $form['sign_for_acknowledgement_nosign'] = array(
+      '#type' => 'details',
+      '#title' => t('If no acknowledgement is required...'),
+      '#open' => FALSE,
+      '#weight' => 125,
+      );
+  }
+
+  // pre-select roles while creating node
+  if (!$edit && !$config->get('use_default_roles')) {
+    $my_roles = $config->get('roles');
+    $my_roles_filtered = array();
+    foreach ($my_roles as $key => $value) {
+      if ($key === $value) {
+        $my_roles_filtered[] = $value;
+      }
+    }
+    $form['enable_roles']['widget']['#default_value'] = $my_roles_filtered;
+  }
+
+  // hide single user setup
+  if (!$config->get('use_single_user')) {
+    $form['enable_users']['#type'] = 'hidden';
+    $form['email_users']['#type'] = 'hidden';
+    if ($beautify) {
+      $form['sign_for_acknowledgement_users']['#type'] = 'hidden';
+    }
+  }
+	  
+  if (!$config->get('email_to_roles')) {
+    $form['email_roles']['#type'] = 'hidden';
+  } else if (!$edit) {
+	  $form['email_roles']['widget']['value']['#default_value'] = 1;
+  }
+  if (!$config->get('email_to_users')) {
+    $form['email_users']['#type'] = 'hidden';
+  } else if (!$edit && $config->get('use_single_user')) {
+	  $form['email_users']['widget']['value']['#default_value'] = 1;
+  }
+  
+  if ($beautify) {
+    $form['sign_for_acknowledgement_roles']['enable_roles'] = $form['enable_roles'];
+    unset($form['enable_roles']);
+    $form['sign_for_acknowledgement_users']['enable_users'] = $form['enable_users'];
+    unset($form['enable_users']);
+    $form['sign_for_acknowledgement_users']['email_users'] = $form['email_users'];
+    unset($form['email_users']);
+    $form['sign_for_acknowledgement_roles']['email_roles'] = $form['email_roles'];
+    unset($form['email_roles']);
+    $form['sign_for_acknowledgement_note']['annotation_field'] = $form['annotation_field'];
+    unset($form['annotation_field']);
+    $form['sign_for_acknowledgement_note']['annotation_field_required'] = $form['annotation_field_required'];
+    unset($form['annotation_field_required']);
+    $form['sign_for_acknowledgement_alternate']['alternate_form_text'] = $form['alternate_form_text'];
+    unset($form['alternate_form_text']);
+    $form['sign_for_acknowledgement_alternate']['alternate_form'] = $form['alternate_form'];
+    unset($form['alternate_form']);
+    if (isset($form['alternate_form_multiselect'])) {
+      $form['sign_for_acknowledgement_alternate']['alternate_form_multiselect'] = $form['alternate_form_multiselect'];
+      unset($form['alternate_form_multiselect']);
+      $form['sign_for_acknowledgement_alternate']['alternate_form_multiselect']['#weight'] = 1;
+    }
+    $form['sign_for_acknowledgement_alternate']['alternate_form']['#weight'] = 0;
+    $form['sign_for_acknowledgement_alternate']['alternate_form_text']['#weight'] = 2;
+    $form['sign_for_acknowledgement_nosign']['enable_roles_nosign'] = $form['enable_roles_nosign'];
+    unset($form['enable_roles_nosign']);
+  }
+
+  //echo "<pre>";print_r($form['email_users']);exit;	  
+  if (!$edit) {
+	  return;
+  }
+
+  $form['sign_for_acknowledgement_content'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Delete exsisting acknowledgements?'),
+    '#description' => t('If you modify this node in such a way that all affected users need to re-acknowledge, please check this checkbox.'),
+	'#weight' => 200,
+  );
+  $form['sign_for_acknowledgement_content']['delete_acknowledgements'] = array (
+    '#type' => 'checkbox',
+    '#title' => t('delete acknowledgements'),
+  );
+}
+
+/**
+ * Implements hook_page_attachments
+ *
+ **/
+function  sign_for_acknowledgement_page_attachments(array &$page) {
+  if (\Drupal::currentUser()->isAuthenticated()) {
+    $page['#attached']['library'][] = 'sign_for_acknowledgement/stylesheet';
+  }
+}
+
+/**
+ * Implements hook_entity_type_update().
+ */
+function sign_for_acknowledgement_node_update(EntityInterface $node) {
+  $fieldman = \Drupal::service('sign_for_acknowledgement.field_manager');
+  $mailman = \Drupal::service('sign_for_acknowledgement.mail_manager');
+
+  // Right content type?
+  if (!$fieldman->appliesToBundle($node->bundle())) {
+    return;
+  }
+
+  if (Drupal::request()->get('delete_acknowledgements')) {
+    // Delete all acknowledgements (and email flags) to this node.
+    Database::getConnection()->delete('sign_for_acknowledgement')
+      ->condition('node_id', $node->id())
+      ->execute();
+    Database::getConnection()->delete('sign_for_acknowledgement_email')
+      ->condition('node_id', $node->id())
+      ->execute();
+  }
+
+  $roles = Drupal::request()->get('enable_roles');
+  $users = Drupal::request()->get('enable_users');
+  $nosign = Drupal::request()->get('enable_roles_nosign');
+
+  $mailman->nodeEmail($node, $roles, $users, $nosign);
+}
+
+/**
+ * Implements hook_entity_type_insert().
+ */
+function sign_for_acknowledgement_node_insert(EntityInterface $node) {
+  $fieldman = \Drupal::service('sign_for_acknowledgement.field_manager');
+  $mailman = \Drupal::service('sign_for_acknowledgement.mail_manager');
+
+  // Right content type?
+  if (!$fieldman->appliesToBundle($node->bundle())) {
+	return;
+  }
+
+  $roles = Drupal::request()->get('enable_roles');
+  $users = Drupal::request()->get('enable_users');
+  $nosign = Drupal::request()->get('enable_roles_nosign');
+
+  $mailman->nodeEmail($node, $roles, $users, $nosign);
+}
+
+/**
+ * Implements hook_mail().  
+ */
+function sign_for_acknowledgement_mail($key, &$message, $params) {
+  switch($key) {
+    case 'notify':
+      $message['subject'] = $params['subject'];
+      $message['body'][] = $params['body'];
+      $message['headers'] += $params['headers'];
+      break;
+  }
+}
+
+
+/**
+  * Get roles list
+  *
+  */
+function sign_for_acknowledgement_get_roles(FieldStorageConfig $definition, ContentEntityInterface $entity = NULL, $cacheable) {
+  $config = \Drupal::config('sign_for_acknowledgement.settings');
+  $my_roles = $config->get('roles');
+  $my_roles_filtered = array();
+    foreach ($my_roles as $key => $value) {
+      if ($key === $value || !$config->get('use_default_roles')) {
+        $my_roles_filtered[$key] = $key;
+      }
+    }
+  return $my_roles_filtered;
+}
+ 
+/**
+  * Get users list
+  *
+  */
+function sign_for_acknowledgement_get_users(FieldStorageConfig $definition, ContentEntityInterface $entity = NULL, $cacheable) {
+  // thanks to pvasener for patch
+  $users = Database::getConnection()->query('SELECT uid, name FROM {users_field_data} WHERE uid > 0 AND status = 1 ORDER BY name ASC')->fetchAllKeyed(0, 1);    
+  return $users;
+}
+ 
+/**
+ * @param boolean $expired
+ * @param boolean $signed
+ * @return string describing the status of the signature.  
+ */    
+function sign_for_acknowledgement_partial($expired, $signed)
+{
+  if ($signed) {
+    return '<div class="signed">' . t('document has been signed by you') . '</div>';
+  }
+  else {
+    if (!$expired) {
+      return '<div class="unsigned">' . t('document to be signed by you') . '</div>';
+    }
+    else {
+      return '<div class="expired">' . t('your signature period has expired') . '</div>';
+    }
+  }
+}
+
