@@ -1,0 +1,276 @@
+<?php
+/**
+ * @file
+ * VWO module main functionality.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+
+/**
+ * Implements hook_page_attachments().
+ */
+function visual_website_optimizer_page_attachments(array &$attachments) {
+  $state = &drupal_static('visual_website_optimizer_state', array(
+    'add' => FALSE,
+    'added' => FALSE,
+    'custom_url' => FALSE,
+    'cache_contexts' => array(),
+  ));
+
+  // Do not attempt to add more than once.
+  if ($state['added']) {
+    return;
+  }
+
+  $config = \Drupal::config('visual_website_optimizer.settings');
+  $id = $config->get('id');
+
+  // If not configured, no point to continue.
+  if ($id == NULL) {
+    return;
+  }
+
+  // Do not proceed if not flagged to add, and filtering not enabled.
+  $filter = ($config->get('filter.enabled') == 'on');
+  if (!$filter && !$state['add']) {
+    return;
+  }
+
+  // Check filter and add appropriate cache contexts.
+  // @todo Replace with Conditions API.
+  if ($filter) {
+
+    // Assumption is that we add the code and negate with tests.
+    $state['add'] = TRUE;
+
+    // Need account for user and role checks.
+    $account = \Drupal::currentUser();
+
+    // Per user opt-out.
+    $usercontrol = $config->get('filter.userconfig');
+    if ($usercontrol != 'nocontrol' && $account->id()) {
+
+      // Start with default.
+      $addjs = ($usercontrol == 'optin') ? FALSE : TRUE;
+
+      // Get user data and set if needed.
+      $userconfig = \Drupal::service('user.data')
+        ->get('visual_website_optimizer', $account->id(), 'userconfig');
+      if (isset($userconfig)) {
+        $addjs = $userconfig;
+      }
+
+      // Add the caching context and indicate choice.
+      $state['add'] = $addjs;
+      $state['cache_contexts'][] = 'user';
+    }
+
+    // Node type filtering.
+    if ($state['add'] && $include_node_types = $config->get('filter.nodetypes')) {
+      $node = \Drupal::routeMatch()->getParameter('node');
+
+      if ($node) {
+        $state['add'] = in_array($node->getType(), $include_node_types);
+        // @todo Find correct cache context.
+        $state['cache_contexts'][] = 'url.path';
+      }
+
+      else {
+        // Condition requires that the page be a node based one.
+        $state['add'] = FALSE;
+      }
+    }
+
+    // Role filtering.
+    if ($state['add'] && $include_roles = $config->get('filter.roles')) {
+      $intersect = array_intersect($include_roles, $account->getRoles());
+
+      $state['add'] = ($intersect) ? TRUE : FALSE;
+      $state['cache_contexts'][] = 'user.roles';
+    }
+
+    // Path filtering.
+    if ($state['add'] && $pathlist = $config->get('filter.page.list')) {
+       $filter_type = $config->get('filter.page.type');
+
+       // Eval the PHP code.
+       if ($filter_type == 'usephp') {
+         // Only actually run if the php module is also here.
+         // See https://www.drupal.org/node/2088811
+         if (\Drupal::moduleHandler()->moduleExists('php')) {
+           if (php_eval($pathlist)) {
+             $state['add'] = TRUE;
+           }
+           else {
+             $state['add'] = FALSE;
+           }
+           // @todo Cache context? Currently inherits the page filter context
+           // of url.path set below.
+         }
+
+         // @todo Notify admin of foul up? Requires full logger factory.
+       }
+
+       // Check against the path and alias.
+       else {
+
+         $path_matcher = \Drupal::service('path.matcher');
+         $current_path = \Drupal::service('path.current')->getPath();
+
+         // @todo API update probable.
+         // Change PathMatcher::matchPath() $patterns param from string to an array of strings
+         // https://www.drupal.org/node/2274701
+         $matched = $path_matcher->matchPath($current_path, $pathlist);
+
+         // If we haven't matched, also check agains the alias.
+         if (!$matched) {
+           // Get the alias.
+           $alias = \Drupal::service('path.alias_manager')->getAliasByPath($current_path);
+
+           // Only check again if there's a difference.
+           if ($current_path != $alias) {
+             $matched = $path_matcher->matchPath($alias, $pathlist);
+           }
+         }
+
+         if ($filter_type == 'listexclude' && $matched) {
+           $state['add'] = FALSE;
+         }
+         if ($filter_type == 'listinclude' && !$matched) {
+           $state['add'] = FALSE;
+         }
+       }
+
+       // @todo Confirm correct cache context.
+      $state['cache_contexts'][] = 'url.path';
+    }
+  }
+
+  // Add JS if we are going to.
+  if ($state['add']) {
+    $settings = array(
+      'id' => $id,
+    );
+
+    // @todo // Using #attached js inline is vorboten. May be addessed in 8.2.x?
+    // https://www.drupal.org/node/2391025
+
+    if ($config->get('loading.type') == 'async') {
+      $settings['timeout_library'] = $config->get('loading.timeout.library');
+      $settings['timeout_setting'] = $config->get('loading.timeout.settings');
+      $settings['usejquery'] = ($config->get('loading.usejquery') == 'local') ? TRUE : FALSE;
+      $settings['testnull'] = NULL;
+
+      $attachments['#attached']['drupalSettings']['vwo'] = $settings;
+      $attachments['#attached']['library'][] = 'visual_website_optimizer/asynchronous';
+    }
+    else {
+      // Synchronous adding of code is not implemented. Do not alter cache
+      // contexts.
+      return;
+    }
+  }
+
+  // Add the cache contexts if set.
+  if ($state['cache_contexts']) {
+    if (isset($attachments['#cache']['contexts'])) {
+      $attachments['#cache']['contexts'] = array_merge(
+        $attachments['#cache']['contexts'],
+        $state['cache_contexts']
+      );
+    }
+    else {
+      $attachments['#cache']['contexts'] = $state['cache_contexts'];
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function visual_website_optimizer_form_user_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+
+  // This hook is called for more than just the user editing.
+  if ($form_id == 'user_form') {
+
+    $config = \Drupal::config('visual_website_optimizer.settings');
+    $userfilter = $config->get('filter.userconfig');
+
+    // If there is no user control, or the module is not working/enabled
+    // then do not show the options.
+    if ($userfilter == 'nocontrol'
+        || $config->get('id') == NULL) {
+      return;
+    }
+
+    // Default setting based on visibility setting.
+    $vwo_checkbox = ($userfilter == 'optin') ? 0 : 1;
+
+    // User settings stored in user.data.
+    $account = $form_state->getFormObject()->getEntity();
+    $userconfig = \Drupal::service('user.data')
+      ->get('visual_website_optimizer', $account->id(), 'userconfig');
+    if (isset($userconfig)) {
+      $vwo_checkbox = $userconfig;
+    }
+
+    $form['vwo_user'] = array(
+      '#type' => 'details',
+      '#open' => TRUE,
+      '#title' => t('Visual Website Optimiser'),
+    );
+
+    $form['vwo_user']['vwo_userfilter'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Include VWO A/B testing'),
+      '#description' => t('This website may run A/B testing at times. If this box is checked, the javascript required for it to work will be included.'),
+      '#default_value' => $vwo_checkbox,
+    );
+
+    $form['actions']['submit']['#submit'][] = '_visual_website_optimizer_form_user_form_alter_submit';
+  }
+}
+
+/**
+ * Submit handler to save user choice on VWO code optin/out.
+ */
+function _visual_website_optimizer_form_user_form_alter_submit($form, FormStateInterface $form_state) {
+
+  // Save data in the user data store.
+  $account = $form_state->getFormObject()->getEntity();
+  $userconfig = \Drupal::service('user.data')->set(
+    'visual_website_optimizer',
+    $account->id(),
+    'userconfig',
+    $form_state->getValue('vwo_userfilter')
+  );
+}
+
+/**
+ * Implements hook_help().
+ */
+function visual_website_optimizer_help($route_name, RouteMatchInterface $route_match) {
+  // Real content is in visual_website_optimizer.help.inc.
+
+  // @todo D8 API page for module_load_include function indicates that there
+  // may be a better method to use in the future.
+  // https://api.drupal.org/api/drupal/core%21includes%21module.inc/function/module_load_include/8
+
+  if ($route_name == 'visual_website_optimizer.settings'
+      || $route_name == 'help.page.visual_website_optimizer') {
+
+    module_load_include('inc', 'visual_website_optimizer', 'visual_website_optimizer.help');
+    return _visual_website_optimizer_help_settings();
+  }
+
+  elseif ($route_name == 'visual_website_optimizer.settings.visibility') {
+    module_load_include('inc', 'visual_website_optimizer', 'visual_website_optimizer.help');
+    return _visual_website_optimizer_help_visibility();
+  }
+
+  elseif ($route_name == 'visual_website_optimizer.settings.vwoid') {
+    module_load_include('inc', 'visual_website_optimizer', 'visual_website_optimizer.help');
+    return _visual_website_optimizer_help_vwoid();
+  }
+}
