@@ -1,0 +1,567 @@
+<?php
+
+/**
+ * @file
+ * Module's hooks implementations and helper functions.
+ */
+
+use Drupal\Component\Utility\Html;
+use Drupal\Component\Utility\Unicode;
+use Drupal\Component\Utility\UrlHelper;
+use Drupal\Core\Asset\AttachedAssetsInterface;
+use Drupal\Core\Render\Element;
+use Drupal\Core\Url;
+
+/**
+ * Indicates that the cookie must live 365 days more.
+ */
+const STYLESWITCHER_COOKIE_EXPIRE = 31536000;
+
+/**
+ * Implements hook_page_attachments().
+ */
+function styleswitcher_page_attachments(array &$attachments) {
+  // Add the dynamic CSS to every page. Use a library instead of straight
+  // html_head_link attachment because we need our alternative stylesheets to
+  // overwrite the most other css on the page and in standard html.html.twig
+  // css goes after head.
+  $attachments['#attached']['library'][] = 'styleswitcher/dynamic-css';
+}
+
+/**
+ * Implements hook_css_alter().
+ */
+function styleswitcher_css_alter(&$css, AttachedAssetsInterface $assets) {
+  $path = drupal_get_path('module', 'styleswitcher') . '/styleswitcher.active.css';
+
+  // The dynamic-css library is not always attached. For example, maintenance
+  // pages don't have it. So check for its presence.
+  if (isset($css[$path])) {
+    $asset = $css[$path];
+    unset($css[$path]);
+
+    // Use the latest standard group to be after the most of other css. Some
+    // themes (like Omega) use even latter groups to set their grid layouts
+    // hoping they wouldn't be overridden.
+    $asset['group'] = CSS_AGGREGATE_THEME;
+    $asset['weight'] = PHP_INT_MAX;
+
+    $theme = Drupal::theme()->getActiveTheme()->getName();
+    // Construct absolute URL explicitly to work out disabled clean URLs.
+    $path = Url::fromRoute('styleswitcher.css', array('theme' => $theme), array('absolute' => TRUE))->toString();
+
+    $css[$path] = $asset;
+    $css[$path]['data'] = $path;
+  }
+}
+
+/**
+ * Implements hook_element_info_alter().
+ */
+function styleswitcher_element_info_alter(&$types) {
+  // This pre-render callback must run before element's #markup is created in
+  // HtmlTag::preRenderHtmlTag() which is a pre-render callback too.
+  array_unshift($types['html_tag']['#pre_render'], 'styleswitcher_pre_render_html_tag');
+}
+
+/**
+ * Render API callback: Adds HTML id for Styleswitcher style link.
+ *
+ * This function is assigned as a #pre_render callback in
+ * styleswitcher_element_info_alter().
+ */
+function styleswitcher_pre_render_html_tag(array $element) {
+  if (!empty($element['#attributes']['media']) && $element['#attributes']['media'] == 'styleswitcher') {
+    // Set 'media' back to its default value.
+    $element['#attributes']['media'] = 'all';
+    // Add an ID.
+    $element['#attributes']['id'] = 'styleswitcher-css';
+  }
+
+  return $element;
+}
+
+/**
+ * Loads a style array by its machine name and a theme name.
+ *
+ * @param string $name
+ *   Machine name of the style to load.
+ * @param string $theme
+ *   Machine name of the theme to get the style for.
+ * @param string $type
+ *   (optional) Style type: 'theme' or 'custom'. If the type is specified then
+ *   it will be prefixed with a slash to the $name argument.
+ *
+ * @return array|null
+ *   Style array on success or NULL otherwise. Style is an associative array
+ *   containing:
+ *   - name: Machine name.
+ *   - label: Human-readable label.
+ *   - path: System or external path to the CSS file.
+ *   - weight: Weight of style link in the switch list.
+ *   - status: Indicates whether the style is enabled or not.
+ *   - is_default: Indicates that this style is the default one. This element
+ *     may not always show the truth. It is recommended to use
+ *     styleswitcher_default_style_key() to get the default style key.
+ *   - _i: Index number of the style. It is used for sorting of styles with
+ *     equal weights.
+ *   - theme: Name of the theme the style is loaded for.
+ *
+ * @see styleswitcher_default_style_key()
+ */
+function styleswitcher_style_load($name, $theme, $type = '') {
+  if ($type) {
+    $name = $type . '/' . $name;
+    // The next conversion is only rationale for auto-loader wildcards in paths
+    // and there are $type arguments always set in menu items so if this
+    // function is called with only one argument this conversion is redundant.
+    $name = strtr($name, '-', '_');
+  }
+
+  $styles = styleswitcher_style_load_multiple($theme, array('name' => $name));
+
+  if ($styles) {
+    return reset($styles);
+  }
+}
+
+/**
+ * Returns a list of styles.
+ *
+ * @param string $theme
+ *   Name of the theme to get styles for.
+ * @param array $filter
+ *   Style properties to filter by. Each key is a property name, and value is
+ *   a corresponding filter value.
+ *
+ * @return array
+ *   Array of styles - all or just filtered by conditions from the $filter
+ *   argument. Keys are machine names and each element is a corresponding style
+ *   array, which structure is the same as returned from
+ *   styleswitcher_style_load().
+ *
+ * @see styleswitcher_style_load()
+ */
+function styleswitcher_style_load_multiple($theme, array $filter = array()) {
+  $styles = &drupal_static(__FUNCTION__, array());
+
+  if (!isset($styles[$theme])) {
+    $theme_styles = styleswitcher_custom_styles() + styleswitcher_theme_styles($theme);
+    $settings = styleswitcher_styles_settings($theme);
+
+    foreach (array_keys($theme_styles) as $i => $key) {
+      if (isset($settings[$key])) {
+        $theme_styles[$key] += $settings[$key];
+      }
+
+      // Default settings.
+      $theme_styles[$key] += array(
+        'is_default' => FALSE,
+        'status' => TRUE,
+        'weight' => 0,
+        '_i' => $i,
+        'theme' => $theme,
+      );
+    }
+
+    $styles[$theme] = $theme_styles;
+  }
+
+  if (empty($filter)) {
+    return $styles[$theme];
+  }
+
+  $return = array();
+
+  foreach ($styles[$theme] as $key => $style) {
+    // Check the requested conditions.
+    foreach ($filter as $property => $value) {
+      if ($style[$property] != $value) {
+        continue 2;
+      }
+    }
+
+    $return[$key] = $style;
+  }
+
+  return $return;
+}
+
+/**
+ * Returns a list of styles with theme-specific settings.
+ *
+ * @param string $theme
+ *   Name of the theme to get styles settings for.
+ *
+ * @return array
+ *   Array which keys are styles machine names and each element is a
+ *   corresponding array with settings: weight, status and is_default. All
+ *   settings are optional. See styleswitcher_style_load() for their
+ *   descriptions.
+ *
+ * @see styleswitcher_style_load()
+ */
+function styleswitcher_styles_settings($theme) {
+  $settings = Drupal::config('styleswitcher.styles_settings')->get();
+
+  if (empty($settings[$theme])) {
+    $settings[$theme] = array();
+
+    styleswitcher_theme_styles($theme);
+    // Disable the blank style if theme has its own default one.
+    if (styleswitcher_theme_default_style_key($theme)) {
+      $settings[$theme]['custom/default']['status'] = FALSE;
+    }
+  }
+
+  return $settings[$theme];
+}
+
+/**
+ * Returns a list of custom styles.
+ *
+ * @return array
+ *   Array which keys are styles machine names and each element is a
+ *   corresponding array with properties: name, label and path. All properties
+ *   are mandatory. See styleswitcher_style_load() for their descriptions.
+ *
+ * @see styleswitcher_style_load()
+ */
+function styleswitcher_custom_styles() {
+  $defaults['custom/default'] = array(
+    'name' => 'custom/default',
+    'label' => 'Default',
+    'path' => NULL,
+  );
+
+  $styles = Drupal::config('styleswitcher.custom_styles')->get();
+
+  if ($styles) {
+    unset($styles['_core']);
+  }
+
+  return $styles ? $styles : $defaults;
+}
+
+/**
+ * Returns a list of styles provided by a theme.
+ *
+ * @param string $theme
+ *   Name of the theme to retrieve styles of.
+ * @param string|null $original_theme
+ *   (optional) Name of the theme which the function was originally called with.
+ *   While iterating over base themes the $theme argument changes but
+ *   $original_theme keeps the same value.
+ *
+ * @return array
+ *   Array of styles. Keys are machine names and each element is a corresponding
+ *   array of style properties: name, label and path. All properties are
+ *   mandatory. See styleswitcher_style_load() for their descriptions.
+ *
+ * @see styleswitcher_style_load()
+ */
+function styleswitcher_theme_styles($theme, $original_theme = NULL) {
+  $styles = &drupal_static(__FUNCTION__, array());
+
+  // Theme can be an empty string if custom style is loading.
+  if (!$theme) {
+    return array();
+  }
+
+  if (isset($styles[$theme])) {
+    return $styles[$theme];
+  }
+
+  $theme_styles = array();
+  $theme_path = drupal_get_path('theme', $theme);
+  $themes = Drupal::service('theme_handler')->listInfo();
+  $theme_info = isset($themes[$theme]) ? $themes[$theme]->info : array();
+
+  if (!isset($original_theme)) {
+    $original_theme = $theme;
+  }
+
+  // Search base themes for styleswitcher info.
+  if (isset($theme_info['base theme'])) {
+    $theme_styles = styleswitcher_theme_styles($theme_info['base theme'], $original_theme);
+  }
+
+  if (!empty($theme_info['styleswitcher'])) {
+    $info = $theme_info['styleswitcher'];
+
+    // Array of alternatives.
+    if (!empty($info['css'])) {
+      foreach ($info['css'] as $label => $path) {
+        $name = 'theme/' . _styleswitcher_style_name($label);
+        $theme_styles[$name] = array(
+          'name' => $name,
+          'label' => $label,
+          'path' => UrlHelper::isExternal($path) ? $path : $theme_path . '/' . $path,
+        );
+      }
+    }
+
+    // Default style.
+    if (isset($info['default'])) {
+      $default = $info['default'];
+    }
+    elseif (isset($info['css']['default'])) {
+      $default = $info['css']['default'];
+      unset($theme_styles['theme/default']);
+    }
+
+    if (isset($default)) {
+      $default_in_existing = FALSE;
+
+      // Check if Default points to one of existing alternatives.
+      foreach ($theme_styles as $name => $style) {
+        if ($default == $style['label'] || $default == $style['path'] || $theme_path . '/' . $default == $style['path']) {
+          styleswitcher_theme_default_style_key($original_theme, $name);
+          $default_in_existing = TRUE;
+          break;
+        }
+      }
+
+      // Default is a path not mentioned in css array.
+      if (!$default_in_existing) {
+        $defaults['theme/default'] = array(
+          'name' => 'theme/default',
+          'label' => 'Default',
+          'path' => UrlHelper::isExternal($default) ? $default : $theme_path . '/' . $default,
+        );
+        // Place default style above others.
+        $theme_styles = $defaults + $theme_styles;
+        styleswitcher_theme_default_style_key($original_theme, 'theme/default');
+      }
+    }
+  }
+
+  // Do not inflate the memory.
+  if ($theme == $original_theme) {
+    $styles[$theme] = $theme_styles;
+  }
+
+  return $theme_styles;
+}
+
+/**
+ * Transliterates a human-readable name to a machine name.
+ *
+ * @param string $display_name
+ *   Style label.
+ *
+ * @return string
+ *   Transliterated name.
+ *
+ * @see Drupal.behaviors.machineName.transliterate()
+ * @see drupal_clean_css_identifier()
+ * @see drupal_html_id()
+ */
+function _styleswitcher_style_name($display_name) {
+  $name = Unicode::strtolower($display_name);
+  $name = strtr($name, array(' ' => '_', '-' => '_'));
+  $name = preg_replace('/[^a-z0-9_]/', '', $name);
+
+  return $name;
+}
+
+/**
+ * Saves/returns the key of default style provided by a theme.
+ *
+ * When theme's .info file is scanned for styles to switch this function is
+ * called with argument to statically save a style key for further use. And
+ * after, when this function is called it returns the key saved earlier.
+ *
+ * @param string $theme
+ *   Name of the theme which default style is being saved/requested.
+ * @param string|null $key
+ *   The key of theme's default style.
+ *
+ * @return string|null
+ *   The key of theme's default style.
+ */
+function styleswitcher_theme_default_style_key($theme, $key = NULL) {
+  $default_key = &drupal_static(__FUNCTION__, array());
+
+  if (isset($key)) {
+    $default_key[$theme] = $key;
+  }
+
+  return isset($default_key[$theme]) ? $default_key[$theme] : NULL;
+}
+
+/**
+ * Finds the default style and returns its key.
+ *
+ * @param string $theme
+ *   Name of the theme to find the default style for.
+ *
+ * @return string
+ *   The key of the default style.
+ */
+function styleswitcher_default_style_key($theme) {
+  $default_key = &drupal_static(__FUNCTION__, array());
+
+  // Search the default style explicitly set by admin.
+  if (!isset($default_key[$theme])) {
+    $styles = styleswitcher_style_load_multiple($theme, array('is_default' => TRUE));
+    $default_key[$theme] = key($styles);
+  }
+
+  // Plan B. If default style is not set in styles configuration form by admin
+  // then find out initial default style defined by theme.
+  if (!isset($default_key[$theme])) {
+    styleswitcher_theme_styles($theme);
+    $default_key[$theme] = styleswitcher_theme_default_style_key($theme);
+  }
+
+  // Fallback to the blank style.
+  if (!isset($default_key[$theme])) {
+    $styles = styleswitcher_style_load_multiple($theme, array('path' => NULL));
+    $default_key[$theme] = key($styles);
+  }
+
+  return $default_key[$theme];
+}
+
+/**
+ * Implements hook_theme().
+ */
+function styleswitcher_theme() {
+  return array(
+    'styleswitcher_admin_styles_table' => array(
+      'render element' => 'form',
+      'function' => 'theme_styleswitcher_admin_styles_table',
+    ),
+    'styleswitcher_admin_style_overview' => array(
+      'variables' => array('style' => NULL),
+      'function' => 'theme_styleswitcher_admin_style_overview',
+    ),
+  );
+}
+
+/**
+ * Returns HTML for the styles settings overview form element.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - form: An element representing the form.
+ *
+ * @ingroup themeable
+ */
+function theme_styleswitcher_admin_styles_table(array $variables) {
+  $form = $variables['form'];
+  $header = array(
+    t('Style'),
+    t('Enabled'),
+    t('Default'),
+    t('Weight'),
+  );
+  $rows = array();
+
+  if (!empty($form['weight'])) {
+    foreach (Element::children($form['weight']) as $key) {
+      if ($key == $form['default']['#default_value']) {
+        $form['enabled'][$key]['#attributes']['disabled'] = 'disabled';
+      }
+
+      $label = $form['label'][$key]['#markup'];
+      $form['enabled'][$key]['#title'] = t('Enable @title', array('@title' => $label));
+      $form['enabled'][$key]['#title_display'] = 'invisible';
+      $form['default'][$key]['#title'] = t('Set @title as default', array('@title' => $label));
+      $form['default'][$key]['#title_display'] = 'invisible';
+
+      // Build the table row.
+      $row = array(
+        array('data' => $form['name'][$key]),
+        array('data' => $form['enabled'][$key]),
+        array('data' => $form['default'][$key]),
+        array('data' => $form['weight'][$key]),
+      );
+      $rows[] = array(
+        'data' => $row,
+        'class' => array('draggable'),
+      );
+    }
+  }
+
+  $table = array(
+    '#type' => 'table',
+    '#header' => $header,
+    '#rows' => $rows,
+    '#empty' => t('No styles to switch.'),
+    '#attributes' => array('id' => 'styleswitcher-styles-table'),
+    '#tabledrag' => array(
+      0 => array(
+        'action' => 'order',
+        'relationship' => 'sibling',
+        'group' => 'styleswitcher-style-weight',
+      ),
+    ),
+  );
+
+  return Drupal::service('renderer')->render($table);
+}
+
+/**
+ * Returns HTML for a style description on the styles overview page.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - style: A style array as returned from styleswitcher_style_load().
+ *
+ * @see styleswitcher_style_load()
+ *
+ * @ingroup themeable
+ */
+function theme_styleswitcher_admin_style_overview(array $variables) {
+  $style = $variables['style'];
+
+  $output = Html::escape($style['label']);
+  $output .= ' <small>' . t('(Machine name: @name)', array('@name' => $style['name'])) . '</small>';
+
+  if (isset($style['path'])) {
+    $description = $style['path'];
+  }
+  else {
+    $description = t('Blank style which just removes effect of others.');
+  }
+  $output .= '<div class="description">' . $description . '</div>';
+
+  return $output;
+}
+
+/**
+ * Sorts styles by weight and index.
+ *
+ * This function first compares style weights, and then - if weights are equal -
+ * style index numbers.
+ *
+ * The compared items (function parameters) should be associative arrays that
+ * include a 'weight' and an '_i' elements.
+ *
+ * Callback for uasort() within
+ * Drupal\styleswitcher\Plugin\Block\Styleswitcher::build() and
+ * Drupal\styleswitcher\Form\StyleswitcherConfigTheme::buildForm().
+ *
+ * @see \Drupal\styleswitcher\Plugin\Block\Styleswitcher::build()
+ * @see \Drupal\styleswitcher\Form\StyleswitcherConfigTheme::buildForm()
+ */
+function styleswitcher_sort(array $a, array $b) {
+  $property = $a['weight'] != $b['weight'] ? 'weight' : '_i';
+  return $a[$property] - $b[$property];
+}
+
+/**
+ * Implements hook_themes_uninstalled().
+ */
+function styleswitcher_themes_uninstalled(array $theme_list) {
+  // Delete styleswitcher settings of disabled themes.
+  $config = Drupal::configFactory()->getEditable('styleswitcher.styles_settings');
+  $settings = $config->get();
+  if (!$settings) {
+    $settings = array();
+  }
+  $settings = array_diff_key($settings, array_flip($theme_list));
+  $config->setData($settings)->save();
+}
