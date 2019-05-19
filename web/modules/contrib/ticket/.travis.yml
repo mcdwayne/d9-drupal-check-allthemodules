@@ -1,0 +1,103 @@
+sudo: required
+dist: trusty
+language: php
+
+php:
+  - 5.6
+  - 7
+
+matrix:
+  fast_finish: true
+
+env:
+
+# Cache Composer & Drush directories.
+cache:
+  bundler: true
+  apt: true
+  directories:
+  - "$HOME/.composer/cache"
+  - "$HOME/.drush/cache"
+
+notifications:
+#  slack: $SLACK_TOKEN
+
+mysql:
+  database: drupal
+  username: root
+  encoding: utf8
+
+before_install:
+  # Disable xdebug.
+  - phpenv config-rm xdebug.ini
+  # Update composer.
+  - composer self-update
+  - composer --version
+  # Add the oauth token to prevent GitHub timeouts.
+  #  - git config --global github.accesstoken $GITHUB_OAUTH_TOKEN
+
+  # Initialize xvfb (see https://docs.travis-ci.com/user/gui-and-headless-browsers)
+  - export DISPLAY=:99.0
+  - sh -e /etc/init.d/xvfb start
+  - sleep 3
+
+  # Download Chrome Driver
+  - LATEST_CHROMEDRIVER=$(wget -q -O - http://chromedriver.storage.googleapis.com/LATEST_RELEASE)
+  - wget http://chromedriver.storage.googleapis.com/$LATEST_CHROMEDRIVER/chromedriver_linux64.zip
+  - unzip chromedriver_linux64.zip
+  - chmod +x chromedriver
+  - mkdir -p $HOME/.composer/vendor/bin
+  - mv -f chromedriver $HOME/.composer/vendor/bin/
+  - rm chromedriver_linux64.zip
+
+  # Update Chrome.
+  - export CHROME_BIN=/usr/bin/google-chrome
+  - wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+  - sudo dpkg -i google-chrome-stable_current_amd64.deb
+  - rm google-chrome-stable_current_amd64.deb
+  - google-chrome --version
+
+install:
+  # Add Composer's local bin directory to the PATH so that we will be running
+  # our installed versions of Drush, PHPCS, Behat, PhantomJS, etc.
+  - export PATH="$TRAVIS_BUILD_DIR/vendor/bin:$PATH"
+
+  # Composer install should fail on bad patches.
+  - export COMPOSER_EXIT_ON_PATCH_FAILURE=1
+
+  # MySQL Options
+  - mysql -e 'SET GLOBAL wait_timeout = 5400;'
+  - mysql -e "SHOW VARIABLES LIKE 'wait_timeout'"
+
+  # PHP conf tweaks
+  - echo 'max_execution_time = 120' >> drupal.php.ini;
+  - echo 'sendmail_path = /bin/true' >> drupal.php.ini;
+  - phpenv config-add drupal.php.ini
+  - phpenv rehash
+
+  # Let Composer do all the magic!
+  - composer install
+
+  # Install Standard profile.
+  - cd docroot
+  - drush site-install standard --yes --account-pass=admin --db-url=mysql://root:@localhost/drupal
+  - drush config-set system.logging error_level all --yes
+
+
+before_script:
+  - drush runserver --default-server=builtin 8080 &>/dev/null &
+  - jdk_switcher use oraclejdk8
+  # Start Selenium and dump its ginormous log into a temporary file.
+  - mkdir ../tmp
+  - selenium-server-standalone -port 4444 -log ../tmp/selenium2.log &
+  - sleep 5
+
+script:
+  - cd $TRAVIS_BUILD_DIR/docroot/modules/ticket
+  - phpcs $TRAVIS_BUILD_DIR/docroot/modules/ticket --standard=$TRAVIS_BUILD_DIR/vendor/drupal/coder/coder_sniffer/Drupal/ruleset.xml --ignore=bin,*.css,libraries,modules/contrib
+  - behat --config $TRAVIS_BUILD_DIR/tests/behat/behat.yml --strict
+  - cd $TRAVIS_BUILD_DIR/docroot
+  - drush en simpletest ticket --yes
+  - php core/scripts/run-tests.sh --module ticket --php $(which php)
+  - cd $TRAVIS_BUILD_DIR/
+  - phpunit --configuration tests/phpunit/phpunit.xml --testdox
