@@ -1,0 +1,268 @@
+<?php
+
+/**
+ * @file
+ * Google Webfont Loader API primary file.
+ *
+ * The designer/developer creates a set of packages (will use .fontinfo files
+ * created in a similar manner to a module or theme .info file) from which the
+ * site admin can then choose for their site.  The fonts can then be tied to how
+ * the page and various rules on the page get rendered.
+ */
+
+use Drupal\Core\Extension\InfoParserException;
+use Symfony\Component\Yaml\Exception\ParseException;
+use Symfony\Component\Yaml\Parser;
+
+/**
+ * Implements hook_library_info_build().
+ */
+function google_webfont_loader_api_library_info_build() {
+  $library['fonts'] = array(
+    'css' => [],
+    'js' => [],
+    'drupalSettings' => [],
+  );
+  $css = _google_webfont_loader_api_add_css();
+  foreach ($css as $key => $css_file) {
+    $library['fonts']['css']['component']["/$css_file"] = array(
+      'basename' => $css_file,
+    );
+  }
+  return $library;
+}
+
+/**
+ * Implements hook_library_info_alter().
+ */
+function google_webfont_loader_api_library_info_alter(&$library, $module) {
+  $config = \Drupal::config('google_webfont_loader_api.settings');
+  $extension = 'webfont_loader';
+  if ($module == 'google_webfont_loader_api') {
+    if ($config->get('cache')) {
+      foreach ($library[$extension]['js'] as $key => $value) {
+        if (strpos($key, 'webfontloader.js') !== FALSE) {
+          unset($library[$extension]['js'][$key]);
+        }
+      }
+      $library[$extension]['js']['webfont.js'] = array(
+        'type' => 'file',
+        'every_page' => TRUE,
+      );
+    }
+    if ($config->get('display_style') == 'hidden') {
+      $library[$extension]['css']['component']['google_webfont_loader_api.hidden.css'] = array(
+        'every_page' => TRUE,
+      );
+    }
+  }
+}
+
+/**
+ * Implements hook_js_settings_alter().
+ */
+function google_webfont_loader_api_js_settings_alter(array &$settings, \Drupal\Core\Asset\AttachedAssetsInterface $assets) {
+  $loader_js = _google_webfont_loader_api_add_js();
+  if (count($loader_js) > 0) {
+    $loader_js['timeout'] = 3000;
+    $settings['google_webfont_loader_api']['font_config'] = $loader_js;
+  }
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function google_webfont_loader_api_page_attachments(&$page) {
+  // Retrieve the font list and the font the user chose.
+  $config = \Drupal::config('google_webfont_loader_api.settings');
+  $font_list = google_webfont_loader_api_get_font_list();
+
+  $page['#attached']['library'][] = 'google_webfont_loader_api/webfont_loader';
+  $page['#attached']['library'][] = 'google_webfont_loader_api/fonts';
+  $page['#attached']['drupalSettings']['google_webfont_loader_api'] = array(
+    'loaded' => 'TRUE',
+  );
+
+  $user_chosen_fonts = $config->get('font');
+  foreach ($user_chosen_fonts as $user_chosen_font => $value) {
+    if (!empty($value) && array_key_exists($user_chosen_font, $font_list)) {
+      $font = $font_list[$user_chosen_font];
+      $filepath = str_replace('//', '/', dirname($font['uri']));
+      $font_info = $font['info'];
+      _google_webfont_loader_api_load_font($font_info, $filepath);
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_HOOK() for HTML document templates.
+ */
+function google_webfont_loader_api_preprocess_html(&$variables) {
+  $config = \Drupal::config('google_webfont_loader_api.settings');
+  if ($config->get('display_style') == 'hidden') {
+    if (!isset($variables['html_attributes']['class'])) {
+      $variables['html_attributes']['class'] = array();
+    }
+    $variables['html_attributes']['class'][] = 'wf-loading';
+  }
+}
+
+/**
+ * Retrieve the list of fonts available.
+ */
+function google_webfont_loader_api_get_font_list($reset = FALSE) {
+  if ($reset) {
+    $listings = google_webfont_loader_api_scan_fontinfo_files('modules');
+    $listings = array_merge($listings, google_webfont_loader_api_scan_fontinfo_files('libraries'));
+    $listings = array_merge($listings, google_webfont_loader_api_scan_fontinfo_files('themes'));
+    $parser = new Parser();
+    foreach ($listings as $key => $listing) {
+      try {
+        $new_key = preg_replace("/[^a-zA-Z0-9]/", "_", $key);
+        $listing_array = (array) $listing;
+        $listing_array['info'] = $parser->parse(file_get_contents($listing_array['uri']));
+        $listing_array['name'] = $new_key;
+        unset($listings[$key]);
+        $listings[$new_key] = $listing_array;
+      }
+      catch (ParseException $e) {
+        throw new InfoParserException("Unable to parse $listing", $e->getMessage());
+      }
+    }
+  }
+  else {
+    $config = \Drupal::config('google_webfont_loader_api.settings');
+    $listings = $config->get('fontinfo_listing');
+  }
+  return $listings;
+}
+
+/**
+ * Add new font loader css.
+ */
+function _google_webfont_loader_api_add_css($new_css = NULL, $reset = FALSE) {
+  static $loader_css;
+  if (!isset($loader_css) || $reset) {
+    $loader_css = array();
+  }
+  if (isset($new_css)) {
+    $loader_css[] = $new_css;
+  }
+  return $loader_css;
+}
+
+/**
+ * Add new font loader js.
+ */
+function _google_webfont_loader_api_add_js($new_js = NULL, $reset = FALSE) {
+  static $loader_js;
+  if (!isset($loader_js) || $reset) {
+    $loader_js = array();
+  }
+  if (isset($new_js)) {
+    $loader_js = array_merge_recursive($loader_js, $new_js);
+  }
+  return $loader_js;
+}
+
+/**
+ * Parse a fontinfo description and create a javascript settings loader.
+ *
+ * This is the real meat of the functionality as fonts need to get added.
+ */
+function _google_webfont_loader_api_load_js_from_fontinfo($font_info, $filepath) {
+  $url = file_create_url($filepath);
+  if (strpos(strrev($url), '/') !== 0) {
+    $url .= '/';
+  }
+  $loader_js = array();
+  // Load all the information from the font info file into the loader_js.
+  // loader_js is a settings format recognized by the webfont loader.
+  // You can specify your google fonts, typekit id, or custom fonts
+  // (with their fontface css locations)
+  foreach ($font_info as $key => $key_info) {
+    $info = $key_info;
+    if (!is_array($key_info)) {
+      $info = array($key_info);
+    }
+    if ($key == 'google_families' && is_array($info)) {
+      $loader_js['google'] = array('families' => $info);
+    }
+    if ($key == "typekit") {
+      $loader_js['typekit'] = array('id' => $info[0]);
+    }
+    if ($key == 'fontdeck') {
+      $loader_js['fontdeck'] = array('id' => $info[0]);
+    }
+    if ($key == 'monotype') {
+      $loader_js['monotype'] = array('projectId' => $info[0]);
+    }
+    // A custom style css must be specified if using custom families.
+    if ($key == "custom_families" && is_array($font_info['custom_style_css'])) {
+      $loader_js['custom'] = array(
+        'families' => $info,
+        'urls' => array(),
+      );
+      foreach ($font_info['custom_style_css'] as $custom_style) {
+        if (\Drupal\Core\File\FileSystem::uriScheme($custom_style)) {
+          $loader_js['custom']['urls'][] = file_create_url($custom_style);
+        }
+        else {
+          $loader_js['custom']['urls'][] = $url . $custom_style;
+        }
+      }
+    }
+  }
+  return _google_webfont_loader_api_add_js($loader_js);
+}
+
+/**
+ * Loads font into the webfont stack.
+ */
+function _google_webfont_loader_api_load_font($font_info, $filepath = 'public://') {
+  $loader_js = _google_webfont_loader_api_load_js_from_fontinfo($font_info, $filepath);
+  // If there are items in the loader_js, create a setting and load the render
+  // css which is useless unless correct information regarding fonts are
+  // actually loaded.
+  if (count($loader_js) > 0) {
+    // Start loading the css that will be rendered.
+    if (isset($font_info['render_css'])) {
+      if (is_array($font_info['render_css'])) {
+        foreach ($font_info['render_css'] as $render_css) {
+          _google_webfont_loader_api_add_css($filepath . '/' . $render_css);
+        }
+      }
+      else {
+        _google_webfont_loader_api_add_css($filepath . '/' . $font_info['render_css']);
+      }
+    }
+  }
+}
+
+/**
+ * Finds fontinfo yml files.
+ */
+function google_webfont_loader_api_scan_fontinfo_files($directory_type) {
+  $profile = drupal_get_path('profile', drupal_get_profile());
+  $config = \Drupal::service('site.path');
+
+  // Build a list of directories.
+  $directories = \Drupal::moduleHandler()->invokeAll('libraries_info_file_paths');
+  $directories[] = "$profile/$directory_type";
+  $directories[] = "sites/all/$directory_type";
+  $directories[] = $directory_type;
+  $directories[] = "$config/$directory_type";
+
+  $files = array();
+  foreach ($directories as $dir) {
+    if (file_exists($dir)) {
+      $files = array_merge($files, file_scan_directory($dir, '@^[a-z0-9._-]+\.font\.yml$@', array(
+        'nomask' => '/(\.\.?|CVS)$/',
+        'key' => 'name',
+        'recurse' => TRUE,
+      )));
+    }
+  }
+
+  return $files;
+}
