@@ -1,0 +1,283 @@
+<?php
+/**
+ * @file
+ * X-Connect Translator service for the Translation Management module (tmgmt).
+ */
+
+use Amplexor\XConnect\Response;
+use Amplexor\XConnect\Response\File\ZipFile;
+use Amplexor\XConnect\Service\FtpService;
+use Amplexor\XConnect\Service\SFtpService;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\tmgmt\TranslatorInterface;
+use Drupal\tmgmt_xconnect\Exception\ImportException;
+
+/**
+ * Key to save watchdog messages for.
+ *
+ * @var string
+ */
+define('TMGMT_XCONNECT_WATCHDOG', 'tmgmt_xconnect');
+
+
+/**
+ * Implements hook_help().
+ */
+function tmgmt_xconnect_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.tmgmt_xconnect':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('The X-Connect translator is a plugin for the Translation Management Tool (TMGMT) and provides support to send and receive translation jobs to the AMPLEXOR Translation Services : http://goo.gl/xCQ4em.') . '</p>';
+      return $output;
+
+    case 'tmgmt_xconnect.admin_actions':
+      $output = '';
+      $output .= '<h3>' . t('Send & receive translation jobs') . '</h3>';
+      $output .= '<p>' . t('X-Connect sends the requests and processes the responses by default automatically during cron. You can use this page to manually send & receive the translation jobs.') . '</p>';
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function tmgmt_xconnect_theme() {
+  return array(
+    // Template to export content as HTML.
+    'tmgmt_xconnect_html_template' => array(
+      'path' => drupal_get_path('module', 'tmgmt_xconnect') . '/templates',
+      'template' => 'tmgmt_xconnect_html_template',
+      'variables' => array(
+        'tjid' => NULL,
+        'source_language' => NULL,
+        'target_language' => NULL,
+        'source_url' => NULL,
+        'items' => NULL,
+      ),
+    ),
+  );
+}
+
+/**
+ * Implements hook_cron().
+ */
+function tmgmt_xconnect_cron() {
+  // Get all translators.
+  $translators = \Drupal::entityManager()->getStorage('tmgmt_translator')->loadByProperties(['plugin' => 'xconnect']);
+
+  if (!$translators) {
+    return;
+  }
+
+  foreach ($translators as $translator) {
+    // Receive all processed translations.
+    module_load_include('inc', 'tmgmt_xconnect', 'tmgmt_xconnect.cron');
+    tmgmt_xconnect_cron_receive($translator);
+  }
+}
+
+
+/*******************************************************************************
+ * Glue between Drupal, TMGMT module and X-Connect API.
+ ******************************************************************************/
+
+/**
+ * Get the proper X-Connect connection based on the Translator configuration.
+ *
+ * @param \Drupal\tmgmt\TranslatorInterface $translator
+ *   The translator service.
+ *
+ * @return \Amplexor\XConnect\Service\ServiceAbstract
+ *   The connection.
+ */
+function tmgmt_xconnect_connection(TranslatorInterface $translator) {
+  // Get the translator connection settings.
+  $config = $translator->getSetting('connection');
+
+  switch ($config['protocol']) {
+    case 'FTP':
+      // Transport over FTP (no encryption).
+      return new FtpService($config);
+      break;
+
+    case 'SFTP':
+      // Transport over SSH (encryption).
+      return new SFtpService($config);
+      break;
+
+    default:
+      \Drupal::logger(TMGMT_XCONNECT_WATCHDOG)->error('No connection available for translator "%translator".', [
+        '%translator' => $translator->label(),
+      ]);
+      break;
+  }
+}
+
+/**
+ * Import a remote file for the given translation service.
+ *
+ * @param \Drupal\tmgmt\TranslatorInterface $translator
+ *   The translator service to perform the action for.
+ * @param string $filename
+ *   The file that is ready to be processed (remote file name without path).
+ */
+function tmgmt_xconnect_import_remote_file(TranslatorInterface $translator, $filename) {
+  // Connect to the GCM service.
+  $service = tmgmt_xconnect_connection($translator);
+
+  // Retrieve a single translation file (ZIP package).
+  $filePath = $service->receive(
+    // The filename ready to be picked up.
+    $filename,
+    // The local directory where to store the downloaded file.
+    tmgmt_xconnect_directory_receive()
+  );
+
+  // Create a response object as a wrapper around the received file.
+  $response = new Response(new ZipFile($filePath));
+
+  // Get the translations from the Response.
+  $translations = $response->getTranslations();
+
+  // Get the content of the translations.
+  $plugin = \Drupal::service('plugin.manager.tmgmt_xconnect.format')->createInstance('html');
+  foreach ($translations as $translation) {
+    $content = $translation->getContent();
+
+    // Validate translation.
+    $job = $plugin->validateImport($content);
+
+    if (!$job) {
+      \Drupal::logger(TMGMT_XCONNECT_WATCHDOG)->error("No translation job found for @filename.", [
+        '@filename' => $translation->getInfo()->getName(),
+      ]);
+      continue;
+    }
+
+    if ($job->isFinished()) {
+      drupal_set_message(t('Skipping @filename for finished job @name (#@id).', [
+        '@filename' => $translation->getInfo()->getName(),
+        '@name' => $job->label(),
+        '@id' => $job->id(),
+      ]), 'warning');
+      \Drupal::logger(TMGMT_XCONNECT_WATCHDOG)->warning("Skipping @filename for finished job @name (#@id).", [
+        '@filename' => $translation->getInfo()->getName(),
+        '@name' => $job->label(),
+        '@id' => $job->id(),
+      ]);
+      continue;
+    }
+
+    try {
+      // Import the translation(s).
+      $job->addTranslatedData($plugin->import($content));
+
+      \Drupal::logger(TMGMT_XCONNECT_WATCHDOG)->info("Successfully imported file @filename for translation job @name (#@id).", [
+        '@filename' => $translation->getInfo()->getName(),
+        '@name' => $job->label(),
+        '@id' => $job->id(),
+      ]);
+    }
+    catch (Exception $e) {
+      // Log error.
+      \Drupal::logger(TMGMT_XCONNECT_WATCHDOG)->error("Failed importing file @filename: @error", [
+        '@filename' => $translation->getInfo()->getName(),
+        '@error' => $e->getMessage(),
+      ]);
+
+      // Move downloaded file to error directory.
+      tmgmt_xconnect_import_remote_file_error($filePath);
+
+      // Delegate error.
+      throw new ImportException($e->getMessage(), 0, $e);
+    }
+  }
+
+  // Delete the downloaded file from local file system.
+  unlink($filePath);
+
+  // Let the service know that the response Zip archive is processed.
+  $service->processed($filename);
+}
+
+/**
+ * Get the local temporary directory to store the request files in.
+ *
+ * The request files are ZIP packages that are first created locally and then
+ * sent to the remote service. The local file is deleted after being sent.
+ *
+ * @return string
+ *   The directory path.
+ *
+ * @throws Exception
+ *   When the local directory can't be created.
+ */
+function tmgmt_xconnect_directory_request() {
+  $directory = 'public://tmgmt/xconnect/request';
+  if (!file_prepare_directory($directory, FILE_CREATE_DIRECTORY)) {
+    throw new Exception(
+      sprintf('Can\'t create the receive directory "%s"', $directory)
+    );
+  }
+
+  return \Drupal::service("file_system")->realpath($directory);
+}
+
+/**
+ * Get the local directory to store the downloaded remote files.
+ *
+ * The response files are ZIP packages that are first downloaded and then
+ * processed. The local file is deleted when successfully processed.
+ * Files that could not be processed are moved to an error directory.
+ * See tmgmt_xconnect_import_remote_file_error().
+ *
+ * @return string
+ *   The directory path.
+ *
+ * @throws Exception
+ *   When the local directory can't be created.
+ */
+function tmgmt_xconnect_directory_receive() {
+  $directory = 'public://tmgmt/xconnect/receive';
+  if (!file_prepare_directory($directory, FILE_CREATE_DIRECTORY)) {
+    throw new Exception(
+      sprintf('Can\'t create the receive directory "%s"', $directory)
+    );
+  }
+
+  return \Drupal::service("file_system")->realpath($directory);
+}
+
+/**
+ * Move a file with errors to the error directory.
+ *
+ * Files are moved to a local error directory. This to allow inspection of the
+ * file and to determine why the file could not be processed.
+ *
+ * @param string $file
+ *   The file path with the errors.
+ *
+ * @return bool
+ *   Move success or not.
+ */
+function tmgmt_xconnect_import_remote_file_error($file) {
+  // Prepare the directory.
+  $directory = 'public://tmgmt/xconnect/receive/error';
+  if (!file_prepare_directory($directory, FILE_CREATE_DIRECTORY)) {
+    \Drupal::logger(TMGMT_XCONNECT_WATCHDOG)->error("Can't create the receive archive folder %directory.", array('%directory' => $directory));
+    return FALSE;
+  }
+
+  // Move the file.
+  $file_error = \Drupal::service("file_system")->realpath($directory . '/' . basename($file));
+  if (!rename($file, $file_error)) {
+    \Drupal::logger(TMGMT_XCONNECT_WATCHDOG)->error("Can't move the file %file to the error directory %directory.", array(
+      '%file' => $file,
+      '%directory' => $directory,
+    ));
+    return FALSE;
+  }
+
+  return TRUE;
+}
