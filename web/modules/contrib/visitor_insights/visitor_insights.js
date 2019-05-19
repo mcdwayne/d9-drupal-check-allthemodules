@@ -1,0 +1,1 @@
+(function() {var s=document.getElementsByTagName('script')[0],p=document.createElement('script');p.async='async';p.src='//rum-static.pingdom.net/pa-'+drupalSettings.visitor_insights.hash+'.js';s.parentNode.insertBefore(p,s);})();
