@@ -1,0 +1,132 @@
+<?php
+
+/**
+ * @file
+ * Skip temp file warnings file.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Database\Database;
+
+/**
+ * Implements hook_form_cron().
+ */
+function skip_temp_file_warnings_cron() {
+  $age = \Drupal::config('system.file')->get('temporary_maximum_age');
+  $file_storage = \Drupal::entityManager()->getStorage('file');
+  $fds = [];
+  $config = \Drupal::config('skip_temp_file_warnings.settings')->get('strings');
+  $strings = explode(",", $config);
+  if(!empty($strings)) {
+    if ($age) { 
+      $fids = Drupal::entityQuery('file')
+        ->condition('status', FILE_STATUS_PERMANENT, '<>')
+        ->condition('changed', REQUEST_TIME - $age, '<')
+        ->range(0, 100)
+        ->execute();
+      $files = $file_storage->loadMultiple($fids);
+   
+      foreach ($files as $file) {
+        $references = \Drupal::service('file.usage')->listUsage($file);
+        if (empty($references)) {
+          if (file_exists($file->getFileUri())) {
+            $file->delete();
+          }
+          else {
+            $fds[] = $file->id();
+          }
+        }
+        else {
+          \Drupal::logger('file system')->info('Did not delete temporary file "%path" during garbage collection because it is in use by the following modules: %modules.', ['%path' => $file->getFileUri(), '%modules' => implode(', ', array_keys($references))]);
+        }
+      }
+    }
+    if(!empty($fds)) {
+      $con = Database::getConnection();
+      $string_condition = db_or();
+      foreach ($strings as $key => $value) {
+        $string_condition->condition('uri', $value . "%", 'LIKE');
+      }
+      $query = $con->delete('file_managed');
+      $query->condition('status', FILE_STATUS_PERMANENT, '<>');
+      $query->condition('fid', $fds, 'IN');
+      $query->condition($string_condition);
+      $query->execute();
+    }
+  }
+}
+
+/**
+ * Implements hook_help().
+ *
+ * @inheritdoc
+ */
+function skip_temp_file_warnings_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.skip_temp_file_warnings':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Drupal deletes unused temporary managed files automatically in file_cron. However if the file has already been deleted from disk, then Drupal generates an error message:
+
+Could not delete temporary file "public://XXXXX" during garbage collection
+
+The error message repeats every cron cycle and there is no obvious way to recover from the UI.
+
+It seems that this error message is unnecessary and unhelpful. This module will help to skip this warning.') . '</p>';
+      $output .= '<h3>' . t('Uses') . '</h3>';
+      $output .= '<dl>';
+      $output .= '<dt>' . t('Configuring Skip Temp File Warnings') . '</dt>';
+      $output .= '<dd>' . t('On the <a href=":skip_temp_file_warnings">Configuration page</a>, you can set the string start with for file uri which throws error.', [':skip_temp_file_warnings' => \Drupal::url('system.logging_settings')]) . '</dd>';
+
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function skip_temp_file_warnings_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $form_ids = ['system_logging_settings'];
+  if (in_array($form_id, $form_ids)) {
+   $config = \Drupal::config('skip_temp_file_warnings.settings')->get('strings');
+   $form['skip_temp_file_warnings_strings'] = ["#type" => 'textarea', "#title" => t('Strings in file uri'), "#description" => 'Enter the strings that is appearing at start of the file uri. (eg) <b>public</b> is the string in the following warning message. "Could not delete temporary file "<b>public</b>://sample.jpg" during garbage collection"</b>', "#default_value" =>  $config]; 
+   $form['#submit'][0] = 'skip_temp_file_warnings_form_submit';
+  }
+
+}
+
+/**
+ * Implements custom submit().
+ *
+ * save config.
+ *
+ * @param array $form
+ *   The form array.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   The form state.
+ */
+function skip_temp_file_warnings_form_submit(array $form, FormStateInterface $form_state) {
+
+ $config = \Drupal::getContainer()->get('config.factory')->getEditable('skip_temp_file_warnings.settings');
+ $config->set('strings', $form_state->getValue('skip_temp_file_warnings_strings'));
+ $config->save();
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function skip_temp_file_warnings_module_implements_alter(&$implementations, $hook) {
+  // Move our hook_cron() implementation to the first of the list.
+  if ($hook == 'cron') {
+    $group = $implementations['skip_temp_file_warnings'];
+    unset($implementations['skip_temp_file_warnings']);
+    $backup = $implementations;
+    $implement['skip_temp_file_warnings'] = $group;
+    foreach ($backup as $key => $value) {
+      $implement[$key] = $value;
+    }
+    $implementations = $implement;
+  }
+}
+
