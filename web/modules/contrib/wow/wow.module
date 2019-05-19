@@ -1,0 +1,604 @@
+<?php
+
+/**
+ * @file
+ * Wow system that lets administrators modify the workings of the guild.
+ */
+
+use WoW\Core\Entity\EntityServiceController;
+
+module_load_include('module', 'wow', 'wow.field');
+
+/**
+ * WoW Entity refresh method; Let the user/code fetch a resource explicitly.
+ */
+define('WOW_REFRESH_EXPLICITLY', -1);
+
+/**
+ * WoW Entity refresh method; Fetch a resource at entity load hook.
+ */
+define('WOW_REFRESH_LOAD', 0);
+
+/**
+ * WoW Entity refresh method; Periodically fetch a resource through cron.
+ */
+define('WOW_REFRESH_CRON', 1);
+
+/**
+ * Implements hook_init().
+ */
+function wow_init() {
+  $loader = drupal_classloader();
+  $loader->registerNamespace('WoW\Core', __DIR__ . '/lib');
+  $loader->registerNamespace('WoW\Achievement', __DIR__ . '/modules/wow_achievement/lib');
+  $loader->registerNamespace('WoW\Character', __DIR__ . '/modules/wow_character/lib');
+  $loader->registerNamespace('WoW\Guild', __DIR__ . '/modules/wow_guild/lib');
+  $loader->registerNamespace('WoW\Guild\Rank', __DIR__ . '/modules/wow_guild_rank/lib');
+  $loader->registerNamespace('WoW\Item', __DIR__ . '/modules/wow_item/lib');
+  $loader->registerNamespace('WoW\Realm', __DIR__ . '/modules/wow_realm/lib');
+  $loader->registerNamespace('WoW\Statistic', __DIR__ . '/modules/wow_statistic/lib');
+}
+
+/**
+ * Implements hook_menu().
+ */
+function wow_menu() {
+  // Administrative pages.
+  $items['admin/wow'] = array(
+    'title' => 'World of Warcraft',
+    'description' => 'Manage World of Warcraft.',
+    'page callback' => 'wow_admin',
+    'access arguments' => array('access administration pages'),
+    'position' => 'left',
+    'file' => 'wow.admin.inc',
+  );
+  $items['admin/wow/dashboard'] = array(
+    'title' => 'World of Warcraft',
+    'description' => 'Manage World of Warcraft content.',
+    'access arguments' => array('access administration pages'),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'file' => 'wow.admin.inc',
+  );
+
+  // Configuration pages.
+  $items['admin/config/wow'] = array(
+    'title' => 'World of Warcraft',
+    'description' => 'General World of Warcraft related configuration.',
+    'position' => 'right',
+    'weight' => -15,
+    'page callback' => 'system_admin_menu_block_page',
+    'access arguments' => array('access administration pages'),
+    'file' => 'system.admin.inc',
+    'file path' => drupal_get_path('module', 'system'),
+  );
+  $items['admin/config/wow/service'] = array(
+    'title' => 'Service settings',
+    'description' => 'Configure data services for content and the user interface. Manage private and public key to connect the API.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('wow_services_overview_form'),
+    'access arguments' => array('administer wow'),
+    'file' => 'wow.admin.inc',
+    'weight' => -10,
+  );
+  $items['admin/config/wow/service/overview'] = array(
+    'title' => 'List',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => 0,
+  );
+  $items['admin/config/wow/service/add'] = array(
+    'title' => 'Add service',
+    'page callback' => 'wow_services_add_screen',
+    'access callback' => 'wow_add_service_access',
+    'access arguments' => array('administer wow'),
+    'weight' => 5,
+    'type' => MENU_LOCAL_ACTION,
+    'file' => 'wow.admin.inc',
+  );
+  $items['admin/config/wow/service/edit/%'] = array(
+    'title' => 'Edit service',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('wow_services_edit_form', 5),
+    'access arguments' => array('administer wow'),
+    'file' => 'wow.admin.inc',
+  );
+  $items['admin/config/wow/service/delete/%'] = array(
+    'title' => 'Confirm',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('wow_services_delete_form', 5),
+    'access arguments' => array('administer wow'),
+    'file' => 'wow.admin.inc',
+  );
+
+  // Service authentication
+  $items['admin/config/wow/service/authentication'] = array(
+    'title' => 'Authentication',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('wow_services_authentication_form'),
+    'access arguments' => array('administer wow'),
+    'weight' => 10,
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'wow.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_help().
+ */
+function wow_help($path, $arg) {
+  switch ($path) {
+    case 'admin/wow':
+      return '<p>' . t('This page is a dashboard for WoW data content, such as character races, classes, or achievements.') . '</p>' .
+      '<p><strong>' . t('Services are a developers preview only and will be fully functional in a future release.') . '</strong></p>';
+    case 'admin/config/wow/service':
+      return '<p>' . t('This page is a dashboard for WoW services. You can Enable, Disable or Edit a service; Once enabled, the service will periodically fetch data for the specified region and update the local database with fresh information from battle.net API. Each service behaves like an entity, when you instanciates a service, it will be bundled with a language and controlled individually. This allows each language to have its own settings (the refresh rate for instance).') . '</p>' .
+        '<p>' . t('A service is intimately tied up to a language, and is not necessary enabled if a language is enabled, but is disabled if a language is disabled. Thus, a service cannot exist if a language is not installed.') . '</p>' .
+        (module_exists('locale') ? '' : '<p><strong>' . t('You must enable the locale module to add a new service.') . '</strong></p>');
+  }
+}
+
+/**
+ * Implements hook_permission().
+ */
+function wow_permission() {
+  return array(
+    'administer wow' => array(
+      'title' => t('Administer World of Warcraft API configuration'),
+      'restrict access' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Implements hook_multilingual_settings_changed().
+ */
+function wow_multilingual_settings_changed() {
+  drupal_static_reset('language_list');
+  $default = language_default('language');
+  $services = wow_service_list();
+  $languages = language_list();
+
+  foreach (array_diff_key($services, $languages) as $delete) {
+    include_once 'wow.admin.inc';
+    $form_state['values']['langcode'] = $delete->language;
+    wow_services_delete_form_submit(array(), $form_state);
+  }
+
+  foreach ($languages as $language) {
+    // Enable or disable the service to reflect regional settings.
+    if (isset($services[$language->language]) && $services[$language->language]->enabled != $language->enabled) {
+      db_update('wow_services')
+        ->fields(array('enabled' => $language->enabled))
+        ->condition('language', $language->language)
+        ->execute();
+    }
+  }
+
+  if (isset($services[$default]) && $services[$default]->language != wow_service_default('language')) {
+    unset($services[$default]->expires);
+    variable_set('wow_service_default', $services[$default]);
+    drupal_set_message(t('The service %name has been defaulted.', array('%name' => $services[$default]->name)));
+  }
+  elseif (!isset($services[$default])) {
+    include_once 'wow.admin.inc';
+    wow_add_service($default);
+
+    $services = wow_service_list();
+    $variables = array('%locale' => $services[$default]->name);
+    drupal_set_message(t('The service %locale has been installed.', $variables));
+    watchdog('wow', 'The service %locale has been installed.', $variables);
+  }
+}
+
+/**
+ * Returns the wow entity refresh method.
+ *
+ * @param string $entity_type
+ *   The entity type.
+ */
+function wow_entity_refresh_method($entity_type) {
+  return variable_get($entity_type . '_refresh_method', WOW_REFRESH_CRON);
+}
+
+/**
+ * Returns the wow entity refresh threshold.
+ *
+ * @param string $entity_type
+ *   The entity type.
+ */
+function wow_entity_refresh_threshold($entity_type) {
+  $threshold = variable_get($entity_type . '_refresh_threshold');
+
+  if (isset($threshold)) {
+    return $threshold;
+  }
+
+  return variable_get('cron_safe_threshold', DRUPAL_CRON_DEFAULT_THRESHOLD);
+}
+
+/**
+ * Implements hook_modules_installed().
+ */
+function wow_modules_installed($modules) {
+  foreach ($modules as $module) {
+    if (module_hook($module, 'wow_data_resources')) {
+      // Collates all information on field types, widget types and related structures.
+      _field_info_collate_types(TRUE);
+
+      foreach (module_invoke($module, 'wow_data_resources') as $resources) {
+        foreach ($resources as $resource) {
+          // Create all the fields we are adding to our entity.
+          field_create_field(array(
+            'field_name' => $resource['entity type'],
+            'entity_types' => array($resource['entity type']),
+            'type' => $resource['entity type'],
+            'cardinality' => 1,
+            'locked' => TRUE,
+            'translatable' => TRUE,
+          ));
+
+          // Create all the instances for our fields.
+          field_create_instance(array(
+            'entity_type' => $resource['entity type'],
+            'field_name' => $resource['entity type'],
+            'label' => $resource['label'],
+            'required' => TRUE,
+            'bundle' => $resource['entity type'],
+          ));
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_modules_uninstalled().
+ */
+function wow_modules_uninstalled($modules) {
+  foreach ($modules as $module) {
+    if (module_hook($module, 'wow_data_resources')) {
+
+      foreach (module_invoke($module, 'wow_data_resources') as $resources) {
+        // Loop over each of the fields defined by this module and delete
+        // all instances of the field, their data, and the field itself.
+        foreach ($resources as $resource) {
+          field_delete_field($resource['entity type']);
+          $instances = field_info_instances($resource['entity type'], $resource['entity type']);
+          // Loop over any remaining field instances attached to the entity
+          // and delete them individually.
+          foreach ($instances as $instance_name => $instance) {
+            field_delete_instance($instance);
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Returns an API compliant locale value.
+ *
+ * @param string $region
+ *   The region of the API.
+ * @param string $language
+ *   (Optional) The language used to determine the locale to return. Default
+ *   to language_content.
+ *
+ * @deprecated: move to a controller class.
+ *
+ * @return array
+ *   An API compliant locale value or FALSE if non compatible.
+ */
+function wow_api_locale($region, &$language = LANGUAGE_NONE) {
+  if (LANGUAGE_NONE == $language) {
+    $language = $GLOBALS['language_content']->language;
+  }
+
+  // Sometimes the language can be of the form 'en_US', or en-US, just get the
+  // language.
+  $key = drupal_substr($language, 0, 2);
+  $locales = wow_api_info($region)->locales;
+
+  return isset($locales[$key]) ? $locales[$key] : FALSE;
+}
+
+/**
+ * The data APIs provide information that can compliment profile information to
+ * provide structure, definition and context.
+ *
+ * @deprecated Will be deprecated in the 3.x release. Use WoWDataResourceConroller
+ * instead: $controller->fetchAll() and $controller->load() methods.
+ *
+ * @param string $region
+ *   The region to return data from.
+ * @param string $path
+ *   The path to the data.
+ * @param string $inner
+ *   The inner object to extract.
+ * @param string $callback
+ *   The callback function to apply on each items.
+ * @param string $language
+ *   (Optional) The language to use. Default to language_content.
+ * @param bool $reset
+ *   (Optional) Reset the character race static cache.
+ *
+ * @return object
+ *   A data object.
+ */
+function wow_data($region, $path, $inner, $callback, $language = NULL, $reset = FALSE) {
+  $key = str_replace('/', '_', $path);
+  $locale = wow_api_locale($region, $language);
+  $values = variable_get("wow_$key:$locale", array());
+
+  if (empty($values) || $reset) {
+
+    // Call the Data API.
+    $response = wow_http_request($region, "data/$path", array('locale' => $locale));
+    foreach ($response->getObject($inner) as $object) {
+      $callback($values, $object);
+    }
+
+    variable_set("wow_$key:$locale", $values);
+  }
+
+  return $values;
+}
+
+/**
+ * Determine whether the user has a given privilege.
+ *
+ * @param $region
+ *   The region.
+ * @param $string
+ *   The permission, such as "administer nodes", being checked for.
+ * @param $account
+ *   (Optional) The account to check, if not given use currently logged in user.
+ *
+ * @return
+ *   Boolean TRUE if the current user has the requested permission.
+ */
+function wow_region_access($region, $string, $account = NULL) {
+  // Calling user_acces will no longer be needed in Drupal8. http://drupal.org/node/329872
+  return array_key_exists($region, wow_service_info()) && user_access($string, $account);
+}
+
+/**
+ * Determine whether the user has a given privilege.
+ *
+ * @param $string
+ *   The permission, such as "administer nodes", being checked for.
+ * @param $account
+ *   (Optional) The account to check, if not given use currently logged in user.
+ *
+ * @return
+ *   Boolean TRUE if the current user has the requested permission.
+ */
+function wow_add_service_access($string, $account = NULL) {
+  // Calling user_acces will no longer be needed in Drupal8. http://drupal.org/node/329872
+  return module_exists('locale') && user_access($string, $account);
+}
+
+/**
+ * Implements hook_cron().
+ */
+function wow_cron() {
+  include_once 'wow.inc';
+
+  // Long-running tasks and tasks that could time out, such as retrieving
+  // remote data makes use of the queue API instead of executing tak directly.
+  $queue = DrupalQueue::get('wow');
+  foreach (wow_service_list() as $langcode => $service) {
+//     if ($service->enabled && $batch = wow_batch_by_service($langcode, '_wow_batch_cron_service_finished')) {
+//       // TODO: put this back on track.
+//       $queue->createItem($batch);
+//     }
+  }
+}
+
+/**
+ * Implements hook_cron_queue_info().
+ */
+function wow_cron_queue_info() {
+  $queues['wow'] = array(
+    'worker callback' => '_wow_batch_execute',
+    'time' => 60,
+  );
+  return $queues;
+}
+
+/**
+ * Returns the default Service used on the site
+ *
+ * @param string $property
+ *   Optional property of the service object to return
+ */
+function wow_service_default($property = NULL) {
+  $service = variable_get('wow_service_default', (object) array('language' => 'en', 'region' => 'us', 'locale' => 'en_US', 'name' => 'English', 'native' => 'English', 'enabled' => 1, 'weight' => 0, 'expires' => array()));
+  return $property ? $service->$property : $service;
+}
+
+/**
+ * Returns a key-value array with default regions where this API is available.
+ *
+ * @param string $region
+ *   (Optional) The region of the API.
+ *
+ * @throws RuntimeException
+ *   An Exception if the region is not supported.
+ */
+function wow_service_info($region = NULL) {
+  static $infos;
+
+  if (empty($infos)) {
+    $infos['us'] = (object) array(
+      'name' => 'United States',
+      'locales' => array(
+        'en' => 'en_US',
+        'es' => 'es_MX',
+        'pt' => 'pt_BR',
+      ),
+      'content' => 'us.media.blizzard.com',
+      'host' => 'us.battle.net',
+    );
+    $infos['eu'] = (object) array(
+      'name' => 'Europe',
+      'locales' => array(
+        'en' => 'en_GB',
+        'es' => 'es_ES',
+        'fr' => 'fr_FR',
+        'ru' => 'ru_RU',
+        'de' => 'de_DE',
+        'pt' => 'pt_PT',
+        'it' => 'it_IT',
+      ),
+      'content' => 'eu.media.blizzard.com',
+      'host' => 'eu.battle.net',
+    );
+    $infos['kr'] = (object) array(
+      'name' => 'South Korea',
+      'locales' => array('ko' => 'ko_KR'),
+      'content' => 'kr.media.blizzard.com',
+      'host' => 'kr.battle.net',
+    );
+    $infos['tw'] = (object) array(
+      'name' => 'Taiwan',
+      'locales' => array('zh-hant' => 'zh_TW'),
+      'content' => 'tw.media.blizzard.com',
+      'host' => 'tw.battle.net',
+    );
+    $infos['cn'] = (object) array(
+      'name' => 'China',
+      'locales' => array('zh-hans' => 'zh_CN'),
+      'content' => 'www.battlenet.com.cn',
+      'host' => 'battlenet.com.cn',
+    );
+  }
+
+  if (empty($region)) {
+    return $infos;
+  }
+  elseif (isset($infos[$region])) {
+    return $infos[$region];
+  }
+  else {
+    throw new \RuntimeException(sprintf('The region "%s" is not supported.', $region));
+  }
+}
+
+/**
+ * Gets the entity service controller class for an entity type.
+ *
+ * @param string $entity_type
+ *   The type of the entity.
+ *
+ * @return EntityServiceController
+ *   An entity service controller.
+ *
+ * @see hook_entity_info()
+ */
+function wow_service_controller($entity_type) {
+  $controllers = &drupal_static('wow_service_controller', array());
+
+  if (!isset($controllers[$entity_type])) {
+    $entity_info = entity_get_info($entity_type);
+    $storage = entity_get_controller($entity_type);
+    $class = $entity_info['service controller class'];
+    $controllers[$entity_type] = new $class($entity_type, $entity_info, $storage, new ServiceLocator());
+  }
+
+  return $controllers[$entity_type];
+}
+
+/**
+ * Returns a list of installed services, indexed by the specified key.
+ *
+ * @param string $field
+ *   (Optional) The field to index the list with.
+ *
+ * @return array
+ *   An associative array, keyed on the values of $field.
+ */
+function wow_service_list($field = 'language') {
+  $services = &drupal_static(__FUNCTION__);
+
+  // Init service list.
+  if (!isset($services)) {
+    if (drupal_multilingual() || module_exists('locale')) {
+      $services['language'] = db_query('SELECT * FROM {wow_services} ORDER BY weight ASC, region ASC')->fetchAllAssoc('language');
+    }
+    else {
+      // No locale module, so use the default service only.
+      $default = wow_service_default();
+      $services['language'][$default->language] = $default;
+    }
+
+    // Unserialize expires column.
+    foreach ($services['language'] as $langcode => $service) {
+      $services['language'][$langcode]->expires = empty($service->expires) ? array() : unserialize($service->expires);
+    }
+  }
+
+  // Return the array indexed by the right field.
+  if (!isset($services[$field])) {
+    $services[$field] = array();
+    foreach ($services['language'] as $service) {
+
+      // Some values should be collected into an array.
+      if (in_array($field, array('enabled', 'weight'))) {
+        $services[$field][$service->$field][$service->language] = $service;
+      }
+      else {
+        $services[$field][$service->$field] = $service;
+      }
+    }
+  }
+
+  return $services[$field];
+}
+
+/**
+ * Implements hook_hook_info().
+ */
+function wow_hook_info() {
+  $hooks['wow_data_resources'] = array(
+    'group' => 'resources',
+  );
+
+  return $hooks;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function wow_theme() {
+  return array(
+    'wow_services_overview_form' => array(
+      'render element' => 'form',
+    ),
+  );
+}
+
+/**
+ * Returns wether Alliance or Horde given a value returned by the service.
+ *
+ * @param string $var
+ *   Either alliance(0) or horde(1).
+ */
+function wow_side($side = NULL) {
+  static $values;
+
+  if (empty($values)) {
+    $values = array(
+      (object) array('slug' => 'alliance', 'name' => t('Alliance')),
+      (object) array('slug' => 'horde', 'name' => t('Horde')),
+    );
+  }
+
+  if (is_null($side)) {
+    return $values;
+  }
+  else {
+    return $values[$side];
+  }
+}
