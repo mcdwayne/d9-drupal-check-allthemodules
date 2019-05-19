@@ -1,0 +1,155 @@
+<?php
+
+use Drupal\Component\Utility\Html;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Render\BubbleableMetadata;
+use Drupal\Core\StringTranslation\PluralTranslatableMarkup;
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_webform_third_party_settings_form_alter().
+ */
+function webform_counter_webform_third_party_settings_form_alter(array &$form, FormStateInterface $form_state) {
+  /** @var \Drupal\webform\WebformInterface $webform */
+  $webform = $form_state->getFormObject()->getEntity();
+
+  $form['third_party_settings']['webform_counter'] = [
+    '#type' => 'details',
+    '#title' => t('Submissions Counter'),
+    '#open' => TRUE,
+    '#description' => t('The Webform Counter provides tokens that display the amount of current webform submissions and optionally a progress bar:
+<ul>
+  <li><code>[site:webform-counter:?]</code> displays text only, example usage: <code>[site:webform-counter:machine_name_of_my_webform]</code></li>
+  <li><code>[site:webform-counter-progress:?]</code> displays a progress bar and text, example usage: <code>[site:webform-counter-progress:my_webform]</code></li>
+</ul>
+Texts for singular and plural forms has to be entered to make tokens work.<br><br>
+<strong>Important:</strong> If these tokens are to be used in processed text, make sure that "@filter_html" filter is disabled for the chosen text format.<br><br>
+Also, please note that counter in shown via Javascript/AJAX. It does not appear on the page immediately.'),
+  ];
+
+  $form['third_party_settings']['webform_counter']['offline_submissions_count'] = [
+    '#type' => 'textfield',
+    '#title' => t('Offline submissions count'),
+    '#description' => t('An additional number that will be added to the webform submissions count.'),
+    '#min' => 0,
+    '#default_value' => $webform->getThirdPartySetting('webform_counter', 'offline_submissions_count'),
+  ];
+
+  $form['third_party_settings']['webform_counter']['target_submissions_count'] = [
+    '#type' => 'textfield',
+    '#title' => t('Target submissions count'),
+    '#description' => t('The progress bar will only be visible if this value is set.'),
+    '#min' => 1,
+    '#default_value' => $webform->getThirdPartySetting('webform_counter', 'target_submissions_count'),
+  ];
+
+  /* @see \Drupal\views\Plugin\views\field\NumericField::buildOptionsForm */
+  $plural_array = explode(
+    PluralTranslatableMarkup::DELIMITER,
+    $webform->getThirdPartySetting('webform_counter', 'submissions_count_text')
+  );
+  $plurals = 2;
+  if (\Drupal::hasService('locale.plural.formula')) {
+    $plurals = \Drupal::service('locale.plural.formula')->getNumberOfPlurals($webform->get('langcode'));
+  }
+  for ($i = 0; $i < $plurals; $i++) {
+    $form['third_party_settings']['webform_counter']['submissions_count_text'][$i] = [
+      '#type' => 'textfield',
+      '#title' => $i === 0
+        ? t('Singular form')
+        : \Drupal::translation()->formatPlural($i, 'First plural form', '@count. plural form'),
+      '#description' => t('Text to use for this variant, @count will be replaced with the value.') . '<br><br>' . ($i === 0 ? t('Example: "@count person already signed"') : t('Example: "@count people already signed"')),
+      '#default_value' => isset($plural_array[$i]) ? $plural_array[$i] : '',
+    ];
+  }
+  if ($plurals == 2) {
+    $form['third_party_settings']['webform_counter']['submissions_count_text'][0]['#description'] =
+      t('Text to use for the singular form, @count will be replaced with the value.') . '<br><br>' . t('Example: "@count person already signed"');
+    $form['third_party_settings']['webform_counter']['submissions_count_text'][1]['#title'] =
+      t('Plural form');
+    $form['third_party_settings']['webform_counter']['submissions_count_text'][1]['#description'] =
+      t('Text to use for the plural form, @count will be replaced with the value.') . '<br><br>' . t('Example: "@count people already signed"');
+  }
+
+  $form['#validate'][] = '_webform_counter_settings_form_validate';
+}
+
+/**
+ * Additional validation handler for the webform settings form.
+ */
+function _webform_counter_settings_form_validate(&$form, FormStateInterface $form_state) {
+  $settings = $form_state->getValue(['third_party_settings', 'webform_counter']);
+  $settings['submissions_count_text'] = implode(
+    PluralTranslatableMarkup::DELIMITER,
+    $settings['submissions_count_text']
+  );
+  $form_state->setValue(['third_party_settings', 'webform_counter'], $settings);
+}
+
+/**
+ * Implements hook_token_info_alter().
+ */
+function webform_counter_token_info_alter(&$data) {
+  $data['tokens']['site']['webform-counter'] = array(
+    'name' => t('Webform counter'),
+    'dynamic' => TRUE,
+  );
+  $data['tokens']['site']['webform-counter-progress'] = array(
+    'name' => t('Webform counter with progress bar'),
+    'dynamic' => TRUE,
+  );
+}
+
+/**
+ * Implements hook_tokens().
+ */
+function webform_counter_tokens($type, $tokens, array $data, array $options, BubbleableMetadata $bubbleable_metadata) {
+  $replacements = [];
+  if ($type === 'site') {
+    foreach ($tokens as $name => $original) {
+      $parts = explode(':', $name, 2);
+      if (
+        count($parts) === 2 &&
+        (list($type, $webform_id) = $parts) &&
+        (
+          $type === 'webform-counter' ||
+          $type === 'webform-counter-progress'
+        )
+      ) {
+        $type = $type === 'webform-counter-progress'
+          ? 'progress'
+          : 'basic';
+        $id = Html::getUniqueId('webform-counter');
+        $build = [
+          '#type' => 'inline_template',
+          '#template' => '
+            <span 
+              class="webform-counter webform-counter--placeholder webform-counter--{{ type }}" 
+              data-webform-counter="{{ data }}" 
+              id="{{ id }}"
+            />
+          ',
+          '#context' => [
+            'data' => json_encode([
+              'url' => Url::fromRoute('webform_counter.ajax_counter')->toString(),
+              'submit' => [
+                'webform' => $webform_id,
+                'type' => $type,
+                'selector' => '#' . $id,
+              ],
+            ]),
+            'id' => $id,
+            'type' => $type,
+          ],
+          '#attached' => [
+            'library' => [
+              'webform_counter/counter',
+            ],
+          ],
+        ];
+        $replacements[$original] = \Drupal::service('renderer')->render($build);
+      }
+    }
+  }
+  return $replacements;
+}
