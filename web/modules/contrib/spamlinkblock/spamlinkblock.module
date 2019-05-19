@@ -1,0 +1,182 @@
+<?php
+
+/**
+ * @file
+ * Blocks form submissions that contain links and/or stop words.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\filter\Plugin\Filter\FilterUrl;
+
+/**
+ * Implements hook_form_alter().
+ */
+function spamlinkblock_form_alter(&$form, FormStateInterface &$form_state, $form_id) {
+  $form['#validate'][] = 'spamlinkblock_validate';
+}
+
+/**
+ * Check textfield and textarea fields for any link, if submitted anonymously.
+ */
+function spamlinkblock_validate($form, FormStateInterface $form_state) {
+  $account = \Drupal::currentUser();
+
+  // Retrieve ID of the form being validated.
+  $form_id = (isset($form['#form_id'])) ? $form['#form_id'] : '';
+
+  // Do not add any validation if user can bypass the spamlinkblock.
+  if ($account->hasPermission('Bypass SpamLinkBlock protection')) {
+    return;
+  }
+
+  // Read setting for all forms protection.
+  $protect_all_forms = \Drupal::config('spamlinkblock.settings')->get('protect_all_forms');
+
+  // Don't protect system forms, search and exposed views.
+  if ($protect_all_forms && (strpos($form_id, 'system_') !== FALSE || strpos($form_id, 'search_') !== FALSE || strpos($form_id, 'views_exposed_form_') !== FALSE)) {
+    return;
+  }
+
+  // Read setting for anonymous submissions.
+  $protect_anonymous_submissions_only = \Drupal::config('spamlinkblock.settings')->get('protect_anonymous_submissions_only');
+
+  // Do not protect forms that are submitted by authenticated users.
+  if ($protect_anonymous_submissions_only && !$account->isAnonymous()) {
+    return;
+  }
+
+  // Check if this form should be protected.
+  if (!$protect_all_forms) {
+
+    // Generate array of all forms protected by spamlinkblock.
+    $protected_forms = spamlinkblock_get_protected_forms();
+
+    // Check if current form is in the list.
+    if (!in_array($form_id, $protected_forms)) {
+      return;
+    }
+  }
+
+  // VALIDATE - Check form for spam links.
+  spamlinkblock_validate_content($form, $form_state, $form_id);
+
+}
+
+/**
+ * Perform content validation.
+ */
+function spamlinkblock_validate_content($form, FormStateInterface $form_state, $form_id) {
+
+  // Get list of user defined spam stopwords.
+  $stopwords = \Drupal::config('spamlinkblock.settings')->get('spam_stopwords');
+
+  // Iterate through all form elements and check text and textarea fields.
+  foreach ($form as $form_element_key => $form_element_value) {
+
+    if ((isset($form_element_value['widget'][0]['value']['#type']) && $form_element_value['widget'][0]['value']['#type'] == 'textarea')
+      || (isset($form_element_value['#type']) && $form_element_value['#type'] == 'textfield')) {
+
+      // Get field value.
+      $raw_value = $form_state->getValue($form_element_key);
+      if (is_array($raw_value) && isset($raw_value[0]['value'])) {
+        $raw_value = $raw_value[0]['value'];
+      }
+
+      // Apply filter to convert strings into links.
+      $filter = new FilterUrl(['settings' => ['filter_url_length' => 255]], 'filter_url', NULL);
+      $filtered_value = $filter->process($raw_value, '')->getProcessedText();
+
+      // Check filtered_value for href element (link).
+      if (stripos($filtered_value, "href=") !== FALSE) {
+        $form_state->setErrorByName($form_element_key, t('Links in form submissions are not allowed. This is an anti-spam measure.'));
+        // Log event.
+        _spamlinkblock_log($form_id);
+      }
+      elseif (($stopword = _spamlinkblock_word_check($raw_value, $stopwords)) !== FALSE) {
+        $form_state->setErrorByName($form_element_key, t('Usage of "@stopword" word in form submissions is not allowed. This is an anti-spam measure.', ['@stopword' => $stopword]));
+        // Log event.
+        _spamlinkblock_log($form_id, $stopword);
+      }
+    }
+  }
+}
+
+/**
+ * Get all protected forms on the site.
+ *
+ * @return array|mixed
+ *   Array list of protected form ids.
+ */
+function spamlinkblock_get_protected_forms() {
+  $forms = &drupal_static(__FUNCTION__);
+
+  // If the data isn't already in memory, get from cache or look it up fresh.
+  if (!isset($forms)) {
+    if ($cache = \Drupal::cache()->get('spamlinkblock_protected_forms')) {
+      $forms = $cache->data;
+    }
+    else {
+      $form_settings = \Drupal::config('spamlinkblock.settings')->get('form_settings');
+      if (!empty($form_settings)) {
+        // Add each form that's enabled to the $forms array.
+        foreach ($form_settings as $form_id => $enabled) {
+          if ($enabled) {
+            $forms[] = $form_id;
+          }
+        }
+      }
+      else {
+        $forms = [];
+      }
+
+      // Save the cached data.
+      \Drupal::cache()->set('spamlinkblock_protected_forms', $forms);
+    }
+  }
+
+  return $forms;
+}
+
+/**
+ * Helper function to check if word exist in string.
+ *
+ * @param string $str
+ *   String to search.
+ * @param array $stopwords
+ *   Array of words to check.
+ *
+ * @return bool|string
+ *   Return matched word or false if there is no match.
+ */
+function _spamlinkblock_word_check($str, array $stopwords) {
+  foreach ($stopwords as $stopword) {
+    // Prepare stopword for regex (wildcard allowed).
+    $stopword = str_replace('\*', '\S*', preg_quote(trim($stopword), '#'));
+    // Perform case insensitive word match.
+    if (preg_match('#\\b' . $stopword . '\\b#i', $str, $result)) {
+      if (isset($result[0]) && !empty($result[0])) {
+        return $result[0];
+      }
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Helper function to log blocked form submissions.
+ *
+ * @param string $form_id
+ *   Form ID for the form on which submission was blocked.
+ * @param string|bool $reason
+ *   Form ID for the form on which submission was blocked.
+ */
+function _spamlinkblock_log($form_id, $reason = 'LINK') {
+  // Check if logging is enabled.
+  if (\Drupal::config('spamlinkblock.settings')->get('log')) {
+    $variables = [
+      '%form'  => $form_id,
+      '@cause' => t('submission of a "@reason" in a text field', ['@reason' => $reason]),
+    ];
+    \Drupal::logger('spamlinkblock')->notice(t('Blocked submission of %form due to @cause.', $variables));
+  }
+}
