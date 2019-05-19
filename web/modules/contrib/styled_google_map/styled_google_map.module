@@ -1,0 +1,193 @@
+<?php
+
+/**
+ * @file
+ * Contains all hooks and functions for the Styled Google Map module.
+ */
+
+use Drupal\Component\Utility\UrlHelper;
+
+use Drupal\Component\Utility\Xss;
+use Drupal\Core\Entity\Entity\EntityViewDisplay;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\styled_google_map\StyledGoogleMapInterface;
+
+/**
+ * Implements hook_theme().
+ */
+function styled_google_map_theme() {
+  $themes['styled_google_map'] = [
+    'variables' => [
+      'location' => NULL,
+      'settings' => [],
+      'entity' => NULL,
+    ],
+    'function' => 'theme_styled_google_map',
+  ];
+
+  return $themes;
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ */
+function styled_google_map_preprocess_styled_google_map(&$variables) {
+  $language = Drupal::languageManager()->getCurrentLanguage();
+
+  $location = &$variables['location'];
+  /** @var \Drupal\Core\Entity\FieldableEntityInterface|\Drupal\Core\Entity\TranslatableInterface $entity */
+  $entity = &$variables['entity'];
+  $settings = &$variables['settings'];
+
+  if (empty($location) || !$location['geohash']) {
+    $location = NULL;
+    return;
+  }
+
+  // Get the pin file url.
+  if (isset($settings['style']['pin']) && !empty($settings['style']['pin'])) {
+    $settings['style']['pin'] = file_create_url($settings['style']['pin']);
+  }
+  // Sanitize the output of the style settings.
+  foreach ($settings['style'] as $id => $setting) {
+    if ($id != 'style') {
+      $location[$id] = Xss::filter($settings['style'][$id]);
+    }
+  }
+  // Get the label settings.
+  if ($entity instanceof EntityInterface) {
+    switch ($settings['popup']['choice']) {
+      // Create popup from label.
+      case 1:
+        $settings['popup']['label'] = $settings['popup']['label'] ? 'inline' : 'hidden';
+        $popup_field = $entity->{$settings['popup']['text']}->view(['label' => $settings['popup']['label']], $language->getId());
+        break;
+
+      // Create popup from view mode.
+      case 2:
+        $display = EntityViewDisplay::collectRenderDisplay($entity, $settings['popup']['view_mode']);
+        $popup_field = $display->build($entity);
+        break;
+
+      // Default to empty.
+      default:
+        $popup_field = [];
+    }
+    $location['popup'] = render($popup_field);
+  }
+  else {
+    // Not an entity object.
+    $location['popup'] = [];
+  }
+  if ($settings['map_center']['center_coordinates']
+    && $entity->hasField($settings['map_center']['center_coordinates'])) {
+    if ($entity->hasTranslation($language->getId())) {
+      $map_center = $entity->getTranslation($language->getId())
+        ->get($settings['map_center']['center_coordinates'])
+        ->getValue();
+    }
+    else {
+      $map_center = $entity->get($settings['map_center']['center_coordinates'])->getValue();
+    }
+    if ($map_center && isset($map_center[0]['lat'], $map_center[0]['lon'])) {
+      $settings['map_center']['center_coordinates'] = $map_center[0];
+    }
+    else {
+      $settings['map_center']['center_coordinates'] = FALSE;
+    }
+  }
+  else {
+    $settings['map_center']['center_coordinates'] = FALSE;
+  }
+}
+
+/**
+ * Returns HTML for the styled google map.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - location: The location object including longitude and latitude.
+ *   - display: Display array including formatter settings.
+ *
+ * @ingroup themeable
+ *
+ * @return mixed|null
+ *   Rendered output.
+ */
+function theme_styled_google_map(array $variables) {
+  $location = $variables['location'];
+  $settings = $variables['settings'];
+
+  $output = [];
+  if (!empty($location)) {
+    $gid = uniqid();
+    // Include the Google Maps API and map location settings.
+    $map_settings['locations'] = [$location];
+    // Include the custom map settings.
+    $map_settings['settings'] = $settings;
+    // Include the unique div id.
+    $map_settings['id'] = 'styled-google-map-' . $gid;
+    $output['#attached']['drupalSettings']['styled_google_map'] = [$gid => $gid];
+    $output['#attached']['drupalSettings']['maps'] = ['id' . $gid => $map_settings];
+    // Output a div placeholder for the Styled Google Map.
+    $output['styled_google_map']['#markup'] = '<div class="styled_map" id="styled-google-map-' . $gid . '"></div>';
+    // Attach the Styled Google Map javascript file.
+    $output['#attached']['library'][] = 'styled_google_map/styled-google-map';
+  }
+
+  return render($output);
+}
+
+/**
+ * Implements hook_library_info_alter().
+ */
+function styled_google_map_library_info_alter(&$libraries, $extension) {
+  if ($extension == 'styled_google_map' && isset($libraries['styled-google-map'])) {
+    if (!empty($libraries['styled-google-map']['js']['//maps.google.com/maps/api/js'])) {
+      $options = $libraries['styled-google-map']['js']['//maps.google.com/maps/api/js'];
+      unset($libraries['styled-google-map']['js']['//maps.google.com/maps/api/js']);
+      $api_url = styled_google_map_build_api_url(['visualization']);
+      $libraries['styled-google-map']['js']['//maps.google.com/maps/api/js' . $api_url] = $options;
+    }
+  }
+}
+
+/**
+ * Create url addition for Google Maps library.
+ *
+ * @param array $libraries
+ *   Any libraries that should be loaded with API.
+ *
+ * @return string
+ *   The url of the API for maps library.
+ */
+function styled_google_map_build_api_url($libraries = []) {
+  $api_url = '';
+  $config = \Drupal::config('styled_google_map.settings');
+  $query = ['v' => '3'];
+  switch ($config->get('styled_google_map_google_auth_method')) {
+    case StyledGoogleMapInterface::STYLED_GOOGLE_MAP_GOOGLE_AUTH_KEY:
+      $key = $config->get('styled_google_map_google_apikey');
+      if ($key) {
+        $query['key'] = $key;
+      }
+      break;
+
+    case StyledGoogleMapInterface::STYLED_GOOGLE_MAP_GOOGLE_AUTH_WORK:
+      $client_id = $config->get('styled_google_map_google_client_id');
+      if ($client_id) {
+        $query['client'] = $client_id;
+      }
+      break;
+  }
+
+  if (!empty($libraries)) {
+    $query['libraries'] = implode(",", $libraries);
+  }
+
+  // Add query params to API url.
+  if (!empty($query)) {
+    $api_url .= '?' . UrlHelper::buildQuery($query);
+  }
+  return $api_url;
+}
