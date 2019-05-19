@@ -1,0 +1,533 @@
+<?php
+
+/**
+ * @file
+ * Allows users to create public shopping/wish lists.
+ */
+
+use Drupal\Core\Url;
+use Drupal\node\Entity\Node;
+use Drupal\Core\Form\FormState;
+use Drupal\uc_order\Entity\Order;
+
+/**
+ * Implements hook_theme().
+ */
+function uc_wishlist_theme() {
+  return [
+    'uc_wishlist_view_wishlist' => [
+      'variables' => [
+        'form' => NULL,
+        'expired' => FALSE,
+        'expiration_date' => NULL,
+        'message' => NULL,
+        'wishlist' => NULL,
+        'email_link' => NULL,
+      ],
+    ],
+    'uc_wishlist_block_title' => [
+      'variables' => [
+        'wishlist_image' => NULL,
+        'uc_wishlist_path' => FALSE,
+        'arrow_up_image' => FALSE,
+      ],
+    ],
+    'uc_wishlist_block_content' => [
+      'variables' => [],
+    ],
+    'uc_wishlist_view_form' => [
+      'render element' => 'form',
+    ],
+  ];
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Alter uc_product_add_to_cart_form instances to include 'add to wish list'
+ * button. Form submission is routed through uc_wishlist_add_to_wishlist
+ * to differentiate between 'add to cart' and 'add to wish list'. If this
+ * module is added to Ubercart core, then this can be simplified.
+ *
+ * Alter uc_cart_checkout_form to include by default the delivery address
+ * of a wish list's owner, if items come from a single wish list.
+ */
+function uc_wishlist_form_alter(&$form, FormState $form_state, $form_id) {
+
+  if ((strpos($form_id, 'uc_product_add_to_cart_form_') === 0) ||
+        (strpos($form_id, 'uc_product_kit_add_to_cart_form_') === 0)) {
+    $user = \Drupal::currentUser();
+    // Allow users which has 'create wish lists' permissions.
+    if (!$user->hasPermission('create wish lists')) {
+      return;
+    }
+    $moduleHandler = \Drupal::service('module_handler');
+    // ['args'][0];.
+    $product = $form_state->getBuildInfo();
+    // Check only stock active products, and if not, bail out.
+    $config = \Drupal::config('uc_wishlist.settings');
+    if (!$config->get('uc_wishlist_out_of_stock')) {
+      if ($moduleHandler->moduleExists('uc_stock')) {
+        $stock_level = uc_stock_level($product->model);
+        if ($stock_level !== FALSE && $stock_level <= 0) {
+          return;
+        }
+      }
+    }
+
+    $pid = $form['nid']['#value'];
+    $wishlist_manager = \Drupal::service('uc_wishlist.manager');
+    $wid = uc_wishlist_get_wid();
+    // Check to see if the users wishlist has been created.
+    if ($wid == NULL || empty($wid)) {
+      // Add the wish list button to the add to cart form because this users wishlist hasnt been made yet.
+      $form['actions']['wishlist'] = [
+        '#type' => 'submit',
+        '#attributes' => ['class' => ['node-add-to-wishlist']],
+        '#value' => t('Add to wish list'),
+        '#submit' => ['uc_wishlist_add_to_wishlist_submit'],
+        '#weight' => 1,
+      ];
+    }
+    else {
+      // Make sure this product isnt already in the users wish list.
+      $wishlistProduct = $wishlist_manager->isProductInWishlist($wid, $pid);
+      if (is_object($wishlistProduct[0])) {
+        // dpm($wishlistProduct[0]);
+        // the product was found in the user's wishlist so display the remove from wishlist button on the add to cart form.
+        $form['actions']['wishlist'] = [
+          '#type' => 'submit',
+          '#attributes' => ['class' => ['node-add-to-wishlist']],
+          '#value' => t('Remove from wish list'),
+          '#submit' => ['uc_wishlist_remove_from_wishlist_submit'],
+          '#weight' => 1,
+        ];
+      }
+      else {
+        // Product is not in the users wishlist.
+        $form['actions']['wishlist'] = [
+          '#type' => 'submit',
+          '#attributes' => ['class' => ['node-add-to-wishlist']],
+          '#value' => t('Add to wish list'),
+          '#submit' => ['uc_wishlist_add_to_wishlist_submit'],
+          '#weight' => 1,
+        ];
+      }
+    }
+  }
+
+  // Checking if the product is added from wishlist in checkout page.
+  if ($form_id == 'uc_cart_checkout_form') {
+    if (isset($form['panes']['cart']['cart_review_table']['#items']) && !empty($form['panes']['cart']['cart_review_table']['#items'])) {
+      $items = $form['panes']['cart']['cart_review_table']['#items'];
+      $wids = [];
+
+      foreach ($items as $item) {
+        if (!empty($item->data['wid'])) {
+          $wids[] = $item->data['wid'];
+        }
+      }
+      $wids = array_unique($wids);
+
+      if (count($wids) > 1) {
+        drupal_set_message(t('This order contains items from multiple wish lists. It is not possible to automatically address this order for its recipient.'));
+      }
+      elseif (count($wids) == 1) {
+        $wishlist = uc_wishlist_load($wids[0]);
+
+        if (variable_get('uc_wishlist_save_address', TRUE) &&
+        !empty($wishlist->address->firstname) && !empty($wishlist->address->lastname) &&
+        !empty($wishlist->address->addr1) && !empty($wishlist->address->postcode) &&
+        is_object($form['panes']['delivery']['address']['#default_value']) &&
+        empty($form['panes']['delivery']['address']['#default_value']->delivery_first_name)) {
+          $order = Order::load($_SESSION['cart_order']);
+          if ($order) {
+            $defaults = $order;
+            $defaults->delivery_first_name = $wishlist->address->firstname;
+            $defaults->delivery_last_name = $wishlist->address->lastname;
+            $defaults->delivery_company = $wishlist->address->company;
+            $defaults->delivery_street1 = $wishlist->address->addr1;
+            $defaults->delivery_street2 = $wishlist->address->addr2;
+            $defaults->delivery_city = $wishlist->address->city;
+            $defaults->delivery_country = $wishlist->address->country;
+            $defaults->delivery_zone = $wishlist->address->zone;
+            $defaults->delivery_postal_code = $wishlist->address->postcode;
+            $defaults->delivery_phone = $wishlist->address->phone;
+            $form['panes']['delivery']['address']['#default_value'] = $defaults;
+
+            drupal_set_message(t('This order contains items from a wish list. The delivery address has been automatically set to the preferred address from the wish list. You may change this address.'));
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ *
+ */
+function uc_wishlist_remove_from_wishlist_submit($form, FormState $form_state) {
+  $wishlist_manager = \Drupal::service('uc_wishlist.manager');
+  $pid = $form_state->getValue('nid');
+  $wishlist_manager->remove_product($pid);
+  $node = Node::load($pid);
+  $productTitle = $node->get('title')->getValue()[0]['value'];
+  drupal_set_message(t('@product_title was removed from your wish list.',
+    ['@product_title' => $productTitle, '@url' => Url::fromRoute('uc_wishlist.wishlist')->toString()]));
+}
+
+/**
+ * Submit handler of the uc_wishlist_add_to_wishlist.
+ *
+ * See comment for uc_wishlist_form_alter: This function handles submission
+ * of uc_product_add_to_cart_form and differentiates between 'add to cart'
+ * and 'add to wish list' functions.
+ */
+function uc_wishlist_add_to_wishlist_submit($form, FormState $form_state) {
+
+  // Add the item to the user's wish list.
+  uc_wishlist_add_item($form_state->getValue('nid'), $form_state->getValue('qty'));
+}
+
+/**
+ * Creates a new wishlist for the current authenticated or anonymous user.
+ */
+function uc_wishlist_create_wishlist($title = NULL) {
+  $user = \Drupal::currentUser();
+
+  // Abort if user is not logged in and anonymous wish lists are not allowed.
+  if (!$user->id() && !$user->hasPermission('create wish lists')) {
+    drupal_set_message(t('You must be logged in to create a wish list. Please <a href="@login_url">login</a> or <a href="@register_url">register</a>.',
+        [
+          '@login_url' => Url::fromRoute('user.login'),
+          '@register_url' => Url::fromRoute('user.register'),
+        ]));
+    return FALSE;
+  }
+
+  // Get the current user ID for the wish list.
+  $uid = uc_wishlist_get_uid();
+  $config = \Drupal::config('uc_wishlist.settings');
+  if (empty($title)) {
+    $title = $config->get('uc_wishlist_default_title');
+  }
+  $title = '%user\'s wish list.';
+  if (strpos($title, '%user') !== FALSE) {
+    $uname = $user->getAccountName();
+    $title = str_replace('%user', $uname, $title);
+  }
+
+  $expiration = REQUEST_TIME + $config->get('uc_wishlist_default_length');
+
+  $private = $config->get('uc_wishlist_default_private') ? $config->get('uc_wishlist_default_private') : 0;
+  $wishlist_manager = \Drupal::service('uc_wishlist.manager');
+  $fields = [
+    'uid',
+    'title',
+    'expiration',
+    'private',
+  ];
+  $values = [
+    $uid,
+    $title,
+    $expiration,
+    $private,
+  ];
+  $wishlist_manager = \Drupal::service('uc_wishlist.manager');
+  $result = $id = $wishlist_manager->createWishlist($fields, $values);
+
+  if ($result) {
+    return $id;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Adds an item to a user's wish list.
+ */
+function uc_wishlist_add_item($nid, $qty = 1, $data = NULL, $wid = NULL, $msg = TRUE, $check_redirect = TRUE) {
+  $wid = $wid ? $wid : uc_wishlist_get_wid();
+  $created = FALSE;
+
+  if (!$wid || $wid === NULL) {
+    $wid = uc_wishlist_create_wishlist();
+
+    if (!$wid) {
+      drupal_set_message(t('Could not create wish list. Adding item failed.'), 'error');
+      return FALSE;
+    }
+    $created = TRUE;
+  }
+
+  $node = Node::load($nid);
+
+  // Adding data variables.
+  if (empty($data)) {
+    $data = ['module' => 'uc_product'];
+  }
+  elseif (!array_key_exists('module', $data)) {
+    $data['module'] = 'uc_product';
+  }
+  // $data = $node;
+  // If Product Kit is enable, then add products into data array.
+  $moduleHandler = \Drupal::service('module_handler');
+  /*
+  if ($moduleHandler->moduleExists('uc_product_kit') && $node->getType() == 'product_kit') {
+
+  // Adding products of the product kit into data object.
+  $products = $node->products;
+
+  foreach ($products as $pid => $product) {
+
+  $data['products'][$pid]['nid'] = $pid;
+  $data['products'][$pid]['qty'] = $product->qty;
+
+  // Creating attributes array.
+  $attributes = array();
+
+  // Getting attributes list of the product.
+  $product_attributes = $product->attributes;
+
+  // Iterating through the attributes list.
+  foreach ($product_attributes as $aid => $product_attribute) {
+  $attribute[$product_attribute->aid] = $product_attribute->default_option;
+  }
+
+  // Assigning attributes to data array.
+  $data['products'][$pid]['attributes'] = $attributes;
+  }
+  }
+   */
+  // If product kit module is install in the site, then we need to check if the
+  // product is product kit or product.
+  /*
+  if ($moduleHandler->moduleExists('uc_product_kit')) {
+  $supported_node_types = array_merge(array_keys(uc_product_node_info()), array_keys(uc_product_kit_node_info()));
+  }
+  else {
+  $supported_node_types = array_keys(uc_product_node_info());
+  }
+
+  // Checking if the node is product type or product kit type.
+
+  if (!in_array($node->type, $supported_node_types)) {
+  drupal_set_message(t('@title is not a product. Unable to add to wish list.', array('@title' => $node->title)), 'error');
+  return;
+  }
+
+  $result = $moduleHandler->invokeAll('add_to_cart', $nid, $qty, $data);
+  if (is_array($result) && !empty($result)) {
+  foreach ($result as $row) {
+  if ($row['success'] === FALSE) {
+  if (isset($row['message']) && !empty($row['message'])) {
+  $message = $row['message'];
+  }
+  else {
+  $message = t('Sorry, that item is not available for purchase at this time.');
+  }
+  drupal_set_message(\Drupal\Component\Utility\Xss::filter($message), 'error');
+  return;
+  }
+  }
+  }
+   */
+  $wishlist_manager = \Drupal::service('uc_wishlist.manager');
+  $item = $wishlist_manager->getWishlistItem($wid, $nid, $data);
+
+  // If the item isn't in the cart yet, add it.
+  if (is_null($item) || $item === FALSE) {
+    $fields = [
+      'wid',
+      'nid',
+      'qty',
+      'changed',
+      'data',
+      'purchase',
+    ];
+    $values = [
+      $wid,
+      $nid,
+      $qty,
+      REQUEST_TIME,
+      serialize($data),
+      '',
+    ];
+
+    $id = $wishlist_manager->createWishlistProduct($fields, $values);
+    $productTitle = $node->get('title')->getValue()[0]['value'];
+    // dpm($productTitle);
+    if ($msg) {
+      drupal_set_message(t('<b>@product-title</b> was added to <a href="@url">your wish list</a>.', ['@product-title' => $productTitle, '@url' => Url::fromRoute('uc_wishlist.wishlist')->toString()]));
+    }
+  }
+  else {
+    // Update the item instead.
+    $qty += $item->qty;
+    $wpid = $item->wpid;
+
+    uc_product_update_wishlist_item($nid, $data, min($qty, 999999), $wid, $wpid);
+
+    if ($msg) {
+      drupal_set_message(t('Your <a href="@url">wish list</a> has been updated.', ['@url' => Url::fromRoute('uc_wishlist.wishlist')->toString()]));
+    }
+  }
+
+}
+
+/**
+ * Update information about a specific item in current wish list.
+ */
+function uc_product_update_wishlist_item($nid, $data = [], $qty, $wid = NULL, $wpid = NULL) {
+  if (!$nid) {
+    return NULL;
+  }
+
+  $wid = $wid ? $wid : uc_wishlist_get_wid();
+
+  if ($qty < 1) {
+    $wpid = $wpid ? $wpid : $data['wpid'];
+  }
+  else {
+    db_update('uc_wishlist_products')
+      ->fields([
+        'qty' => $qty,
+        'changed' => REQUEST_TIME,
+      ])
+      ->condition('wpid', $wpid)
+      ->execute();
+  }
+
+  if (strpos(\Drupal::request()->getRequestUri(), 'wishlist', 1) !== FALSE) {
+    drupal_set_message(t('Your item(s) have been updated.'));
+  }
+}
+
+/**
+ * Submit callback handler for wishlistviewform add to cart action.
+ */
+function addToCart(array &$form, FormState $form_state) {
+  // $form_state->get();
+  $submitButton = $form_state->getTriggeringElement()['#name'];
+  $buttonName = $submitButton;
+  // The add to cart button was pressed on a product in the wish list
+  // explode the button name to get the product id.
+  $names = explode('-', $buttonName);
+  $pid = $names[1];
+
+  $values = $form_state->getValues();
+  $nid = $values['items'][$pid]['nid'];
+  $qty = $values['items'][$pid]['qty'];
+  $data = [
+    'nid' => $nid,
+    'qty' => $qty,
+  ];
+  $data = \Drupal::moduleHandler()->invokeAll('uc_add_to_cart_data', [$data]);
+  $msg = TRUE;
+  $cart = \Drupal::service('uc_cart.manager')->get();
+  $redirect = $cart->addItem($nid, $qty, $data, $msg);
+  $form_state->set('variant', uc_product_load_variant($qty, $data));
+  if (isset($redirect)) {
+    $form_state->setRedirectUrl($redirect);
+  }
+}
+
+/**
+ * Return the wish list ID of the specified user (defaults to current user).
+ */
+function uc_wishlist_get_wid($uid = NULL) {
+  // Find the wish list matching the authenticated or anonymous user ID.
+  // TODO: Handle multiple wishlists?
+  if (empty($uid)) {
+    // uc_wishlist_get_uid();
+    $uid = \Drupal::currentUser()->id();
+  }
+  $wishlist_manager = \Drupal::service('uc_wishlist.manager');
+  return $wishlist_manager->getWishlistIdByUser($uid);
+}
+
+/**
+ * Get either an authenticated user's uid or an anonymous user's unique ID.
+ */
+function uc_wishlist_get_uid() {
+  $user = \Drupal::currentUser();
+
+  // Get either an authenticated user's uid or an anonymous user's unique ID.
+  if ($user->getAccount()->id()) {
+    $uid = $user->getAccount()->id();
+  }
+  else {
+    if (!isset($_SESSION['uc_wishlist_uid']) || empty($_SESSION['uc_wishlist_uid'])) {
+      $_SESSION['uc_wishlist_uid'] = md5(uniqid(rand(), TRUE));
+    }
+
+    $uid = $_SESSION['uc_wishlist_uid'];
+  }
+
+  return $uid;
+}
+
+/**
+ * Load a wish list object from the database.
+ *
+ * @param numeric $wid
+ *   The wish list ID to load; if NULL, looks for the current user's wish list.
+ *
+ * @return object
+ *   A wish list object.
+ */
+function uc_wishlist_load($wid) {
+  if (empty($wid)) {
+    $wid = uc_wishlist_get_wid();
+  }
+
+  if (!$wid || !is_numeric($wid)) {
+    return FALSE;
+  }
+  $wishlist_manager = \Drupal::service('uc_wishlist.manager');
+  $result = $wishlist_manager->getWishlist($wid);
+
+  if ($wishlist = $result->fetchObject()) {
+    $wishlist->address = unserialize($wishlist->address);
+
+    return $wishlist;
+  }
+}
+
+/**
+ * Get the items in a specified wish list.
+ */
+function uc_wishlist_get_contents($wid = NULL) {
+  $wid = $wid ? $wid : uc_wishlist_get_wid();
+  if (!$wid || !is_numeric($wid)) {
+    return FALSE;
+  }
+  $items = [];
+  $wishlist_manager = \Drupal::service('uc_wishlist.manager');
+  $res = $wishlist_manager->selectWishlistProducts($wid);
+  // dpm($res);
+  // Iterating through the array.
+  foreach ($res as $item) {
+
+    $product = Node::load($item->nid);
+    $item->model = $product->get('model')->getValue();
+    $item->price = $product->get('price')->getValue();
+    // $item->price = $product->get('sell_price');.
+    $item->weight = $product->get('weight')->getValue();
+    // $item->weight_units = $product->get('weight_units');.
+    $item->shippable = $product->get('shippable')->getValue();
+    $item->data = unserialize($item->data);
+    $item->module = $item->data['module'];
+    $item->purchase = unserialize($item->purchase);
+    $item->options = [];
+    $item->qty = $item->qty;
+    $item->haveqty = 1;
+    // Add wishlist id data.
+    $item->data['wid'] = $item->wid;
+    $item->data['wpid'] = $item->wpid;
+
+    $items[] = $item;
+  }
+
+  return $items;
+}
