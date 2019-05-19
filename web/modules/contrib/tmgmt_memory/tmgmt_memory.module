@@ -1,0 +1,128 @@
+<?php
+
+/**
+ * @file
+ * Main module file for the TMGMT Memory module.
+ */
+
+use Drupal\tmgmt\JobItemInterface;
+
+/**
+ * Implements hook_tmgmt_job_item_update().
+ */
+function tmgmt_memory_tmgmt_job_item_update(JobItemInterface $job_item) {
+  /** @var \Drupal\tmgmt\JobItemInterface $original */
+  $original = $job_item->original;
+
+  // Save the segments of a completed translation.
+  if (!$original->isAccepted() && $job_item->isAccepted()) {
+    $unfiltered_data = $job_item->getData();
+    /** @var \Drupal\tmgmt_memory\Segmenter $segmenter */
+    $segmenter = \Drupal::service('tmgmt.segmenter');
+    $unfiltered_data = $segmenter->getSegmentedData($unfiltered_data);
+    /** @var \Drupal\tmgmt\Data $data_service */
+    $data_service = \Drupal::service('tmgmt.data');
+    $fields = $data_service->filterTranslatable($unfiltered_data);
+    foreach ($fields as $field_key => $field) {
+      if (isset($field['#translation'])) {
+        $key = explode('][', $field_key);
+        $source_segments = $segmenter->getSegmentsOfData($field['#segmented_text']);
+        $target_segments = $segmenter->getSegmentsOfData($field['#translation']['#segmented_text']);
+
+        /** @var \Drupal\tmgmt_memory\MemoryManager $memory_manager */
+        $memory_manager = \Drupal::service('tmgmt_memory.memory_manager');
+        /** @var \Drupal\tmgmt_memory\Entity\UsageTranslation $translation */
+        foreach ($source_segments as $id => $source_segment) {
+          $source_usage = $memory_manager->addUsage($job_item->getJob()
+            ->getSourceLangcode(), $source_segment['data'], $job_item->id(), implode('|', $key), $id);
+          if (isset($target_segments[$id])) {
+            $target_segment = $target_segments[$id]['data'];
+            $target_usage = $memory_manager->addUsage($job_item->getJob()
+              ->getTargetLangcode(), $target_segment, $job_item->id(), implode('|', $key), $id);
+            $memory_manager->addUsageTranslation($source_usage, $target_usage);
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Allows to alter job checkout workflow after the default behavior.
+ *
+ * @param \Drupal\tmgmt\JobItemInterface[] $items
+ *   The JobItems being submitted.
+ */
+function tmgmt_memory_tmgmt_job_before_request_translation(array $items) {
+  /** @var \Drupal\tmgmt\Data $data_service */
+  $data_service = \Drupal::service('tmgmt.data');
+  /** @var \Drupal\tmgmt_memory\MemoryManager $memory_manager */
+  $memory_manager = \Drupal::service('tmgmt_memory.memory_manager');
+
+  // Translate exact matches on submission.
+  foreach ($items as $job_item) {
+    $unfiltered_data = $job_item->getData();
+    $fields = $data_service->filterTranslatable($unfiltered_data);
+    foreach ($fields as $field_key => $field) {
+      $key = explode('][', $field_key);
+      $target_data = $memory_manager->getPerfectMatchForDataItem($job_item->getJob()->getSourceLangcode(), $job_item->getJob()->getTargetLangcode(), $field);
+      if ($target_data) {
+        $field['#text'] = $target_data;
+        $job_item->addTranslatedData($field, $key);
+        $data = $job_item->getData($data_service->ensureArrayKey($key));
+        $data['#translate'] = FALSE;
+        $data['#tmgmt_memory_translate'] = TRUE;
+        $job_item->updateData($key, $data);
+        $job_item->save();
+      }
+    }
+  }
+}
+
+/**
+ * Allows to alter job checkout workflow after the default behavior.
+ *
+ * @param \Drupal\tmgmt\JobItemInterface[] $items
+ *   The JobItems being submitted.
+ */
+function tmgmt_memory_tmgmt_job_after_request_translation(array $items) {
+  /** @var \Drupal\tmgmt\Data $data_service */
+  $data_service = \Drupal::service('tmgmt.data');
+
+  // Translate exact matches on submission.
+  foreach ($items as $job_item) {
+    $unfiltered_data = $job_item->getData();
+    $fields = $data_service->flatten($unfiltered_data);
+    foreach ($fields as $field_key => $field) {
+      $key = explode('][', $field_key);
+      $source = $job_item->getData($data_service->ensureArrayKey($key));
+      if (isset($source['#tmgmt_memory_translate'])) {
+        $data = $job_item->getData($data_service->ensureArrayKey($key));
+        $data['#translate'] = TRUE;
+        unset($data['#tmgmt_memory_translate']);
+        $job_item->updateData($key, $data);
+        $job_item->save();
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_file_download().
+ */
+function tmgmt_memory_file_download($uri) {
+  $scheme = file_uri_scheme($uri);
+  $target = file_uri_target($uri);
+  if ($scheme == 'temporary' && $target == 'tmgmt_memory.tar.gz') {
+    $request = \Drupal::request();
+    $date = DateTime::createFromFormat('U', $request->server->get('REQUEST_TIME'));
+    $date_string = $date->format('Y-m-d-H-i');
+    $hostname = str_replace('.', '-', $request->getHttpHost());
+    $filename = 'tmgmt_memory' . '-' . $hostname . '-' . $date_string . '.tar.gz';
+    $disposition = 'attachment; filename="' . $filename . '"';
+    return array(
+      'Content-disposition' => $disposition,
+    );
+  }
+  return NULL;
+}
