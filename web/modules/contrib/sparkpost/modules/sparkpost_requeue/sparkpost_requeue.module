@@ -1,0 +1,65 @@
+<?php
+
+/**
+ * @file
+ * Sparkpost requeue module.
+ */
+
+use Drupal\sparkpost\MessageWrapperInterface;
+use Drupal\sparkpost_requeue\QueuedMessageWrapper;
+
+/**
+ * Implements hook_sparkpost_mailsend_error().
+ */
+function sparkpost_requeue_sparkpost_mailsend_error(MessageWrapperInterface $message_wrapper) {
+  $config = \Drupal::config('sparkpost_requeue.settings');
+  // Check if sparkpost requeue is enabled.
+  if (!$config->get('enable')) {
+    return;
+  }
+  // Check if this message has been bouncing around for way too long.
+  $limit = $config->get('max_retries');
+  $minimum_time = $config->get('minimum_time');
+
+  if (!$message_wrapper instanceof QueuedMessageWrapper) {
+    // We want to wrap it in our own class.
+    $message_wrapper_new = new QueuedMessageWrapper($message_wrapper->getClientService());
+    $message_wrapper_new->setDrupalMessage($message_wrapper->getDrupalMessage());
+    $message_wrapper_new->setSparkpostMessage($message_wrapper->getSparkpostMessage());
+    $message_wrapper = $message_wrapper_new;
+  }
+
+  if ($message_wrapper->getRetryCount() >= $limit) {
+    // Log the problem.
+    \Drupal::logger('sparkpost_requeue')
+      ->info('Message has been requeued a total of @number times. Message will be discarded.', [
+        '@number' => $message_wrapper->getRetryCount(),
+      ]);
+    return;
+  }
+
+  // Check if it's not too soon for retrying.
+  if (time() - $message_wrapper->getLastRetry() < $minimum_time) {
+    throw new Exception('Too soon to retry');
+  }
+
+  // Set a log message about what we are doing.
+  \Drupal::logger('sparkpost_requeue')
+    ->info('Caught a failed message. Will requeue it for sending later. Current count is @count', [
+      '@count' => $message_wrapper->getRetryCount(),
+    ]);
+  // Increment a counter about how many times we have tried to send this
+  // message.
+  $message_wrapper->incrementRetryCount();
+
+  // Set last retry timestamp.
+  $message_wrapper->setLastRetry(time());
+
+  // Clear the current exception, since this will not be of use to us in the
+  // next round of processing, and it cannot be serialized.
+  $message_wrapper->clearApiResposeException();
+
+  // Then just put it in the queue.
+  $queue = \Drupal::queue('sparkpost_send');
+  $queue->createItem($message_wrapper);
+}
