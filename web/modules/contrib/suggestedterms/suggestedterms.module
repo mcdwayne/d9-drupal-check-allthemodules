@@ -1,0 +1,294 @@
+<?php
+/*
+ * @file
+ * Module that displays terms and uses javascript to allow click-adding to
+ * taxonomy autocomplete fields.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+
+/**
+* define constants
+*/
+define('SUGGESTEDTERMS_SORT_POPULAR', 0);
+define('SUGGESTEDTERMS_SORT_NAME', 1);
+define('SUGGESTEDTERMS_SORT_RECENT', 2);
+define('SUGGESTEDTERMS_SORT_WEIGHT', 3);
+define('SUGGESTEDTERMS_SORT_USED', 4);
+
+define('SUGGESTEDTERMS_DISPLAY_ALL', 1);
+define('SUGGESTEDTERMS_DISPLAY_USED', 2);
+
+define('SUGGESTEDTERMS_DISPLAY_FIELDSET', 0);
+
+/**
+ * Implementation of hook_help().
+ */
+function suggestedterms_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case "help.page.suggestedterms":
+      return '<p>' . t("Replaces the default \'description\' text on free-tagging textfields on node edit pages with a list of taxonomy terms in that vocabulary, with appropriate labeling") . '</p>';
+      break;
+  }
+}
+
+/**
+ * Implementation of hook_permission().
+ */
+function suggestedterms_permission() {
+  return array(
+    'administer suggested terms' => array(
+      'title' => t('Administer suggested terms'),
+      'description' => t('User can adjust settings such as how to sort the suggested terms.'),
+    )
+  );
+}
+
+/*
+ * Implementation of hook_field_widget_WIDGET_TYPE_form_alter().
+ */
+function suggestedterms_field_widget_taxonomy_autocomplete_form_alter(&$element, $form_state, $context) {
+  // Add scripts (css and js).
+  _suggestedterms_add_scripts($element);
+
+  // Get the config.
+  $config = \Drupal::config('suggestedterms.settings');
+  $display_what = $config->get('display_mode', SUGGESTEDTERMS_DISPLAY_ALL);
+  $sort_order = $config->get('sort_order', SUGGESTEDTERMS_SORT_NAME);
+  $display_fieldset = $config->get('display_fieldset', SUGGESTEDTERMS_DISPLAY_FIELDSET);
+
+  switch ($sort_order) {
+    case SUGGESTEDTERMS_SORT_POPULAR:
+      $tag_description = t('Most popular terms');
+      break;
+    case SUGGESTEDTERMS_SORT_RECENT:
+      $tag_description = t('Recently added');
+      break;
+    case SUGGESTEDTERMS_SORT_WEIGHT:
+      $tag_description = t('Terms by Weight');
+      break;
+    case SUGGESTEDTERMS_SORT_USED:
+      $tag_description = t('Recently Used');
+      break;
+    default:
+      $tag_description = t('Terms by name');
+      break;
+  }
+
+  $selected_terms = suggestedterms_list_terms_used($context);
+
+  $settings = $context['items']->getSettings();
+  $allowed = $settings['allowed_values'];
+  foreach($allowed as $value) {
+    $vocab_name = $value['vocabulary'];
+
+    $terms_list = _suggestedterms_build_suggestions($vocab_name, $sort_order, $display_what, explode(', ', $selected_terms));
+     // If the user has checked the "fieldset" box in settings, make a fieldset.
+     if ($display_fieldset == TRUE ) {
+       $fieldset_variables['element'] = array(
+         '#id' => 'suggestedterms_widget_list',
+         '#theme' => 'fieldset',
+         '#title' => "$tag_description:",
+         '#children' => $terms_list,
+       );
+
+       $element['#children'][] = $fieldset_variables;
+     }
+     // Otherwise just paste the list into the description directly.
+     else {
+       $terms_list['#title'] = "$tag_description:";
+       $element['#children'][] = $terms_list;
+     }
+  }
+}
+
+/**
+ * Hooks are above this line. Custom functions below.
+ */
+
+/**
+ * Adds suggestedterms' scripts to the element.
+ * @param array $element
+ */
+function _suggestedterms_add_scripts(&$element) {
+    // Attach the js and css we need to the page.
+  $path = drupal_get_path('module', 'suggestedterms');
+  $element['#attached']['js'][$path . '/js/suggestedterms.js'] = array('every_page' => TRUE);
+  $element['#attached']['css'][$path . '/css/suggestedterms.css'] = array('every_page' => TRUE);
+}
+
+/**
+ * Creates a list of terms already used, from the context.
+ *
+ * @param array $context
+ *  Field item context.
+ * @return array
+ *  An array of terms already selected.
+ */
+function suggestedterms_list_terms_used($context) {
+  // Get the names of each term already used in the field.
+  $used_tids = explode(',', $context['items']->getString());
+  foreach ($context['items']->list as $item) {
+    $used_tids[] = $item->value;
+  }
+  $selected_terms = '';
+  $used_terms = taxonomy_term_load_multiple($used_tids);
+  foreach($used_terms as $used_term) {
+    if (!empty($selected_terms)) {
+      $selected_terms .= ', ';
+    }
+    $selected_terms .= $used_term->name->value;
+  }
+  return $selected_terms;
+}
+
+/**
+* Queries for vocabulary terms.
+*
+* @return
+*   A render array for the list of items.
+*/
+function _suggestedterms_build_suggestions($vid, $sort_order, $display_what, $selected_terms) {
+  $config = Drupal::config('suggestedterms.settings');
+  // Use left join to display all entries, inner join to diaplay only used ones.
+  $query_type = ($display_what == SUGGESTEDTERMS_DISPLAY_ALL) ? " LEFT " : " INNER ";
+
+  // Get max number of terms set by admin.
+  $total_terms = array(
+    0 => $config->get('maximum_displayed', 5),
+  );
+
+  $query = db_select('taxonomy_term_field_data', 't');
+  $query->fields('t', array('name'));
+  $query->condition('t.vid', $vid, '=');
+  // Get sort order set by admin.
+  switch ($sort_order) {
+    case SUGGESTEDTERMS_SORT_POPULAR:
+      if ($query_type == ' INNER ') {
+        $query->innerJoin('taxonomy_index', 'ti', 't.tid = ti.tid');
+      }
+      elseif ($query_type = ' LEFT ') {
+        $query->leftJoin('taxonomy_index', 'ti', 't.tid = ti.tid');
+      }
+      else {
+        debug('Join type should be LEFT or INNER, but something else got passed instead.');
+      }
+      $query->addExpression('COUNT(t.name)', 'total');
+      $query->groupBy('t.name');
+      $query->orderBy('total', 'DESC');
+      if ($total_terms[0] >= 1) {
+        $query->range(0, $total_terms[0]);
+      }
+      break;
+
+    case SUGGESTEDTERMS_SORT_RECENT:
+      // List all the terms in the specified vocabulary and sort by term ID (We assume larger numbers were added more recently).
+      $query->groupBy('t.name');
+      $query->orderBy('t.tid', 'DESC');
+      $query->condition('t.vid', $vid, '=');
+      if ($query_type == ' INNER ') {
+        $query->innerJoin('taxonomy_index', 'ti', 't.tid = ti.tid');
+      }
+      elseif ($query_type = ' LEFT ') {
+        $query->leftJoin('taxonomy_index', 'ti', 't.tid = ti.tid');
+      }
+      else {
+        debug('Join type should be LEFT or INNER, but something else got passed instead.');
+      }
+      if ($total_terms[0] >= 1) {
+        $query->range(0, $total_terms[0]);
+      }      //$query = "SELECT t.name AS name FROM {taxonomy_term_data} t $query_type JOIN {taxonomy_index} tn ON (t.tid = tn.tid) WHERE t.vid = %d GROUP BY t.name ORDER BY t.tid desc";
+      break;
+
+    case SUGGESTEDTERMS_SORT_WEIGHT:
+      // List all the terms in the specified vocabulary and sort by term weight.
+      if ($query_type == ' INNER ') {
+        $query->innerJoin('taxonomy_index', 'ti', 't.tid = ti.tid');
+      }
+      elseif ($query_type = ' LEFT ') {
+        $query->leftJoin('taxonomy_index', 'ti', 't.tid = ti.tid');
+      }
+      else {
+        debug('Join type should be LEFT or INNER, but something else got passed instead.');
+      }
+      $query->groupBy('name');
+      $query->orderBy('weight', 'ASC');
+      $query->orderBy('name');
+      if ($total_terms[0] >= 1) {
+        $query->range(0, $total_terms[0]);
+      }      //$query = "SELECT t.name AS name, t.weight AS weight FROM {taxonomy_term_data} t $query_type JOIN {taxonomy_index} tn ON (t.tid = tn.tid) WHERE t.vid = %d GROUP BY t.name ORDER BY weight, name";
+      break;
+
+    case SUGGESTEDTERMS_SORT_USED:
+      // List all the terms in the specified vocabulary that are used on nodes. Order by the date the node was last changed.
+      if ($query_type == ' INNER ') {
+        $query->innerJoin('taxonomy_index', 'ti', 't.tid = ti.tid');
+        $query->innerJoin('node', 'n', 'ti.nid = n.nid');
+      }
+      elseif ($query_type = ' LEFT ') {
+        $query->leftJoin('taxonomy_index', 'ti', 't.tid = ti.tid');
+        $query->leftJoin('node', 'n', 'ti.nid = n.nid');
+      }
+      else {
+        debug('Join type should be LEFT or INNER, but something else got passed instead.');
+      }
+      $query->orderBy('n.changed', 'DESC');
+      $query->orderBy('name', 'ASC');
+      $query->distinct();
+      if ($total_terms[0] >= 1) {
+        $query->range(0, $total_terms[0]);
+      }      //$query = "SELECT DISTINCT t.name AS name FROM {taxonomy_term_data} t $query_type JOIN {taxonomy_index} tn ON (t.tid = tn.tid) $query_type JOIN {node} n ON (tn.nid = n.nid) WHERE t.vid = %d ORDER BY n.changed DESC, name";
+      break;
+
+    default:
+      // List all the term names in the specified vocabulary and order alphabetically.
+      $query->groupBy('t.name');
+      $query->orderBy('t.name');
+      if ($query_type == ' INNER ') {
+        $query->innerJoin('taxonomy_index', 'ti', 't.tid = ti.tid');
+      }
+      elseif ($query_type = ' LEFT ') {
+        $query->leftJoin('taxonomy_index', 'ti', 't.tid = ti.tid');
+      }
+      else {
+        debug('Join type should be LEFT or INNER, but something else got passed instead.');
+      }
+      if ($total_terms[0] >= 1) {
+        $query->range(0, $total_terms[0]);
+      }      //$query = "SELECT t.name AS name FROM {taxonomy_term_data} t $query_type JOIN {taxonomy_index} tn ON (t.tid = tn.tid) WHERE t.vid = $vid GROUP BY t.name ORDER BY t.name";
+      break;
+  }
+  // Run the query
+  $result = $query->execute();
+
+  $terms = array();
+  $selected = FALSE;
+  // Get the term names out from the query results and add classes.
+  foreach ($result as $record) {
+  $query_result[] = $record->name;
+    if (is_array($selected_terms) && in_array($record->name, $selected_terms)) {
+      $selected = TRUE;
+    }
+    $term = strip_tags($record->name);
+
+    $attributes = array(
+      'class' => array(
+        'suggestedterm'
+      ),
+    );
+    // If the item is selected already, clicking will remove, not add.
+    if ($selected) {
+      $attributes['class'][] = 'remove';
+    }
+    $variables = l($term, NULL, array('attributes' => $attributes));
+
+    $terms['#items'][] = $variables;
+    $selected = FALSE;
+  }
+  // Turn that big array of terms into a string for output and send it back to the calling function.
+  $terms['#attributes']['class'][] = 'suggestedterms';
+  $terms['#theme'] = 'item_list';
+  $terms['#type'] = 'ul';
+
+  return $terms;
+}
