@@ -1,0 +1,80 @@
+<?php
+
+/**
+ * Implements hook_webform_submission_insert().
+ */
+function sweepstakes_webform_submission_insert($node, $submission) {
+  $user = \Drupal::currentUser();
+
+  db_update('sweepstakes_entries')
+    ->fields(array('confirmed' => REQUEST_TIME,))
+    ->condition('nid', $node->nid)
+    ->condition('uid', $user->uid)
+    ->condition('prize_id', 0, '>')
+    ->execute();
+
+  $prize = current(\Drupal::entityManager()->getStorage('field_collection_item', array(
+    current(db_select('sweepstakes_entries')
+      ->fields(NULL, array('prize_id'))
+      ->condition('nid', $node->nid)
+      ->condition('uid', $user->uid)
+      ->condition('prize_id', 0, '>')
+      ->range(0, 1)
+      ->execute()
+      ->fetchAssoc())
+  )));
+
+  if (!empty($prize->field_prize_giveaway)) {
+    drupal_goto(drupal_get_path_alias('node/' . $prize->field_prize_giveaway[\Drupal\Core\Language\Language::LANGCODE_NOT_SPECIFIED][0]['target_id']));
+    return;
+  }
+
+  drupal_set_message(t('Thank you for providing the details. We will revert back with the shipping information of the gift'));
+  drupal_goto('node/' . $node->nid);
+}
+
+/**
+ * Implements hook_cron().
+ */
+function sweepstakes_cron() {
+  // @FIXME
+// Could not extract the default value because it is either indeterminate, or
+// not scalar. You'll need to provide a default value in
+// config/install/sweepstakes.settings.yml and config/schema/sweepstakes.schema.yml.
+$sweepstakes = \Drupal::config('sweepstakes.settings')->get('sweepstakes_redraw_timings');
+  foreach ($sweepstakes as $id => $time) {
+    if ($time < REQUEST_TIME) {
+      unset($sweepstakes[$id]);
+
+      // first clear out all the un-confirmed prizes.
+      db_update('sweepstakes_entries')
+        ->fields(array('prize_id' => 0))
+        ->condition('nid', $id)
+        ->condition('confirmed', 0)
+        ->condition('prize_id', 0, '>')
+        ->execute();
+
+      //start re-assigning prizes
+      $sweepstake = \Drupal::entityManager()->getStorage('node')->load($id);
+      $prizes = \Drupal::entityManager()->getStorage('field_collection_item');
+
+      foreach ($prizes as $pid => $prize) {
+        // avoid giving out more than available prizes.
+        $prizes_awarded = db_select('sweepstakes_entries')
+          ->fields(NULL, array('seid'))
+          ->condition('nid', $sweepstake->nid)
+          ->condition('prize_id', $pid)
+          ->execute()
+          ->rowCount();
+
+        for ($count = $prizes_awarded; $count < $prize->field_prize_count[\Drupal\Core\Language\Language::LANGCODE_NOT_SPECIFIED][0]['value']; $count++) {
+          if (empty($prize->field_prize_giveaway)) {
+            $context = array();
+            sweepstakes_pick_one_winner_for_non_giveaway($pid, $id, $context);
+          }
+        }
+      }
+    }
+  }
+  \Drupal::configFactory()->getEditable('sweepstakes.settings')->set('sweepstakes_redraw_timings', $sweepstakes)->save();
+}
