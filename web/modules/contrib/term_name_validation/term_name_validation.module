@@ -1,0 +1,235 @@
+<?php
+
+/**
+ * @file
+ * Contains term_name_validation.module..
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Component\Utility\Unicode;
+
+/**
+ * Implements hook_help().
+ */
+function term_name_validation_help($route_name, RouteMatchInterface $route_match) {
+  $output = '';
+  switch ($route_name) {
+    case 'help.page.term_name_validation':
+      // Help text for the term_name_validation module.
+      $output .= '<p>' . t('This module helps to validate term name with min/max characters, min/max word count, blacklist special characters, significant words and unique node titles .') . '</p>';
+      $output .= '<p>' . t('Validate the Term Name By:') . '</p>';
+      $output .= '<ul>';
+      $output .= '<li>' . t('Special Character & blacklisted words.') . '</li>';
+      $output .= '<li>' . t('Length (optionally specify min and/or max characters.)') . '</li>';
+      $output .= '<li>' . t('Word Count (optionally specify min and/or max words.)') . '</li>';
+      $output .= '<li>' . t('Unique term name (for specific taxonomy term.)') . '</li>';
+      $output .= '</ul>';
+      break;
+  }
+  return $output;
+}
+
+/**
+ * Implements hook_entity_base_field_info_alter().
+ */
+function term_name_validation_entity_base_field_info_alter(&$fields, EntityTypeInterface $entity_type) {
+  if ($entity_type->id() == 'taxonomy_term' && !empty($fields['name'])) {
+    $fields['name']->addConstraint('TermNameValidate', []);
+  }
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function term_name_validation_form_node_form_alter(&$form, FormStateInterface $form_state) {
+  if (!isset($form_state->getUserInput()['op']) || $form_state->getUserInput()['op'] != 'Delete') {
+    $form['#validate'][] = 'taxonomy_term_name_validation_validate';
+  }
+}
+
+/**
+ * Validate function for term field validation from content type.
+ */
+function taxonomy_term_name_validation_validate(&$form, FormStateInterface $form_state) {
+  $field = $form_state->get('form_display')->get('content');
+  $bundle = $form_state->get('form_display')->getTargetBundle();
+  $term_name_validation_config = \Drupal::config('term_name_validation.settings');
+  foreach ($form_state->getUserInput() as $key => $input_values) {
+    if (!empty($field[$key]['type']) && ($field[$key]['type'] == 'entity_reference_autocomplete' || $field[$key]['type'] == 'entity_reference_autocomplete_tags')) {
+
+      // Get vocab id for which the term will create.
+      $field_defination_settings = \Drupal::entityTypeManager()
+        ->getStorage('entity_form_display')
+        ->load('node.' . $bundle . '.default')
+        ->get('fieldDefinitions')[$key];
+
+      foreach ($input_values as $input_value) {
+        if (isset($field_defination_settings) && !empty($field_defination_settings->getSetting('handler_settings')['auto_create']) && $field_defination_settings->getSetting('handler_settings')['auto_create'] == TRUE) {
+          $term_name = '';
+          if (is_array($input_value)) {
+            // Check for Multiple auto-complete field widget.
+            if (!empty($input_value['target_id'])) {
+              preg_match('/\((\d+)\)$/', $input_value['target_id'], $match);
+              $term_name = $match ? \Drupal::entityTypeManager()->getStorage('taxonomy_term')->load($match[1])->getName() : $input_value['target_id'];
+            }
+          }
+          else {
+            // Check for Multiple auto-complete (tag style) field widget.
+            preg_match('/\((\d+)\)$/', $input_value, $match);
+            $term_name = $match ? \Drupal::entityTypeManager()->getStorage('taxonomy_term')->load($match[1])->getName() : $input_value;
+          }
+
+          // Validating start from here.
+          if ($term_name) {
+            $vid = !empty($field_defination_settings->getSetting('handler_settings')['auto_create_bundle']) ? $field_defination_settings->getSetting('handler_settings')['auto_create_bundle'] : '';
+            // Existing same term name.
+            $term_exists = $vid ? taxonomy_term_load_multiple_by_name($term_name, $vid) : taxonomy_term_load_multiple_by_name($term_name);
+
+            // Check for existing term name.
+            if (empty($term_exists)) {
+              // Check the following, only if we can create new terms.
+              // Get exclude values for current content type.
+              $type_exclude = $term_name_validation_config->get('exclude-' . $vid) ? $term_name_validation_config->get('exclude-' . $vid) : '';
+
+              if (!empty($type_exclude)) {
+                // Replace \r\n with comma.
+                $type_exclude = str_replace("\r\n", ',', $type_exclude);
+                // Store into array.
+                $type_exclude = explode(',', $type_exclude);
+                // Find any exclude value found in node title.
+                $findings = _term_name_validation_search_excludes_in_title($term_name, $type_exclude);
+                if ($findings) {
+                  $form_state->setErrorByName($key, t('The characters/words are not allowed to enter in the Taxonomy Reference field (@key). - @findings',
+                    [
+                      '@findings' => implode(',', $findings),
+                      '@key' => $key,
+                    ]
+                  ));
+                }
+              }
+
+              // Validating minimum characters in the node title.
+              $type_min_chars = $term_name_validation_config->get('min-' . $vid) ? $term_name_validation_config->get('min-' . $vid) : '';
+              if (!empty($type_min_chars)) {
+                if (Unicode::strlen($term_name) < $type_min_chars) {
+                  $form_state->setErrorByName($key, t("Taxonomy Reference field (@key) should have minimum @num characters", [
+                    '@num' => $type_min_chars,
+                    '@key' => $key,
+                  ]));
+                }
+              }
+
+              // Validating maximum characters in the node title.
+              $type_max_chars = $term_name_validation_config->get('max-' . $vid) ? $term_name_validation_config->get('max-' . $vid) : '';
+              if (!empty($type_max_chars)) {
+                if (Unicode::strlen($term_name) > $type_max_chars) {
+                  $form_state->setErrorByName($key, t("Taxonomy Reference field (@key) should not exceed @num characters", [
+                    '@num' => $type_max_chars,
+                    '@key' => $key,
+                  ]));
+                }
+              }
+
+              // Validating Minimum Word Count in the Term Name.
+              $type_min_wc = $term_name_validation_config->get('min-wc-' . $vid) ? $term_name_validation_config->get('min-wc-' . $vid) : '';
+              if (!empty($type_min_wc)) {
+                if (str_word_count($term_name) < $type_min_wc) {
+                  $form_state->setErrorByName($key, t("Term Name (for field: @key) should have minimum word count of @num", [
+                    '@num' => $type_min_wc,
+                    '@key' => $key,
+                  ]));
+                }
+              }
+
+              // Validating Maximum Word Count in the Term Name.
+              $type_max_wc = $term_name_validation_config->get('max-wc-' . $vid) ? $term_name_validation_config->get('max-wc-' . $vid) : '';
+              if (!empty($type_max_wc)) {
+                if (str_word_count($term_name) > $type_max_wc) {
+                  $form_state->setErrorByName($key, t("Term Name (for field: @key) should not exceed word count of @num", [
+                    '@num' => $type_max_wc,
+                    '@key' => $key,
+                  ]));
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Checks whether a term is already exist with same term name.
+ *
+ * @param string $term
+ *   Name of the new term to check.
+ * @param int $vid
+ *   ID of the vocabulary the new term belongs to.
+ * @param int $tid
+ *   Term ID of the new term (used when updating an existing term name).
+ *
+ * @return bool
+ *   Returns bool TRUE if the term already exists, FALSE if not.
+ */
+function term_name_validation_unique_term($term, $vid, $tid = 0) {
+  // Tid null means new term else editing.
+  $term_objects = taxonomy_term_load_multiple_by_name($term, $vid);
+
+  // While adding new term check that any term already exists.
+  if (empty($tid) || $tid == 0) {
+    if (count($term_objects) >= 1) {
+      return TRUE;
+    }
+  }
+
+  // While editing check that any term already exists.
+  if ($tid) {
+    if (count($term_objects) > 1) {
+      return TRUE;
+    }
+  }
+
+  return FALSE;
+}
+
+/**
+ * Helper function to find any exclude values in term title.
+ *
+ * @param string $input
+ *   The input of the field.
+ * @param string $find
+ *   Finding string.
+ *
+ * @return array
+ *   Return finding text in array.
+ */
+function _term_name_validation_search_excludes_in_title($input, $find) {
+  $findings = [];
+  // Finding characters in the term title.
+  foreach ($find as $char) {
+    // Check for single character.
+    if (Unicode::strlen($char) == 1) {
+      if (strpos($input, trim($char)) !== FALSE) {
+        $findings[] = trim($char);
+      }
+    }
+  }
+
+  // Finding words in the term title.
+  $words = str_word_count($input, 1);
+  if (!empty($find)) {
+    $find = array_map('trim', $find);
+  }
+  foreach ($words as $word) {
+    if (strlen(trim($word)) > 1) {
+      if (in_array($word, $find)) {
+        $findings[] = $word;
+      }
+    }
+  }
+
+  return $findings;
+}
