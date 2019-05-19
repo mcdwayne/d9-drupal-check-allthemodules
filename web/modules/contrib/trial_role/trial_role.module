@@ -1,0 +1,92 @@
+<?php
+
+/**
+ * @file
+ * Trial role module.
+ */
+
+use Drupal\Core\Entity\EntityInterface;
+
+define('TRIAL_ROLE_TRIAL_ROLE', 'trial');
+define('TRIAL_ROLE_STATE_CRON_KEY', 'trial_role.last_cron');
+define('TRIAL_ROLE_LOG_TAG', 'trial_role');
+
+/**
+ * Implements hook_ENTITY_TYPE_presave().
+ *
+ * @todo: Might be possible to do this in a hook that fires only once?
+ */
+function trial_role_user_presave(EntityInterface $entity) {
+  /** @var \Drupal\user\UserInterface $entity */
+  if (!$entity->isNew()) {
+    return;
+  }
+  $roles = $entity->get('roles')->getValue();
+  $roles[] = TRIAL_ROLE_TRIAL_ROLE;
+  $entity->set('roles', $roles);
+}
+
+/**
+ * Implements hook_cron().
+ */
+function trial_role_cron() {
+  // Only run once a day.
+  $last_day = \Drupal::state()
+    ->get(TRIAL_ROLE_STATE_CRON_KEY);
+  $current_day = date('d');
+  if ($current_day != $last_day) {
+    _trial_role_run_cron();
+    \Drupal::state()
+      ->set(TRIAL_ROLE_STATE_CRON_KEY, $current_day);
+  }
+}
+
+/**
+ * Runs the actual cron job we want to do.
+ */
+function _trial_role_run_cron() {
+  $user_storage = \Drupal::entityTypeManager()
+    ->getStorage('user');
+  $ids = $user_storage
+    ->getQuery()
+    ->condition('status', 1)
+    ->condition('roles', TRIAL_ROLE_TRIAL_ROLE)
+    ->execute();
+
+  $users = $user_storage->loadMultiple($ids);
+
+  foreach ($users as $user) {
+    /** @var \Drupal\user\UserInterface $user */
+    // See if they are too old to be trial users.
+    if ($user->getCreatedTime() < time() - _trial_role_get_expiration_length()) {
+      \Drupal::logger(TRIAL_ROLE_LOG_TAG)
+        ->info('Removing trial role from user @user', [
+          '@user' => $user->label(),
+        ]);
+      // Let other modules react to this.
+      \Drupal::moduleHandler()
+        ->invokeAll('trial_role_removed', [$user]);
+      $roles = $user->getRoles();
+      $new_roles = array_diff($roles, [TRIAL_ROLE_TRIAL_ROLE]);
+      $user->set('roles', $new_roles);
+      $user->save();
+    }
+  }
+}
+
+/**
+ * Helper to get trial role expiration length.
+ */
+function _trial_role_get_expiration_length() {
+  $days = \Drupal::config('trial_role.settings')
+    ->get('days');
+
+  // Allow for dynamic alteration.
+  \Drupal::moduleHandler()
+    ->alter('trial_role_expiration_days', $days);
+  $seconds = (3600 * 24) * (int) $days;
+  // Allow for even more altering.
+  \Drupal::moduleHandler()
+    ->alter('trial_role_expiration_length', $seconds);
+  return $seconds;
+}
