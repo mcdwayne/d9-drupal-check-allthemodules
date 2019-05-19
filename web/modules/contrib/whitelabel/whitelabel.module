@@ -1,0 +1,326 @@
+<?php
+
+/**
+ * @file
+ * Provides hooks and helper functions for the white label functionality.
+ */
+
+use Drupal\Core\Asset\AttachedAssetsInterface;
+use Drupal\Core\Block\BlockPluginInterface;
+use Drupal\Core\Cache\CacheableMetadata;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Language\LanguageInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\whitelabel\WhiteLabelInterface;
+
+/**
+ * Implements hook_css_alter().
+ */
+function whitelabel_css_alter(&$css, AttachedAssetsInterface $assets) {
+  /* @var \Drupal\whitelabel\WhiteLabelInterface $whitelabel */
+  if ($whitelabel = \Drupal::service('whitelabel.whitelabel_provider')->getWhiteLabel()) {
+    // If a white label library is requested, inject the associated stylesheets.
+    if (in_array('whitelabel/whitelabel.' . $whitelabel->getToken(), $assets->getLibraries())) {
+      $stylesheets = $whitelabel->getStylesheets();
+      foreach ($stylesheets as $i => $stylesheet) {
+        $url = file_create_url($stylesheet);
+        $path = file_url_transform_relative($url);
+
+        // Insert a new stylesheet and hash with the palette to be able to
+        // update the cached version once the file is regenerated.
+        $hash = md5(json_encode($whitelabel->getPalette()));
+        $css[$path] = [
+          'weight' => 100,
+          'group' => 200,
+          'type' => 'file',
+          'data' => $path . '?' . $hash,
+          'version' => 1,
+          'media' => 'all',
+          'preprocess' => 0,
+          'browsers' => [
+            'IE' => TRUE,
+            '!IE' => TRUE,
+          ],
+        ];
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_page_attachments().
+ *
+ * Attaches white label cache contexts to every page and injects css libraries.
+ */
+function whitelabel_page_attachments(array &$attachments) {
+  // Add the white label cache context.
+  $attachments['#cache']['contexts'][] = 'whitelabel';
+
+  /* @var \Drupal\whitelabel\WhiteLabelInterface $whitelabel */
+  if ($whitelabel = \Drupal::service('whitelabel.whitelabel_provider')->getWhiteLabel()) {
+    // Fetch from build array.
+    $cacheable_metadata = CacheableMetadata::createFromRenderArray($attachments);
+
+    if (\Drupal::config('whitelabel.settings')->get('site_colors') == TRUE) {
+      $current_theme = \Drupal::service('theme.manager')->getActiveTheme()->getName();
+      // Only attach library to themes configured with white label.
+      // TODO: Default system theme seems wrong as it will pass most of the
+      // time. We should use WL configuration instead.
+      if ($current_theme === $whitelabel->getTheme() || $current_theme === \Drupal::config('system.theme')->get('default')) {
+        $attachments['#attached']['library'][] = 'whitelabel/whitelabel.' . $whitelabel->getToken();
+      }
+    }
+    // Add white label specific cacheability metadata.
+    $cacheable_metadata->addCacheableDependency($whitelabel);
+    // Apply cacheable metadata.
+    $cacheable_metadata->applyTo($attachments);
+  }
+}
+
+/**
+ * Implements hook_block_view_alter().
+ *
+ * @see whitelabel_block_view_pre_render()
+ */
+function whitelabel_block_view_alter(array &$build, BlockPluginInterface $block) {
+  $build['#pre_render'][] = 'whitelabel_block_view_pre_render';
+}
+
+/**
+ * Pre-render callback: Sets white label cacheability metadata on blocks.
+ *
+ * Scans all blocks to see if they depend on the system.site cache tag. If so,
+ * also make them depend on the white label cache tag and cache context to make
+ * sure we can cache one block for every white label.
+ */
+function whitelabel_block_view_pre_render(array $build) {
+  $cacheable_metadata = CacheableMetadata::createFromRenderArray($build);
+
+  // Add cacheable data for blocks depending on config:system.site cache tags.
+  $tags = $cacheable_metadata->getCacheTags();
+  if (in_array('config:system.site', $tags)) {
+
+    // Always create a cache context for the no-whitelabel version.
+    $cacheable_metadata->addCacheContexts(['whitelabel']);
+
+    if ($whitelabel = \Drupal::service('whitelabel.whitelabel_provider')->getWhiteLabel()) {
+      // Add white label specific cacheability metadata.
+      $cacheable_metadata->addCacheableDependency($whitelabel);
+    }
+
+    // Add cacheable metadata.
+    $cacheable_metadata->applyTo($build);
+  }
+
+  return $build;
+}
+
+/**
+ * Implements hook_block_view_BASE_BLOCK_ID_alter().
+ */
+function whitelabel_block_view_system_branding_block_alter(array &$build, BlockPluginInterface $block) {
+  $build['#pre_render'][] = 'whitelabel_system_branding_block_view_pre_render';
+}
+
+/**
+ * Pre-render callback: Sets visibility for site name in system branding block.
+ *
+ * Sets the site name visibility based on white label specific configuration.
+ */
+function whitelabel_system_branding_block_view_pre_render(array $build) {
+  /** @var \Drupal\whitelabel\WhiteLabelInterface $whitelabel */
+  if ($whitelabel = \Drupal::service('whitelabel.whitelabel_provider')->getWhiteLabel()) {
+    /* @var \Drupal\Core\Field\FieldItemListInterface $fields */
+    $fields = $whitelabel->getFields(FALSE);
+
+    if ($fields['name_display']->access()) {
+      $build['content']['site_name']['#access'] = $whitelabel->getNameDisplay();
+    }
+  }
+
+  return $build;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Ensure that white label is the only widget for ERR fields referencing a
+ * white label entity.
+ */
+function whitelabel_form_entity_form_display_edit_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $field_definitions = \Drupal::service('entity_field.manager')->getFieldDefinitions($form['#entity_type'], $form['#bundle']);
+  // Loop over ERR field's display options with whitelabel target type.
+  foreach (array_keys($field_definitions) as $field_name) {
+    if ($field_definitions[$field_name]->getType() == 'entity_reference_revisions') {
+      if ($field_definitions[$field_name]->getSettings()['target_type'] == 'whitelabel') {
+        // Ensure that only the white label widget is used for WL fields.
+        $form['fields'][$field_name]['plugin']['type']['#options'] = [
+          'entity_reference_whitelabel' => $form['fields'][$field_name]['plugin']['type']['#options']['entity_reference_whitelabel'],
+        ];
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Ensures that white label entities can no longer be selected in a 'normal'
+ * entity reference field.
+ */
+function whitelabel_form_field_storage_config_edit_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  if ($form_state->getFormObject()->getEntity()->getType() == 'entity_reference') {
+    // Entity Reference fields are no longer supported to reference Paragraphs.
+    unset($form['settings']['target_type']['#options'][(string) t('Content')]['whitelabel']);
+  }
+}
+
+/**
+ * Helper function for fetching enabled themes.
+ *
+ * @return array
+ *   Array of themes, keyed by system name.
+ */
+function whitelabel_load_available_themes() {
+  $theme_options = [];
+
+  $themes = \Drupal::service('theme_handler')->listInfo();
+  uasort($themes, 'system_sort_modules_by_info_name');
+  foreach ($themes as &$theme) {
+    if (!empty($theme->info['hidden'])) {
+      continue;
+    }
+    $theme_options[$theme->getName()] = $theme->info['name'];
+  }
+
+  return $theme_options;
+}
+
+/**
+ * Implements hook_help().
+ */
+function whitelabel_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the white label module.
+    case 'help.page.whitelabel':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('White Label help') . '</p>';
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_entity_extra_field_info().
+ */
+function whitelabel_entity_extra_field_info() {
+  $extra = [];
+  if (\Drupal::moduleHandler()->moduleExists('color')) {
+    $extra['whitelabel']['whitelabel']['form']['color'] = [
+      'label' => t('Color schemes'),
+      'description' => 'Provides a color scheme configuration form for themes which support it.',
+      'weight' => 50,
+      'visible' => TRUE,
+    ];
+  }
+
+  return $extra;
+}
+
+/**
+ * Form constructor for the color configuration form for a particular theme.
+ *
+ * @param string $theme
+ *   The machine name of the theme whose color settings are being configured.
+ * @param \Drupal\whitelabel\WhiteLabelInterface $whitelabel
+ *   An white label entity (used to extract current color scheme).
+ *
+ * @return array
+ *   The generated color form.
+ *
+ * @see color_scheme_form()
+ * @see color_scheme_form_validate()
+ * @see color_scheme_form_submit()
+ */
+function whitelabel_color_scheme_form($complete_form, FormStateInterface $form_state, $theme, WhiteLabelInterface $whitelabel) {
+  $info = color_get_info($theme);
+
+  $info['schemes'][''] = ['title' => t('Custom'), 'colors' => []];
+  $color_sets = [];
+  $schemes = [];
+  foreach ($info['schemes'] as $key => $scheme) {
+    $color_sets[$key] = $scheme['title'];
+    $schemes[$key] = $scheme['colors'];
+    $schemes[$key] += $info['schemes']['default']['colors'];
+  }
+
+  // See if we're using a predefined scheme.
+  // Note: we use the original theme when the default scheme is chosen.
+  // Note: we use configuration without overrides since this information is used
+  // in a form and therefore without doing this would bleed overrides into
+  // active configuration. Furthermore, color configuration is used to write
+  // CSS to the file system making configuration overrides pointless.
+  $current_scheme = $whitelabel->getPalette();
+  foreach ($schemes as $key => $scheme) {
+    if ($current_scheme == $scheme) {
+      $scheme_name = $key;
+      break;
+    }
+  }
+  if (empty($scheme_name)) {
+    if (empty($current_scheme)) {
+      $scheme_name = 'default';
+    }
+    else {
+      $scheme_name = '';
+    }
+  }
+
+  // Add scheme selector.
+  $default_palette = color_get_palette($theme, TRUE);
+  $form['scheme'] = [
+    '#type' => 'select',
+    '#title' => t('Color set'),
+    '#options' => $color_sets,
+    '#default_value' => $scheme_name,
+    '#attached' => [
+      'library' => [
+        'color/drupal.color',
+        'color/admin',
+      ],
+      // Add custom JavaScript.
+      'drupalSettings' => [
+        'color' => [
+          'reference' => $default_palette,
+          'schemes' => $schemes,
+        ],
+        'gradients' => $info['gradients'],
+      ],
+    ],
+  ];
+
+  // Add palette fields. Use the configuration if available.
+  $palette = $current_scheme ?: $default_palette;
+  $names = $info['fields'];
+  $form['palette']['#tree'] = TRUE;
+  foreach ($palette as $name => $value) {
+    if (isset($names[$name])) {
+      $form['palette'][$name] = [
+        '#type' => 'textfield',
+        '#title' => $names[$name],
+        '#value_callback' => 'color_palette_color_value',
+        '#default_value' => $value,
+        '#size' => 8,
+        '#attributes' => ['dir' => LanguageInterface::DIRECTION_LTR],
+      ];
+    }
+  }
+  $form['theme'] = ['#type' => 'value', '#value' => $theme];
+  if (isset($info['#attached'])) {
+    $form['#attached'] = $info['#attached'];
+    unset($info['#attached']);
+  }
+  $form['info'] = ['#type' => 'value', '#value' => $info];
+
+  return $form;
+}
