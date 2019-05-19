@@ -1,0 +1,198 @@
+<?php
+
+/**
+ * @file
+ * Contains subscription.module.
+ */
+
+const SUBSCRIPTION_EXPIRED = 0;
+const SUBSCRIPTION_ACTIVE = 1;
+const SUBSCRIPTION_PENDING = 2;
+const SUBSCRIPTION_CANCELLED = 3;
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Database\Database;
+
+/**
+ * Implements hook_help().
+ */
+function subscription_entity_entity_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the subscription module.
+    case 'help.page.subscription':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('A module that handles user and group subscriptions') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function subscription_entity_theme() {
+  $theme = [];
+  $theme['subscription'] = array(
+    'render element' => 'elements',
+    'file' => 'subscription_entity.page.inc',
+    'template' => 'subscription',
+  );
+  $theme['subscription_content_add_list'] = [
+    'render element' => 'content',
+    'variables' => ['content' => NULL],
+    'file' => 'subscription_entity.page.inc',
+  ];
+
+  $theme['subscription_term'] = array(
+    'render element' => 'elements',
+    'file' => 'subscription_term.page.inc',
+    'template' => 'subscription_term',
+  );
+  $theme['subscription_term_content_add_list'] = [
+    'render element' => 'content',
+    'variables' => ['content' => NULL],
+    'file' => 'subscription_term.page.inc',
+  ];
+
+  return $theme;
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK().
+ */
+function subscription_entity_theme_suggestions_subscription(array $variables) {
+  $suggestions = array();
+  $entity = $variables['elements']['#subscription'];
+  $sanitized_view_mode = strtr($variables['elements']['#view_mode'], '.', '_');
+
+  $suggestions[] = 'subscription__' . $sanitized_view_mode;
+  $suggestions[] = 'subscription__' . $entity->bundle();
+  $suggestions[] = 'subscription__' . $entity->bundle() . '__' . $sanitized_view_mode;
+  $suggestions[] = 'subscription__' . $entity->id();
+  $suggestions[] = 'subscription__' . $entity->id() . '__' . $sanitized_view_mode;
+  return $suggestions;
+}
+
+/**
+ * Implements hook_theme_suggestions_HOOK().
+ */
+function subscription_entity_theme_suggestions_subscription_term(array $variables) {
+  $suggestions = array();
+  $entity = $variables['elements']['#subscription_term'];
+  $sanitized_view_mode = strtr($variables['elements']['#view_mode'], '.', '_');
+
+  $suggestions[] = 'subscription_term__' . $sanitized_view_mode;
+  $suggestions[] = 'subscription_term__' . $entity->bundle();
+  $suggestions[] = 'subscription_term__' . $entity->bundle() . '__' . $sanitized_view_mode;
+  $suggestions[] = 'subscription_term__' . $entity->id();
+  $suggestions[] = 'subscription_term__' . $entity->id() . '__' . $sanitized_view_mode;
+  return $suggestions;
+}
+
+/**
+ * Implements hook_element_info_alter().
+ */
+function subscription_entity_element_info_alter(array &$types) {
+  // Attach our extra CSS for toolbar icons.
+  if (isset($types['toolbar'])) {
+    $types['toolbar']['#attached']['library'][] = 'subscription_entity/toolbar';
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function subscription_entity_cron() {
+  // We find all the pending subscriptions and activate them.
+  $subscriptions_that_need_activating = _get_subscriptions_that_need_activated();
+  if (!empty($subscriptions_that_need_activating)) {
+    $queue_service = \Drupal::service('queue');
+    $queue = $queue_service->get('activate_subscriptions');
+    foreach ($subscriptions_that_need_activating as $item) {
+      $queue->createItem($item);
+    }
+  }
+
+  // We find all the active subscriptions and deactivate them.
+  $subscriptions_that_need_deactivating = _get_subscriptions_that_need_deactivated();
+  if (!empty($subscriptions_that_need_deactivating)) {
+    $queue_service = \Drupal::service('queue');
+    $queue = $queue_service->get('deactivate_subscriptions');
+    foreach ($subscriptions_that_need_deactivating as $item) {
+      $queue->createItem($item);
+    }
+  }
+
+}
+
+/**
+ * Find subscription ids that need to be activated.
+ *
+ * We also check to make sure that the subscription is pending.
+ * We don't want to mess around with any other subscription states.
+ *
+ * @return mixed
+ *   An array that has term ids.
+ */
+function _get_subscriptions_that_need_activated() {
+  $connection = Database::getConnection();
+
+  $result = $connection->query(
+    'SELECT st.id
+      FROM {subscription_term_field_data} fd
+      LEFT JOIN {subscription} s ON fd.subscription_entity_id = s.id
+      LEFT JOIN {subscription_field_data} sd ON fd.subscription_entity_id = sd.id
+      LEFT JOIN {subscription_term} st ON st.id = fd.id AND st.type=fd.type
+      WHERE sd.subscription_status IN (:subscription_pending, :subscription_expired)
+      AND fd.term_status = :subscription_pending
+      AND CASE sd.grace_period_unit
+        WHEN \'Days\' THEN DATE_ADD(fd.end_date, INTERVAL sd.grace_period_value DAY)
+        WHEN \'Month\' THEN DATE_ADD(fd.end_date, INTERVAL sd.grace_period_value MONTH)
+        WHEN \'Year\' THEN DATE_ADD(fd.end_date, INTERVAL sd.grace_period_value YEAR)
+        ELSE fd.end_date
+      END >= :now_datetime
+      AND fd.start_date <= :now_datetime
+      ', [
+        ':subscription_pending' => SUBSCRIPTION_PENDING,
+        ':subscription_expired' => SUBSCRIPTION_EXPIRED,
+        ':now_datetime' => date('Y-m-d\TH:i:s'),
+      ])->fetchAll();
+
+  return $result;
+}
+
+/**
+ * If there is a subscription and it's active with a term then it needs expired.
+ *
+ * We don't want to mess around with any other subscription states.
+ *
+ * @return mixed
+ *   An array that has term ids.
+ */
+function _get_subscriptions_that_need_deactivated() {
+  $connection = Database::getConnection();
+
+  // I can't find out how to do a "having or" in Drupal using select.
+  $result = $connection->query(
+    'SELECT st.id
+      FROM {subscription_term_field_data} fd
+      LEFT JOIN {subscription} s ON fd.subscription_entity_id = s.id
+      LEFT JOIN {subscription_field_data} sd ON fd.subscription_entity_id = sd.id
+      LEFT JOIN {subscription_term} st ON st.id = fd.id AND st.type=fd.type
+      WHERE sd.subscription_status = :subscription_active
+      AND fd.term_status = :subscription_active
+      AND (CASE sd.grace_period_unit
+        WHEN \'Days\' THEN DATE_ADD(fd.end_date, INTERVAL sd.grace_period_value DAY)
+        WHEN \'Month\' THEN DATE_ADD(fd.end_date, INTERVAL sd.grace_period_value MONTH)
+        WHEN \'Year\' THEN DATE_ADD(fd.end_date, INTERVAL sd.grace_period_value YEAR)
+        ELSE fd.end_date
+      END <= :now_datetime OR fd.start_date >= :now_datetime)
+      ', [
+        ':subscription_active' => SUBSCRIPTION_ACTIVE,
+        ':now_datetime' => date('Y-m-d\TH:i:s'),
+      ])->fetchAll();
+
+  return $result;
+}
