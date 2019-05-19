@@ -1,0 +1,157 @@
+<?php
+
+/**
+ * @file
+ * Drupal Module: Slaask.
+ *
+ * Adds the required Javascript to all your Drupal pages to Slaask to be
+ * displayed.
+ */
+
+use Drupal\Component\Utility\Crypt;
+use Drupal\Core\Routing\RouteMatchInterface;
+
+/**
+ * Implements hook_help().
+ */
+function slaask_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'slaask.admin_settings_form':
+      return t('<a href=":slaask_url">Slaask</a> is the first customer chat tool that is 100% integrated into Slack. Enter the widget id from the Slaask <a href=":slaask_code_url">code snippet</a>, "_slaask.init(#########)".', [':slaask_url' => 'http://www.slaask.com/', ':slaask_code_url' => 'https://slaask.help/general/adding-the-slaask-code-to-my-site-280']);
+  }
+}
+
+/**
+ * Implements hook_page_attachments().
+ *
+ * Insert JavaScript to the appropriate scope/region of the configured page(s).
+ */
+function slaask_page_attachments(array &$page) {
+  // Retrieve the widget ID if it exists.
+  $config = \Drupal::config('slaask.settings');
+  $widget_id = $config->get('widget_id');
+
+  $is_admin = \Drupal::service('router.admin_context')->isAdminRoute();
+
+  // Attach JavaScript if this is not an admin page and the widget ID is set.
+  if (!$is_admin && $widget_id) {
+
+    $uri = 'public://slaask_js/chat.js';
+    $path = file_create_url($uri);
+
+    if ($config->get('cache') && file_exists($path)) {
+
+      $page['#attached']['html_head'][] = [
+        // The data.
+        [
+          '#type' => 'html_tag',
+          // The HTML tag to add, in this case a  tag.
+          '#tag' => 'script',
+          // Set attributes like src to load a file.
+          '#attributes' => array('src' => $path),
+
+        ],
+
+        // Key for finding HTML element later for alter.
+        'slaask_chat',
+      ];
+    }
+    else {
+      $page['#attached']['library'][] = 'slaask/slaask.chat';
+    }
+    $page['#attached']['library'][] = 'slaask/slaask.init';
+    $page['#attached']['drupalSettings']['slaask']['init'] = $widget_id;
+  }
+
+}
+
+/**
+ * Implements hook_cron().
+ */
+function slaask_cron() {
+  $config = \Drupal::config('slaask.settings');
+
+  // Regenerate the tracking code file every day.
+  if (REQUEST_TIME - \Drupal::state()->get('slaask.last_cache') >= 1 && $config->get('cache')) {
+    _slaask_cache('https://cdn.slaask.com/chat.js', TRUE);
+    \Drupal::state()->set('slaask.last_cache', REQUEST_TIME);
+    \Drupal::logger('slaask')->info('Slaask cron complete.');
+  }
+}
+
+/**
+ * Download/Synchronize/Cache tracking code file locally.
+ *
+ * @param string $location
+ *   The full URL to the external javascript file.
+ * @param bool $synchronize
+ *   Synchronize to local cache if remote file has changed.
+ *
+ * @return mixed
+ *   The path to the local javascript file on success, boolean FALSE on failure.
+ */
+function _slaask_cache($location, $synchronize = FALSE) {
+  $path = 'public://slaask_js';
+  $file_destination = $path . '/' . basename($location);
+  \Drupal::logger('slaask')->info('attempting cache.');
+  if (!file_exists($file_destination) || $synchronize) {
+    // Download the latest tracking code.
+    try {
+      $data = \Drupal::httpClient()
+        ->get($location)
+        ->getBody(TRUE);
+
+      if (file_exists($file_destination)) {
+        // Synchronize tracking code and and replace local file if outdated.
+        $data_hash_local = Crypt::hashBase64(file_get_contents($file_destination));
+        $data_hash_remote = Crypt::hashBase64($data);
+        // Check that the files directory is writable.
+        if ($data_hash_local != $data_hash_remote && file_prepare_directory($path)) {
+          // Save updated tracking code file to disk.
+          file_unmanaged_save_data($data, $file_destination, FILE_EXISTS_REPLACE);
+          \Drupal::logger('slaask')->info('Locally cached code file has been updated.');
+
+          // Change query-strings on css/js files to enforce reload for all
+          // users.
+          _drupal_flush_css_js();
+        }
+      }
+      else {
+        // Check that the files directory is writable.
+        if (file_prepare_directory($path, FILE_CREATE_DIRECTORY)) {
+          // There is no need to flush JS here as core refreshes JS caches
+          // automatically, if new files are added.
+          file_unmanaged_save_data($data, $file_destination, FILE_EXISTS_REPLACE);
+          \Drupal::logger('slaask')->info('Locally cached code file has been saved.');
+
+          // Return the local JS file path.
+          return file_create_url($file_destination);
+        }
+      }
+    }
+    catch (RequestException $exception) {
+      watchdog_exception('slaask', $exception);
+    }
+  }
+  else {
+    // Return the local JS file path.
+    return file_create_url($file_destination);
+  }
+}
+
+/**
+ * Delete cached files and directory.
+ */
+function slaask_clear_js_cache() {
+  $path = 'public://slaask_js';
+
+  if (file_prepare_directory($path)) {
+    file_scan_directory($path, '/.*/', ['callback' => 'file_unmanaged_delete_recursive']);
+    drupal_rmdir($path);
+
+    // Change query-strings on css/js files to enforce reload for all users.
+    _drupal_flush_css_js();
+
+    \Drupal::logger('slaask')->info('Local cache has been purged.');
+  }
+}
