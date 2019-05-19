@@ -1,0 +1,183 @@
+<?php
+
+/**
+ * @file
+ * Main module file.
+ */
+
+declare(strict_types = 1);
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\field\FieldStorageConfigInterface;
+use Drupal\Core\Field\FieldStorageDefinitionInterface;
+use Drupal\Component\Utility\Html;
+use Drupal\Core\Entity\ContentEntityInterface;
+
+/**
+ * Implements hook_help().
+ */
+function views_field_formatter_help($route_name, RouteMatchInterface $route_match) {
+  $help = '';
+
+  if ($route_name === 'help.page.views_field_formatter') {
+    $help .= '<h3>' . t('About') . '</h3>';
+    $help .= '<p>' . t("Provide a new field formatter: '<strong>View</strong>' for each field types and allows you to select a View and to use its result instead of the original field value.") . '</p>';
+    $help .= '<h3>' . t('More Information') . '</h3>';
+    $help .= '<p>' . t('for more information about this module please visit the <a href="@link">project page</a>', ['@link' => 'https://www.drupal.org/project/views_field_formatter']) . '</p>';
+  }
+
+  return $help;
+}
+
+/**
+ * Implements hook_token_info_alter().
+ */
+function views_field_formatter_token_info_alter(array &$info) {
+  $type_info = \Drupal::service('plugin.manager.field.field_type')
+    ->getDefinitions();
+
+  if (!\Drupal::moduleHandler()->moduleExists('token')) {
+    return;
+  }
+
+  foreach (\Drupal::entityTypeManager()->getDefinitions() as $entity_type_id => $entity_type) {
+    if (!$entity_type->isSubclassOf('\Drupal\Core\Entity\ContentEntityInterface')) {
+      continue;
+    }
+
+    // Make sure a token type exists for this entity.
+    $token_type = \Drupal::service('token.entity_mapper')
+      ->getTokenTypeForEntityType($entity_type_id);
+    if (empty($token_type) || !isset($info['types'][$token_type])) {
+      continue;
+    }
+
+    $fields = \Drupal::service('entity_field.manager')
+      ->getFieldStorageDefinitions($entity_type_id);
+
+    foreach ($fields as $field_name => $field) {
+      /** @var \Drupal\field\FieldStorageConfigInterface $field */
+
+      // Ensure the token implements FieldStorageConfigInterface or is defined
+      // in token module.
+      $provider = '';
+      if (isset($info['types'][$token_type]['module'])) {
+        $provider = $info['types'][$token_type]['module'];
+      }
+      if (!($field instanceof FieldStorageConfigInterface) && $provider !== 'token') {
+        continue;
+      }
+
+      if ($token_type === 'comment' && $field_name === 'comment_body') {
+        // Core provides the comment field as [comment:body].
+        continue;
+      }
+
+      // Do not define the token type if the field has no properties.
+      if (!$field->getPropertyDefinitions()) {
+        continue;
+      }
+
+      // Generate a description for the token.
+      $labels = _token_field_label($entity_type_id, $field_name);
+      $label = \array_shift($labels);
+      $params['@type'] = $type_info[$field->getType()]['label'];
+
+      $cardinality = $field->getCardinality();
+
+      $field_token_name = $token_type . '-' . $field_name;
+
+      if ($cardinality === FieldStorageDefinitionInterface::CARDINALITY_UNLIMITED || $cardinality > 1) {
+        $info['tokens']["list<$field_token_name>"]['delta'] = [
+          'name' => t(
+            '@type type current delta',
+            ['@type' => Html::escape($label)]
+          ),
+          'module' => 'token',
+          'type' => $field_token_name,
+        ];
+        $info['tokens']["list<$field_token_name>"]['current'] = [
+          'name' => t(
+            '@type type with current delta',
+            ['@type' => Html::escape($label)]
+          ),
+          'module' => 'token',
+          'type' => $field_token_name,
+        ];
+        $info['tokens']["list<$field_token_name>"]['concat:,'] = [
+          'name' => t(
+            '@type type concatenated values',
+            ['@type' => Html::escape($label)]
+          ),
+          'module' => 'token',
+          'type' => $field_token_name,
+        ];
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_tokens().
+ */
+function views_field_formatter_tokens($type, $tokens, array $data = [], array $options = []) {
+  $replacements = [];
+
+  if (!isset($data['views_field_formatter'])) {
+    return [];
+  }
+
+  /* @var \Drupal\Core\Entity\ContentEntityInterface $entity */
+  $entity = $data['entity'];
+  if (!($entity instanceof ContentEntityInterface)) {
+    return $replacements;
+  }
+
+  foreach ($tokens as $name => $original) {
+    // Do not continue if the $name doesn't contains a semicolon.
+    if (\strpos($name, ':') === FALSE) {
+      continue;
+    }
+
+    // Do not continue if the field is empty.
+    if ($data['views_field_formatter']['items']->isEmpty()) {
+      continue;
+    }
+
+    list(, $delta) = \explode(':', $name, 2);
+
+    // Do not continue if $delta is null.
+    if ($delta === NULL) {
+      continue;
+    }
+
+    // Handle [entity:field_name:delta].
+    if ($delta === 'delta') {
+      $replacements[$original] = $data['views_field_formatter']['delta'];
+    }
+
+    // Handle [entity:field_name:current].
+    if ($delta === 'current') {
+      if ($field_delta = $data['views_field_formatter']['items'][$data['views_field_formatter']['delta']]) {
+        $field_output = $field_delta->view();
+        $replacements[$original] = \Drupal::service('renderer')->renderPlain($field_output);
+      }
+    }
+
+    // Handle [entity:field_name:concat:*].
+    if (\strpos($delta, 'concat:') === 0) {
+      list($third_part, $fourth_part) = \explode(':', $delta, 2);
+
+      if ($third_part === 'concat' && $fourth_part !== NULL) {
+        $field_pieces = [];
+        foreach ($data['views_field_formatter']['items'] as $item) {
+          $item = $item->view();
+          $field_pieces[] = \Drupal::service('renderer')->renderPlain($item);
+        }
+        $replacements[$original] = \implode($fourth_part, $field_pieces);
+      }
+    }
+  }
+
+  return $replacements;
+}
