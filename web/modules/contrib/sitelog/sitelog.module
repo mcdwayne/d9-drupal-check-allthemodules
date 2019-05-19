@@ -1,0 +1,141 @@
+<?php
+
+use Drupal\sitelog\Query\entryExistsQuery;
+use Drupal\sitelog\Query\Comments\commentsQuery;
+use Drupal\sitelog\Query\Content\contentQuery;
+use Drupal\sitelog\Query\Files\uploadedFilesQuery;
+use Drupal\sitelog\Query\Files\storageFilesQuery;
+use Drupal\sitelog\Query\Searches\searchesQuery;
+use Drupal\sitelog\Query\SystemEvents\logsQuery;
+use Drupal\sitelog\Query\Users\activeAccountsQuery;
+use Drupal\sitelog\Query\Users\inactiveAccountsQuery;
+use Drupal\sitelog\Query\Users\accountRegistrationsQuery;
+use Drupal\sitelog\Query\Users\accountsAccessedQuery;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Url;
+
+/**
+ * Implements hook_cron().
+ */
+function sitelog_cron() {
+
+  // inject services
+  $connection = \Drupal::database();
+  $watchdog = \Drupal::service('sitelog.add_watchdog_entry');
+
+  // generate yesterday date/time
+  $yesterday = new \DateTime('yesterday');
+  $start = $yesterday->getTimestamp();
+  $end = $yesterday->setTime(23, 59, 59)->getTimestamp();
+
+  // log new comments data if no entry exists for yesterday
+  $logged = entryExistsQuery::query($connection, $start, 'sitelog_comments');
+  if (!$logged) {
+    $connection->insert('sitelog_comments')
+      ->fields(array(
+        'logged' => $start,
+        'posted' => commentsQuery::query(),
+      ))
+      ->execute();
+    $watchdog->add('comments');
+  }
+
+  // log new content data if no entry exists for yesterday
+  $logged = entryExistsQuery::query($connection, $start, 'sitelog_content');
+  if (!$logged) {
+    $data = contentQuery::query();
+    foreach ($data as $type => $content) {
+      $connection->insert('sitelog_content')
+        ->fields(array(
+          'logged' => $start,
+          'type' => $type,
+          'unpublished' => $content[0],
+          'published' => $content[1],
+        ))
+        ->execute();
+    }
+    $watchdog->add('content');
+  }
+
+  // log new files data if no entry exists for yesterday
+  $logged = entryExistsQuery::query($connection, $start, 'sitelog_files');
+  if (!$logged) {
+    $connection->insert('sitelog_files')
+      ->fields(array(
+        'logged' => $start,
+        'uploaded' => uploadedFilesQuery::query(),
+        'storage' => storageFilesQuery::query($connection),
+      ))
+      ->execute();
+    $watchdog->add('files');
+  }
+
+  // log new search data if no entry exists for yesterday
+  $logged = entryExistsQuery::query($connection, $start, 'sitelog_searches');
+  if (!$logged) {
+    $logs = searchesQuery::query($connection, $start, $end);
+    foreach ($logs as $log) {
+      if ($variables = @unserialize($log->variables)) {
+        $connection->insert('sitelog_searches')
+          ->fields(array(
+            'logged' => $start,
+            'searches' => $log->count,
+            'term' => $variables['%keys'],
+          ))
+          ->execute();
+      }
+    }
+    $watchdog->add('searches');
+  }
+
+  // log new system events data if no entry exists for yesterday
+  $logged = entryExistsQuery::query($connection, $start, 'sitelog_system_events');
+  if (!$logged) {
+    $logs = logsQuery::query($connection, $start, $end);
+    $connection->insert('sitelog_system_events')
+      ->fields(array(
+        'logged' => $start,
+        'emergency' => isset($logs[0]) ? $logs[0] : 0,
+        'alert' => isset($logs[1]) ? $logs[1] : 0,
+        'critical' => isset($logs[2]) ? $logs[2] : 0,
+        'error' => isset($logs[3]) ? $logs[3] : 0,
+        'warning' => isset($logs[4]) ? $logs[4] : 0,
+        'notice' => isset($logs[5]) ? $logs[5] : 0,
+        'info' => isset($logs[6]) ? $logs[6] : 0,
+        'debug' => isset($logs[7]) ? $logs[7] : 0,
+      ))
+      ->execute();
+    $watchdog->add('system events');
+  }
+
+  // log new users data if no entry exists for yesterday
+  $logged = entryExistsQuery::query($connection, $start, 'sitelog_users');
+  if (!$logged) {
+    $connection->insert('sitelog_users')
+      ->fields(array(
+        'logged' => $start,
+        'active' => activeAccountsQuery::query($connection, $end),
+        'inactive' => inactiveAccountsQuery::query($connection, $end),
+        'registrations' => accountRegistrationsQuery::query($connection, $start, $end),
+        'accessed' => accountsAccessedQuery::query($connection, $start, $end),
+      ))
+      ->execute();
+    $watchdog->add('users');
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_view() for node entities.
+ */
+function sitelog_node_view(array &$build, EntityInterface $node, EntityViewDisplayInterface $display, $view_mode) {
+  if (!$node->isNew() && $view_mode == 'full' && node_is_page($node) && empty($node->in_preview)) {
+    $build['#attached']['library'][] = 'sitelog/sitelog.post';
+    $build['#attached']['drupalSettings']['sitelog'] = array(
+      'data' => array(
+        'nid' => $node->id(),
+      ),
+      'url' => Url::fromUri('base:' . drupal_get_path('module', 'sitelog') . '/sitelog.php')->toString(),
+    );
+  }
+}
