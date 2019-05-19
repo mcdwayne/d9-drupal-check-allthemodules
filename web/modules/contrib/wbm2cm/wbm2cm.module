@@ -1,0 +1,133 @@
+<?php
+
+use Drupal\migrate\Plugin\migrate\destination\EntityRevision as CoreEntityRevision;
+use Drupal\user\Entity\Role;
+use Drupal\wbm2cm\Plugin\migrate\destination\EntityRevision;
+use Drupal\workflows\Entity\Workflow;
+
+/**
+ * Implements hook_modules_installed().
+ */
+function wbm2cm_modules_installed(array $modules) {
+  if (in_array('content_moderation', $modules)) {
+    $state = \Drupal::state();
+
+    $permission_map = [];
+    $all_states = ['all' => 'all'];
+
+    foreach ($state->get('moderation_workflows', []) as $workflow) {
+      foreach (array_keys($workflow['type_settings']['states']) as $state_id) {
+        array_push($all_states, $workflow['id'] . "-$state_id");
+      }
+
+      /** @var \Drupal\workflows\WorkflowInterface $workflow */
+      $workflow = Workflow::create($workflow);
+      // Set a flag so that entity hooks can tell if this workflow is being
+      // created by wbm2cm. Normally this would be a bad practice, but there are
+      // extenuating circumstances.
+      $workflow->wbm2cm = TRUE;
+      $workflow->save();
+
+      foreach ($workflow->getTypePlugin()->getTransitions() as $id => $transition) {
+        $old_permission = "use $id transition";
+        $permission_map[$old_permission][] = 'use ' . $workflow->id() . " transition $id";
+      }
+    }
+    // Restore all moderation state filters to views.
+    foreach ($state->get('moderation_filters', []) as $filter) {
+      list ($view_id, $display_id, $filter_id) = $filter;
+
+      $config = \Drupal::configFactory()->getEditable($view_id);
+      $key = "display.$display_id.display_options.filters.$filter_id";
+      $filter = $config->get($key);
+      $filter['operator'] = 'in';
+      $filter['value'] = array_combine($all_states, $all_states);
+      $filter['expose']['reduce'] = FALSE;
+      unset($filter['entity_field']);
+      $filter['plugin_id'] = 'moderation_state_filter';
+      $config->set($key, $filter)->save();
+    }
+    // Restore all moderation state fields to views.
+    foreach ($state->get('moderation_fields', []) as $field) {
+      list ($view_id, $display_id, $field_id) = $field;
+
+      $root_key = "display.$display_id.display_options";
+
+      $config = \Drupal::configFactory()->getEditable($view_id);
+      $key = "$root_key.fields.$field_id";
+      $field = $original_field = $config->get($key);
+      $field['table'] = \Drupal::entityTypeManager()->getDefinition('content_moderation_state')->getDataTable();
+      $field['click_sort_column'] = 'value';
+      $field['type'] = 'string';
+      $field['settings']['link_to_entity'] = FALSE;
+      unset($field['settings']['link']);
+      $field['group_column'] = 'value';
+      $field['entity_type'] = 'content_moderation_state';
+      $config->set($key, $field)->save();
+    }
+
+    /** @var \Drupal\user\RoleInterface $role */
+    foreach (Role::loadMultiple() as $role) {
+      $changed = FALSE;
+
+      foreach ($permission_map as $revoke => $grants) {
+        if ($role->hasPermission($revoke)) {
+          $changed = TRUE;
+          $role->revokePermission($revoke);
+          array_walk($grants, [$role, 'grantPermission']);
+        }
+      }
+      if ($changed) {
+        $role->save();
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function wbm2cm_module_implements_alter(array &$implementations, $hook) {
+  if ($hook == 'entity_presave') {
+    unset($implementations['content_moderation']);
+  }
+  elseif ($hook == 'entity_storage_load') {
+    unset($implementations['workbench_moderation']);
+  }
+}
+
+/**
+ * Implements hook_module_preuninstall().
+ */
+function wbm2cm_module_preuninstall($module) {
+  if (\Drupal::isConfigSyncing()) {
+    return;
+  }
+  elseif ($module == 'workbench_moderation') {
+    $entity_type_manager = \Drupal::entityTypeManager();
+
+    foreach ($entity_type_manager->getDefinitions() as $id => $entity_type) {
+      if ($entity_type->getBundleOf()) {
+        $storage = $entity_type_manager->getStorage($id);
+
+        /** @var \Drupal\Core\Config\Entity\ConfigEntityInterface $bundle */
+        foreach ($storage->loadMultiple() as $bundle) {
+          $bundle
+            ->unsetThirdPartySetting('workbench_moderation', 'enabled')
+            ->unsetThirdPartySetting('workbench_moderation', 'allowed_moderation_states')
+            ->unsetThirdPartySetting('workbench_moderation', 'default_moderation_state');
+
+          $storage->save($bundle);
+        }
+      }
+    }
+  }
+}
+
+function wbm2cm_migrate_destination_info_alter(array &$definitions) {
+  foreach ($definitions as &$definition) {
+    if ($definition['class'] == CoreEntityRevision::class) {
+      $definition['class'] = EntityRevision::class;
+    }
+  }
+}
