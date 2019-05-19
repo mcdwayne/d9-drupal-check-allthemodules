@@ -1,0 +1,126 @@
+<?php
+
+/**
+ * @file
+ */
+
+use Drupal\Core\Entity\Entity\EntityFormDisplay;
+use Drupal\Core\Language\LanguageInterface;
+use Drupal\field\Entity\FieldConfig;
+use Drupal\field\Entity\FieldStorageConfig;
+use Drupal\menu_link_content\Entity\MenuLinkContent;
+use Drupal\node\Entity\Node;
+use Drupal\node\Entity\NodeType;
+
+/**
+ * Implements hook_install().
+ */
+function menu_link_install() {
+  if (!\Drupal::moduleHandler()->moduleExists('menu_ui') || !\Drupal::moduleHandler()->moduleExists('field')) {
+    return;
+  }
+
+  // Install a menu_link field to all node types.
+  $node_types = NodeType::loadMultiple();
+  FieldStorageConfig::create([
+    'field_name' => 'menu_link',
+    'entity_type' => 'node',
+    'type' => 'menu_link',
+  ])->save();
+  foreach ($node_types as $node_type) {
+    FieldConfig::create([
+      'field_name' => 'menu_link',
+      'entity_type' => 'node',
+      'bundle' => $node_type->id(),
+    ])->save();
+  }
+
+  // Add the form configuration.
+  foreach (NodeType::loadMultiple() as $node_type) {
+    // Load the corresponding default form  display.
+    if ($entity_form_display = EntityFormDisplay::load("node.{$node_type->id()}.default")) {
+      $entity_form_display->setComponent('menu_link', [
+        'type' => 'menu_link_default',
+      ]);
+      $entity_form_display->save();
+    }
+  }
+
+  /** @var \Drupal\Core\Menu\MenuLinkManagerInterface $menu_tree_storage */
+  $menu_tree_storage = \Drupal::service('plugin.manager.menu.link');
+  /** @var \Drupal\Core\Entity\EntityRepositoryInterface $entity_repository */
+  $entity_repository = \Drupal::service('entity.repository');
+  // Find all menu links which point to a node and replace them with a menu link
+  // field.
+
+  $old_plugin_id__new_plugin_id_map = [];
+
+  // Ideally we would use $menu_tree_storage->loadLinksByRoute but it doesn't
+  // allow you to just specific the route name.
+  $menu_ids = \Drupal::database()->query("SELECT id from {menu_tree} WHERE route_name = 'entity.node.canonical'")->fetchAllKeyed(0, 0);
+  // Filter out potential other menu links.
+  $menu_ids = array_filter($menu_ids, function ($menu_id) {
+    return strpos($menu_id, 'menu_link_content:') === 0;
+  });
+  $links = array_map(function ($menu_plugin_id) use ($menu_tree_storage) {
+    return $menu_tree_storage->createInstance($menu_plugin_id, []);
+  }, $menu_ids);
+
+  $menu_link_content_to_be_deleted = [];
+  foreach ($links as $link) {
+    /** @var \Drupal\menu_link_content\MenuLinkContentInterface $menu_link_content */
+    $menu_link_content = $entity_repository->loadEntityByUuid('menu_link_content', $link->getDerivativeId());
+    $node_id = $link->getRouteParameters()['node'];
+    if ($menu_link_content && $node = Node::load($node_id)) {
+
+      foreach ($node->getTranslationLanguages() as $language) {
+        $node_translation = $node->getTranslation($language->getId());
+  
+        if ($menu_link_content->hasTranslation($language->getId())) {
+          $menu_link_content_translation = $menu_link_content->getTranslation($language->getId());
+          $node_translation->set('menu_link', [
+            'menu_name' => $menu_link_content->getMenuName(),
+            'title' => $menu_link_content_translation->getTitle(),
+            'description' => $menu_link_content_translation->getDescription(),
+            'parent' => $menu_link_content->getParentId(),
+            'weight' => $menu_link_content->getWeight(),
+          ]);
+        }
+        else {
+          $node_translation->set('menu_link', [
+            'menu_name' => $menu_link_content->getMenuName(),
+            'title' => $menu_link_content->getTitle(),
+            'description' => $menu_link_content->getDescription(),
+            'parent' => $menu_link_content->getParentId(),
+            'weight' => $menu_link_content->getWeight(),
+          ]);
+        }
+      }
+      $node->save();
+
+      $old_plugin_id__new_plugin_id_map[$link->getPluginId()] = $node->get('menu_link')->first()->getMenuPluginId();
+      $menu_link_content_to_be_deleted[] = $link->getDerivativeId();
+    }
+  }
+
+  // Now update all the parents based upon the mappings we made.
+  foreach ($links as $link) {
+    $node_id = $link->getRouteParameters()['node'];
+    if ($node = Node::load($node_id)) {
+      if ($parent_plugin_id = $node->get('menu_link')->parent) {
+        if (isset($old_plugin_id__new_plugin_id_map[$parent_plugin_id])) {
+          $node->get('menu_link')->parent = $old_plugin_id__new_plugin_id_map[$parent_plugin_id];
+          $node->save();
+        }
+      }
+    }
+  }
+
+  // And finally we remove the orphan menu_link_content entities.
+  foreach ($menu_link_content_to_be_deleted as $uuid) {
+    if ($menu_link_content = $entity_repository->loadEntityByUuid('menu_link_content', $uuid)) {
+      $menu_link_content->delete();
+    }
+  }
+}
+
