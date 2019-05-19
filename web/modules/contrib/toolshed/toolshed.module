@@ -1,0 +1,132 @@
+<?php
+
+/**
+ * @file
+ * The core Drupal module hooks and global helpers.
+ */
+
+use Drupal\Core\Asset\AttachedAssetsInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Block\BlockPluginInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Entity\EntityFormInterface;
+use Drupal\Core\Config\Entity\ConfigEntityInterface;
+use Drupal\toolshed\Utility\LibraryMinifyAlter;
+
+/**
+ * Implements hook_help().
+ */
+function toolshed_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'toolshed.js_configs.breakpoints':
+    case 'toolshed.js_configs.breakpoints_theme':
+      $themeHandler = \Drupal::service('theme_handler');
+      $themeName = $route_match->getParameter('theme');
+      $theme = $themeHandler->getTheme(empty($themeName) ? $themeHandler->getDefault() : $themeName);
+
+      return '<p>' . t('These media queries are for <strong>:theme</strong> theme and the breakpoints defined
+        for that theme from the in the :file file. Order your media queries in the order in which they should be tested
+        and determine. Also note if you want to have the `on` event trigger when the query is <strong>TRUE</strong> or
+        when then query conditions are <strong>FALSE</strong> (inverted option turned on).', [
+          ':theme' => $theme->info['name'],
+          ':file' => "$themeName.breakpoints.yml",
+        ]) . '</p>';
+  }
+}
+
+/**
+ * Implements hook_js_settings_alter().
+ */
+function toolshed_js_settings_alter(&$settings, AttachedAssetsInterface $assets) {
+  if (!isset($settings['Toolshed']['breakpoints'])) {
+    return;
+  }
+
+  $theme = \Drupal::theme()->getActiveTheme()->getName();
+  $tsBps = \Drupal::config("toolshed.breakpoints.{$theme}")->get('settings');
+  $themeBps = \Drupal::service('breakpoint.manager')->getBreakpointsByGroup($theme);
+
+  if (!empty($tsBps)) {
+    foreach ($tsBps as $bpInfo) {
+      if (isset($themeBps[$bpInfo['name']]) && !empty($bpInfo['event'])) {
+        $settings['Toolshed']['breakpoints'][] = [
+          'mediaQuery' => $themeBps[$bpInfo['name']]->getMediaQuery(),
+          'event' => $bpInfo['event'],
+          'inverted' => $bpInfo['inverted'],
+        ];
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_library_info_alter().
+ */
+function toolshed_library_info_alter(array &$libraries, $module) {
+  if ($module !== 'toolshed') {
+    return;
+  }
+
+  $assetConfig = \Drupal::config('toolshed.assets.config');
+  $eventOpts = $assetConfig->get('events');
+
+  if ($eventOpts['debounce']['enabled']) {
+    array_unshift($libraries['screen-events']['dependencies'], 'core/drupal.debounce');
+    $libraries['screen-events']['drupalSettings']['Toolshed']['eventDebounce'] = $eventOpts['debounce']['delay'];
+  }
+  else {
+    $libraries['screen-events']['drupalSettings']['Toolshed']['eventDebounce'] = 0;
+  }
+
+  if (isset($libraries['behavior.accordions'])) {
+    $libraries['behavior.accordions']['drupalSettings']['Toolshed']['accordions'] = $assetConfig->get('accordions');
+  }
+
+  if ($assetConfig->get('develop')) {
+    foreach ($libraries as &$library) {
+      LibraryMinifyAlter::minifiedToExpanded($library, 'toolshed', 'module');
+    }
+  }
+}
+
+/**
+ * Implements hook_block_build_BLOCK_PLUGIN_ID_alter() for system_branding_block.
+ */
+function toolshed_block_build_system_branding_block_alter(array &$build, BlockPluginInterface $block) {
+  if (theme_get_setting('dynamic_branding_front_page')) {
+    $build['#cache']['contexts'][] = 'url.path.is_front';
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function toolshed_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+  $formObj = $form_state->getFormObject();
+
+  if ($formObj instanceof EntityFormInterface) {
+    $entity = $formObj->getEntity();
+    $allowedOps = ['default', 'add', 'edit'];
+
+    if ($entity instanceof ConfigEntityInterface && in_array($formObj->getOperation(), $allowedOps)) {
+      $thirdPartyManager = \Drupal::service('plugin.manager.toolshed.third_party_form_elements');
+      $form += ['third_party_settings' => []];
+      $settingsForm = &$form['third_party_settings'];
+      $settingsForm['#tree'] = TRUE;
+
+      foreach ($thirdPartyManager->getSettingsFormPlugins($entity) as $pluginDef) {
+        $plugin = $thirdPartyManager->createInstance($pluginDef['id']);
+
+        if ($plugin && $plugin->isApplicable($entity, $formObj->getOperation())) {
+          $parents = [
+            'third_party_settings',
+            $pluginDef['provider'],
+            $pluginDef['name'],
+          ];
+
+          $settingsForm[$pluginDef['provider']][$pluginDef['name']] = $plugin->settingsForm($entity, $parents, $form_state);
+        }
+      }
+    }
+  }
+}
