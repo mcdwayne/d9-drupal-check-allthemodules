@@ -1,0 +1,207 @@
+<?php
+/**
+ * @file
+ * Contains webtexttool.module.
+ */
+
+use Drupal\Core\Ajax\AjaxResponse;
+use Drupal\Core\Ajax\HtmlCommand;
+use Drupal\webtexttool\Controller\WebtexttoolController;
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function webtexttool_form_node_type_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+
+  if (isset($form['type'])) {
+    $form['webtexttool'] = array(
+      '#type' => 'details',
+      '#title' => t('Webtexttool settings'),
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+      '#group' => 'additional_settings',
+      '#attributes' => array(
+        'class' => array('webtexttool-node-type-settings-form'),
+      ),
+      '#attached' => array(
+        'library' => array('webtexttool/webtexttool_node_type'),
+      ),
+    );
+
+    $enabled = \Drupal::state()->get('webtexttool_enabled_' . $form['type']['#default_value'], 0);
+    $form['webtexttool']['webtexttool_enabled'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Enabled'),
+      '#default_value' => $enabled,
+      '#description' => t('Enable the webtexttool for this contenttype.'),
+    );
+
+    // Add our custom submit handler.
+    $form['actions']['submit']['#submit'][] = 'webtexttool_node_type_form_submit';
+  }
+}
+
+/**
+ * Custom submit handler for saving the webtextool enabled state of a specific content type.
+ */
+function webtexttool_node_type_form_submit(&$form, &$form_state) {
+
+  // Save the enabled state of the content type.
+  $values = $form_state->getValues();
+  if (isset($values['webtexttool_enabled']) && isset($values['type'])) {
+    \Drupal::state()->set('webtexttool_enabled_' . $values['type'], $values["webtexttool_enabled"]);
+  }
+}
+
+/**
+ * Implements hook_form_node_form_alter() on behalf of webtexttool.module.
+ */
+function webtexttool_form_node_form_alter(&$form, &$form_state, $form_id) {
+
+  // First get the node of the page/
+  $node = $form_state->getFormObject()->getEntity();
+
+  // If the user has permission and webtexttool is turned on for this content type, show the form.
+  if (\Drupal::currentUser()->hasPermission('webtexttool_use') && \Drupal::state()->get('webtexttool_enabled_' . $node->getType(), 0) == 1) {
+
+    // Add webtexttool css.
+    $form['#attached']['library'][] = 'webtexttool/webtexttool_view';
+
+    $form['webtexttool'] = array(
+      '#type' => 'details',
+      '#title' => t('Webtexttool'),
+      '#description' => t('Webtextool SEO score.'),
+      '#open' => TRUE, // Controls the HTML5 'open' attribute. Defaults to FALSE.
+    );
+
+    $form['webtexttool']['analyse_page'] = array(
+      '#type' => 'button',
+      '#value' => t('Analyse page'),
+      '#title' => t('Get keyword suggestion'),
+      '#ajax' => array(
+        'callback' => 'webtexttool_analyse_seo_form_node_callback',
+        'wrapper' => 'webtexttool-analyse',
+        'effect' => 'fade',
+        'event' => 'click',
+      ),
+    );
+    $form['webtexttool']['webtexttool_keywords'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Keyword'),
+      '#default_value' => '',
+      '#description' => t('Enter the keywords which should be analyzed.'),
+      '#maxlength' => 512,
+    );
+
+    $language_options = \Drupal::service('webtexttool.webtexttool_controller')->webtexttoolGetSources();
+    $form['webtexttool']['webtexttool_language'] = array(
+      '#type' => 'select',
+      '#title' => t('Keyword suggestions language'),
+      '#options' => $language_options,
+      '#description' => t('Based on the keyword we can lookup synonyms that can be added in the text to score even higher in search engines. This languague will be used to lookup synonyms.'),
+      '#default_value' => '',
+    );
+    $form['webtexttool']['get_keyword_suggestion'] = array(
+      '#type' => 'button',
+      '#value' => t('Get keyword suggestion'),
+      '#title' => t('Get keyword suggestion'),
+      '#ajax' => array(
+        'callback' => 'webtexttool_suggestion_form_node_callback',
+        'wrapper' => 'webtexttool-keyword-suggestion',
+        'effect' => 'fade',
+        'event' => 'click',
+      ),
+    );
+    $form['webtexttool']['keyword_container'] = array(
+      '#prefix' => '<div id="webtexttool-keyword-suggestion">',
+      '#suffix' => '</div>',
+    );
+
+    // Added a pure css loading.
+    // See http://codepen.io/agrimsrud/pen/vtmoq
+    $form['webtexttool']['webtexttool_analyse_container'] = array(
+      '#prefix' => '<div id="webtexttool-analyse">' . t('Loading Webtexttool SEO optimisation tool') . '<br /><br /><div class="loader"><i></i><i></i><i></i><i></i><i></i></div>',
+      '#suffix' => '</div>',
+    );
+  }
+}
+
+/**
+ * callback for the seo analyse.
+ */
+function webtexttool_analyse_seo_form_node_callback($form, $form_state){
+
+  $message = '';
+
+  $entity = $form_state->getFormObject()->getEntity();
+  $values = $form_state->getValues();
+  $key_word = $values['webtexttool_keywords'];
+
+  if ($entity instanceof EntityWithPluginCollectionInterface) {
+    // Do not manually update values represented by plugin collections.
+    $values = array_diff_key($values, $entity->getPluginCollections());
+  }
+
+  foreach ($values as $key => $value) {
+    if(is_array($value) && $key != 'menu' && $key != 'changed' && $key != 'created' && $key !== 'meta'){
+      $entity->set($key, $value, FALSE);
+    }
+  }
+
+  $view_builder = \Drupal::entityTypeManager()->getViewBuilder('node');
+  $html = render(\Drupal::entityTypeManager()->getViewBuilder('node')->view($entity, 'full'));
+  
+  // Create AJAX Response object.
+  $ajax_response = new AjaxResponse();
+  $webtexttool = new WebtexttoolController();
+  $analyzes = $webtexttool->webtexttoolAnalyse($html, $key_word);
+
+  $theme = array(
+    '#theme' => 'webtexttool_suggestion',
+    '#suggestion' => $analyzes,
+  );
+
+  $markup = drupal_render($theme);
+  $message .= $markup;
+
+  // Call the readMessage javascript function.
+  $ajax_response->addCommand(new HtmlCommand('#webtexttool-analyse', $message));
+
+  // Return ajax response.
+  return $ajax_response;
+}
+
+/**
+ * Callback fot the keyword suggestion call.
+ */
+function webtexttool_suggestion_form_node_callback(&$form, &$form_state) {
+
+  $message = 'Testing keywords';
+  $values = $form_state->getValues();
+  $key_word = $values['webtexttool_keywords'];
+
+  $webtexttool = new WebtexttoolController();
+  $keywords = $webtexttool->webtexttoolSearchKeyword('car');
+  $message .= '';
+
+  $ajax_response = new AjaxResponse();
+
+  // Call the readMessage javascript function.
+  $ajax_response->addCommand(new HtmlCommand('#webtexttool-keyword-suggestion', $message));
+
+  // Return ajax response.
+  return $ajax_response;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function webtexttool_theme($existing, $type, $theme, $path) {
+  return array(
+    'webtexttool_suggestion' => array(
+      'variables' => array('suggestion' => NULL),
+    ),
+  );
+}
+
+
