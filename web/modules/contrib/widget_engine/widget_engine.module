@@ -1,0 +1,279 @@
+<?php
+
+/**
+ * @file
+ * Contains widget_engine.module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Ajax\InvokeCommand;
+use Drupal\Core\Render\Element;
+use Drupal\image\Entity\ImageStyle;
+
+/**
+ * Load needed for module includes.
+ */
+require_once 'includes/widget_engine.theme.inc';
+
+/**
+ * Implements hook_help().
+ */
+function widget_engine_help($route_name, RouteMatchInterface $route_match) {
+  $output = '';
+  switch ($route_name) {
+    // Main module help for the widget_engine module.
+    case 'help.page.widget_engine':
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Widget engine module') . '</p>';
+      break;
+
+    default:
+  }
+
+  return $output;
+}
+
+/**
+ * Returns a list of available node type names.
+ *
+ * This list can include types that are queued for addition or deletion.
+ *
+ * @return string[]
+ *   An array of node type labels, keyed by the node type name.
+ */
+function widget_engine_type_get_names() {
+  return array_map(function ($bundle_info) {
+    return $bundle_info['label'];
+  }, \Drupal::entityManager()->getBundleInfo('widget'));
+}
+
+/**
+ * Implements hook_menu_links_discovered_alter().
+ */
+function widget_engine_menu_links_discovered_alter(&$links) {
+  $links['entity.widget.add_page']['parent'] = 'system.admin_content';
+  // Add links for each widget type.
+  foreach (widget_engine_type_get_names() as $machine_name => $label) {
+    $links['entity.widget.add_form' . $machine_name] = array(
+      'title' => $label,
+      'route_name' => 'entity.widget.add_form',
+      'menu_name' => 'admin',
+      'parent' => 'entity.widget.add_page',
+      'route_parameters' => array('widget_type' => $machine_name),
+    );
+  }
+}
+
+/**
+ * Implements hook_library_info_alter().
+ */
+function widget_engine_library_info_alter(&$libraries, $extension) {
+  // Optionally use the Libraries module to determine our library paths.
+  if ($extension == 'widget_engine'
+    && \Drupal::moduleHandler()->moduleExists('libraries')) {
+    // Include html2canvas library.
+    $html2canvas_path = libraries_get_path('html2canvas') . '/dist/html2canvas.min.js';
+    $libraries['html2canvas']['js'] = ['/' . $html2canvas_path => ['minified' => 'true']];
+    // Include es6-promise library.
+    $es6_promise_path = libraries_get_path('es6-promise') . '/dist/es6-promise.auto.min.js';
+    $libraries['es6-promise']['js'] = ['/' . $es6_promise_path => ['minified' => 'true']];
+  }
+}
+
+/**
+ * Implements hook_ajax_render_alter().
+ */
+function widget_engine_ajax_render_alter(&$commands) {
+  $selector = '.ief-widget-table';
+  $command = new InvokeCommand($selector, 'trigger', ['afterSaveWidget']);
+  $commands[] = $command->render();
+}
+
+/**
+ * Implements hook_entity_type_build().
+ */
+function widget_engine_entity_type_build(array &$entity_types) {
+  /** @var \Drupal\Core\Entity\EntityTypeInterface[] $entity_types */
+  if (isset($entity_types['widget'])) {
+    $entity_types['widget']->setHandlerClass('inline_form', '\Drupal\widget_engine\Form\WidgetInlineForm');
+  }
+}
+
+/**
+ * Implements hook_theme_registry_alter().
+ */
+function widget_engine_theme_registry_alter(&$theme_registry) {
+  $theme_registry['inline_entity_form_entity_table']['function'] = 'theme_widget_engine_form_entity_table';
+}
+
+/**
+ * Themes the table showing existing entity references in the widget.
+ */
+function theme_widget_engine_form_entity_table($variables) {
+  $renderer = \Drupal::service('renderer');
+  $form = $variables['form'];
+  $entity_type = $form['#entity_type'];
+
+  $fields = $form['#table_fields'];
+  $has_tabledrag = \Drupal::entityTypeManager()->getHandler($entity_type, 'inline_form')->isTableDragEnabled($form);
+
+  // Sort the fields by weight.
+  uasort($fields, '\Drupal\Component\Utility\SortArray::sortByWeightElement');
+
+  $header = [];
+  if ($has_tabledrag) {
+    $header[] = ['data' => '', 'class' => ['ief-tabledrag-header']];
+    $header[] = ['data' => t('Sort order'), 'class' => ['ief-sort-order-header']];
+  }
+  // Add header columns for each field.
+  $first = TRUE;
+  foreach ($fields as $field_name => $field) {
+    $column = ['data' => $field['label']];
+    // The first column gets a special class.
+    if ($first) {
+      $column['class'] = ['ief-first-column-header'];
+      $first = FALSE;
+    }
+    // Hide wid header label.
+    if ($field_name == 'wid') {
+      $column['class'][] = 'hidden';
+    }
+    $header[] = $column;
+  }
+  $header[] = t('Operations');
+
+  // Build an array of entity rows for the table.
+  $rows = [];
+  foreach (Element::children($form) as $key) {
+    if (empty($form[$key]['#entity'])) {
+      continue;
+    }
+
+    /** @var \Drupal\Core\Entity\FieldableEntityInterface $entity */
+    $entity = $form[$key]['#entity'];
+    // Add new class to row for widget entity type.
+    $widget_row_classes = '';
+
+    // Add image rebuild class to row.
+    if (!empty($form[$key]['#image_rebuild'])) {
+      $widget_row_classes .= 'ief-widget-rebuild-img ';
+    }
+
+    // Add row uniq row class.
+    if ($entity_type == 'widget') {
+      $wid = $entity->id();
+      $widget_row_classes .= 'ief-row-widget-' . $wid;
+    }
+    $row_classes = ["ief-row-entity {$widget_row_classes}"];
+    $cells = [];
+    if ($has_tabledrag) {
+      $cells[] = ['data' => '', 'class' => ['ief-tabledrag-handle']];
+      $cells[] = $renderer->render($form[$key]['delta']);
+      $row_classes[] = 'draggable';
+    }
+    // Add a special class to rows that have a form underneath, to allow
+    // for additional styling.
+    if (!empty($form[$key]['form'])) {
+      $row_classes[] = 'ief-row-entity-form';
+    }
+
+    foreach ($fields as $field_name => $field) {
+      $data = '';
+      if ($field['type'] == 'label') {
+        $data = $variables['form'][$key]['#label'];
+      }
+      elseif ($field['type'] == 'field' && $entity->hasField($field_name)) {
+        $display_options = ['label' => 'hidden'];
+        if (isset($field['display_options'])) {
+          $display_options += $field['display_options'];
+        }
+        $data = $entity->get($field_name)->view($display_options);
+
+        // Add image style.
+        if ($field_name == 'widget_preview') {
+          $data = widget_engine_build_preview_image($data);
+        }
+      }
+      elseif ($field['type'] == 'callback') {
+        $arguments = [
+          'entity' => $entity,
+          'variables' => $variables,
+        ];
+        if (isset($field['callback_arguments'])) {
+          $arguments = array_merge($arguments, $field['callback_arguments']);
+        }
+
+        $data = call_user_func_array($field['callback'], $arguments);
+      }
+
+      // Hide wid column.
+      $cell_classes = [
+        'inline-entity-form-' . $entity_type . '-' . $field_name,
+      ];
+      if ($field_name == 'wid') {
+        $cell_classes[] = 'hidden';
+      }
+      $cells[] = ['data' => $data, 'class' => $cell_classes];
+    }
+
+    // Add the buttons belonging to the "Operations" column.
+    $cells[] = $renderer->render($form[$key]['actions']);
+    // Create the row.
+    $rows[] = ['data' => $cells, 'class' => $row_classes];
+    // If the current entity array specifies a form, output it in the next row.
+    if (!empty($form[$key]['form'])) {
+      $row = [
+        ['data' => $renderer->render($form[$key]['form']), 'colspan' => count($fields) + 1],
+      ];
+      $rows[] = [
+        'data' => $row,
+        'class' => ['ief-row-form'],
+        'no_striping' => TRUE,
+      ];
+    }
+  }
+
+  if (!empty($rows)) {
+    $tabledrag = [];
+    if ($has_tabledrag) {
+      $tabledrag = [
+        [
+          'action' => 'order',
+          'relationship' => 'sibling',
+          'group' => 'ief-entity-delta',
+        ],
+      ];
+    }
+
+    $table_classes = ($entity_type == 'widget') ? 'ief-widget-table' : '';
+    $table = [
+      '#type' => 'table',
+      '#header' => $header,
+      '#rows' => $rows,
+      '#attributes' => [
+        'id' => 'ief-entity-table-' . $form['#id'],
+        'class' => ["ief-entity-table {$table_classes}"],
+      ],
+      '#tabledrag' => $tabledrag,
+    ];
+
+    return $renderer->render($table);
+  }
+}
+
+/**
+ * Add image style to widget preview field.
+ */
+function widget_engine_build_preview_image($data) {
+  // Check image style.
+  if (!$style_preview = ImageStyle::load('widget_preview')) {
+    $style_preview = ImageStyle::load('large');
+  }
+
+  // Set new image style.
+  if (is_object($style_preview)) {
+    $data[0]['#image_style'] = $style_preview->get('name');
+  }
+
+  return $data;
+}

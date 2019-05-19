@@ -1,0 +1,308 @@
+<?php
+
+/**
+ * @file
+ * Domain-based access control for widget entities.
+ */
+
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Session\AccountInterface;
+
+/**
+ * Implements hook_help().
+ */
+function widget_engine_domain_access_help($route_name, RouteMatchInterface $route_match) {
+  $output = '';
+  switch ($route_name) {
+    // Main module help for the widget_engine_domain_access module.
+    case 'help.page.widget_engine_domain_access':
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Domain-based access control for widget entities') . '</p>';
+      break;
+
+    default:
+  }
+
+  return $output;
+}
+
+/**
+ * Implements hook_entity_type_build().
+ */
+function widget_engine_domain_access_entity_type_build(array &$entity_types) {
+  /** @var \Drupal\Core\Entity\EntityTypeInterface[] $entity_types */
+  if (isset($entity_types['widget'])) {
+    // We should reset access handler for widget entity for handling
+    // domain-based access restriction. With standard Widget access handling
+    // it won't work if user has standard Widget create/update permissions.
+    // @TODO: find more elegant way to handle domain-based access restrictions.
+    $entity_types['widget']->setHandlerClass('access', '\Drupal\widget_engine_domain_access\WidgetDomainAccessControlHandler');
+  }
+}
+
+/**
+ * Implements hook_domain_references_alter().
+ */
+function widget_engine_domain_access_domain_references_alter($query, $account, $context) {
+  /*  @var \Drupal\Core\Entity\Query\QueryInterface $query */
+  /*  @var \Drupal\Core\Session\AccountInterface $account */
+  // Restrict domains by editorial assignment.
+  if ($context['field_type'] != 'editor') {
+    return;
+  }
+  switch ($context['entity_type']) {
+    case 'widget':
+      if ($account->hasPermission('save widgets on any domain')) {
+        break;
+      }
+      elseif ($account->hasPermission('save widgets on any assigned domain')) {
+        if (!empty($account->get(DOMAIN_ACCESS_ALL_FIELD)->value)) {
+          break;
+        }
+        $allowed = \Drupal::service('domain_access.manager')->getAccessValues($account);
+        $query->condition('id', array_keys($allowed), 'IN');
+      }
+      else {
+        // Remove all options.
+        $query->condition('id', '-no-possible-match-');
+      }
+      break;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_access().
+ */
+function widget_engine_domain_access_widget_access(EntityInterface $widget, $operation, AccountInterface $account) {
+  static $active_domain;
+  if (!isset($active_domain)) {
+    // Ensure that the loader has run. In some tests, the kernel event has not.
+    $active = \Drupal::service('domain.negotiator')->getActiveDomain();
+    if (empty($active)) {
+      $active = \Drupal::service('domain.negotiator')->getActiveDomain(TRUE);
+    }
+    /** @var \Drupal\domain\Entity\Domain $active_domain */
+    $active_domain = $active;
+  }
+  // Check to see that we have a valid active domain.
+  // Without one, we cannot assert an opinion about access.
+  if (empty($active_domain->getDomainId())) {
+    return AccessResult::neutral();
+  }
+
+  $type = $widget->bundle();
+  $manager = \Drupal::service('widget_engine_domain_access.manager');
+  $allowed = FALSE;
+
+  if ($operation == 'view' && $manager->checkEntityAccess($widget, $account)) {
+    /** @var \Drupal\user\UserInterface $user */
+    if ($widget->isPublished()) {
+      $allowed = TRUE;
+    }
+    elseif ($account->hasPermission('view unpublished domain widgets')) {
+      $allowed = TRUE;
+    }
+  }
+
+  if ($operation == 'update') {
+    if ($account->hasPermission('update ' . $type . ' widget on assigned domains') && $manager->checkEntityAccess($widget, $account)) {
+      $allowed = TRUE;
+    }
+    elseif ($account->hasPermission('edit domain widgets') && $manager->checkEntityAccess($widget, $account)) {
+      $allowed = TRUE;
+    }
+  }
+
+  if ($operation == 'delete') {
+    if ($account->hasPermission('delete ' . $type . ' widget on assigned domains') && $manager->checkEntityAccess($widget, $account)) {
+      $allowed = TRUE;
+    }
+    elseif ($account->hasPermission('delete domain widgets') && $manager->checkEntityAccess($widget, $account)) {
+      $allowed = TRUE;
+    }
+  }
+
+  if ($allowed) {
+    return AccessResult::allowed()
+      ->cachePerPermissions()
+      ->cachePerUser()
+      ->addCacheableDependency($widget);
+  }
+
+  // No opinion.
+  return AccessResult::neutral();
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_create_access().
+ */
+function widget_engine_domain_access_widget_create_access(AccountInterface $account, $context, $entity_bundle) {
+  // Check to see that we have a valid active domain.
+  // Without one, we cannot assert an opinion about access.
+  /** @var \Drupal\domain\DomainInterface $active */
+  if ($active = \Drupal::service('domain.negotiator')->getActiveDomain()) {
+    $id = $active->getDomainId();
+  }
+  else {
+    return AccessResult::neutral();
+  }
+  // Load the full user record.
+  $user = \Drupal::entityTypeManager()->getStorage('user')->load($account->id());
+  $user_domains = \Drupal::service('domain_access.manager')->getAccessValues($user);
+  if (($account->hasPermission('create ' . $entity_bundle . ' widget on assigned domains')
+      || $account->hasPermission('create domain widgets'))
+    && in_array($id, $user_domains)) {
+    // Note the cache context here!
+    return AccessResult::allowed()->addCacheContexts(['user.permissions', 'url.site']);
+  }
+  // No opinion.
+  return AccessResult::neutral();
+}
+
+/**
+ * Implements hook_entity_field_access_alter().
+ */
+function widget_engine_domain_access_entity_field_access_alter(array &$grants, array $context) {
+  /** @var \Drupal\Core\Field\FieldDefinitionInterface $field_definition */
+  $field_definition = $context['field_definition'];
+  if ($field_definition->getTargetEntityTypeId() == 'widget'
+    && ($field_definition->getName() == DOMAIN_ACCESS_ALL_FIELD
+      || $field_definition->getName() == DOMAIN_ACCESS_FIELD )) {
+    switch ($field_definition->getName()) {
+      case DOMAIN_ACCESS_ALL_FIELD:
+        $access = AccessResult::forbiddenIf(!$context['account']->hasPermission('save widgets on any domain'));
+        break;
+
+      case DOMAIN_ACCESS_FIELD:
+        $access = AccessResult::allowedIfHasPermissions($context['account'], [
+          'save widgets on any domain',
+          'save widgets on any assigned domain',
+        ], 'OR');
+
+        if (!$access->isAllowed()) {
+          $access = AccessResult::forbidden();
+        }
+
+        break;
+
+      default:
+    }
+    $grants['domain_access'] = $access;
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ *
+ * Creates our fields when new widget types are created.
+ */
+function widget_engine_domain_access_widget_type_insert(EntityInterface $entity) {
+  /** @var \Drupal\Core\Config\Entity\ConfigEntityInterface $entity */
+  if (!$entity->isSyncing()) {
+    // Do not fire hook when config sync in progress.
+    widget_engine_domain_access_confirm_fields('widget', $entity->id());
+  }
+}
+
+/**
+ * Creates our fields for an entity bundle.
+ *
+ * @param string $entity_type
+ *   The entity type being created.
+ * @param string $bundle
+ *   The bundle being created.
+ * @param array $text
+ *   The text to use for the field. Keys are:
+ *   'name' -- the lower-case, human-readable name of the entity.
+ *   'label' -- the form label for the all affiliates field.
+ *   'description' -- the help text for the all affiliates field.
+ */
+function widget_engine_domain_access_confirm_fields($entity_type, $bundle, $text = array()) {
+  try {
+    $text['widget'] = [
+      'name' => 'widget',
+      'label' => 'Send to all affiliates',
+      'description' => 'Make this widget available on all domains.',
+    ];
+
+    $id = $entity_type . '.' . $bundle . '.' . DOMAIN_ACCESS_FIELD;
+
+    $field_storage = \Drupal::entityTypeManager()->getStorage('field_config');
+    if (!$field = $field_storage->load($id)) {
+      $field = array(
+        'field_name' => DOMAIN_ACCESS_FIELD,
+        'entity_type' => $entity_type,
+        'label' => 'Domain Access',
+        'bundle' => $bundle,
+        // Users should not be required to be a domain editor.
+        'required' => $entity_type !== 'user',
+        'description' => 'Select the affiliate domain(s) for this ' . $text[$entity_type]['name'],
+        'default_value_callback' => 'Drupal\widget_engine_domain_access\WidgetEngineDomainAccessManager::getDefaultValue',
+        'settings' => array(
+          'handler_settings' => array(
+            'sort' => array('field' => 'weight', 'direction' => 'ASC'),
+          ),
+        ),
+      );
+      $field_config = $field_storage->create($field);
+      $field_config->save();
+    }
+    // Assign the all affiliates field.
+    $id = $entity_type . '.' . $bundle . '.' . DOMAIN_ACCESS_ALL_FIELD;
+    if (!$field = $field_storage->load($id)) {
+      $field = array(
+        'field_name' => DOMAIN_ACCESS_ALL_FIELD,
+        'entity_type' => $entity_type,
+        'label' => $text[$entity_type]['label'],
+        'bundle' => $bundle,
+        'required' => FALSE,
+        'description' => $text[$entity_type]['description'],
+      );
+      $field_config = $field_storage->create($field);
+      $field_config->save();
+    }
+    // Tell the form system how to behave. Default to radio buttons.
+    // @TODO: This function is deprecated, but using the OO syntax is causing
+    // test fails.
+    entity_get_form_display($entity_type, $bundle, 'default')
+      ->setComponent(DOMAIN_ACCESS_FIELD, array(
+        'type' => 'options_buttons',
+        'weight' => 40,
+      ))
+      ->setComponent(DOMAIN_ACCESS_ALL_FIELD, array(
+        'type' => 'boolean_checkbox',
+        'settings' => array('display_label' => 1),
+        'weight' => 41,
+      ))
+      ->save();
+  }
+  catch (Exception $e) {
+    \Drupal::logger('domain_access')->notice('Field installation failed.');
+  }
+}
+
+/**
+ * Implements hook_views_data_alter().
+ */
+function widget_engine_domain_access_views_data_alter(array &$data) {
+  $table = 'widget__' . DOMAIN_ACCESS_FIELD;
+  $data[$table][DOMAIN_ACCESS_FIELD]['field']['id'] = 'domain_access_field';
+  $data[$table][DOMAIN_ACCESS_FIELD . '_target_id']['filter']['id'] = 'domain_access_filter';
+  $data[$table][DOMAIN_ACCESS_FIELD . '_target_id']['argument']['id'] = 'domain_access_argument';
+
+  // Current domain filter.
+  $data[$table]['current_all'] = [
+    'title' => t('Current domain'),
+    'group' => t('Domain'),
+    'filter' => [
+      'field' => DOMAIN_ACCESS_FIELD . '_target_id',
+      'id' => 'widget_engine_domain_access_current_all_filter',
+      'title' => t('Available on current domain'),
+      'help' => t('Filters out widgets not available on current domain (published to current domain or all affiliates).'),
+    ],
+  ];
+}
