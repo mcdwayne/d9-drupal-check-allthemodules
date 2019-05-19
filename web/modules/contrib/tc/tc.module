@@ -1,0 +1,219 @@
+<?php
+
+/**
+ * @file
+ * Allows Tinycontrol to submit data to a Drupal site.
+ *
+ * @see http://tinycontrol.eu
+ */
+
+/**
+ * Returns the available fields.
+ */
+function _tc_get_fields() {
+  return [ 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n',
+    'o', 'p', 'q'];
+}
+
+/**
+ * Returns the available periods with their appropriate number of days.
+ */
+function _tc_get_periods() {
+  return [
+    'day' => 1,
+    'week' => 7,
+    'month' => 31,
+    'year' => 365,
+  ];
+}
+
+/**
+ * Returns the available periods with their appropriate format strings.
+ *
+ * @see date()
+ */
+function _tc_get_dateformats() {
+  return [
+    'day' => 'H:00',
+    'week' => 'M j',
+    'month' => 'M j',
+    'year' => 'M',
+  ];
+}
+
+/**
+ * Returns the typical mapping of fields to TC data sources.
+ *
+ * @param $field
+ * @return string
+ */
+function _tc_typical_mapping($field) {
+  $map = [
+    'a' => 24,
+    'b' => 25,
+    'c' => 18,
+    'd' => 19,
+    'e' => 20,
+    'f' => 21,
+    'g' => 22,
+    'h' => 23,
+  ];
+  return isset($map[$field]) ? $map[$field] : 'XX';
+}
+
+/**
+ * Batch worker for importing TC data (from a CSV formatted as ThingSpeak does).
+ *
+ * @param $uid
+ *   The user's ID to import data on behalf of.
+ * @param $file
+ *   The file object to import data from.
+ * @param $context
+ *   The batch context.
+ */
+function tc_import_form_batch_op_progress($uid, $file, &$context) {
+  $handle = fopen($file->getFileUri(), 'r');
+  if (empty($context['sandbox'])) {
+    $context['sandbox'] = [];
+    $context['sandbox']['progress'] = 0;
+
+    // Save node count for the termination message.
+    $context['sandbox']['max'] = $file->getSize();
+    // First row contains field names, skip them.
+    $first_row = fgetcsv($handle, 8192, ',', '"');
+  }
+  else {
+    fseek($handle, $context['sandbox']['progress']);
+  }
+
+  $limit = 100;
+  $rows = 0;
+
+  while ($rows < $limit && $row = fgetcsv($handle, 8192, ',', '"')) {
+    $timestamp = strtotime($timeraw = array_shift($row));
+    if (!$timestamp) {
+      continue;
+    }
+    array_shift($row); // Shift off 'entry_id', which is unused by tc.module.
+    $field_id = 'a';
+    while ($field_value = array_shift($row)) {
+      \Drupal::database()->merge('tc_data')
+        ->keys([
+          'uid' => $uid,
+          'timestamp' => $timestamp,
+          'field_id' => $field_id,
+        ])
+        ->fields([
+          'field_value' => $field_value,
+        ])
+        ->execute();
+      $field_id++;
+    }
+    $rows++;
+  }
+  $context['sandbox']['progress'] = ftell($handle);
+  if ($context['sandbox']['progress'] != $context['sandbox']['max']) {
+    $context['message'] = t('Progress: %timeraw (!percent%)', [
+      '%timeraw' => $timeraw,
+      '!percent' => round($context['sandbox']['progress'] / $context['sandbox']['max'] * 100, 2),
+    ]);
+    $context['finished'] = ($context['sandbox']['progress'] >= $context['sandbox']['max']);
+  }
+  fclose($handle);
+}
+
+/**
+ * Batch worker to delete a file after import.
+ *
+ * @param $file
+ *   The file object to be deleted.
+ * @param $context
+ *   The batch object.
+ */
+function tc_import_form_batch_op_finish($file, &$context) {
+  $file->delete();
+}
+
+/**
+ * Returns the settings for a given user.
+ *
+ * @param \Drupal\Core\Database\Connection $connection
+ *   The database connection.
+ * @param $uid
+ *   The user's ID to return the settings for.
+ * @return array|bool
+ *   An array of settings if found, FALSE otherwise. Keys:
+ *   - write_key: The user's write key.
+ *   - settings: The array of other settings.
+ */
+function _tc_get_settings(\Drupal\Core\Database\Connection $connection, $uid) {
+  $settings_raw = $connection->select('tc_user', 'tu')
+    ->fields('tu', ['write_key', 'settings'])
+    ->condition('uid', $uid)
+    ->execute()
+    ->fetch();
+  if (!$settings_raw) {
+    return FALSE;
+  }
+  return [
+    'write_key' => $settings_raw->write_key,
+    'settings' => unserialize($settings_raw->settings),
+  ];
+}
+
+/**
+ * Implements hook_theme().
+ */
+function tc_theme($existing, $type, $theme, $path) {
+  return [
+    'tc_settings_form' => [
+      'render element' => 'form',
+      'function' => 'theme_tc_settings_form',
+    ],
+  ];
+}
+
+/**
+ * Returns HTML for the settings form.
+ *
+ * @ingroup themeable
+ */
+function theme_tc_settings_form($variables) {
+  $form = &$variables['form'];
+  $renderer = \Drupal::service('renderer');
+  $output = $renderer->render($form['write_key']);
+  $header = [
+    t('Enabled'),
+    t('Name'),
+    t('Skip "N/A" and "-60.0"'),
+  ];
+  $rows = [];
+  foreach (_tc_get_fields() as $field) {
+    $rows[] = [
+      $renderer->render($form['field_enabled'][$field]),
+      $renderer->render($form['field_name'][$field]),
+      $renderer->render($form['field_skip_na'][$field]),
+    ];
+  }
+  $table = array(
+    '#type' => 'table',
+    '#header' => $header,
+    '#rows' => $rows,
+    '#attributes' => array(
+      'id' => 'tc-settings-table',
+    ),
+  );
+  $output .= $renderer->render($table);
+  $output .= $renderer->render($form);
+  return $output;
+}
+
+/**
+ * Implements hook_cron().
+ */
+function tc_cron() {
+  // Delete data more than a year old.
+  \Drupal::database()->delete('tc_data')
+    ->condition('timestamp', REQUEST_TIME - 24 * 60 * 60 * 365, '<=')
+    ->execute();
+}
