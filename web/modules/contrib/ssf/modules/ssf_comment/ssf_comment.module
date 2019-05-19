@@ -1,0 +1,277 @@
+<?php
+
+/**
+ * @file
+ * A working example of how to use the ssf module to prevent comment spam.
+ */
+
+use Drupal\comment\Entity\Comment;
+use Drupal\Core\Database\Query\Condition;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Url;
+use Drupal\ssf\Bayes;
+use Drupal\ssf\Event\SsfRatingEvent;
+use Drupal\views\Plugin\views\query\QueryPluginBase;
+use Drupal\views\ViewExecutable;
+
+/**
+ * Add Spam link to the links of the display of comment.
+ *
+ * Implements hook_preprocess_links__comment().
+ */
+function ssf_comment_preprocess_links__comment(&$variables) {
+  // No links are available without permission or in pre-view mode.
+  if (!isset($variables['links']['comment-edit'])) {
+    return;
+  }
+
+  $user = \Drupal::currentUser();
+  $setSpamPermission = $user->hasPermission('ssf_comment set spam');
+  $adminCommentPermission = $user->hasPermission('administer comments');
+
+  if ($adminCommentPermission && $setSpamPermission) {
+    /** @var \Drupal\Core\Url $url */
+    $url = $variables['links']['comment-edit']['link']['#url'];
+    $routeParameters = $url->getRouteParameters();
+    $commentid = $routeParameters['comment'];
+
+    $comment = Comment::load($commentid);
+    if ($comment === NULL || !$comment->hasField('field_ssf_spam') || $comment->get('field_ssf_spam')->value) {
+      return;
+    }
+    $variables['links']['comment_report'] = [
+      'link' => [
+        '#type' => 'link',
+        '#title' => t('Spam'),
+        '#options' => ['ajax' => NULL],
+        '#url' => new Url('ssf_comment.set.spam', ['comment' => $commentid]),
+        '#ajax' => NULL,
+      ],
+      'text' => t('Spam'),
+    ];
+  }
+}
+
+/**
+ * Adds Spam/Ham operation to the administration list of comments.
+ *
+ * Implements hook_entity_operation_alter().
+ */
+function ssf_comment_entity_operation_alter(array &$operations, EntityInterface $entity) {
+  $set_ham = FALSE;
+  $set_spam = FALSE;
+
+  $entityTypeId = $entity->getEntityTypeId();
+  if ($entityTypeId === 'comment') {
+    /** @var \Drupal\comment\Entity\Comment $entity */
+    if ($entity->hasField('field_ssf_ham') && !$entity->get('field_ssf_ham')->value) {
+      $set_ham = TRUE;
+    }
+    if ($entity->hasField('field_ssf_spam') && !$entity->get('field_ssf_spam')->value) {
+      $set_spam = TRUE;
+    }
+  }
+  else {
+    return;
+  }
+
+  // Set comment to ham operation.
+  if ((\Drupal::currentUser()->hasPermission('ssf_comment set ham')) && $set_ham) {
+    $operations['ssf_comment_set_ham'] = [
+      'title' => 'Publish',
+      'url' => Url::fromRoute('ssf_comment.set.ham', ['comment' => $entity->id()]),
+      'weight' => 51,
+    ];
+  }
+
+  // Set comment to spam operation.
+  if ((\Drupal::currentUser()->hasPermission('ssf_comment set spam')) && $set_spam) {
+    $operations['ssf_comment_set_spam'] = [
+      'title' => 'Spam',
+      'url' => Url::fromRoute('ssf_comment.set.spam', ['comment' => $entity->id()]),
+      'weight' => 52,
+    ];
+  }
+}
+
+/**
+ * Add validation to form submissions of comment.
+ *
+ * Implements hook_form_alter().
+ */
+function ssf_comment_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  if (stripos($form_id, 'comment_') === 0 && stripos($form_id, '_form') !== FALSE) {
+    $form['#validate'][] = 'ssf_comment_comment_form_validate';
+  }
+}
+
+/**
+ * Validate callback for comment form. Classifies comments.
+ *
+ * @param array $form
+ *   Form.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   Form state.
+ */
+function ssf_comment_comment_form_validate(array &$form, FormStateInterface $form_state) {
+  /** @var \Drupal\ssf\Bayes $bayes */
+  $bayes = \Drupal::service('ssf.bayes');
+
+  $values = $form_state->getValues();
+  $body = (isset($values['comment_body']) ? $values['comment_body'][0]['value'] : '');
+
+  if (!empty($body)) {
+    $classification = $bayes->classify($body);
+    $form_state->setValue('field_ssf_rating', $classification);
+  }
+}
+
+/**
+ * Seperate spam from ham comments when they were classified.
+ *
+ * Implements hook_entity_insert().
+ */
+function ssf_comment_entity_insert(EntityInterface $entity) {
+  if ($entity instanceof Comment) {
+    if ($entity->hasField('field_ssf_rating')) {
+      $classification = $entity->get('field_ssf_rating')->value;
+      ssf_comment_trigger_event($entity, 'comment', $classification);
+    }
+    else {
+      ssf_comment_trigger_event($entity, 'comment', 0.5);
+      return;
+    }
+
+    /** @var \Drupal\ssf\Bayes $bayes */
+    $bayes = \Drupal::service('ssf.bayes');
+
+    $config = \Drupal::config('ssf_comment.settings');
+    $ham_threshold = $config->get('ssf_comment_ham_threshold') / 100;
+    $spam_threshold = $config->get('ssf_comment_spam_threshold') / 100;
+
+    if ($classification < $ham_threshold) {
+      $entity->set('field_ssf_ham', TRUE);
+      $bayes->learn($entity->get('comment_body')->value, Bayes::HAM);
+    }
+    if ($classification > $spam_threshold) {
+      $entity->set('field_ssf_spam', TRUE);
+      $bayes->learn($entity->get('comment_body')->value, Bayes::SPAM);
+    }
+
+    $user = \Drupal::currentUser();
+    $hasPermission = $user->hasPermission('skip comment approval');
+    /** @var \Drupal\comment\Entity\Comment $entity */
+    if ($hasPermission && $entity->hasField('field_ssf_ham') && $entity->get('field_ssf_ham')->value) {
+      $entity->setPublished();
+    }
+    elseif ($entity->hasField('field_ssf_spam') && $entity->get('field_ssf_spam')->value) {
+      $entity->setUnpublished();
+    }
+    elseif ($classification >= $ham_threshold && $classification <= $spam_threshold) {
+      $entity->setUnpublished();
+    }
+    $entity->save();
+  }
+}
+
+/**
+ * Exclude spam comments from the Published and Unapproved comment list views.
+ *
+ * Implements hook_views_query_alter().
+ */
+function ssf_comment_views_query_alter(ViewExecutable $view, QueryPluginBase $query) {
+  if ($view->id() == 'comment') {
+    $definition = [
+      'type' => 'LEFT OUTER',
+      'table' => 'comment__field_ssf_spam',
+      'field' => 'entity_id',
+      'left_table' => 'comment_field_data',
+      'left_field' => 'cid',
+    ];
+    $join = Drupal::service('plugin.manager.views.join')->createInstance('standard', $definition);
+    $query->addRelationship('comment__field_ssf_spam', $join, 'comment__field_ssf_spam');
+
+    $query->addWhere('1', (new Condition('OR'))
+      ->condition('comment__field_ssf_spam.field_ssf_spam_value', FALSE, '=')
+      ->condition('comment__field_ssf_spam.field_ssf_spam_value', NULL, 'IS NULL')
+    );
+  }
+}
+
+/**
+ * Set the unapproved comments count.
+ *
+ * Implements hook_menu_local_tasks_alter().
+ */
+function ssf_comment_menu_local_tasks_alter(&$data, $route_name, &$cacheability) {
+  if ($route_name == 'comment.admin' ||
+    $route_name == 'comment.admin_approval' ||
+    $route_name == 'ssf_comment.admin_comment_spam'
+   ) {
+    $data['tabs'][1]['comment.admin_approval']['#link']['title'] =
+      t('Unapproved comments (@count)', [
+        '@count' => get_actual_unapproved_comments(),
+      ]);
+  }
+}
+
+/**
+ * Get the number of unapproved comments.
+ *
+ * @return int
+ *   The number of unapproved comments excluding the spam comments.
+ */
+function get_actual_unapproved_comments() {
+  $query = \Drupal::entityQuery('comment');
+  $query->condition('status', 0);
+  $orCondition = $query->orConditionGroup();
+  $orCondition->condition('field_ssf_spam', NULL, 'IS NULL');
+  $orCondition->condition('field_ssf_spam', FALSE, '=');
+  $query->condition($orCondition);
+  $ids = $query->execute();
+  return count($ids);
+}
+
+/**
+ * Trigger an SSF rating Event.
+ * 
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ *   Comment.
+ * @param string $type
+ *   Type of Entity.
+ * @param float $rating
+ *   SSF rating for classification of content.
+ */
+function ssf_comment_trigger_event(EntityInterface $entity, $type, $rating) {
+  $dispatcher = \Drupal::service('event_dispatcher');
+  $event = new SsfRatingEvent($entity, $type, $rating);
+  $dispatcher->dispatch(SsfRatingEvent::SSF_RATING, $event);
+}
+
+/**
+ * Implements hook_theme().
+ */
+function ssf_comment_theme() {
+  return [
+    'ssf_comment_approve' => [
+      'variables' => [
+        'comment' => NULL,
+        'body' => NULL,
+      ],
+    ]
+  ];
+}
+
+/**
+ * Implementss hook_mail().
+ */
+function ssf_comment_mail($key, &$message, $params) {
+  if (isset($param['headers'])) {
+    $message['headers'] = array_merge($message['headers'], $param['headers']);
+  }
+  
+  $message['from'] = $params['from'];
+  $message['subject'] = $params['subject'];
+  $message['body'] = $params['body'];
+}
