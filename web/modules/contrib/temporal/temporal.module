@@ -1,0 +1,434 @@
+<?php
+
+/**
+ * @file
+ * Contains temporal.module..
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Entity\Entity;
+use Drupal\Core\Form\FormStateInterface;
+
+/**
+ * Implements hook_help().
+ */
+function temporal_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the temporal module.
+    case 'help.page.temporal':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('A system for tracking historical and future changes to fields and properties within entities') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function temporal_cron() {
+  $queue = \Drupal::queue('temporal_future_worker');
+  $queue->createItem([]);
+}
+
+/**
+ * Needed to handle creation of new entities as the nid/uid is not present at the presave stage
+ *
+ * Implements hook_entity_insert().
+ */
+function temporal_entity_insert(Entity $entity) {
+  return temporal_entity_presave($entity);
+}
+
+/**
+ * Implements hook_entity_presave().
+ */
+function temporal_entity_presave(Entity $entity) {
+  // Do not act on new entities as they have no nid/uid to associate yet
+  if(!$entity->id()) {
+    return $entity;
+  }
+
+  // Prevent future value changes from triggering temporal entries from being created
+  if(isset($entity->temporal_bypass)) {
+    return $entity;
+  }
+
+  $account = \Drupal::currentUser();
+
+  $entity_type = $entity->getEntityTypeId();
+  // Don't operate on temporal entities
+  if ($entity_type == 'temporal_type' OR $entity_type == 'temporal') {
+    return $entity;
+  }
+  $entity_bundle = $entity->bundle();
+  $entity_value = NULL;
+  $original_value = array();
+  $tracking_date = NULL;
+  $tracking_retain = NULL;
+  $future_date = 0;
+  $restored = 0;
+  $tempstore = NULL;
+
+  $temporal_types = \Drupal::service('entity.manager')->getStorage('temporal_type')->loadMultiple();
+
+  if(count($temporal_types) == 0) {
+    return $entity;
+  }
+
+  // Have to test on hardcoded entity types as 'drush cr' causes a block to be passed creating a PHP fatal
+  // by the $tempstore->get($entity->getEntityTypeId() call being empty?
+  if($entity_type == 'node' OR $entity_type == 'user') {
+    // Determine if Drush is the trigger for this (cron user/node creation)
+    if (PHP_SAPI === 'cli') {
+      $tracking_retain = FALSE;
+    }
+    else {
+      // Fetch the tempstore tracking date if set
+      /** @var \Drupal\user\PrivateTempStore $tempstore */
+      $tempstore = \Drupal::service('user.private_tempstore')->get('temporal');
+      $tracking_date = $tempstore->get($entity->getEntityTypeId() . '_tracking_date');
+      $tracking_retain = $tempstore->get($entity->getEntityTypeId() . '_tracking_retain');
+    }
+  }
+
+  // This should be statically cached or stored as state when temporal types are created
+  // Each time a temporal type is inserted or updated rebuild the state storage from scratch
+  // Would make it simpler to call and manage without having to pull in all the class stuff
+  foreach ($temporal_types as $temporal_type_name => $temporal_type) {
+    /* @var $temporal_type \Drupal\temporal\Entity\TemporalType */
+    $temporal_entity_type = $temporal_type->getTemporalEntityType();
+    $temporal_entity_bundle = $temporal_type->getTemporalEntityBundle();
+    $temporal_entity_field = $temporal_type->getTemporalEntityField();
+    $temporal_entity_field_type = $temporal_type->getTemporalEntityFieldType();
+
+    // Match Entity Type
+    if($entity_type == $temporal_entity_type) {
+      // Match Entity Bundle
+      if($entity_bundle == $temporal_entity_bundle) {
+        $entity_value = $entity->$temporal_entity_field->getValue();
+        // Insert or Update?
+        if($entity->isNew()) {
+          // Record the field value by default as it is populated above
+        }
+        else {
+          if(isset($entity->original)) {
+            // Now to test if the value has changed
+            $original_value = $entity->original->$temporal_entity_field->getValue();
+            if ($original_value == $entity_value) {
+              $entity_value = NULL;
+            }
+          }
+        }
+        // Do we have a value to store?
+        if($entity_value !== NULL) {
+          // Is this a historical tracking field and a tracking date is provided?
+          if($temporal_type->getTrackingType() == 'historical' AND strstr($tracking_date, '-')) {
+            list($year, $month, $day) = explode('-', $tracking_date);
+            // Current time of edit to preserve when a change was made
+            $hour = date('G');
+            $minute = date('i');
+            $second = date('s');
+            $created_date = mktime($hour, $minute, $second, $month, $day, $year);
+            
+            if($created_date > REQUEST_TIME) {
+              $future_date = 1;
+            }
+
+            // Retain original values if specified or a future date and there is an original copy to work with (not in new entities)
+            if (($tracking_retain OR $future_date > 0) AND isset($entity->original)) {
+              // Re-apply the original field values, this change is in the past, or if in the future, will be applied later
+              $entity->$temporal_entity_field->setValue($entity->original->$temporal_entity_field->getValue());
+              $restored++;
+            }
+          }
+          else {
+            $created_date = REQUEST_TIME;
+          }
+
+          // Loop through all the deltas of the changed entity value
+          foreach($entity_value AS $delta => $value) {
+            $temporal_entry = \Drupal\temporal\Entity\Temporal::create([
+              'delta' => $delta,
+              'value' => is_array($value) ? current($value) : $value,
+              'entity_id' => $entity->id(),
+              'entity_type' => $temporal_entity_type,
+              'entity_bundle' => $temporal_entity_bundle,
+              'entity_field_type' => $temporal_entity_field_type,
+              'entity_field' => $temporal_entity_field,
+              'type' => $temporal_type_name,
+              'langcode' => 'en',
+              'created' => $created_date,
+              'changed' => REQUEST_TIME,
+              'status' => 1,
+              'uid' => $account->id(),
+              'future' => $future_date, // Is the tracking date in the future?
+            ]);
+            $temporal_entry->save();
+          }
+        }
+      }
+    }
+  }
+
+  // Notification and cleanup of effective date code
+  if($tracking_date) {
+    if($restored > 0) {
+      // Notify user that changes have been saved to temporal and original values preserved
+      drupal_set_message('Temporal tracked fields that were changed have been recorded, original values were preserved');
+    }
+    // Clean up the tempstore values
+    $tempstore->delete($entity->getEntityTypeId() . '_tracking_date');
+    $tempstore->delete($entity->getEntityTypeId() . '_tracking_retain');
+  }
+  return $entity;
+}
+
+/**
+ * Ensure that the Temporal entries are cleaned up
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ */
+function temporal_entity_delete(Drupal\Core\Entity\EntityInterface $entity) {
+  // Remove any Temporal entries when a tracked entity is deleted
+  $query = \Drupal::database()->delete('temporal');
+  $query->condition('entity_id', $entity->id());
+  $query->condition('entity_type', $entity->getEntityTypeId());
+  $query->execute();
+
+  // Remove any Temporal entries when a Temporal type is deleted
+  if($entity->getEntityTypeId() == 'temporal_type') {
+    /** @var \Drupal\temporal\Entity\TemporalType $entity */
+    $query = \Drupal::database()->delete('temporal');
+    $query->condition('type', $entity->id());
+    $query->execute();
+  }
+}
+
+function temporal_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+  $form_object = $form_state->getFormObject();
+
+  // Ensure we are only working with node or user entity forms
+  if(!$form_object instanceof \Drupal\user\ProfileForm &&
+    !$form_object instanceof \Drupal\user\RegisterForm &&
+    !$form_object instanceof \Drupal\node\NodeForm
+  ) {
+    return;
+  }
+
+  /** @var Entity $entity */
+  $entity = $form_state->getFormObject()->getEntity();
+
+  // Determine context, are there temporal tracked fields in this form?
+  $historical_date_fields = NULL;
+  $build_info = $form_state->getBuildInfo();
+  $base_form_id = $build_info['base_form_id'];
+
+  $temporal_types = \Drupal::service('entity.manager')->getStorage('temporal_type')->loadMultiple();
+  foreach ($temporal_types as $temporal_type_name => $temporal_type) {
+    /* @var $temporal_type \Drupal\temporal\Entity\TemporalType */
+    $temporal_entity_type = $temporal_type->getTemporalEntityType();
+    $temporal_entity_bundle = $temporal_type->getTemporalEntityBundle();
+    // Is this a user edit form or a node edit form that we are tracking fields for?
+    // There is so much inconsistancy with form_id's and base_form_id's, so hack this crap for now until better ways present
+    if($form_id == $temporal_entity_type.'_form' OR
+        $form_id == $temporal_entity_type.'_'.$temporal_entity_bundle.'_edit_form' OR
+        $base_form_id == 'node_form' OR
+        $base_form_id == 'user_form'
+    ){
+      // Additional conditions to ensure that if we matched on $base_form_id,
+      // we still hide the temporal block for content types we're not interested in.
+      // @todo consider whether this can replace the above conditions entirely
+      if ($entity->getEntityTypeId() != $temporal_type->getTemporalEntityType()) {
+        continue;
+      }
+      if ($entity->bundle() != $temporal_type->getTemporalEntityBundle()) {
+        continue;
+      }
+      if (!array_key_exists($temporal_type->getFieldName(), $form)) {
+        continue;
+      }
+
+      // If so, run through them and determine if any of them are historical tracking types
+      if($temporal_type->getTrackingType() == 'historical') {
+        $historical_date_fields[] = $temporal_type->label();
+      }
+    }
+  }
+
+  // Add the datefield to allow specific dates for historical entry tracking
+  if(is_array($historical_date_fields) AND count($historical_date_fields) > 0) {
+    $form['temporal'] = [
+      '#type' => 'details',
+      '#title' => 'Temporal',
+      '#weight' => 99,
+      '#open' => true,
+    ];
+    $form['temporal']['temporal_tracking_date'] = [
+      '#type' => 'date',
+      '#title' => 'Effective Date',
+      '#default_value' => [],
+      '#description' => 'Optionally apply the effective date to values of the changed fields only. Leave empty to use the current date.</br><b>'.implode(', ', $historical_date_fields).'</b>',
+    ];
+
+    // Detect if this is a node/add form, or a admin/people/create form and disable this option
+    // $entity->isNew() for nodes and users YAY!
+    if($entity->isNew()) {
+      $retain_disable = true;
+    }
+    else {
+      $retain_disable = false;
+    }
+    $form['temporal']['temporal_tracking_retain'] = [
+      '#type' => 'checkbox',
+      '#title' => 'Retain original values',
+      '#default_value' => 0,
+      '#description' => 'When specifying a date in the past, keep the current values and store the changes in Temporal only. Future dates will always retain the current values.',
+      '#disabled' => $retain_disable,
+    ];
+
+    // Some forms have several submit actions, catch them all
+    foreach($form['actions'] AS $action => $action_data) {
+      if($action[0] != '#' AND isset($form['actions'][$action]['#submit'])) {
+        array_unshift($form['actions'][$action]['#submit'], 'temporal_tracking_date_form_submit');
+      }
+    }
+
+  }
+}
+
+/**
+ * Catch our submit callback and store the date in a tempstore
+ *
+ * @param $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+function temporal_tracking_date_form_submit($form, FormStateInterface $form_state) {
+  /** @var Entity $entity */
+  $entity = $form_state->getFormObject()->getEntity();
+
+  if ($form_state->hasValue('temporal_tracking_date')) {
+    /** @var \Drupal\user\PrivateTempStore $tempstore */
+    $tempstore = \Drupal::service('user.private_tempstore')->get('temporal');
+    $tempstore->set($entity->getEntityTypeId().'_tracking_date', $form_state->getValue('temporal_tracking_date'));
+    $tempstore->set($entity->getEntityTypeId().'_tracking_retain', $form_state->getValue('temporal_tracking_retain'));
+  }
+}
+
+function temporal_entity_types() {
+  // List of entity types for discovering fields to monitor
+  // TODO:  Make this configurable? or exposed as a plugin system that we provide two already baked in?
+  $entity_types = [
+    'node',
+    'user',
+  ];
+
+  return $entity_types;
+}
+
+function temporal_entity_properties() {
+  // Entity properties we want to track
+  $entity_type_properties = [
+    'node' => [
+      'status' => 'boolean',
+      'title' => 'string',
+    ],
+    'user' => [
+      'status' => 'boolean',
+      'roles' => 'entity_reference',
+    ],
+  ];
+
+  return $entity_type_properties;
+}
+
+/**
+ * Provides a mapping of the field types and their casting
+ * Used to limit the fields allowed in the TemporalType creation form
+ * Used to assert the data type casting on results pull from the database
+ *
+ * @param string $field_type
+ * @return array
+ */
+function temporal_field_type_mapping($field_type = NULL) {
+  // List of field types that we will track
+  $include = [
+    'boolean'           => 'boolean',
+    'decimal'           => 'float',
+    'float'             => 'float',
+    'integer'           => 'integer',
+    'string'            => 'string',
+    'entity_reference'  => 'integer',
+    'datetime'          => 'string',
+  ];
+
+  if($field_type !== NULL AND isset($include[$field_type])) {
+    return $include[$field_type];
+  }
+  else {
+    return $include;
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function temporal_theme() {
+  $theme = [];
+  $theme['temporal'] = [
+    'render element' => 'elements',
+    'file' => 'temporal.page.inc',
+    'template' => 'temporal',
+  ];
+  $theme['temporal_content_add_list'] = [
+    'render element' => 'content',
+    'variables' => ['content' => NULL],
+    'file' => 'temporal.page.inc',
+  ];
+  return $theme;
+}
+
+/**
+* Implements hook_theme_suggestions_HOOK().
+*/
+function temporal_theme_suggestions_temporal(array $variables) {
+  $suggestions = array();
+  /** @var Entity $entity */
+  $entity = $variables['elements']['#temporal'];
+  $sanitized_view_mode = strtr($variables['elements']['#view_mode'], '.', '_');
+
+  $suggestions[] = 'temporal__' . $sanitized_view_mode;
+  $suggestions[] = 'temporal__' . $entity->bundle();
+  $suggestions[] = 'temporal__' . $entity->bundle() . '__' . $sanitized_view_mode;
+  $suggestions[] = 'temporal__' . $entity->id();
+  $suggestions[] = 'temporal__' . $entity->id() . '__' . $sanitized_view_mode;
+  return $suggestions;
+}
+
+/**
+ * Helper to retireve info about fields without having an entity loaded
+ * 
+ * @param $entity_type
+ * @param $bundle
+ * @param $field
+ * @return array
+ */
+function temporal_field_info_helper($entity_type, $bundle, $field) {
+  foreach (\Drupal::entityManager()->getFieldDefinitions($entity_type, $bundle) as $field_name => $field_definition) {
+    if (!empty($field_definition->getTargetBundle())) {
+      $bundleFields[$entity_type][$field_name]['type'] = $field_definition->getType();
+      $bundleFields[$entity_type][$field_name]['label'] = $field_definition->getLabel();
+    }
+  }
+  if(isset($bundleFields[$entity_type][$field])) {
+    return $bundleFields[$entity_type][$field];
+  }
+  else {
+    return [
+      'type' => 'UNKNOWN FIELD',
+      'label' => 'UNKNOWN LABEL',
+    ];
+  }
+}
