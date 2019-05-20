@@ -1,5 +1,5 @@
-# Drupal 9 Check Ressults - Preinstalled all modules
-## One module per branch
+# Drupal 9 Check Results - 
+## The code in this repo has composer pre-installed all modules - One module per branch
 
 This repository is a composer installed Drupal 8 project 
 
