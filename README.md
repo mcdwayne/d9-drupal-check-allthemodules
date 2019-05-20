@@ -18,6 +18,13 @@ composer update
 drupal-check web/module/contrib/<mosule_name>
 
 ```
+### Also contains 
+
+[repomaker.sh](https://github.com/mcdwayne/d9-drupal-check-allthemodules/blob/master/repomaker.sh), which is the script that created the repo itself and some of the resulting reports
+
+and [modulelistmachinenames.csv](https://github.com/mcdwayne/d9-drupal-check-allthemodules/blob/master/modulelistmachinenames.csv) which is needed to run repomaker.sh. This version contains all known modules.  
+
+
 
 ## Resulting files from creation process
 
